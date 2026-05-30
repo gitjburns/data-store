@@ -1,5 +1,8 @@
 #[cfg(any(feature = "cuda", feature = "metal"))]
-use candle_core::Device;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use candle_core::{Device, Error as CandleError};
 
 use crate::{
     config::{InferenceConfig, InferenceDeviceKind},
@@ -33,9 +36,7 @@ pub fn initialize_device(config: &InferenceConfig) -> Result<SelectedDevice, Api
 /// Initialize a CUDA device when the binary was compiled with CUDA support.
 #[cfg(feature = "cuda")]
 fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
-    Device::new_cuda(index).map_err(|source| ApiError::InferenceInit {
-        message: format!("failed to initialize CUDA device {index}: {source}"),
-    })?;
+    create_candle_device(format!("CUDA device {index}"), || Device::new_cuda(index))?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Cuda,
@@ -56,9 +57,7 @@ fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
 /// Initialize a Metal device when the binary was compiled with Metal support.
 #[cfg(feature = "metal")]
 fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
-    Device::new_metal(index).map_err(|source| ApiError::InferenceInit {
-        message: format!("failed to initialize Metal device {index}: {source}"),
-    })?;
+    create_candle_device(format!("Metal device {index}"), || Device::new_metal(index))?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Metal,
@@ -74,4 +73,38 @@ fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
             "config requested metal:{index}, but this binary was not built with --features metal"
         ),
     })
+}
+
+/// Create a Candle accelerator device and convert backend panics into readiness diagnostics.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn create_candle_device<F>(label: String, create: F) -> Result<(), ApiError>
+where
+    F: FnOnce() -> Result<Device, CandleError>,
+{
+    match catch_unwind(AssertUnwindSafe(create)) {
+        Ok(Ok(_device)) => Ok(()),
+        Ok(Err(source)) => Err(ApiError::InferenceInit {
+            message: format!("failed to initialize {label}: {source}"),
+        }),
+        Err(payload) => Err(ApiError::InferenceInit {
+            message: format!(
+                "failed to initialize {label}: Candle backend panicked: {}",
+                panic_payload_message(payload)
+            ),
+        }),
+    }
+}
+
+/// Render a panic payload without assuming the upstream panic type.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_string()
 }
