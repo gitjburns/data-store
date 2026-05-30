@@ -6,6 +6,7 @@ mod inference;
 mod source;
 mod state;
 mod types;
+mod units;
 
 use std::sync::Arc;
 

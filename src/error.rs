@@ -41,6 +41,9 @@ pub enum ApiError {
     InternalIo { message: String },
 
     #[error("{message}")]
+    UnitSplitting { message: String },
+
+    #[error("{message}")]
     BadRequest { message: String },
 
     #[error("{message}")]
@@ -70,7 +73,8 @@ impl ApiError {
             | Self::InvalidCli { .. }
             | Self::InferenceInit { .. }
             | Self::DoclingUnavailable { .. }
-            | Self::InternalIo { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::InternalIo { .. }
+            | Self::UnitSplitting { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

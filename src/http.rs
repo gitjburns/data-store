@@ -13,6 +13,7 @@ use crate::{
     source::resolve_source_reference,
     state::AppState,
     types::{HealthResponse, IngestRequest, IngestResponse, SearchRequest, SearchResponse},
+    units::split_conversion_into_units,
 };
 
 /// Build the Axum router for the versioned HTTP API.
@@ -29,7 +30,7 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(state.health())
 }
 
-/// Run the Phase 5 source-resolution and Docling conversion path for one ingest request.
+/// Run source-resolution, Docling conversion, and unit splitting for one ingest request.
 async fn post_ingest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<IngestRequest>,
@@ -43,6 +44,13 @@ async fn post_ingest(
         source,
     )
     .await?;
+    let units = split_conversion_into_units(
+        &conversion,
+        &state.config.retrieval,
+        &state.config.models.colbert.path.join("tokenizer.json"),
+    )?;
+    let first_unit = units.first();
+    let last_unit = units.last();
 
     info!(
         requested_source = %conversion.source.requested,
@@ -57,13 +65,29 @@ async fn post_ingest(
         docling_args = ?conversion.args,
         stdout = %conversion.stdout,
         stderr = %conversion.stderr,
-        "Docling conversion completed; unit splitting and indexing are not implemented yet"
+        units = units.len(),
+        first_unit_id = first_unit.map(|unit| unit.unit_id.as_str()).unwrap_or("none"),
+        first_unit_sequence = first_unit.map(|unit| unit.sequence),
+        first_unit_document_id = first_unit.map(|unit| unit.document_id.as_str()).unwrap_or("none"),
+        first_unit_source_path = first_unit.map(|unit| unit.source_path.as_str()).unwrap_or("none"),
+        first_unit_chars = first_unit.map(|unit| unit.content.chars().count()),
+        first_unit_tokens = first_unit.map(|unit| unit.token_count),
+        first_unit_heading_path = ?first_unit.map(|unit| &unit.heading_path),
+        first_unit_page_numbers = ?first_unit.map(|unit| &unit.page_numbers),
+        last_unit_id = last_unit.map(|unit| unit.unit_id.as_str()).unwrap_or("none"),
+        last_unit_sequence = last_unit.map(|unit| unit.sequence),
+        last_unit_chars = last_unit.map(|unit| unit.content.chars().count()),
+        last_unit_tokens = last_unit.map(|unit| unit.token_count),
+        last_unit_heading_path = ?last_unit.map(|unit| &unit.heading_path),
+        last_unit_page_numbers = ?last_unit.map(|unit| &unit.page_numbers),
+        "Docling conversion and unit splitting completed; indexing is not implemented yet"
     );
 
     Err(ApiError::NotImplemented {
         message: format!(
-            "Docling conversion succeeded for {}; unit splitting and indexing are not implemented yet",
-            conversion.source.relative_path.display()
+            "Docling conversion and unit splitting succeeded for {}; produced {} units; indexing is not implemented yet",
+            conversion.source.relative_path.display(),
+            units.len()
         ),
     })
 }
