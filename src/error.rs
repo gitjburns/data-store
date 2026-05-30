@@ -29,6 +29,18 @@ pub enum ApiError {
     InferenceInit { message: String },
 
     #[error("{message}")]
+    SourceResolution { message: String },
+
+    #[error("{message}")]
+    DoclingUnavailable { message: String },
+
+    #[error("{message}")]
+    DoclingConversion { message: String },
+
+    #[error("{message}")]
+    InternalIo { message: String },
+
+    #[error("{message}")]
     BadRequest { message: String },
 
     #[error("{message}")]
@@ -49,13 +61,16 @@ impl ApiError {
     /// Return the HTTP status code that corresponds to this error.
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
+            Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::ConfigRead { .. }
             | Self::ConfigParse { .. }
             | Self::InvalidConfig { .. }
             | Self::InvalidCli { .. }
-            | Self::InferenceInit { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::InferenceInit { .. }
+            | Self::DoclingUnavailable { .. }
+            | Self::InternalIo { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

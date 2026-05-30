@@ -1,7 +1,9 @@
 mod config;
+mod docling;
 mod error;
 mod http;
 mod inference;
+mod source;
 mod state;
 mod types;
 
