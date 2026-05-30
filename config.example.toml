@@ -19,7 +19,7 @@ page_batch_size = 10
 [models.dense]
 path = "/absolute/path/to/qwen3-embedding-8b"
 dimension = 4096
-max_tokens = 32768
+max_tokens = 8192
 pooling = "last_token"
 
 [models.colbert]

@@ -1,8 +1,9 @@
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use candle_core::Device;
 #[cfg(any(feature = "cuda", feature = "metal"))]
-use candle_core::{Device, Error as CandleError};
+use candle_core::Error as CandleError;
 
 use crate::{
     config::{InferenceConfig, InferenceDeviceKind},
@@ -13,6 +14,7 @@ use crate::{
 pub struct SelectedDevice {
     pub kind: InferenceDeviceKind,
     pub index: usize,
+    pub candle: Device,
 }
 
 impl SelectedDevice {
@@ -36,11 +38,12 @@ pub fn initialize_device(config: &InferenceConfig) -> Result<SelectedDevice, Api
 /// Initialize a CUDA device when the binary was compiled with CUDA support.
 #[cfg(feature = "cuda")]
 fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
-    create_candle_device(format!("CUDA device {index}"), || Device::new_cuda(index))?;
+    let candle = create_candle_device(format!("CUDA device {index}"), || Device::new_cuda(index))?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Cuda,
         index,
+        candle,
     })
 }
 
@@ -57,11 +60,13 @@ fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
 /// Initialize a Metal device when the binary was compiled with Metal support.
 #[cfg(feature = "metal")]
 fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
-    create_candle_device(format!("Metal device {index}"), || Device::new_metal(index))?;
+    let candle =
+        create_candle_device(format!("Metal device {index}"), || Device::new_metal(index))?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Metal,
         index,
+        candle,
     })
 }
 
@@ -77,12 +82,12 @@ fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
 
 /// Create a Candle accelerator device and convert backend panics into readiness diagnostics.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn create_candle_device<F>(label: String, create: F) -> Result<(), ApiError>
+fn create_candle_device<F>(label: String, create: F) -> Result<Device, ApiError>
 where
     F: FnOnce() -> Result<Device, CandleError>,
 {
     match catch_unwind(AssertUnwindSafe(create)) {
-        Ok(Ok(_device)) => Ok(()),
+        Ok(Ok(device)) => Ok(device),
         Ok(Err(source)) => Err(ApiError::InferenceInit {
             message: format!("failed to initialize {label}: {source}"),
         }),

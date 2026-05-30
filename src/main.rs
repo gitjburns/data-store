@@ -13,7 +13,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    config::{ServiceConfig, resolve_config_path_from_args},
+    config::{CliOptions, ServiceConfig, resolve_cli_options_from_args},
     http::build_router,
     inference::InferenceRuntime,
     state::AppState,
@@ -24,8 +24,13 @@ use crate::{
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let config_path = resolve_config_path_from_args()?;
-    let config = ServiceConfig::load(config_path)?;
+    let cli_options = resolve_cli_options_from_args()?;
+    let config = ServiceConfig::load(cli_options.config_path.clone())?;
+    if cli_options.smoke_dense {
+        run_dense_smoke(&cli_options, &config)?;
+        return Ok(());
+    }
+
     let bind_address = config.bind_address();
     let inference = InferenceRuntime::initialize(&config);
     let state = Arc::new(AppState::new(config, inference));
@@ -34,6 +39,20 @@ async fn main() -> anyhow::Result<()> {
 
     info!(%bind_address, "data store service listening");
     axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Initialize inference, report dense readiness, and exit without starting HTTP.
+fn run_dense_smoke(cli_options: &CliOptions, config: &ServiceConfig) -> anyhow::Result<()> {
+    let runtime = InferenceRuntime::initialize(config)?;
+    println!(
+        "dense smoke initialized from {}",
+        cli_options.config_path.display()
+    );
+    for detail in runtime.health_details() {
+        println!("{detail}");
+    }
 
     Ok(())
 }

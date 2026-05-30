@@ -14,6 +14,12 @@ pub struct ServiceConfig {
     pub retrieval: RetrievalConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct CliOptions {
+    pub config_path: PathBuf,
+    pub smoke_dense: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
@@ -168,10 +174,11 @@ impl ServiceConfig {
     }
 }
 
-/// Resolve the config path from `--config`, falling back to `config.toml`.
-pub fn resolve_config_path_from_args() -> Result<PathBuf, ApiError> {
+/// Resolve supported CLI options, falling back to `config.toml`.
+pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     let mut args = env::args().skip(1);
     let mut config_path = PathBuf::from("config.toml");
+    let mut smoke_dense = false;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -184,12 +191,20 @@ pub fn resolve_config_path_from_args() -> Result<PathBuf, ApiError> {
             continue;
         }
 
+        if arg == "--smoke-dense" {
+            smoke_dense = true;
+            continue;
+        }
+
         return Err(ApiError::InvalidCli {
             message: format!("unknown argument: {arg}"),
         });
     }
 
-    Ok(config_path)
+    Ok(CliOptions {
+        config_path,
+        smoke_dense,
+    })
 }
 
 /// Ensure a path field uses an absolute path.
