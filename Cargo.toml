@@ -1,0 +1,26 @@
+[package]
+name = "data-store-service"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+
+[dependencies]
+anyhow = "1.0.102"
+axum = "0.8.9"
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
+safetensors = "0.7.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokenizers = "0.23.1"
+tokio = { version = "1.52.3", features = ["full"] }
+toml = "1.1.2"
+tower-http = { version = "0.6.11", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

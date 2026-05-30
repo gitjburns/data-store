@@ -1,0 +1,41 @@
+[server]
+bind_address = "127.0.0.1:8091"
+
+[inference]
+device = "metal"
+device_index = 0
+
+[storage]
+corpus_root = "/absolute/path/to/corpus"
+index_root = "/absolute/path/to/indexes"
+
+[docling]
+python_path = "/absolute/path/to/python"
+docling_path = "/absolute/path/to/docling"
+default_pdf_backend = "docling_parse"
+default_ocr_mode = "auto"
+page_batch_size = 10
+
+[models.dense]
+path = "/absolute/path/to/qwen3-embedding-8b"
+dimension = 4096
+max_tokens = 32768
+pooling = "last_token"
+
+[models.colbert]
+path = "/absolute/path/to/colbert-zero"
+dimension = 128
+query_max_tokens = 512
+document_max_tokens = 512
+
+[models.reranker]
+path = "/absolute/path/to/qwen3-reranker-4b"
+max_tokens = 32768
+
+[retrieval]
+default_top_k = 10
+max_top_k = 100
+rrf_k = 60
+candidate_overfetch_multiplier = 3
+min_search_unit_chars = 400
+max_unit_tokens = 512

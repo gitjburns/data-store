@@ -1,0 +1,129 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use tokenizers::Tokenizer;
+
+use crate::{config::ModelConfig, error::ApiError};
+
+#[derive(Debug, Clone)]
+pub struct ModelArtifactSet {
+    pub dense: ModelArtifacts,
+    pub colbert: ModelArtifacts,
+    pub reranker: ModelArtifacts,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelArtifacts {
+    pub name: &'static str,
+    pub root: PathBuf,
+    pub config_path: PathBuf,
+    pub tokenizer_path: PathBuf,
+    pub safetensor_paths: Vec<PathBuf>,
+}
+
+impl ModelArtifactSet {
+    /// Validate all configured model directories and tokenizer files.
+    pub fn load(config: &ModelConfig) -> Result<Self, ApiError> {
+        Ok(Self {
+            dense: ModelArtifacts::load("dense", &config.dense.path)?,
+            colbert: ModelArtifacts::load("colbert", &config.colbert.path)?,
+            reranker: ModelArtifacts::load("reranker", &config.reranker.path)?,
+        })
+    }
+
+    /// Return readiness details for all configured model artifact groups.
+    pub fn health_details(&self) -> Vec<String> {
+        vec![
+            self.dense.health_detail(),
+            self.colbert.health_detail(),
+            self.reranker.health_detail(),
+        ]
+    }
+}
+
+impl ModelArtifacts {
+    /// Validate the minimum Hugging Face-style files required before graph loading.
+    fn load(name: &'static str, root: &Path) -> Result<Self, ApiError> {
+        if !root.is_dir() {
+            return Err(ApiError::InferenceInit {
+                message: format!("models.{name}.path is not a directory: {}", root.display()),
+            });
+        }
+
+        let config_path = root.join("config.json");
+        require_file(name, "config.json", &config_path)?;
+
+        let tokenizer_path = root.join("tokenizer.json");
+        require_file(name, "tokenizer.json", &tokenizer_path)?;
+        Tokenizer::from_file(&tokenizer_path).map_err(|source| ApiError::InferenceInit {
+            message: format!(
+                "failed to load {name} tokenizer at {}: {source}",
+                tokenizer_path.display()
+            ),
+        })?;
+
+        let safetensor_paths =
+            find_safetensors(root).map_err(|source| ApiError::InferenceInit {
+                message: format!(
+                    "failed to inspect {name} model directory at {}: {source}",
+                    root.display()
+                ),
+            })?;
+        if safetensor_paths.is_empty() {
+            return Err(ApiError::InferenceInit {
+                message: format!("{name} model directory contains no .safetensors files"),
+            });
+        }
+
+        Ok(Self {
+            name,
+            root: root.to_path_buf(),
+            config_path,
+            tokenizer_path,
+            safetensor_paths,
+        })
+    }
+
+    /// Summarize validated artifacts for health diagnostics.
+    fn health_detail(&self) -> String {
+        format!(
+            "{} artifacts ready: {} safetensors, root {}, config {}, tokenizer {}",
+            self.name,
+            self.safetensor_paths.len(),
+            self.root.display(),
+            self.config_path.display(),
+            self.tokenizer_path.display()
+        )
+    }
+}
+
+/// Ensure a required model artifact path exists as a file.
+fn require_file(model_name: &str, artifact_name: &str, path: &Path) -> Result<(), ApiError> {
+    if path.is_file() {
+        return Ok(());
+    }
+
+    Err(ApiError::InferenceInit {
+        message: format!(
+            "{model_name} model is missing required {artifact_name} at {}",
+            path.display()
+        ),
+    })
+}
+
+/// List safetensors shards directly inside one model directory.
+fn find_safetensors(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut paths = Vec::new();
+
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors") {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    Ok(paths)
+}
