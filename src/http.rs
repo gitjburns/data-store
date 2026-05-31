@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
@@ -119,16 +119,38 @@ async fn post_ingest(
     }))
 }
 
-/// Validate a search request and report that retrieval is not implemented yet.
+/// Run dense exact-scan retrieval for one search request.
 async fn post_search(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let started = Instant::now();
     request.validate(state.config.retrieval.max_top_k)?;
+    let top_k = request
+        .top_k
+        .unwrap_or(state.config.retrieval.default_top_k);
+    let inference = state.inference()?;
+    let storage = state.storage()?;
+    let embedding_started = Instant::now();
+    let query_vector = inference.dense.embed_query_vector(&request.query)?;
+    let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
+    let storage_output = storage.search_dense(query_vector, top_k)?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let raw = serde_json::json!({
+        "search": {
+            "mode": "dense_exact_scan",
+            "topK": top_k,
+            "embeddingLatencyMs": embedding_latency_ms,
+            "latencyMs": latency_ms
+        },
+        "storage": storage_output.raw
+    });
 
-    Err(ApiError::NotImplemented {
-        message: "document retrieval is not implemented in this scaffold".to_string(),
-    })
+    Ok(Json(SearchResponse {
+        results: storage_output.results,
+        latency_ms,
+        raw,
+    }))
 }
 
 /// Authorize and request graceful service shutdown.

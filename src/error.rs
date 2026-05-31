@@ -54,9 +54,6 @@ pub enum ApiError {
 
     #[error("{message}")]
     Unauthorized { message: String },
-
-    #[error("{message}")]
-    NotImplemented { message: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -76,7 +73,6 @@ impl ApiError {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::ConfigRead { .. }
             | Self::ConfigParse { .. }
             | Self::InvalidConfig { .. }

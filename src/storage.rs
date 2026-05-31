@@ -13,6 +13,7 @@ use crate::{
     config::{DenseModelConfig, StorageConfig},
     docling::DoclingConversionResult,
     error::ApiError,
+    types::SearchResult,
     units::{RetrievalUnit, build_document_id},
 };
 
@@ -27,6 +28,12 @@ pub struct StorageRuntime {
 pub struct UnitDenseVector {
     pub unit_id: String,
     pub vector: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct DenseSearchOutput {
+    pub results: Vec<SearchResult>,
+    pub raw: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +52,22 @@ struct StoredDenseVector {
     unit_id: String,
     vector: Vec<f32>,
     norm: f32,
+}
+
+#[derive(Debug)]
+struct DenseMatch {
+    unit_id: String,
+    similarity: f32,
+    rank: usize,
+}
+
+#[derive(Debug)]
+struct StoredUnit {
+    unit_id: String,
+    source_path: String,
+    heading_path: Vec<String>,
+    page_numbers: Vec<u32>,
+    content: String,
 }
 
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
@@ -175,6 +198,99 @@ impl StorageRuntime {
         self.replace_document_cache(&document_id, stored_vectors)?;
 
         Ok(())
+    }
+
+    /// Search the dense vector cache with exact cosine similarity and materialize unit rows.
+    pub fn search_dense(
+        &self,
+        query_vector: Vec<f32>,
+        top_k: u32,
+    ) -> Result<DenseSearchOutput, ApiError> {
+        let started = Instant::now();
+        let query_vector = validate_vector(
+            "search-query".to_string(),
+            query_vector,
+            self.dense_dimension,
+        )
+        .map_err(storage_operation_error)?;
+        let matches = {
+            let cache = self.cache.lock().map_err(|source| {
+                storage_operation_error(format!("dense cache lock is poisoned: {source}"))
+            })?;
+            cache.search(&query_vector, top_k as usize)?
+        };
+        let units = self.load_units_for_matches(&matches)?;
+        let results = matches
+            .iter()
+            .filter_map(|matched| {
+                let unit = units.iter().find(|unit| unit.unit_id == matched.unit_id)?;
+                Some(SearchResult {
+                    unit_id: unit.unit_id.clone(),
+                    score: matched.similarity,
+                    content: unit.content.clone(),
+                    heading_path: unit.heading_path.clone(),
+                    source_path: unit.source_path.clone(),
+                    page_numbers: unit.page_numbers.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if results.len() != matches.len() {
+            return Err(storage_operation_error(
+                "dense search result materialization missed one or more unit rows".to_string(),
+            ));
+        }
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let raw = self.build_dense_search_raw(&query_vector, &matches, latency_ms)?;
+
+        Ok(DenseSearchOutput { results, raw })
+    }
+
+    /// Load durable unit metadata and content for already ranked dense matches.
+    fn load_units_for_matches(&self, matches: &[DenseMatch]) -> Result<Vec<StoredUnit>, ApiError> {
+        let connection = open_connection(&self.db_path)?;
+        let mut units = Vec::with_capacity(matches.len());
+        for matched in matches {
+            units.push(load_unit(&connection, &matched.unit_id)?);
+        }
+
+        Ok(units)
+    }
+
+    /// Build raw dense-search diagnostics from authoritative cache state.
+    fn build_dense_search_raw(
+        &self,
+        query_vector: &StoredDenseVector,
+        matches: &[DenseMatch],
+        latency_ms: u64,
+    ) -> Result<serde_json::Value, ApiError> {
+        let cache = self.cache.lock().map_err(|source| {
+            storage_operation_error(format!("dense cache lock is poisoned: {source}"))
+        })?;
+
+        Ok(serde_json::json!({
+            "retrieval": {
+                "mode": "dense_exact_scan",
+                "latencyMs": latency_ms,
+                "query": {
+                    "dimension": query_vector.vector.len(),
+                    "norm": query_vector.norm
+                },
+                "cache": {
+                    "vectorCount": cache.unit_ids.len(),
+                    "dimension": cache.dimension,
+                    "memoryBytes": cache.memory_bytes,
+                    "loadedAtMs": cache.loaded_at_ms,
+                    "loadDurationMs": cache.load_duration_ms
+                },
+                "denseCandidates": matches.iter().map(|matched| {
+                    serde_json::json!({
+                        "unitId": matched.unit_id,
+                        "similarity": matched.similarity,
+                        "rank": matched.rank
+                    })
+                }).collect::<Vec<_>>()
+            }
+        }))
     }
 
     /// Replace all cache rows for one document prefix after SQLite commit succeeds.
@@ -311,6 +427,49 @@ impl DenseVectorCache {
 
         Ok(())
     }
+
+    /// Rank cached dense vectors by exact cosine similarity with deterministic tie-breaking.
+    fn search(&self, query: &StoredDenseVector, top_k: usize) -> Result<Vec<DenseMatch>, ApiError> {
+        let mut matches = self
+            .unit_ids
+            .iter()
+            .enumerate()
+            .map(|(index, unit_id)| {
+                let start = index * self.dimension;
+                let end = start + self.dimension;
+                let dot = self.vectors[start..end]
+                    .iter()
+                    .zip(query.vector.iter())
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                let similarity = dot / (query.norm * self.norms[index]);
+                if !similarity.is_finite() {
+                    return Err(storage_operation_error(format!(
+                        "dense similarity for {unit_id} is non-finite"
+                    )));
+                }
+
+                Ok(DenseMatch {
+                    unit_id: unit_id.clone(),
+                    similarity,
+                    rank: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        matches.sort_by(|left, right| {
+            right
+                .similarity
+                .total_cmp(&left.similarity)
+                .then_with(|| left.unit_id.cmp(&right.unit_id))
+        });
+        matches.truncate(top_k);
+        for (index, matched) in matches.iter_mut().enumerate() {
+            matched.rank = index + 1;
+        }
+
+        Ok(matches)
+    }
 }
 
 /// Create the SQLite schema through the explicit setup command.
@@ -429,6 +588,53 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+/// Load one durable unit row and decode its JSON metadata.
+fn load_unit(connection: &Connection, unit_id: &str) -> Result<StoredUnit, ApiError> {
+    let row = connection
+        .query_row(
+            "SELECT unit_id, source_path, heading_path_json, page_numbers_json, content
+             FROM units
+             WHERE unit_id = ?1",
+            [unit_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| {
+            storage_operation_error(format!("failed to load unit {unit_id}: {source}"))
+        })?;
+    let Some((unit_id, source_path, heading_path_json, page_numbers_json, content)) = row else {
+        return Err(storage_operation_error(format!(
+            "dense search matched missing unit row {unit_id}"
+        )));
+    };
+
+    Ok(StoredUnit {
+        unit_id,
+        source_path,
+        heading_path: decode_json_array("heading_path_json", &heading_path_json)?,
+        page_numbers: decode_json_array("page_numbers_json", &page_numbers_json)?,
+        content,
+    })
+}
+
+/// Decode JSON array metadata from SQLite and treat malformed data as storage corruption.
+fn decode_json_array<T>(label: &str, value: &str) -> Result<Vec<T>, ApiError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(value).map_err(|source| {
+        storage_operation_error(format!("invalid {label} metadata in unit row: {source}"))
+    })
 }
 
 /// Delete any existing document rows and corresponding external-content FTS rows.
