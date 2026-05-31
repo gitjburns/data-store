@@ -81,6 +81,11 @@ pub struct SearchResult {
     pub page_numbers: Vec<u32>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ShutdownResponse {
+    pub status: String,
+}
+
 impl IngestRequest {
     /// Validate ingest request fields before the runtime pipeline consumes them.
     pub fn validate(&self) -> Result<(), ApiError> {

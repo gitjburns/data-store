@@ -540,7 +540,7 @@ fn normalize_unit_content(content: &str) -> String {
 }
 
 /// Build a deterministic document identifier from the corpus-relative source path.
-fn build_document_id(path: &Path) -> String {
+pub(crate) fn build_document_id(path: &Path) -> String {
     let source = path.display().to_string();
     let mut slug = String::with_capacity(source.len());
     for value in source.chars() {

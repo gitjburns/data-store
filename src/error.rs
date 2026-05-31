@@ -44,7 +44,16 @@ pub enum ApiError {
     UnitSplitting { message: String },
 
     #[error("{message}")]
+    StorageInit { message: String },
+
+    #[error("{message}")]
+    StorageOperation { message: String },
+
+    #[error("{message}")]
     BadRequest { message: String },
+
+    #[error("{message}")]
+    Unauthorized { message: String },
 
     #[error("{message}")]
     NotImplemented { message: String },
@@ -65,6 +74,7 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
+            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::ConfigRead { .. }
@@ -74,7 +84,9 @@ impl ApiError {
             | Self::InferenceInit { .. }
             | Self::DoclingUnavailable { .. }
             | Self::InternalIo { .. }
-            | Self::UnitSplitting { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::UnitSplitting { .. }
+            | Self::StorageInit { .. }
+            | Self::StorageOperation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

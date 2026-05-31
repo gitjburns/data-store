@@ -141,6 +141,11 @@ impl DenseEmbeddingRuntime {
         )]
     }
 
+    /// Embed a retrieval unit as a passage and return its dense vector.
+    pub fn embed_passage_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
+        Ok(self.embed_passage(text)?.vector)
+    }
+
     /// Embed a retrieval query with the Qwen3 instruction prefix.
     fn embed_query(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
         self.embed_text(&format!("{QUERY_INSTRUCTION_PREFIX} {text}"))

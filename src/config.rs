@@ -18,6 +18,7 @@ pub struct ServiceConfig {
 pub struct CliOptions {
     pub config_path: PathBuf,
     pub smoke_dense: bool,
+    pub setup_storage: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +180,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     let mut args = env::args().skip(1);
     let mut config_path = PathBuf::from("config.toml");
     let mut smoke_dense = false;
+    let mut setup_storage = false;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -196,6 +198,11 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
             continue;
         }
 
+        if arg == "--setup-storage" {
+            setup_storage = true;
+            continue;
+        }
+
         return Err(ApiError::InvalidCli {
             message: format!("unknown argument: {arg}"),
         });
@@ -204,6 +211,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     Ok(CliOptions {
         config_path,
         smoke_dense,
+        setup_storage,
     })
 }
 
