@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::{
-    config::{DenseModelConfig, StorageConfig},
+    config::{DenseModelConfig, RetrievalConfig, StorageConfig},
     docling::DoclingConversionResult,
     error::ApiError,
     types::SearchResult,
@@ -31,7 +32,7 @@ pub struct UnitDenseVector {
 }
 
 #[derive(Debug)]
-pub struct DenseSearchOutput {
+pub struct SearchOutput {
     pub results: Vec<SearchResult>,
     pub raw: serde_json::Value,
 }
@@ -62,6 +63,24 @@ struct DenseMatch {
 }
 
 #[derive(Debug)]
+struct Bm25Match {
+    unit_id: String,
+    score: f64,
+    rank: usize,
+}
+
+#[derive(Debug)]
+struct FusedMatch {
+    unit_id: String,
+    score: f64,
+    rank: usize,
+    dense_rank: Option<usize>,
+    dense_similarity: Option<f32>,
+    bm25_rank: Option<usize>,
+    bm25_score: Option<f64>,
+}
+
+#[derive(Debug)]
 struct StoredUnit {
     unit_id: String,
     source_path: String,
@@ -70,11 +89,26 @@ struct StoredUnit {
     content: String,
 }
 
+struct SearchRawInput<'a> {
+    query_vector: &'a StoredDenseVector,
+    dense_matches: &'a [DenseMatch],
+    bm25_matches: &'a [Bm25Match],
+    fused_matches: &'a [FusedMatch],
+    bm25_query: Option<&'a str>,
+    candidate_limit: usize,
+    top_k: u32,
+    rrf_k: u32,
+    overfetch_multiplier: u32,
+    dense_latency_ms: u64,
+    bm25_latency_ms: u64,
+    latency_ms: u64,
+}
+
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
 
 impl StorageRuntime {
-    /// Open existing storage, validate schema, and load the dense vector cache.
+    /// Open existing storage, validate schema, and load the dense vector cache without runtime schema changes.
     pub fn open(storage: &StorageConfig, dense: &DenseModelConfig) -> Result<Self, ApiError> {
         let db_path = database_path(storage);
         if !db_path.is_file() {
@@ -125,7 +159,7 @@ impl StorageRuntime {
         }
     }
 
-    /// Persist one converted document and replace its entries in the dense cache.
+    /// Persist one converted document, then replace its dense-cache entries only after the SQLite commit succeeds.
     pub fn ingest_document(
         &self,
         conversion: &DoclingConversionResult,
@@ -200,12 +234,16 @@ impl StorageRuntime {
         Ok(())
     }
 
-    /// Search the dense vector cache with exact cosine similarity and materialize unit rows.
-    pub fn search_dense(
+    /// Search with dense exact scan, SQLite FTS5 BM25, and RRF fusion.
+    ///
+    /// Public result scores are fused-rank scores, not dense similarities or BM25 values.
+    pub fn search(
         &self,
+        query: &str,
         query_vector: Vec<f32>,
         top_k: u32,
-    ) -> Result<DenseSearchOutput, ApiError> {
+        retrieval: &RetrievalConfig,
+    ) -> Result<SearchOutput, ApiError> {
         let started = Instant::now();
         let query_vector = validate_vector(
             "search-query".to_string(),
@@ -213,20 +251,38 @@ impl StorageRuntime {
             self.dense_dimension,
         )
         .map_err(storage_operation_error)?;
-        let matches = {
+        let candidate_limit = candidate_limit(top_k, retrieval.candidate_overfetch_multiplier);
+
+        let dense_started = Instant::now();
+        let dense_matches = {
             let cache = self.cache.lock().map_err(|source| {
                 storage_operation_error(format!("dense cache lock is poisoned: {source}"))
             })?;
-            cache.search(&query_vector, top_k as usize)?
+            cache.search(&query_vector, candidate_limit)?
         };
-        let units = self.load_units_for_matches(&matches)?;
-        let results = matches
+        let dense_latency_ms = dense_started.elapsed().as_millis() as u64;
+
+        let bm25_started = Instant::now();
+        // Treat user text as plain search terms, not FTS syntax, so operators cannot alter the query language boundary.
+        let bm25_query = build_fts_query(query);
+        let bm25_matches = self.search_bm25(bm25_query.as_deref(), candidate_limit)?;
+        let bm25_latency_ms = bm25_started.elapsed().as_millis() as u64;
+
+        let fused_matches = fuse_matches(
+            &dense_matches,
+            &bm25_matches,
+            top_k as usize,
+            retrieval.rrf_k,
+        );
+        let units = self.load_units_for_fused_matches(&fused_matches)?;
+        let results = fused_matches
             .iter()
             .filter_map(|matched| {
                 let unit = units.iter().find(|unit| unit.unit_id == matched.unit_id)?;
                 Some(SearchResult {
                     unit_id: unit.unit_id.clone(),
-                    score: matched.similarity,
+                    // After RRF fusion this score is a rank-fusion signal, not a dense cosine similarity or BM25 value.
+                    score: matched.score as f32,
                     content: unit.content.clone(),
                     heading_path: unit.heading_path.clone(),
                     source_path: unit.source_path.clone(),
@@ -234,19 +290,91 @@ impl StorageRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        if results.len() != matches.len() {
+        if results.len() != fused_matches.len() {
             return Err(storage_operation_error(
-                "dense search result materialization missed one or more unit rows".to_string(),
+                "fused search result materialization missed one or more unit rows".to_string(),
             ));
         }
         let latency_ms = started.elapsed().as_millis() as u64;
-        let raw = self.build_dense_search_raw(&query_vector, &matches, latency_ms)?;
+        let raw = self.build_search_raw(SearchRawInput {
+            query_vector: &query_vector,
+            dense_matches: &dense_matches,
+            bm25_matches: &bm25_matches,
+            fused_matches: &fused_matches,
+            bm25_query: bm25_query.as_deref(),
+            candidate_limit,
+            top_k,
+            rrf_k: retrieval.rrf_k,
+            overfetch_multiplier: retrieval.candidate_overfetch_multiplier,
+            dense_latency_ms,
+            bm25_latency_ms,
+            latency_ms,
+        })?;
 
-        Ok(DenseSearchOutput { results, raw })
+        Ok(SearchOutput { results, raw })
     }
 
-    /// Load durable unit metadata and content for already ranked dense matches.
-    fn load_units_for_matches(&self, matches: &[DenseMatch]) -> Result<Vec<StoredUnit>, ApiError> {
+    /// Retrieve BM25-ranked candidates from the SQLite FTS5 index.
+    ///
+    /// SQLite bm25() returns better matches as lower, usually negative, values.
+    fn search_bm25(
+        &self,
+        fts_query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Bm25Match>, ApiError> {
+        let Some(fts_query) = fts_query else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let connection = open_connection(&self.db_path)?;
+        let mut statement = connection
+            .prepare(
+                // ASC preserves SQLite FTS5's lower-is-better bm25() ordering.
+                "SELECT units.unit_id, bm25(units_fts) AS bm25_score
+                 FROM units_fts
+                 JOIN units ON units.rowid = units_fts.rowid
+                 WHERE units_fts MATCH ?1
+                 ORDER BY bm25_score ASC, units.unit_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| {
+                storage_operation_error(format!("failed to prepare BM25 search: {source}"))
+            })?;
+        let rows = statement
+            .query_map(params![fts_query, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|source| {
+                storage_operation_error(format!("failed to execute BM25 search: {source}"))
+            })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let (unit_id, score) = row.map_err(|source| {
+                storage_operation_error(format!("failed to read BM25 candidate: {source}"))
+            })?;
+            if !score.is_finite() {
+                return Err(storage_operation_error(format!(
+                    "BM25 score for {unit_id} is non-finite"
+                )));
+            }
+            matches.push(Bm25Match {
+                unit_id,
+                score,
+                rank: matches.len() + 1,
+            });
+        }
+
+        Ok(matches)
+    }
+
+    /// Load durable unit metadata and content for already ranked fused matches.
+    fn load_units_for_fused_matches(
+        &self,
+        matches: &[FusedMatch],
+    ) -> Result<Vec<StoredUnit>, ApiError> {
         let connection = open_connection(&self.db_path)?;
         let mut units = Vec::with_capacity(matches.len());
         for matched in matches {
@@ -256,24 +384,26 @@ impl StorageRuntime {
         Ok(units)
     }
 
-    /// Build raw dense-search diagnostics from authoritative cache state.
-    fn build_dense_search_raw(
-        &self,
-        query_vector: &StoredDenseVector,
-        matches: &[DenseMatch],
-        latency_ms: u64,
-    ) -> Result<serde_json::Value, ApiError> {
+    /// Build raw search diagnostics without hiding per-stage rank inputs.
+    fn build_search_raw(&self, input: SearchRawInput<'_>) -> Result<serde_json::Value, ApiError> {
         let cache = self.cache.lock().map_err(|source| {
             storage_operation_error(format!("dense cache lock is poisoned: {source}"))
         })?;
 
         Ok(serde_json::json!({
             "retrieval": {
-                "mode": "dense_exact_scan",
-                "latencyMs": latency_ms,
+                "mode": "dense_bm25_rrf",
+                "latencyMs": input.latency_ms,
+                "denseLatencyMs": input.dense_latency_ms,
+                "bm25LatencyMs": input.bm25_latency_ms,
+                "topK": input.top_k,
+                "candidateLimit": input.candidate_limit,
+                "rrfK": input.rrf_k,
+                "candidateOverfetchMultiplier": input.overfetch_multiplier,
                 "query": {
-                    "dimension": query_vector.vector.len(),
-                    "norm": query_vector.norm
+                    "dimension": input.query_vector.vector.len(),
+                    "norm": input.query_vector.norm,
+                    "fts": input.bm25_query
                 },
                 "cache": {
                     "vectorCount": cache.unit_ids.len(),
@@ -282,18 +412,36 @@ impl StorageRuntime {
                     "loadedAtMs": cache.loaded_at_ms,
                     "loadDurationMs": cache.load_duration_ms
                 },
-                "denseCandidates": matches.iter().map(|matched| {
+                "denseCandidates": input.dense_matches.iter().map(|matched| {
                     serde_json::json!({
                         "unitId": matched.unit_id,
                         "similarity": matched.similarity,
                         "rank": matched.rank
+                    })
+                }).collect::<Vec<_>>(),
+                "bm25Candidates": input.bm25_matches.iter().map(|matched| {
+                    serde_json::json!({
+                        "unitId": matched.unit_id,
+                        "score": matched.score,
+                        "rank": matched.rank
+                    })
+                }).collect::<Vec<_>>(),
+                "fusedCandidates": input.fused_matches.iter().map(|matched| {
+                    serde_json::json!({
+                        "unitId": matched.unit_id,
+                        "score": matched.score,
+                        "rank": matched.rank,
+                        "denseRank": matched.dense_rank,
+                        "denseSimilarity": matched.dense_similarity,
+                        "bm25Rank": matched.bm25_rank,
+                        "bm25Score": matched.bm25_score
                     })
                 }).collect::<Vec<_>>()
             }
         }))
     }
 
-    /// Replace all cache rows for one document prefix after SQLite commit succeeds.
+    /// Replace all cache rows for one document prefix while leaving durable rows authoritative if cache validation fails.
     fn replace_document_cache(
         &self,
         document_id: &str,
@@ -472,7 +620,94 @@ impl DenseVectorCache {
     }
 }
 
-/// Create the SQLite schema through the explicit setup command.
+/// Return the configured candidate pool size for each first-stage retriever.
+fn candidate_limit(top_k: u32, overfetch_multiplier: u32) -> usize {
+    top_k.saturating_mul(overfetch_multiplier) as usize
+}
+
+/// Build a conservative FTS5 query from user text by discarding operators and quoting each term.
+fn build_fts_query(query: &str) -> Option<String> {
+    let terms = query
+        .split(|value: char| !value.is_alphanumeric())
+        .filter_map(|value| {
+            let term = value.trim().to_lowercase();
+            if term.is_empty() { None } else { Some(term) }
+        })
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return None;
+    }
+
+    Some(
+        terms
+            .into_iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Fuse dense and BM25 candidates with reciprocal rank fusion.
+///
+/// The output score is only a fused rank signal, not a semantic similarity score.
+fn fuse_matches(
+    dense_matches: &[DenseMatch],
+    bm25_matches: &[Bm25Match],
+    top_k: usize,
+    rrf_k: u32,
+) -> Vec<FusedMatch> {
+    let mut values = BTreeMap::<String, FusedMatch>::new();
+    for matched in dense_matches {
+        let entry = values
+            .entry(matched.unit_id.clone())
+            .or_insert_with(|| empty_fused_match(&matched.unit_id));
+        entry.score += reciprocal_rank_score(rrf_k, matched.rank);
+        entry.dense_rank = Some(matched.rank);
+        entry.dense_similarity = Some(matched.similarity);
+    }
+    for matched in bm25_matches {
+        let entry = values
+            .entry(matched.unit_id.clone())
+            .or_insert_with(|| empty_fused_match(&matched.unit_id));
+        entry.score += reciprocal_rank_score(rrf_k, matched.rank);
+        entry.bm25_rank = Some(matched.rank);
+        entry.bm25_score = Some(matched.score);
+    }
+
+    let mut fused = values.into_values().collect::<Vec<_>>();
+    fused.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.unit_id.cmp(&right.unit_id))
+    });
+    fused.truncate(top_k);
+    for (index, matched) in fused.iter_mut().enumerate() {
+        matched.rank = index + 1;
+    }
+
+    fused
+}
+
+/// Return the initial fused-candidate record for one unit id.
+fn empty_fused_match(unit_id: &str) -> FusedMatch {
+    FusedMatch {
+        unit_id: unit_id.to_string(),
+        score: 0.0,
+        rank: 0,
+        dense_rank: None,
+        dense_similarity: None,
+        bm25_rank: None,
+        bm25_score: None,
+    }
+}
+
+/// Return the reciprocal-rank contribution for one candidate rank using the configured RRF K constant.
+fn reciprocal_rank_score(rrf_k: u32, rank: usize) -> f64 {
+    1.0 / (rrf_k as f64 + rank as f64)
+}
+
+/// Create the SQLite schema through the explicit setup command, which is the only schema-creation path.
 pub fn setup_storage(storage: &StorageConfig) -> Result<PathBuf, ApiError> {
     fs::create_dir_all(&storage.index_root).map_err(|source| ApiError::InternalIo {
         message: format!(

@@ -38,7 +38,9 @@ pub struct DoclingConversionResult {
     pub stderr: String,
 }
 
-/// Convert one resolved PDF source to markdown with the configured Docling CLI.
+/// Convert one resolved PDF source to markdown without fallback across requested Docling options.
+///
+/// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
 pub async fn convert_source_to_markdown(
     config: &DoclingConfig,
     index_root: &Path,
@@ -175,7 +177,9 @@ fn build_docling_args(
     args
 }
 
-/// Run Docling as a child process and capture bounded diagnostics.
+/// Run Docling as a child process with no stdin and no shell interpretation.
+///
+/// The caller owns diagnostic truncation so success and failure paths preserve the same output shape.
 async fn run_docling(
     config: &DoclingConfig,
     args: &[String],

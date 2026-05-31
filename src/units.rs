@@ -32,6 +32,8 @@ struct UnitBuilder {
 }
 
 /// Split one converted markdown document into deterministic retrieval units.
+///
+/// Units preserve heading boundaries, honor the ColBERT token cap, and drop content below the searchable-size floor.
 pub fn split_conversion_into_units(
     conversion: &DoclingConversionResult,
     retrieval: &RetrievalConfig,

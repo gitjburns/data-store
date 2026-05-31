@@ -39,7 +39,7 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(state.health())
 }
 
-/// Run source-resolution, Docling conversion, and unit splitting for one ingest request.
+/// Run one synchronous ingest request while keeping file bytes inside the service-owned corpus.
 async fn post_ingest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<IngestRequest>,
@@ -119,7 +119,7 @@ async fn post_ingest(
     }))
 }
 
-/// Run dense exact-scan retrieval for one search request.
+/// Run dense, BM25, and RRF retrieval for one search request while keeping embedding and storage diagnostics separate.
 async fn post_search(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SearchRequest>,
@@ -134,11 +134,12 @@ async fn post_search(
     let embedding_started = Instant::now();
     let query_vector = inference.dense.embed_query_vector(&request.query)?;
     let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
-    let storage_output = storage.search_dense(query_vector, top_k)?;
+    let storage_output =
+        storage.search(&request.query, query_vector, top_k, &state.config.retrieval)?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::json!({
         "search": {
-            "mode": "dense_exact_scan",
+            "mode": "dense_bm25_rrf",
             "topK": top_k,
             "embeddingLatencyMs": embedding_latency_ms,
             "latencyMs": latency_ms

@@ -82,7 +82,7 @@ struct MetalSafeRmsNorm {
 }
 
 impl DenseEmbeddingRuntime {
-    /// Load the dense tokenizer and Qwen3 embedding graph, then verify one sample vector.
+    /// Load the dense tokenizer and Qwen3 embedding graph, then verify query and passage formatting paths.
     pub fn load(
         artifacts: &ModelArtifacts,
         config: &DenseModelConfig,
@@ -162,6 +162,8 @@ impl DenseEmbeddingRuntime {
     }
 
     /// Tokenize, truncate, run the model, last-token pool, and L2-normalize one text.
+    ///
+    /// This is the single boundary that applies embedding truncation, pooling, and normalization.
     fn embed_text(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
         let ids = tokenize_truncated(&self.tokenizer, text, self.max_tokens)?;
         if ids.is_empty() {
