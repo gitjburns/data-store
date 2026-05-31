@@ -104,8 +104,345 @@ struct SearchRawInput<'a> {
     latency_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ColumnSpec {
+    table_name: &'static str,
+    name: &'static str,
+    declared_type: &'static str,
+    required: bool,
+    primary_key_position: i64,
+}
+
+#[derive(Debug)]
+struct ColumnInfo {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key_position: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForeignKeySpec {
+    table_name: &'static str,
+    from_column: &'static str,
+    referenced_table: &'static str,
+    referenced_column: &'static str,
+    on_delete: &'static str,
+}
+
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
+const EXPECTED_SCHEMA_VERSION: i64 = 1;
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
+const STORAGE_SCHEMA_SQL: &str = include_str!("../sql/schema.sql");
+const ENABLE_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_keys = ON;";
+const GET_SCHEMA_VERSION_SQL: &str = "PRAGMA user_version;";
+const BM25_SEARCH_SQL: &str = "
+SELECT units.unit_id, bm25(units_fts) AS bm25_score
+FROM units_fts
+JOIN units ON units.rowid = units_fts.rowid
+WHERE units_fts MATCH ?1
+ORDER BY bm25_score ASC, units.unit_id ASC
+LIMIT ?2";
+const LOAD_DENSE_VECTORS_SQL: &str = "
+SELECT unit_id, dimension, vector_blob, vector_norm
+FROM dense_vectors
+ORDER BY unit_id ASC";
+const SCHEMA_OBJECT_EXISTS_SQL: &str = "
+SELECT 1
+FROM sqlite_master
+WHERE name = ?1
+LIMIT 1";
+const SCHEMA_OBJECT_SQL_SQL: &str = "
+SELECT sql
+FROM sqlite_master
+WHERE name = ?1
+LIMIT 1";
+const DOCUMENTS_TABLE_INFO_SQL: &str = "PRAGMA table_info(documents);";
+const UNITS_TABLE_INFO_SQL: &str = "PRAGMA table_info(units);";
+const DENSE_VECTORS_TABLE_INFO_SQL: &str = "PRAGMA table_info(dense_vectors);";
+const UNITS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(units);";
+const DENSE_VECTORS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(dense_vectors);";
+const DOCUMENTS_INDEX_LIST_SQL: &str = "PRAGMA index_list(documents);";
+const UNITS_INDEX_LIST_SQL: &str = "PRAGMA index_list(units);";
+const DOCUMENTS_SOURCE_PATH_INDEX_INFO_SQL: &str = "PRAGMA index_info(idx_documents_source_path);";
+const UNITS_DOCUMENT_SEQUENCE_INDEX_INFO_SQL: &str =
+    "PRAGMA index_info(idx_units_document_sequence);";
+const LOAD_UNIT_SQL: &str = "
+SELECT unit_id, source_path, heading_path_json, page_numbers_json, content
+FROM units
+WHERE unit_id = ?1";
+const DELETE_EXISTING_FTS_ROWS_SQL: &str = "
+DELETE FROM units_fts
+WHERE rowid IN (
+  SELECT units.rowid
+  FROM units
+  JOIN documents ON documents.document_id = units.document_id
+  WHERE documents.source_path = ?1
+)";
+const DELETE_EXISTING_DOCUMENT_SQL: &str = "DELETE FROM documents WHERE source_path = ?1";
+const INSERT_DOCUMENT_SQL: &str = "
+INSERT INTO documents (
+  document_id, source_path, source_sha256, markdown_path, markdown_sha256,
+  pdf_backend, ocr_mode, page_batch_size, units_ingested, status,
+  diagnostics_json, created_at_ms, updated_at_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ingested', ?10, ?11, ?12)";
+const INSERT_UNIT_SQL: &str = "
+INSERT INTO units (
+  unit_id, document_id, source_path, sequence, heading_path_json,
+  page_numbers_json, token_count, content, content_chars
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+const INSERT_UNIT_FTS_SQL: &str = "INSERT INTO units_fts(rowid, content) VALUES (?1, ?2)";
+const INSERT_DENSE_VECTOR_SQL: &str = "
+INSERT INTO dense_vectors (
+  unit_id, dimension, vector_blob, vector_norm, model_path,
+  model_dimension, pooling, format, created_at_ms, updated_at_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+const EXPECTED_UNITS_FTS_SQL: &str =
+    "CREATE VIRTUAL TABLE units_fts USING fts5(content, content='units', content_rowid='rowid')";
+const DOCUMENTS_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "documents",
+        name: "document_id",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 1,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "source_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "source_sha256",
+        declared_type: "TEXT",
+        required: false,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "markdown_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "markdown_sha256",
+        declared_type: "TEXT",
+        required: false,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "pdf_backend",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "ocr_mode",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "page_batch_size",
+        declared_type: "INTEGER",
+        required: false,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "units_ingested",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "status",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "diagnostics_json",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "created_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "documents",
+        name: "updated_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+];
+const UNITS_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "units",
+        name: "unit_id",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 1,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "document_id",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "source_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "sequence",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "heading_path_json",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "page_numbers_json",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "token_count",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "content",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "content_chars",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+];
+const DENSE_VECTORS_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "unit_id",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 1,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "dimension",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "vector_blob",
+        declared_type: "BLOB",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "vector_norm",
+        declared_type: "REAL",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "model_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "model_dimension",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "pooling",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "format",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "created_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "dense_vectors",
+        name: "updated_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+];
+const UNITS_DOCUMENT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
+    table_name: "units",
+    from_column: "document_id",
+    referenced_table: "documents",
+    referenced_column: "document_id",
+    on_delete: "CASCADE",
+};
+const DENSE_VECTORS_UNIT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
+    table_name: "dense_vectors",
+    from_column: "unit_id",
+    referenced_table: "units",
+    referenced_column: "unit_id",
+    on_delete: "CASCADE",
+};
 
 impl StorageRuntime {
     /// Open existing storage, validate schema, and load the dense vector cache without runtime schema changes.
@@ -331,15 +668,8 @@ impl StorageRuntime {
 
         let connection = open_connection(&self.db_path)?;
         let mut statement = connection
-            .prepare(
-                // ASC preserves SQLite FTS5's lower-is-better bm25() ordering.
-                "SELECT units.unit_id, bm25(units_fts) AS bm25_score
-                 FROM units_fts
-                 JOIN units ON units.rowid = units_fts.rowid
-                 WHERE units_fts MATCH ?1
-                 ORDER BY bm25_score ASC, units.unit_id ASC
-                 LIMIT ?2",
-            )
+            // ASC preserves SQLite FTS5's lower-is-better bm25() ordering.
+            .prepare(BM25_SEARCH_SQL)
             .map_err(|source| {
                 storage_operation_error(format!("failed to prepare BM25 search: {source}"))
             })?;
@@ -460,11 +790,7 @@ impl DenseVectorCache {
     fn load(connection: &Connection, dimension: usize) -> Result<Self, ApiError> {
         let started = Instant::now();
         let mut statement = connection
-            .prepare(
-                "SELECT unit_id, dimension, vector_blob, vector_norm
-                 FROM dense_vectors
-                 ORDER BY unit_id ASC",
-            )
+            .prepare(LOAD_DENSE_VECTORS_SQL)
             .map_err(|source| {
                 storage_init_error(format!("failed to prepare dense cache load: {source}"))
             })?;
@@ -719,56 +1045,7 @@ pub fn setup_storage(storage: &StorageConfig) -> Result<PathBuf, ApiError> {
     let db_path = database_path(storage);
     let connection = open_connection(&db_path)?;
     connection
-        .execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS documents (
-              document_id TEXT PRIMARY KEY,
-              source_path TEXT NOT NULL UNIQUE,
-              source_sha256 TEXT,
-              markdown_path TEXT NOT NULL,
-              markdown_sha256 TEXT,
-              pdf_backend TEXT NOT NULL,
-              ocr_mode TEXT NOT NULL,
-              page_batch_size INTEGER,
-              units_ingested INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              diagnostics_json TEXT NOT NULL,
-              created_at_ms INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS units (
-              unit_id TEXT PRIMARY KEY,
-              document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-              source_path TEXT NOT NULL,
-              sequence INTEGER NOT NULL,
-              heading_path_json TEXT NOT NULL,
-              page_numbers_json TEXT NOT NULL,
-              token_count INTEGER NOT NULL,
-              content TEXT NOT NULL,
-              content_chars INTEGER NOT NULL
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_units_document_sequence
-            ON units(document_id, sequence);
-
-            CREATE TABLE IF NOT EXISTS dense_vectors (
-              unit_id TEXT PRIMARY KEY REFERENCES units(unit_id) ON DELETE CASCADE,
-              dimension INTEGER NOT NULL,
-              vector_blob BLOB NOT NULL,
-              vector_norm REAL NOT NULL,
-              model_path TEXT NOT NULL,
-              model_dimension INTEGER NOT NULL,
-              pooling TEXT NOT NULL,
-              format TEXT NOT NULL,
-              created_at_ms INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS units_fts
-            USING fts5(content, content='units', content_rowid='rowid');
-            ",
-        )
+        .execute_batch(STORAGE_SCHEMA_SQL)
         .map_err(|source| {
             storage_operation_error(format!("failed to create SQLite schema: {source}"))
         })?;
@@ -791,7 +1068,7 @@ fn open_connection(db_path: &Path) -> Result<Connection, ApiError> {
         ))
     })?;
     connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
+        .execute_batch(ENABLE_FOREIGN_KEYS_SQL)
         .map_err(|source| {
             storage_init_error(format!("failed to enable SQLite foreign keys: {source}"))
         })?;
@@ -799,50 +1076,378 @@ fn open_connection(db_path: &Path) -> Result<Connection, ApiError> {
     Ok(connection)
 }
 
-/// Validate that all Phase 8 tables exist before runtime operations proceed.
+/// Validate the durable SQLite contract before runtime operations proceed.
 fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
+    validate_schema_version(connection)?;
     for table_name in ["documents", "units", "dense_vectors", "units_fts"] {
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE name = ?1 LIMIT 1",
-                [table_name],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|source| {
-                storage_init_error(format!("failed to inspect SQLite schema: {source}"))
-            })?
-            .is_some();
-        if !exists {
-            return Err(ApiError::StorageInit {
-                message: format!(
-                    "SQLite schema is missing required table {table_name}; run --setup-storage"
-                ),
-            });
+        validate_schema_object_exists(connection, table_name)?;
+    }
+    validate_table_columns(connection, DOCUMENTS_TABLE_INFO_SQL, DOCUMENTS_COLUMNS)?;
+    validate_table_columns(connection, UNITS_TABLE_INFO_SQL, UNITS_COLUMNS)?;
+    validate_table_columns(
+        connection,
+        DENSE_VECTORS_TABLE_INFO_SQL,
+        DENSE_VECTORS_COLUMNS,
+    )?;
+    validate_foreign_key(
+        connection,
+        UNITS_FOREIGN_KEYS_SQL,
+        UNITS_DOCUMENT_FOREIGN_KEY,
+    )?;
+    validate_foreign_key(
+        connection,
+        DENSE_VECTORS_FOREIGN_KEYS_SQL,
+        DENSE_VECTORS_UNIT_FOREIGN_KEY,
+    )?;
+    validate_named_unique_index(
+        connection,
+        DOCUMENTS_INDEX_LIST_SQL,
+        DOCUMENTS_SOURCE_PATH_INDEX_INFO_SQL,
+        "documents",
+        "idx_documents_source_path",
+        &["source_path"],
+    )?;
+    validate_units_document_sequence_index(connection)?;
+    validate_units_fts_definition(connection)?;
+
+    Ok(())
+}
+
+/// Validate that the database was created by the current explicit setup schema.
+fn validate_schema_version(connection: &Connection) -> Result<(), ApiError> {
+    let version = connection
+        .query_row(GET_SCHEMA_VERSION_SQL, [], |row| row.get::<_, i64>(0))
+        .map_err(|source| {
+            storage_init_error(format!("failed to read SQLite schema version: {source}"))
+        })?;
+    if version != EXPECTED_SCHEMA_VERSION {
+        return Err(storage_init_error(format!(
+            "SQLite schema version is {version}, expected {EXPECTED_SCHEMA_VERSION}; run --setup-storage"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate that one named schema object exists before deeper contract checks run.
+fn validate_schema_object_exists(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<(), ApiError> {
+    let exists = connection
+        .query_row(SCHEMA_OBJECT_EXISTS_SQL, [table_name], |_| Ok(()))
+        .optional()
+        .map_err(|source| storage_init_error(format!("failed to inspect SQLite schema: {source}")))?
+        .is_some();
+    if !exists {
+        return Err(ApiError::StorageInit {
+            message: format!(
+                "SQLite schema is missing required table {table_name}; run --setup-storage"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate one table's declared columns against the service-owned schema contract.
+fn validate_table_columns(
+    connection: &Connection,
+    table_info_sql: &str,
+    expected: &[ColumnSpec],
+) -> Result<(), ApiError> {
+    let table_name = expected
+        .first()
+        .map(|value| value.table_name)
+        .unwrap_or("unknown");
+    let actual = load_table_columns(connection, table_info_sql, table_name)?;
+    if actual.len() != expected.len() {
+        return Err(storage_init_error(format!(
+            "SQLite table {table_name} has {} columns, expected {}",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    for spec in expected {
+        let Some(column) = actual.get(spec.name) else {
+            return Err(storage_init_error(format!(
+                "SQLite table {} is missing required column {}",
+                spec.table_name, spec.name
+            )));
+        };
+        validate_column_contract(spec, column)?;
+    }
+    for column_name in actual.keys() {
+        if !expected.iter().any(|spec| spec.name == column_name) {
+            return Err(storage_init_error(format!(
+                "SQLite table {table_name} has unexpected column {column_name}"
+            )));
         }
     }
 
     Ok(())
 }
 
+/// Load SQLite table_info rows into a name-keyed map for contract validation.
+fn load_table_columns(
+    connection: &Connection,
+    table_info_sql: &str,
+    table_name: &str,
+) -> Result<BTreeMap<String, ColumnInfo>, ApiError> {
+    let mut statement = connection.prepare(table_info_sql).map_err(|source| {
+        storage_init_error(format!(
+            "failed to prepare column inspection for {table_name}: {source}"
+        ))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get::<_, String>(1)?,
+                declared_type: row.get::<_, String>(2)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                primary_key_position: row.get::<_, i64>(5)?,
+            })
+        })
+        .map_err(|source| {
+            storage_init_error(format!(
+                "failed to inspect SQLite table {table_name}: {source}"
+            ))
+        })?;
+    let mut columns = BTreeMap::new();
+    for row in rows {
+        let column = row.map_err(|source| {
+            storage_init_error(format!(
+                "failed to read SQLite table_info row for {table_name}: {source}"
+            ))
+        })?;
+        columns.insert(column.name.clone(), column);
+    }
+
+    Ok(columns)
+}
+
+/// Validate one column's type, nullability, and primary-key position.
+fn validate_column_contract(spec: &ColumnSpec, column: &ColumnInfo) -> Result<(), ApiError> {
+    if !column
+        .declared_type
+        .eq_ignore_ascii_case(spec.declared_type)
+    {
+        return Err(storage_init_error(format!(
+            "SQLite column {}.{} has type {}, expected {}",
+            spec.table_name, spec.name, column.declared_type, spec.declared_type
+        )));
+    }
+    if spec.required && !column.not_null && column.primary_key_position == 0 {
+        return Err(storage_init_error(format!(
+            "SQLite column {}.{} is nullable, expected NOT NULL or PRIMARY KEY",
+            spec.table_name, spec.name
+        )));
+    }
+    if column.primary_key_position != spec.primary_key_position {
+        return Err(storage_init_error(format!(
+            "SQLite column {}.{} has primary-key position {}, expected {}",
+            spec.table_name, spec.name, column.primary_key_position, spec.primary_key_position
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate one expected single-column foreign key and its delete behavior.
+fn validate_foreign_key(
+    connection: &Connection,
+    foreign_keys_sql: &str,
+    expected: ForeignKeySpec,
+) -> Result<(), ApiError> {
+    let mut statement = connection.prepare(foreign_keys_sql).map_err(|source| {
+        storage_init_error(format!(
+            "failed to prepare foreign-key inspection for {}: {source}",
+            expected.table_name
+        ))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|source| {
+            storage_init_error(format!(
+                "failed to inspect foreign keys for {}: {source}",
+                expected.table_name
+            ))
+        })?;
+    for row in rows {
+        let (referenced_table, from_column, referenced_column, on_delete) =
+            row.map_err(|source| {
+                storage_init_error(format!(
+                    "failed to read foreign-key row for {}: {source}",
+                    expected.table_name
+                ))
+            })?;
+        if referenced_table == expected.referenced_table
+            && from_column == expected.from_column
+            && referenced_column == expected.referenced_column
+            && on_delete.eq_ignore_ascii_case(expected.on_delete)
+        {
+            return Ok(());
+        }
+    }
+
+    Err(storage_init_error(format!(
+        "SQLite table {} is missing foreign key {} -> {}.{} ON DELETE {}",
+        expected.table_name,
+        expected.from_column,
+        expected.referenced_table,
+        expected.referenced_column,
+        expected.on_delete
+    )))
+}
+
+/// Validate one named unique index and its ordered column list.
+fn validate_named_unique_index(
+    connection: &Connection,
+    index_list_sql: &str,
+    index_info_sql: &str,
+    table_name: &str,
+    index_name: &str,
+    expected_columns: &[&str],
+) -> Result<(), ApiError> {
+    let mut statement = connection.prepare(index_list_sql).map_err(|source| {
+        storage_init_error(format!(
+            "failed to prepare {table_name} index inspection: {source}"
+        ))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .map_err(|source| {
+            storage_init_error(format!("failed to inspect {table_name} indexes: {source}"))
+        })?;
+    let mut found_unique_index = false;
+    for row in rows {
+        let (name, unique) = row.map_err(|source| {
+            storage_init_error(format!("failed to read {table_name} index row: {source}"))
+        })?;
+        if name == index_name && unique {
+            found_unique_index = true;
+        }
+    }
+    if !found_unique_index {
+        return Err(storage_init_error(format!(
+            "SQLite table {table_name} is missing unique index {index_name}"
+        )));
+    }
+
+    validate_index_columns(connection, index_info_sql, index_name, expected_columns)
+}
+
+/// Validate the unique index that preserves deterministic unit sequence per document.
+fn validate_units_document_sequence_index(connection: &Connection) -> Result<(), ApiError> {
+    validate_named_unique_index(
+        connection,
+        UNITS_INDEX_LIST_SQL,
+        UNITS_DOCUMENT_SEQUENCE_INDEX_INFO_SQL,
+        "units",
+        "idx_units_document_sequence",
+        &["document_id", "sequence"],
+    )
+}
+
+/// Validate one index's ordered column list.
+fn validate_index_columns(
+    connection: &Connection,
+    index_info_sql: &str,
+    index_name: &str,
+    expected_columns: &[&str],
+) -> Result<(), ApiError> {
+    let mut statement = connection.prepare(index_info_sql).map_err(|source| {
+        storage_init_error(format!(
+            "failed to prepare index inspection for {index_name}: {source}"
+        ))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|source| {
+            storage_init_error(format!("failed to inspect index {index_name}: {source}"))
+        })?;
+    let mut columns = Vec::new();
+    for row in rows {
+        let (sequence, name) = row.map_err(|source| {
+            storage_init_error(format!(
+                "failed to read index row for {index_name}: {source}"
+            ))
+        })?;
+        columns.push((sequence, name));
+    }
+    columns.sort_by_key(|(sequence, _)| *sequence);
+    let actual_columns = columns
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
+    let expected = expected_columns
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if actual_columns != expected {
+        return Err(storage_init_error(format!(
+            "SQLite index {index_name} has columns {:?}, expected {:?}",
+            actual_columns, expected
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate that units_fts is the expected external-content FTS5 table.
+fn validate_units_fts_definition(connection: &Connection) -> Result<(), ApiError> {
+    let sql = connection
+        .query_row(SCHEMA_OBJECT_SQL_SQL, ["units_fts"], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|source| {
+            storage_init_error(format!("failed to inspect units_fts definition: {source}"))
+        })?
+        .ok_or_else(|| {
+            storage_init_error("SQLite schema is missing units_fts definition".to_string())
+        })?;
+    if normalize_schema_sql(&sql) != normalize_schema_sql(EXPECTED_UNITS_FTS_SQL) {
+        return Err(storage_init_error(format!(
+            "SQLite units_fts definition is incompatible: {sql}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Normalize SQLite DDL text for stable comparison across formatting differences.
+fn normalize_schema_sql(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 /// Load one durable unit row and decode its JSON metadata.
 fn load_unit(connection: &Connection, unit_id: &str) -> Result<StoredUnit, ApiError> {
     let row = connection
-        .query_row(
-            "SELECT unit_id, source_path, heading_path_json, page_numbers_json, content
-             FROM units
-             WHERE unit_id = ?1",
-            [unit_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
+        .query_row(LOAD_UNIT_SQL, [unit_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
         .optional()
         .map_err(|source| {
             storage_operation_error(format!("failed to load unit {unit_id}: {source}"))
@@ -877,26 +1482,14 @@ fn delete_existing_document(
     tx: &rusqlite::Transaction<'_>,
     source_path: &str,
 ) -> Result<(), ApiError> {
-    tx.execute(
-        "DELETE FROM units_fts
-         WHERE rowid IN (
-           SELECT units.rowid
-           FROM units
-           JOIN documents ON documents.document_id = units.document_id
-           WHERE documents.source_path = ?1
-         )",
-        [source_path],
-    )
-    .map_err(|source| {
-        storage_operation_error(format!("failed to delete existing FTS rows: {source}"))
-    })?;
-    tx.execute(
-        "DELETE FROM documents WHERE source_path = ?1",
-        [source_path],
-    )
-    .map_err(|source| {
-        storage_operation_error(format!("failed to delete existing document: {source}"))
-    })?;
+    tx.execute(DELETE_EXISTING_FTS_ROWS_SQL, [source_path])
+        .map_err(|source| {
+            storage_operation_error(format!("failed to delete existing FTS rows: {source}"))
+        })?;
+    tx.execute(DELETE_EXISTING_DOCUMENT_SQL, [source_path])
+        .map_err(|source| {
+            storage_operation_error(format!("failed to delete existing document: {source}"))
+        })?;
 
     Ok(())
 }
@@ -913,11 +1506,7 @@ fn insert_document(
     timestamp_ms: u64,
 ) -> Result<(), ApiError> {
     tx.execute(
-        "INSERT INTO documents (
-           document_id, source_path, source_sha256, markdown_path, markdown_sha256,
-           pdf_backend, ocr_mode, page_batch_size, units_ingested, status,
-           diagnostics_json, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ingested', ?10, ?11, ?12)",
+        INSERT_DOCUMENT_SQL,
         params![
             document_id,
             conversion.source.relative_path.display().to_string(),
@@ -947,10 +1536,7 @@ fn insert_unit(tx: &rusqlite::Transaction<'_>, unit: &RetrievalUnit) -> Result<(
         storage_operation_error(format!("failed to encode page numbers: {source}"))
     })?;
     tx.execute(
-        "INSERT INTO units (
-           unit_id, document_id, source_path, sequence, heading_path_json,
-           page_numbers_json, token_count, content, content_chars
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        INSERT_UNIT_SQL,
         params![
             &unit.unit_id,
             &unit.document_id,
@@ -967,16 +1553,13 @@ fn insert_unit(tx: &rusqlite::Transaction<'_>, unit: &RetrievalUnit) -> Result<(
         storage_operation_error(format!("failed to insert unit {}: {source}", unit.unit_id))
     })?;
     let rowid = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO units_fts(rowid, content) VALUES (?1, ?2)",
-        params![rowid, &unit.content],
-    )
-    .map_err(|source| {
-        storage_operation_error(format!(
-            "failed to insert FTS row for {}: {source}",
-            unit.unit_id
-        ))
-    })?;
+    tx.execute(INSERT_UNIT_FTS_SQL, params![rowid, &unit.content])
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to insert FTS row for {}: {source}",
+                unit.unit_id
+            ))
+        })?;
 
     Ok(())
 }
@@ -989,10 +1572,7 @@ fn insert_dense_vector(
     timestamp_ms: u64,
 ) -> Result<(), ApiError> {
     tx.execute(
-        "INSERT INTO dense_vectors (
-           unit_id, dimension, vector_blob, vector_norm, model_path,
-           model_dimension, pooling, format, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        INSERT_DENSE_VECTOR_SQL,
         params![
             &vector.unit_id,
             dense.dimension as i64,
