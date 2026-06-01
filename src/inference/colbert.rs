@@ -28,8 +28,10 @@ const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 pub struct ColbertRuntime {
     input_path: ColbertInputPath,
     projection: ColbertProjection,
+    encoder: ColbertEncoderRuntime,
     attention_smoke: ColbertAttentionSmoke,
     single_layer_smoke: ColbertLayerSmoke,
+    full_encoder_smoke: ColbertFullEncoderSmoke,
     query_tokens: usize,
     document_tokens: usize,
     hidden_size: usize,
@@ -79,6 +81,13 @@ struct ColbertLayerPrimitive {
 }
 
 #[derive(Debug, Clone)]
+struct ColbertEncoderRuntime {
+    layers: Vec<ColbertLayerPrimitive>,
+    final_norm: MetalSafeLayerNorm,
+    hidden_size: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ColbertMlpPrimitive {
     input_proj: Linear,
     output_proj: Linear,
@@ -104,6 +113,19 @@ struct ColbertLayerSmoke {
     hidden_size: usize,
     mean_abs: f32,
     max_abs: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertFullEncoderSmoke {
+    query_tokens: usize,
+    document_tokens: usize,
+    hidden_size: usize,
+    projection_dimension: usize,
+    maxsim_score: f32,
+    query_mean_abs: f32,
+    query_max_abs: f32,
+    document_mean_abs: f32,
+    document_max_abs: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,7 +195,7 @@ impl ColbertRuntime {
         validate_root_safetensors(artifacts, &model_config)?;
         let input_path = ColbertInputPath::load(artifacts, &model_config, device)?;
         let projection = ColbertProjection::load(artifacts, config, device)?;
-        let layer = ColbertLayerPrimitive::load(artifacts, &model_config, 0, device)?;
+        let encoder = ColbertEncoderRuntime::load(artifacts, &model_config, device)?;
 
         let query_token_ids = tokenize_formatted(
             &tokenizer,
@@ -192,14 +214,18 @@ impl ColbertRuntime {
         let query_projection = projection.project(&query_hidden)?;
         let document_projection = projection.project(&document_hidden)?;
         let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
-        let attention_smoke = layer.attention.smoke(&query_hidden, "query")?;
-        let single_layer_smoke = layer.smoke(&query_hidden, "query")?;
+        let first_layer = encoder.first_layer()?;
+        let attention_smoke = first_layer.attention.smoke(&query_hidden, "query")?;
+        let single_layer_smoke = first_layer.smoke(&query_hidden, "query")?;
+        let full_encoder_smoke = encoder.smoke(&query_hidden, &document_hidden, &projection)?;
 
         Ok(Self {
             input_path,
             projection,
+            encoder,
             attention_smoke,
             single_layer_smoke,
+            full_encoder_smoke,
             query_tokens: query_token_ids.len(),
             document_tokens: document_token_ids.len(),
             hidden_size: model_config.hidden_size,
@@ -213,7 +239,7 @@ impl ColbertRuntime {
     pub fn health_details(&self) -> Vec<String> {
         vec![
             format!(
-                "colbert input path ready: architecture {}, layers {}, vocab {}, hidden {}, embedding_norm_eps {}, projection {}->{}, query_tokens {}, document_tokens {}, embedding_path_maxsim {:.6}, projection_path {}, encoder_runtime not yet executed",
+                "colbert input path ready: architecture {}, layers {}, vocab {}, hidden {}, embedding_norm_eps {}, projection {}->{}, query_tokens {}, document_tokens {}, embedding_path_maxsim {:.6}, projection_path {}",
                 EXPECTED_ARCHITECTURE,
                 self.num_hidden_layers,
                 self.input_path.vocab_size,
@@ -227,7 +253,7 @@ impl ColbertRuntime {
                 self.projection.path.display()
             ),
             format!(
-                "colbert attention primitive ready: layer {}, kind {}, tokens {}, hidden {}, head_dim {}, mean_abs {:.6}, max_abs {:.6}, full_encoder_runtime not yet executed",
+                "colbert attention primitive ready: layer {}, kind {}, tokens {}, hidden {}, head_dim {}, mean_abs {:.6}, max_abs {:.6}",
                 self.attention_smoke.layer_index,
                 self.attention_smoke.attention_kind.label(),
                 self.attention_smoke.tokens,
@@ -237,12 +263,25 @@ impl ColbertRuntime {
                 self.attention_smoke.max_abs
             ),
             format!(
-                "colbert single layer ready: layer {}, tokens {}, hidden {}, mean_abs {:.6}, max_abs {:.6}, full_encoder_runtime not yet executed",
+                "colbert single layer ready: layer {}, tokens {}, hidden {}, mean_abs {:.6}, max_abs {:.6}",
                 self.single_layer_smoke.layer_index,
                 self.single_layer_smoke.tokens,
                 self.single_layer_smoke.hidden_size,
                 self.single_layer_smoke.mean_abs,
                 self.single_layer_smoke.max_abs
+            ),
+            format!(
+                "colbert full encoder ready: layers {}, query_tokens {}, document_tokens {}, hidden {}, projection {}, maxsim {:.6}, query_mean_abs {:.6}, query_max_abs {:.6}, document_mean_abs {:.6}, document_max_abs {:.6}",
+                self.encoder.layer_count(),
+                self.full_encoder_smoke.query_tokens,
+                self.full_encoder_smoke.document_tokens,
+                self.full_encoder_smoke.hidden_size,
+                self.full_encoder_smoke.projection_dimension,
+                self.full_encoder_smoke.maxsim_score,
+                self.full_encoder_smoke.query_mean_abs,
+                self.full_encoder_smoke.query_max_abs,
+                self.full_encoder_smoke.document_mean_abs,
+                self.full_encoder_smoke.document_max_abs
             ),
         ]
     }
@@ -701,6 +740,130 @@ impl ColbertLayerPrimitive {
                 "ColBERT {label} MLP residual failed for layer {}: {source}",
                 self.layer_index
             ))
+        })
+    }
+}
+
+impl ColbertEncoderRuntime {
+    /// Load the full ModernBERT encoder stack and final normalization used for ColBERT token vectors.
+    fn load(
+        artifacts: &ModelArtifacts,
+        config: &ModernBertConfig,
+        device: &Device,
+    ) -> Result<Self, ApiError> {
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::F32, device)
+        }
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to memory-map ColBERT encoder tensors from {}: {source}",
+                artifacts.root.display()
+            ))
+        })?;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_index in 0..config.num_hidden_layers {
+            layers.push(ColbertLayerPrimitive::load(
+                artifacts,
+                config,
+                layer_index,
+                device,
+            )?);
+        }
+        let final_norm =
+            MetalSafeLayerNorm::load(config.hidden_size, config.norm_eps, vb.pp("final_norm"))
+                .map_err(|source| {
+                    inference_error(format!("failed to load ColBERT final norm: {source}"))
+                })?;
+
+        Ok(Self {
+            layers,
+            final_norm,
+            hidden_size: config.hidden_size,
+        })
+    }
+
+    /// Return the first layer so startup can keep the narrower primitive smoke diagnostics.
+    fn first_layer(&self) -> Result<&ColbertLayerPrimitive, ApiError> {
+        self.layers.first().ok_or_else(|| {
+            inference_error("ColBERT encoder has no layers after initialization".to_string())
+        })
+    }
+
+    /// Return the number of loaded layers for health diagnostics.
+    fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Run query and document smoke texts through the full encoder, projection, and MaxSim path.
+    fn smoke(
+        &self,
+        query_hidden: &Tensor,
+        document_hidden: &Tensor,
+        projection: &ColbertProjection,
+    ) -> Result<ColbertFullEncoderSmoke, ApiError> {
+        let query_encoded = self.encode(query_hidden, "query")?;
+        let document_encoded = self.encode(document_hidden, "document")?;
+        let query_projection = projection.project(&query_encoded)?;
+        let document_projection = projection.project(&document_encoded)?;
+        let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
+        let (query_tokens, query_projection_dimension) =
+            query_projection.dims2().map_err(|source| {
+                inference_error(format!(
+                    "ColBERT full-encoder query projection shape error: {source}"
+                ))
+            })?;
+        let (document_tokens, document_projection_dimension) =
+            document_projection.dims2().map_err(|source| {
+                inference_error(format!(
+                    "ColBERT full-encoder document projection shape error: {source}"
+                ))
+            })?;
+        if query_projection_dimension != projection.out_features
+            || document_projection_dimension != projection.out_features
+        {
+            return Err(inference_error(format!(
+                "ColBERT full-encoder projection dimensions were query={} document={}, expected {}",
+                query_projection_dimension, document_projection_dimension, projection.out_features
+            )));
+        }
+        let (query_mean_abs, query_max_abs) =
+            tensor_abs_summary(&query_encoded, "query", "full-encoder output")?;
+        let (document_mean_abs, document_max_abs) =
+            tensor_abs_summary(&document_encoded, "document", "full-encoder output")?;
+
+        Ok(ColbertFullEncoderSmoke {
+            query_tokens,
+            document_tokens,
+            hidden_size: self.hidden_size,
+            projection_dimension: projection.out_features,
+            maxsim_score,
+            query_mean_abs,
+            query_max_abs,
+            document_mean_abs,
+            document_max_abs,
+        })
+    }
+
+    /// Apply every ModernBERT layer followed by final normalization, preserving the runtime's synchronous surface.
+    fn encode(&self, hidden_states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+        let (_, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} full-encoder input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size {
+            return Err(inference_error(format!(
+                "ColBERT {label} full-encoder hidden size {hidden_size}, expected {}",
+                self.hidden_size
+            )));
+        }
+
+        let mut current = hidden_states.clone();
+        for layer in &self.layers {
+            current = layer.forward(&current, label)?;
+        }
+        self.final_norm.forward(&current).map_err(|source| {
+            inference_error(format!("ColBERT {label} final norm failed: {source}"))
         })
     }
 }
