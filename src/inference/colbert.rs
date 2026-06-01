@@ -4,8 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{Linear, Module, VarBuilder, linear_no_bias};
+use candle_core::{D, DType, Device, Tensor};
+use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_no_bias};
 use safetensors::{Dtype as SafeTensorDType, SafeTensors};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -26,6 +26,7 @@ const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 
 #[derive(Debug, Clone)]
 pub struct ColbertRuntime {
+    input_path: ColbertInputPath,
     projection: ColbertProjection,
     query_tokens: usize,
     document_tokens: usize,
@@ -33,6 +34,14 @@ pub struct ColbertRuntime {
     projection_dimension: usize,
     num_hidden_layers: usize,
     maxsim_score: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertInputPath {
+    embeddings: Embedding,
+    norm: MetalSafeLayerNorm,
+    vocab_size: usize,
+    hidden_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +58,7 @@ struct ModernBertConfig {
     hidden_size: usize,
     intermediate_size: usize,
     model_type: String,
+    norm_eps: f64,
     num_attention_heads: usize,
     num_hidden_layers: usize,
     vocab_size: usize,
@@ -75,7 +85,7 @@ struct TensorMetadata {
 }
 
 impl ColbertRuntime {
-    /// Validate the ColBERT artifact contract and run projection-only smoke checks without executing ModernBERT.
+    /// Validate the ColBERT artifact contract and run embedding-path smoke checks without executing ModernBERT layers.
     pub fn load(
         artifacts: &ModelArtifacts,
         config: &ColbertModelConfig,
@@ -93,33 +103,32 @@ impl ColbertRuntime {
         validate_modernbert_config(&model_config, config)?;
         validate_tokenizer_contract(artifacts, config)?;
         validate_root_safetensors(artifacts, &model_config)?;
+        let input_path = ColbertInputPath::load(artifacts, &model_config, device)?;
         let projection = ColbertProjection::load(artifacts, config, device)?;
 
-        let query_tokens = tokenize_formatted(
+        let query_token_ids = tokenize_formatted(
             &tokenizer,
             &format_query(SMOKE_QUERY),
             config.query_max_tokens as usize,
             "query",
-        )?
-        .len();
-        let document_tokens = tokenize_formatted(
+        )?;
+        let document_token_ids = tokenize_formatted(
             &tokenizer,
             &format_document(SMOKE_DOCUMENT),
             config.document_max_tokens as usize,
             "document",
-        )?
-        .len();
-        let query_hidden = synthetic_hidden_states(query_tokens, model_config.hidden_size, device)?;
-        let document_hidden =
-            synthetic_hidden_states(document_tokens, model_config.hidden_size, device)?;
+        )?;
+        let query_hidden = input_path.forward(&query_token_ids, device, "query")?;
+        let document_hidden = input_path.forward(&document_token_ids, device, "document")?;
         let query_projection = projection.project(&query_hidden)?;
         let document_projection = projection.project(&document_hidden)?;
         let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
 
         Ok(Self {
+            input_path,
             projection,
-            query_tokens,
-            document_tokens,
+            query_tokens: query_token_ids.len(),
+            document_tokens: document_token_ids.len(),
             hidden_size: model_config.hidden_size,
             projection_dimension: config.dimension as usize,
             num_hidden_layers: model_config.num_hidden_layers,
@@ -127,13 +136,15 @@ impl ColbertRuntime {
         })
     }
 
-    /// Return ColBERT loader/projection readiness details while clearly excluding encoder execution.
+    /// Return ColBERT input-path readiness details while clearly excluding encoder execution.
     pub fn health_details(&self) -> Vec<String> {
         vec![format!(
-            "colbert contract/projection ready: architecture {}, layers {}, hidden {}, projection {}->{}, query_tokens {}, document_tokens {}, synthetic_maxsim {:.6}, projection_path {}, encoder_runtime not yet executed",
+            "colbert input path ready: architecture {}, layers {}, vocab {}, hidden {}, embedding_norm_eps {}, projection {}->{}, query_tokens {}, document_tokens {}, embedding_path_maxsim {:.6}, projection_path {}, encoder_runtime not yet executed",
             EXPECTED_ARCHITECTURE,
             self.num_hidden_layers,
+            self.input_path.vocab_size,
             self.hidden_size,
+            self.input_path.norm.eps,
             self.projection.in_features,
             self.projection_dimension,
             self.query_tokens,
@@ -141,6 +152,91 @@ impl ColbertRuntime {
             self.maxsim_score,
             self.projection.path.display()
         )]
+    }
+}
+
+impl ColbertInputPath {
+    /// Load the ModernBERT token embedding and embedding norm tensors used before transformer layers.
+    fn load(
+        artifacts: &ModelArtifacts,
+        config: &ModernBertConfig,
+        device: &Device,
+    ) -> Result<Self, ApiError> {
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::F32, device)
+        }
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to memory-map ColBERT root safetensors from {}: {source}",
+                artifacts.root.display()
+            ))
+        })?;
+        let embeddings = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("embeddings.tok_embeddings"),
+        )
+        .map_err(|source| {
+            inference_error(format!("failed to load ColBERT token embeddings: {source}"))
+        })?;
+        let norm = MetalSafeLayerNorm::load(
+            config.hidden_size,
+            config.norm_eps,
+            vb.pp("embeddings.norm"),
+        )
+        .map_err(|source| {
+            inference_error(format!("failed to load ColBERT embedding norm: {source}"))
+        })?;
+
+        Ok(Self {
+            embeddings,
+            norm,
+            vocab_size: config.vocab_size,
+            hidden_size: config.hidden_size,
+        })
+    }
+
+    /// Convert real token IDs into normalized ModernBERT input hidden states without running encoder layers.
+    fn forward(&self, token_ids: &[u32], device: &Device, label: &str) -> Result<Tensor, ApiError> {
+        let input = Tensor::new(token_ids, device)
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to build ColBERT {label} input tensor: {source}"
+                ))
+            })?
+            .unsqueeze(0)
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to batch ColBERT {label} input tensor: {source}"
+                ))
+            })?;
+        let hidden = self.embeddings.forward(&input).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} token embedding lookup failed: {source}"
+            ))
+        })?;
+        let normalized = self.norm.forward(&hidden).map_err(|source| {
+            inference_error(format!("ColBERT {label} embedding norm failed: {source}"))
+        })?;
+        let (batch_size, token_count, hidden_size) = normalized.dims3().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} embedding hidden-state shape error: {source}"
+            ))
+        })?;
+        if batch_size != 1 || hidden_size != self.hidden_size {
+            return Err(inference_error(format!(
+                "ColBERT {label} embedding hidden states have shape [{batch_size}, {token_count}, {hidden_size}], expected [1, tokens, {}]",
+                self.hidden_size
+            )));
+        }
+
+        normalized
+            .reshape((token_count, hidden_size))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to flatten ColBERT {label} hidden states for projection: {source}"
+                ))
+            })
     }
 }
 
@@ -214,6 +310,31 @@ impl ColbertProjection {
         }
 
         Ok(projected)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MetalSafeLayerNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl MetalSafeLayerNorm {
+    /// Load a bias-free LayerNorm boundary while avoiding Candle fused ops that may be unavailable on Metal.
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(Self {
+            weight: vb.get(size, "weight")?,
+            eps,
+        })
+    }
+
+    /// Apply bias-free LayerNorm with primitive tensor operations available across configured accelerators.
+    fn forward(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
+        let mean = hidden_states.mean_keepdim(D::Minus1)?;
+        let centered = hidden_states.broadcast_sub(&mean)?;
+        let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        normed.broadcast_mul(&self.weight)
     }
 }
 
@@ -607,27 +728,6 @@ fn tokenize_formatted(
     }
 
     Ok(ids)
-}
-
-/// Build deterministic hidden states for projection smoke without invoking ModernBERT.
-fn synthetic_hidden_states(
-    tokens: usize,
-    hidden_size: usize,
-    device: &Device,
-) -> Result<Tensor, ApiError> {
-    let mut values = Vec::with_capacity(tokens * hidden_size);
-    for token_index in 0..tokens {
-        for hidden_index in 0..hidden_size {
-            let value = (((token_index + 1) * (hidden_index + 3)) % 97) as f32 / 97.0;
-            values.push(value);
-        }
-    }
-
-    Tensor::from_vec(values, (tokens, hidden_size), device).map_err(|source| {
-        inference_error(format!(
-            "failed to build ColBERT synthetic hidden states: {source}"
-        ))
-    })
 }
 
 /// Compute ColBERT MaxSim by summing each query token's best document-token dot product.
