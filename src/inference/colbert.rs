@@ -29,6 +29,7 @@ pub struct ColbertRuntime {
     input_path: ColbertInputPath,
     projection: ColbertProjection,
     attention_smoke: ColbertAttentionSmoke,
+    single_layer_smoke: ColbertLayerSmoke,
     query_tokens: usize,
     document_tokens: usize,
     hidden_size: usize,
@@ -69,12 +70,38 @@ struct ColbertAttentionPrimitive {
 }
 
 #[derive(Debug, Clone)]
+struct ColbertLayerPrimitive {
+    attention: ColbertAttentionPrimitive,
+    mlp_norm: MetalSafeLayerNorm,
+    mlp: ColbertMlpPrimitive,
+    layer_index: usize,
+    hidden_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertMlpPrimitive {
+    input_proj: Linear,
+    output_proj: Linear,
+    hidden_size: usize,
+    intermediate_size: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ColbertAttentionSmoke {
     layer_index: usize,
     attention_kind: ColbertAttentionKind,
     tokens: usize,
     hidden_size: usize,
     head_dim: usize,
+    mean_abs: f32,
+    max_abs: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertLayerSmoke {
+    layer_index: usize,
+    tokens: usize,
+    hidden_size: usize,
     mean_abs: f32,
     max_abs: f32,
 }
@@ -91,11 +118,13 @@ struct ModernBertConfig {
     architectures: Vec<String>,
     global_attn_every_n_layers: usize,
     global_rope_theta: f64,
+    hidden_activation: String,
     hidden_size: usize,
     intermediate_size: usize,
     local_attention: usize,
     local_rope_theta: f64,
     max_position_embeddings: usize,
+    mlp_bias: bool,
     model_type: String,
     norm_eps: f64,
     num_attention_heads: usize,
@@ -124,7 +153,7 @@ struct TensorMetadata {
 }
 
 impl ColbertRuntime {
-    /// Validate the ColBERT artifact contract and run embedding-path smoke checks without executing ModernBERT layers.
+    /// Validate the ColBERT artifact contract and run incremental ColBERT runtime smoke checks.
     pub fn load(
         artifacts: &ModelArtifacts,
         config: &ColbertModelConfig,
@@ -144,7 +173,7 @@ impl ColbertRuntime {
         validate_root_safetensors(artifacts, &model_config)?;
         let input_path = ColbertInputPath::load(artifacts, &model_config, device)?;
         let projection = ColbertProjection::load(artifacts, config, device)?;
-        let attention = ColbertAttentionPrimitive::load(artifacts, &model_config, 0, device)?;
+        let layer = ColbertLayerPrimitive::load(artifacts, &model_config, 0, device)?;
 
         let query_token_ids = tokenize_formatted(
             &tokenizer,
@@ -163,12 +192,14 @@ impl ColbertRuntime {
         let query_projection = projection.project(&query_hidden)?;
         let document_projection = projection.project(&document_hidden)?;
         let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
-        let attention_smoke = attention.smoke(&query_hidden, "query")?;
+        let attention_smoke = layer.attention.smoke(&query_hidden, "query")?;
+        let single_layer_smoke = layer.smoke(&query_hidden, "query")?;
 
         Ok(Self {
             input_path,
             projection,
             attention_smoke,
+            single_layer_smoke,
             query_tokens: query_token_ids.len(),
             document_tokens: document_token_ids.len(),
             hidden_size: model_config.hidden_size,
@@ -178,7 +209,7 @@ impl ColbertRuntime {
         })
     }
 
-    /// Return ColBERT input-path readiness details while clearly excluding encoder execution.
+    /// Return ColBERT readiness details while distinguishing partial smoke checks from the full encoder runtime.
     pub fn health_details(&self) -> Vec<String> {
         vec![
             format!(
@@ -204,6 +235,14 @@ impl ColbertRuntime {
                 self.attention_smoke.head_dim,
                 self.attention_smoke.mean_abs,
                 self.attention_smoke.max_abs
+            ),
+            format!(
+                "colbert single layer ready: layer {}, tokens {}, hidden {}, mean_abs {:.6}, max_abs {:.6}, full_encoder_runtime not yet executed",
+                self.single_layer_smoke.layer_index,
+                self.single_layer_smoke.tokens,
+                self.single_layer_smoke.hidden_size,
+                self.single_layer_smoke.mean_abs,
+                self.single_layer_smoke.max_abs
             ),
         ]
     }
@@ -566,6 +605,193 @@ impl ColbertAttentionPrimitive {
     }
 }
 
+impl ColbertLayerPrimitive {
+    /// Load one complete ModernBERT layer so startup can verify attention, MLP, and residual boundaries together.
+    fn load(
+        artifacts: &ModelArtifacts,
+        config: &ModernBertConfig,
+        layer_index: usize,
+        device: &Device,
+    ) -> Result<Self, ApiError> {
+        if layer_index >= config.num_hidden_layers {
+            return Err(inference_error(format!(
+                "ColBERT single-layer smoke layer {layer_index} is outside {} configured layers",
+                config.num_hidden_layers
+            )));
+        }
+
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::F32, device)
+        }
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to memory-map ColBERT layer tensors from {}: {source}",
+                artifacts.root.display()
+            ))
+        })?;
+        let layer_vb = vb.pp(format!("layers.{layer_index}"));
+        let attention = ColbertAttentionPrimitive::load(artifacts, config, layer_index, device)?;
+        let mlp_norm =
+            MetalSafeLayerNorm::load(config.hidden_size, config.norm_eps, layer_vb.pp("mlp_norm"))
+                .map_err(|source| {
+                    inference_error(format!(
+                        "failed to load ColBERT layer {layer_index} MLP norm: {source}"
+                    ))
+                })?;
+        let mlp = ColbertMlpPrimitive::load(config, layer_vb.pp("mlp"), layer_index)?;
+
+        Ok(Self {
+            attention,
+            mlp_norm,
+            mlp,
+            layer_index,
+            hidden_size: config.hidden_size,
+        })
+    }
+
+    /// Run one complete ModernBERT layer and summarize shape plus finite-value diagnostics.
+    fn smoke(&self, hidden_states: &Tensor, label: &str) -> Result<ColbertLayerSmoke, ApiError> {
+        let output = self.forward(hidden_states, label)?;
+        let (tokens, hidden_size) = output.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} single-layer smoke output shape error: {source}"
+            ))
+        })?;
+        let (mean_abs, max_abs) = tensor_abs_summary(&output, label, "single-layer output")?;
+
+        Ok(ColbertLayerSmoke {
+            layer_index: self.layer_index,
+            tokens,
+            hidden_size,
+            mean_abs,
+            max_abs,
+        })
+    }
+
+    /// Apply one bidirectional ModernBERT encoder layer with attention and GELU-gated MLP residuals.
+    fn forward(&self, hidden_states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+        let (_, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} single-layer input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size {
+            return Err(inference_error(format!(
+                "ColBERT {label} single-layer hidden size {hidden_size}, expected {}",
+                self.hidden_size
+            )));
+        }
+
+        let attention_output = self.attention.forward(hidden_states, label)?;
+        let hidden_states = (attention_output + hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} attention residual failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        let mlp_input = self.mlp_norm.forward(&hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} MLP norm failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        let mlp_output = self.mlp.forward(&mlp_input, label, self.layer_index)?;
+        (mlp_output + hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} MLP residual failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })
+    }
+}
+
+impl ColbertMlpPrimitive {
+    /// Load the fused ModernBERT gated MLP projections for one layer.
+    fn load(
+        config: &ModernBertConfig,
+        vb: VarBuilder,
+        layer_index: usize,
+    ) -> Result<Self, ApiError> {
+        let input_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            vb.pp("Wi"),
+        )
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to load ColBERT layer {layer_index} MLP Wi: {source}"
+            ))
+        })?;
+        let output_proj = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to load ColBERT layer {layer_index} MLP Wo: {source}"
+                ))
+            })?;
+
+        Ok(Self {
+            input_proj,
+            output_proj,
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+        })
+    }
+
+    /// Apply ModernBERT's fused GELU-gated feed-forward block after MLP layer normalization.
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        label: &str,
+        layer_index: usize,
+    ) -> Result<Tensor, ApiError> {
+        let (_, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} MLP input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size {
+            return Err(inference_error(format!(
+                "ColBERT {label} MLP hidden size {hidden_size}, expected {}",
+                self.hidden_size
+            )));
+        }
+
+        let projected = self.input_proj.forward(hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} MLP Wi failed for layer {layer_index}: {source}"
+            ))
+        })?;
+        let input = projected
+            .narrow(1, 0, self.intermediate_size)
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} MLP activation split failed for layer {layer_index}: {source}"
+                ))
+            })?;
+        let gate = projected
+            .narrow(1, self.intermediate_size, self.intermediate_size)
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} MLP gate split failed for layer {layer_index}: {source}"
+                ))
+            })?;
+        let activated = input
+            .gelu()
+            .and_then(|tensor| tensor.mul(&gate))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} MLP GELU gate failed for layer {layer_index}: {source}"
+                ))
+            })?;
+
+        self.output_proj.forward(&activated).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} MLP Wo failed for layer {layer_index}: {source}"
+            ))
+        })
+    }
+}
+
 impl ColbertAttentionKind {
     /// Resolve ModernBERT's layer policy so global and local attention stay explicit.
     fn for_layer(layer_index: usize, config: &ModernBertConfig) -> Self {
@@ -746,6 +972,17 @@ fn validate_modernbert_config(
         return Err(inference_error(
             "ColBERT attention_bias must be false for the bias-free attention adapter".to_string(),
         ));
+    }
+    if model_config.mlp_bias {
+        return Err(inference_error(
+            "ColBERT mlp_bias must be false for the bias-free MLP adapter".to_string(),
+        ));
+    }
+    if model_config.hidden_activation != "gelu" {
+        return Err(inference_error(format!(
+            "ColBERT hidden_activation must be gelu, got {}",
+            model_config.hidden_activation
+        )));
     }
     if model_config.vocab_size == 0
         || model_config.num_hidden_layers == 0
