@@ -28,6 +28,7 @@ const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 pub struct ColbertRuntime {
     input_path: ColbertInputPath,
     projection: ColbertProjection,
+    attention_smoke: ColbertAttentionSmoke,
     query_tokens: usize,
     document_tokens: usize,
     hidden_size: usize,
@@ -52,11 +53,49 @@ struct ColbertProjection {
     out_features: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ColbertAttentionPrimitive {
+    qkv_proj: Linear,
+    out_proj: Linear,
+    attn_norm: Option<MetalSafeLayerNorm>,
+    layer_index: usize,
+    attention_kind: ColbertAttentionKind,
+    num_attention_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    local_attention: usize,
+    max_position_embeddings: usize,
+    rope_theta: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertAttentionSmoke {
+    layer_index: usize,
+    attention_kind: ColbertAttentionKind,
+    tokens: usize,
+    hidden_size: usize,
+    head_dim: usize,
+    mean_abs: f32,
+    max_abs: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColbertAttentionKind {
+    Global,
+    Local,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ModernBertConfig {
+    attention_bias: bool,
     architectures: Vec<String>,
+    global_attn_every_n_layers: usize,
+    global_rope_theta: f64,
     hidden_size: usize,
     intermediate_size: usize,
+    local_attention: usize,
+    local_rope_theta: f64,
+    max_position_embeddings: usize,
     model_type: String,
     norm_eps: f64,
     num_attention_heads: usize,
@@ -105,6 +144,7 @@ impl ColbertRuntime {
         validate_root_safetensors(artifacts, &model_config)?;
         let input_path = ColbertInputPath::load(artifacts, &model_config, device)?;
         let projection = ColbertProjection::load(artifacts, config, device)?;
+        let attention = ColbertAttentionPrimitive::load(artifacts, &model_config, 0, device)?;
 
         let query_token_ids = tokenize_formatted(
             &tokenizer,
@@ -123,10 +163,12 @@ impl ColbertRuntime {
         let query_projection = projection.project(&query_hidden)?;
         let document_projection = projection.project(&document_hidden)?;
         let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
+        let attention_smoke = attention.smoke(&query_hidden, "query")?;
 
         Ok(Self {
             input_path,
             projection,
+            attention_smoke,
             query_tokens: query_token_ids.len(),
             document_tokens: document_token_ids.len(),
             hidden_size: model_config.hidden_size,
@@ -138,20 +180,32 @@ impl ColbertRuntime {
 
     /// Return ColBERT input-path readiness details while clearly excluding encoder execution.
     pub fn health_details(&self) -> Vec<String> {
-        vec![format!(
-            "colbert input path ready: architecture {}, layers {}, vocab {}, hidden {}, embedding_norm_eps {}, projection {}->{}, query_tokens {}, document_tokens {}, embedding_path_maxsim {:.6}, projection_path {}, encoder_runtime not yet executed",
-            EXPECTED_ARCHITECTURE,
-            self.num_hidden_layers,
-            self.input_path.vocab_size,
-            self.hidden_size,
-            self.input_path.norm.eps,
-            self.projection.in_features,
-            self.projection_dimension,
-            self.query_tokens,
-            self.document_tokens,
-            self.maxsim_score,
-            self.projection.path.display()
-        )]
+        vec![
+            format!(
+                "colbert input path ready: architecture {}, layers {}, vocab {}, hidden {}, embedding_norm_eps {}, projection {}->{}, query_tokens {}, document_tokens {}, embedding_path_maxsim {:.6}, projection_path {}, encoder_runtime not yet executed",
+                EXPECTED_ARCHITECTURE,
+                self.num_hidden_layers,
+                self.input_path.vocab_size,
+                self.hidden_size,
+                self.input_path.norm.eps,
+                self.projection.in_features,
+                self.projection_dimension,
+                self.query_tokens,
+                self.document_tokens,
+                self.maxsim_score,
+                self.projection.path.display()
+            ),
+            format!(
+                "colbert attention primitive ready: layer {}, kind {}, tokens {}, hidden {}, head_dim {}, mean_abs {:.6}, max_abs {:.6}, full_encoder_runtime not yet executed",
+                self.attention_smoke.layer_index,
+                self.attention_smoke.attention_kind.label(),
+                self.attention_smoke.tokens,
+                self.attention_smoke.hidden_size,
+                self.attention_smoke.head_dim,
+                self.attention_smoke.mean_abs,
+                self.attention_smoke.max_abs
+            ),
+        ]
     }
 }
 
@@ -237,6 +291,297 @@ impl ColbertInputPath {
                     "failed to flatten ColBERT {label} hidden states for projection: {source}"
                 ))
             })
+    }
+}
+
+impl ColbertAttentionPrimitive {
+    /// Load one ModernBERT attention block so startup can verify the real QKV/output projection path.
+    fn load(
+        artifacts: &ModelArtifacts,
+        config: &ModernBertConfig,
+        layer_index: usize,
+        device: &Device,
+    ) -> Result<Self, ApiError> {
+        if layer_index >= config.num_hidden_layers {
+            return Err(inference_error(format!(
+                "ColBERT attention smoke layer {layer_index} is outside {} configured layers",
+                config.num_hidden_layers
+            )));
+        }
+
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::F32, device)
+        }
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to memory-map ColBERT attention tensors from {}: {source}",
+                artifacts.root.display()
+            ))
+        })?;
+        let layer_vb = vb.pp(format!("layers.{layer_index}"));
+        let qkv_proj = linear_no_bias(
+            config.hidden_size,
+            config.hidden_size * 3,
+            layer_vb.pp("attn.Wqkv"),
+        )
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to load ColBERT layer {layer_index} Wqkv: {source}"
+            ))
+        })?;
+        let out_proj = linear_no_bias(
+            config.hidden_size,
+            config.hidden_size,
+            layer_vb.pp("attn.Wo"),
+        )
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to load ColBERT layer {layer_index} Wo: {source}"
+            ))
+        })?;
+        let attn_norm = if layer_index == 0 {
+            None
+        } else {
+            Some(
+                MetalSafeLayerNorm::load(
+                    config.hidden_size,
+                    config.norm_eps,
+                    layer_vb.pp("attn_norm"),
+                )
+                .map_err(|source| {
+                    inference_error(format!(
+                        "failed to load ColBERT layer {layer_index} attention norm: {source}"
+                    ))
+                })?,
+            )
+        };
+        let attention_kind = ColbertAttentionKind::for_layer(layer_index, config);
+        let rope_theta = match attention_kind {
+            ColbertAttentionKind::Global => config.global_rope_theta,
+            ColbertAttentionKind::Local => config.local_rope_theta,
+        };
+
+        Ok(Self {
+            qkv_proj,
+            out_proj,
+            attn_norm,
+            layer_index,
+            attention_kind,
+            num_attention_heads: config.num_attention_heads,
+            head_dim: config.hidden_size / config.num_attention_heads,
+            hidden_size: config.hidden_size,
+            local_attention: config.local_attention,
+            max_position_embeddings: config.max_position_embeddings,
+            rope_theta,
+        })
+    }
+
+    /// Run the one-layer attention primitive and summarize shape plus finite-value diagnostics.
+    fn smoke(
+        &self,
+        hidden_states: &Tensor,
+        label: &str,
+    ) -> Result<ColbertAttentionSmoke, ApiError> {
+        let output = self.forward(hidden_states, label)?;
+        let (tokens, hidden_size) = output.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} attention smoke output shape error: {source}"
+            ))
+        })?;
+        let (mean_abs, max_abs) = tensor_abs_summary(&output, label, "attention output")?;
+
+        Ok(ColbertAttentionSmoke {
+            layer_index: self.layer_index,
+            attention_kind: self.attention_kind,
+            tokens,
+            hidden_size,
+            head_dim: self.head_dim,
+            mean_abs,
+            max_abs,
+        })
+    }
+
+    /// Apply ModernBERT bidirectional attention for one configured layer without running the MLP block.
+    fn forward(&self, hidden_states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+        let (seq_len, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} attention input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size {
+            return Err(inference_error(format!(
+                "ColBERT {label} attention hidden size {hidden_size}, expected {}",
+                self.hidden_size
+            )));
+        }
+        if seq_len > self.max_position_embeddings {
+            return Err(inference_error(format!(
+                "ColBERT {label} attention sequence length {seq_len} exceeds max_position_embeddings {}",
+                self.max_position_embeddings
+            )));
+        }
+
+        let batched = hidden_states
+            .reshape((1, seq_len, hidden_size))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to batch ColBERT {label} attention input: {source}"
+                ))
+            })?;
+        let attention_input = match &self.attn_norm {
+            Some(norm) => norm.forward(&batched).map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} attention norm failed for layer {}: {source}",
+                    self.layer_index
+                ))
+            })?,
+            None => batched,
+        };
+        let qkv = self.qkv_proj.forward(&attention_input).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} fused QKV projection failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        let q = self.split_attention_projection(&qkv, 0, seq_len, label, "query")?;
+        let k = self.split_attention_projection(&qkv, hidden_size, seq_len, label, "key")?;
+        let v = self.split_attention_projection(&qkv, hidden_size * 2, seq_len, label, "value")?;
+        let q = apply_rope(&q, self.rope_theta, label)?;
+        let k = apply_rope(&k, self.rope_theta, label)?;
+        let attention_output = self.attention_output_by_head(&q, &k, &v, seq_len, label)?;
+        let projected = self.out_proj.forward(&attention_output).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} attention output projection failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+
+        projected.reshape((seq_len, hidden_size)).map_err(|source| {
+            inference_error(format!(
+                "failed to flatten ColBERT {label} attention output: {source}"
+            ))
+        })
+    }
+
+    /// Compute attention per head with 2D matmuls to stay inside Candle Metal's supported operation shapes.
+    fn attention_output_by_head(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        seq_len: usize,
+        label: &str,
+    ) -> Result<Tensor, ApiError> {
+        let mut head_outputs = Vec::with_capacity(self.num_attention_heads);
+        for head_index in 0..self.num_attention_heads {
+            let q_head = self.narrow_head(q, head_index, seq_len, label, "query")?;
+            let k_head = self.narrow_head(k, head_index, seq_len, label, "key")?;
+            let v_head = self.narrow_head(v, head_index, seq_len, label, "value")?;
+            let attention_scores = q_head
+                .matmul(&k_head.t().map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT {label} key transpose failed for head {head_index}: {source}"
+                    ))
+                })?)
+                .and_then(|tensor| {
+                    (tensor / (self.head_dim as f64).sqrt()).map_err(candle_core::Error::from)
+                })
+                .map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT {label} attention scores failed for head {head_index}: {source}"
+                    ))
+                })?;
+            let attention_scores = match self.attention_kind {
+                ColbertAttentionKind::Global => attention_scores,
+                ColbertAttentionKind::Local => {
+                    apply_local_attention_mask(&attention_scores, seq_len, self.local_attention)
+                        .map_err(|source| {
+                            inference_error(format!(
+                                "ColBERT {label} local attention mask failed for head {head_index}: {source}"
+                            ))
+                        })?
+                }
+            };
+            let attention_probs =
+                softmax_last_dim_metal_safe(&attention_scores).map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT {label} attention softmax failed for head {head_index}: {source}"
+                    ))
+                })?;
+            let head_output = attention_probs.matmul(&v_head).map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} attention output failed for head {head_index}: {source}"
+                ))
+            })?;
+            head_outputs.push(head_output);
+        }
+        let head_refs = head_outputs.iter().collect::<Vec<_>>();
+        Tensor::cat(&head_refs, 1)
+            .and_then(|tensor| tensor.reshape((1, seq_len, self.hidden_size)))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} attention head merge failed: {source}"
+                ))
+            })
+    }
+
+    /// Extract one attention head as a `[tokens, head_dim]` matrix for the primitive smoke path.
+    fn narrow_head(
+        &self,
+        states: &Tensor,
+        head_index: usize,
+        seq_len: usize,
+        label: &str,
+        projection_label: &str,
+    ) -> Result<Tensor, ApiError> {
+        states
+            .narrow(1, head_index, 1)
+            .and_then(|tensor| tensor.reshape((seq_len, self.head_dim)))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} {projection_label} head {head_index} extraction failed: {source}"
+                ))
+            })
+    }
+
+    /// Split one fused ModernBERT QKV projection into `[batch, heads, tokens, head_dim]`.
+    fn split_attention_projection(
+        &self,
+        qkv: &Tensor,
+        offset: usize,
+        seq_len: usize,
+        label: &str,
+        projection_label: &str,
+    ) -> Result<Tensor, ApiError> {
+        qkv.narrow(2, offset, self.hidden_size)
+            .and_then(|tensor| {
+                tensor.reshape((1, seq_len, self.num_attention_heads, self.head_dim))
+            })
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} {projection_label} split failed: {source}"
+                ))
+            })
+    }
+}
+
+impl ColbertAttentionKind {
+    /// Resolve ModernBERT's layer policy so global and local attention stay explicit.
+    fn for_layer(layer_index: usize, config: &ModernBertConfig) -> Self {
+        if layer_index % config.global_attn_every_n_layers == 0 {
+            Self::Global
+        } else {
+            Self::Local
+        }
+    }
+
+    /// Return a stable health diagnostic label for the attention policy.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Local => "local",
+        }
     }
 }
 
@@ -397,12 +742,29 @@ fn validate_modernbert_config(
             "ColBERT hidden_size must divide evenly by num_attention_heads".to_string(),
         ));
     }
+    if model_config.attention_bias {
+        return Err(inference_error(
+            "ColBERT attention_bias must be false for the bias-free attention adapter".to_string(),
+        ));
+    }
     if model_config.vocab_size == 0
         || model_config.num_hidden_layers == 0
         || model_config.intermediate_size == 0
+        || model_config.global_attn_every_n_layers == 0
+        || model_config.local_attention == 0
+        || model_config.max_position_embeddings == 0
     {
         return Err(inference_error(
-            "ColBERT config must have positive vocab, layer, and intermediate sizes".to_string(),
+            "ColBERT config must have positive vocab, layer, intermediate, attention cadence, local window, and position sizes".to_string(),
+        ));
+    }
+    if !model_config.global_rope_theta.is_finite()
+        || model_config.global_rope_theta <= 0.0
+        || !model_config.local_rope_theta.is_finite()
+        || model_config.local_rope_theta <= 0.0
+    {
+        return Err(inference_error(
+            "ColBERT RoPE theta values must be finite and greater than zero".to_string(),
         ));
     }
     if config.query_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
@@ -728,6 +1090,152 @@ fn tokenize_formatted(
     }
 
     Ok(ids)
+}
+
+/// Apply ModernBERT rotary position embeddings to query or key states.
+fn apply_rope(states: &Tensor, theta: f64, label: &str) -> Result<Tensor, ApiError> {
+    let (_, _, seq_len, head_dim) = states
+        .dims4()
+        .map_err(|source| inference_error(format!("ColBERT {label} rope shape error: {source}")))?;
+    let device = states.device();
+    let dtype = states.dtype();
+    let half_dim = head_dim / 2;
+    let mut cos = Vec::with_capacity(seq_len * head_dim);
+    let mut sin = Vec::with_capacity(seq_len * head_dim);
+    for position in 0..seq_len {
+        for dim in 0..head_dim {
+            let freq_index = dim % half_dim;
+            let inv_freq = theta.powf(-(2.0 * freq_index as f64) / head_dim as f64);
+            let angle = position as f64 * inv_freq;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+
+    let cos = Tensor::from_vec(cos, (1, 1, seq_len, head_dim), device)
+        .and_then(|tensor| tensor.to_dtype(dtype))
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to build ColBERT {label} rope cosines: {source}"
+            ))
+        })?;
+    let sin = Tensor::from_vec(sin, (1, 1, seq_len, head_dim), device)
+        .and_then(|tensor| tensor.to_dtype(dtype))
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to build ColBERT {label} rope sines: {source}"
+            ))
+        })?;
+    let rotated = rotate_half(states, label)?;
+    states
+        .broadcast_mul(&cos)
+        .and_then(|left| rotated.broadcast_mul(&sin).and_then(|right| left + right))
+        .map_err(|source| {
+            inference_error(format!("failed to apply ColBERT {label} rope: {source}"))
+        })
+}
+
+/// Rotate the final dimension as `[-x2, x1]` for rotary embedding.
+fn rotate_half(states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+    let (_, _, _, head_dim) = states.dims4().map_err(|source| {
+        inference_error(format!("ColBERT {label} rotate-half shape error: {source}"))
+    })?;
+    let half_dim = head_dim / 2;
+    let first = states.narrow(3, 0, half_dim).map_err(|source| {
+        inference_error(format!(
+            "ColBERT {label} rotate-half first split failed: {source}"
+        ))
+    })?;
+    let second = states
+        .narrow(3, half_dim, half_dim)
+        .and_then(|tensor| tensor.neg())
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} rotate-half second split failed: {source}"
+            ))
+        })?;
+
+    Tensor::cat(&[&second, &first], 3).map_err(|source| {
+        inference_error(format!(
+            "ColBERT {label} rotate-half concat failed: {source}"
+        ))
+    })
+}
+
+/// Apply ModernBERT's local bidirectional window mask to attention scores.
+fn apply_local_attention_mask(
+    scores: &Tensor,
+    seq_len: usize,
+    local_attention: usize,
+) -> candle_core::Result<Tensor> {
+    if local_attention >= seq_len {
+        return Ok(scores.clone());
+    }
+
+    let device = scores.device();
+    let radius = local_attention / 2;
+    let mut values = Vec::with_capacity(seq_len * seq_len);
+    for row in 0..seq_len {
+        for col in 0..seq_len {
+            let outside_left = col + radius < row;
+            let outside_right = col > row + radius;
+            values.push(if outside_left || outside_right {
+                f32::NEG_INFINITY
+            } else {
+                0.0
+            });
+        }
+    }
+    let mask = Tensor::from_vec(values, (seq_len, seq_len), device)?.to_dtype(scores.dtype())?;
+    scores.broadcast_add(&mask)
+}
+
+/// Apply softmax over the final dimension without relying on fused kernels.
+fn softmax_last_dim_metal_safe(scores: &Tensor) -> candle_core::Result<Tensor> {
+    let output_dtype = scores.dtype();
+    let scores = scores.to_dtype(DType::F32)?;
+    let exp = scores.exp()?;
+    let denominator = exp.sum_keepdim(D::Minus1)?;
+    exp.broadcast_div(&denominator)?.to_dtype(output_dtype)
+}
+
+/// Verify that one smoke tensor is finite and return compact magnitude diagnostics.
+fn tensor_abs_summary(
+    tensor: &Tensor,
+    label: &str,
+    tensor_label: &str,
+) -> Result<(f32, f32), ApiError> {
+    let rows = tensor
+        .to_device(&Device::Cpu)
+        .and_then(|tensor| tensor.to_vec2::<f32>())
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to read ColBERT {label} {tensor_label} for diagnostics: {source}"
+            ))
+        })?;
+    let mut count = 0usize;
+    let mut total_abs = 0.0f32;
+    let mut max_abs = 0.0f32;
+    for row in rows {
+        for value in row {
+            if !value.is_finite() {
+                return Err(inference_error(format!(
+                    "ColBERT {label} {tensor_label} produced a non-finite value"
+                )));
+            }
+            let abs = value.abs();
+            total_abs += abs;
+            max_abs = max_abs.max(abs);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Err(inference_error(format!(
+            "ColBERT {label} {tensor_label} produced no values"
+        )));
+    }
+
+    Ok((total_abs / count as f32, max_abs))
 }
 
 /// Compute ColBERT MaxSim by summing each query token's best document-token dot product.
