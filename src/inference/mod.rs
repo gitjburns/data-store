@@ -1,10 +1,12 @@
 mod artifacts;
+mod colbert;
 mod dense;
 mod device;
 
 use crate::{config::ServiceConfig, error::ApiError};
 
 pub use artifacts::ModelArtifactSet;
+pub use colbert::ColbertRuntime;
 pub use dense::DenseEmbeddingRuntime;
 pub use device::SelectedDevice;
 
@@ -13,6 +15,7 @@ pub struct InferenceRuntime {
     pub device: SelectedDevice,
     pub artifacts: ModelArtifactSet,
     pub dense: DenseEmbeddingRuntime,
+    pub colbert: ColbertRuntime,
 }
 
 impl InferenceRuntime {
@@ -22,11 +25,14 @@ impl InferenceRuntime {
         let artifacts = ModelArtifactSet::load(&config.models)?;
         let dense =
             DenseEmbeddingRuntime::load(&artifacts.dense, &config.models.dense, &device.candle)?;
+        let colbert =
+            ColbertRuntime::load(&artifacts.colbert, &config.models.colbert, &device.candle)?;
 
         Ok(Self {
             device,
             artifacts,
             dense,
+            colbert,
         })
     }
 
@@ -35,6 +41,7 @@ impl InferenceRuntime {
         let mut details = vec![format!("device ready: {}", self.device.label())];
         details.extend(self.artifacts.health_details());
         details.extend(self.dense.health_details());
+        details.extend(self.colbert.health_details());
         details
     }
 }
