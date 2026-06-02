@@ -72,6 +72,25 @@ async fn post_ingest(
 ) -> Result<Json<IngestResponse>, ApiError> {
     let Json(request) = payload.map_err(json_rejection_to_api_error)?;
     request.validate(state.config.server.max_ingest_source_chars)?;
+    let _admission_permit = match state.try_acquire_ingest_admission() {
+        Ok(permit) => permit,
+        Err(error) => {
+            let admission = state.ingest_admission_snapshot();
+            info!(
+                in_flight = admission.in_flight,
+                max_in_flight = admission.max_in_flight,
+                error = %error,
+                "ingest request rejected by admission gate"
+            );
+            return Err(error);
+        }
+    };
+    let admission = state.ingest_admission_snapshot();
+    info!(
+        in_flight = admission.in_flight,
+        max_in_flight = admission.max_in_flight,
+        "ingest request admitted"
+    );
     state.inference()?;
     state.storage()?;
 
@@ -191,6 +210,25 @@ async fn post_search(
         state.config.server.max_search_query_chars,
         state.config.retrieval.max_top_k,
     )?;
+    let _admission_permit = match state.try_acquire_search_admission() {
+        Ok(permit) => permit,
+        Err(error) => {
+            let admission = state.search_admission_snapshot();
+            info!(
+                in_flight = admission.in_flight,
+                max_in_flight = admission.max_in_flight,
+                error = %error,
+                "search request rejected by admission gate"
+            );
+            return Err(error);
+        }
+    };
+    let admission = state.search_admission_snapshot();
+    info!(
+        in_flight = admission.in_flight,
+        max_in_flight = admission.max_in_flight,
+        "search request admitted"
+    );
     let top_k = request
         .top_k
         .unwrap_or(state.config.retrieval.default_top_k);
@@ -238,6 +276,10 @@ async fn post_search(
         "search": {
             "mode": "dense_bm25_rrf_colbert_reranker",
             "topK": top_k,
+            "admission": {
+                "inFlight": admission.in_flight,
+                "maxInFlight": admission.max_in_flight
+            },
             "embeddingLatencyMs": embedding_latency_ms,
             "colbertLatencyMs": colbert_latency_ms,
             "rerankerLatencyMs": reranker_latency_ms,

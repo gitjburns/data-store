@@ -3,6 +3,8 @@ bind_address = "127.0.0.1:8091"
 max_request_body_bytes = 16384
 max_ingest_source_chars = 2048
 max_search_query_chars = 4096
+max_in_flight_ingest = 1
+max_in_flight_search = 1
 
 [inference]
 device = "metal"

@@ -57,6 +57,9 @@ pub enum ApiError {
 
     #[error("{message}")]
     Unauthorized { message: String },
+
+    #[error("{message}")]
+    ServiceUnavailable { message: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +79,7 @@ impl ApiError {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConfigRead { .. }
             | Self::ConfigParse { .. }

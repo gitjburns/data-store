@@ -27,6 +27,8 @@ pub struct ServerConfig {
     pub max_request_body_bytes: usize,
     pub max_ingest_source_chars: u32,
     pub max_search_query_chars: u32,
+    pub max_in_flight_ingest: u32,
+    pub max_in_flight_search: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +134,14 @@ impl ServiceConfig {
         require_positive(
             "server.max_search_query_chars",
             self.server.max_search_query_chars,
+        )?;
+        require_positive(
+            "server.max_in_flight_ingest",
+            self.server.max_in_flight_ingest,
+        )?;
+        require_positive(
+            "server.max_in_flight_search",
+            self.server.max_in_flight_search,
         )?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
