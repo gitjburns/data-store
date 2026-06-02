@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
@@ -11,11 +11,12 @@ use tracing::info;
 use crate::{
     docling::convert_source_to_markdown,
     error::ApiError,
+    inference::{ColbertCandidateScore, ColbertDocumentCandidate},
     source::resolve_source_reference,
     state::AppState,
-    storage::UnitDenseVector,
+    storage::{SearchCandidate, UnitDenseVector},
     types::{
-        HealthResponse, IngestRequest, IngestResponse, SearchRequest, SearchResponse,
+        HealthResponse, IngestRequest, IngestResponse, SearchRequest, SearchResponse, SearchResult,
         ShutdownResponse,
     },
     units::{build_document_id, split_conversion_into_units},
@@ -119,7 +120,7 @@ async fn post_ingest(
     }))
 }
 
-/// Run dense, BM25, and RRF retrieval for one search request while keeping embedding and storage diagnostics separate.
+/// Run dense, BM25, RRF, and bounded ColBERT reranking for one search request.
 async fn post_search(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SearchRequest>,
@@ -134,24 +135,104 @@ async fn post_search(
     let embedding_started = Instant::now();
     let query_vector = inference.dense.embed_query_vector(&request.query)?;
     let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
-    let storage_output =
-        storage.search(&request.query, query_vector, top_k, &state.config.retrieval)?;
+    let storage_output = storage.build_search_candidate_pool(
+        &request.query,
+        query_vector,
+        top_k,
+        &state.config.retrieval,
+    )?;
+    let colbert_candidates = storage_output
+        .candidates
+        .iter()
+        .map(|candidate| ColbertDocumentCandidate {
+            unit_id: candidate.unit_id.clone(),
+            content: candidate.content.clone(),
+        })
+        .collect::<Vec<_>>();
+    let colbert_started = Instant::now();
+    let colbert_scores = inference
+        .colbert
+        .score_candidates(&request.query, &colbert_candidates)?;
+    let colbert_latency_ms = colbert_started.elapsed().as_millis() as u64;
+    let (results, final_result_raw) =
+        build_colbert_results(&storage_output.candidates, &colbert_scores, top_k)?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::json!({
         "search": {
-            "mode": "dense_bm25_rrf",
+            "mode": "dense_bm25_rrf_colbert",
             "topK": top_k,
             "embeddingLatencyMs": embedding_latency_ms,
+            "colbertLatencyMs": colbert_latency_ms,
             "latencyMs": latency_ms
         },
-        "storage": storage_output.raw
+        "storage": storage_output.raw,
+        "colbert": {
+            "mode": "on_demand_candidate_pool_maxsim",
+            "candidateCount": storage_output.candidates.len(),
+            "scores": colbert_scores.iter().map(|score| {
+                serde_json::json!({
+                    "unitId": score.unit_id,
+                    "score": score.score,
+                    "rank": score.rank,
+                    "queryTokens": score.query_tokens,
+                    "documentTokens": score.document_tokens
+                })
+            }).collect::<Vec<_>>(),
+            "finalResults": final_result_raw
+        }
     });
 
     Ok(Json(SearchResponse {
-        results: storage_output.results,
+        results,
         latency_ms,
         raw,
     }))
+}
+
+/// Materialize public results from ColBERT-ranked candidates while preserving first-stage score context.
+fn build_colbert_results(
+    candidates: &[SearchCandidate],
+    colbert_scores: &[ColbertCandidateScore],
+    top_k: u32,
+) -> Result<(Vec<SearchResult>, Vec<serde_json::Value>), ApiError> {
+    let candidate_by_id = candidates
+        .iter()
+        .map(|candidate| (candidate.unit_id.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut results = Vec::new();
+    let mut raw = Vec::new();
+    for score in colbert_scores.iter().take(top_k as usize) {
+        let Some(candidate) = candidate_by_id.get(score.unit_id.as_str()) else {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "ColBERT score referenced missing candidate {}",
+                    score.unit_id
+                ),
+            });
+        };
+        results.push(SearchResult {
+            unit_id: candidate.unit_id.clone(),
+            // Phase 11F makes ColBERT MaxSim the public score after first-stage RRF candidate generation.
+            score: score.score,
+            content: candidate.content.clone(),
+            heading_path: candidate.heading_path.clone(),
+            source_path: candidate.source_path.clone(),
+            page_numbers: candidate.page_numbers.clone(),
+        });
+        raw.push(serde_json::json!({
+            "unitId": candidate.unit_id,
+            "colbertScore": score.score,
+            "colbertRank": score.rank,
+            "rrfScore": candidate.rrf_score,
+            "rrfRank": candidate.rrf_rank,
+            "denseRank": candidate.dense_rank,
+            "denseSimilarity": candidate.dense_similarity,
+            "bm25Rank": candidate.bm25_rank,
+            "bm25Score": candidate.bm25_score
+        }));
+    }
+
+    Ok((results, raw))
 }
 
 /// Authorize and request graceful service shutdown.

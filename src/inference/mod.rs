@@ -6,7 +6,7 @@ mod device;
 use crate::{config::ServiceConfig, error::ApiError};
 
 pub use artifacts::ModelArtifactSet;
-pub use colbert::ColbertRuntime;
+pub use colbert::{ColbertCandidateScore, ColbertDocumentCandidate, ColbertRuntime};
 pub use dense::DenseEmbeddingRuntime;
 pub use device::SelectedDevice;
 

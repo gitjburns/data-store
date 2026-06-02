@@ -37,5 +37,6 @@ default_top_k = 10
 max_top_k = 100
 rrf_k = 60
 candidate_overfetch_multiplier = 3
+colbert_candidate_pool_size = 100
 min_search_unit_chars = 400
 max_unit_tokens = 512

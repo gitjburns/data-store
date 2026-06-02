@@ -14,7 +14,6 @@ use crate::{
     config::{DenseModelConfig, RetrievalConfig, StorageConfig},
     docling::DoclingConversionResult,
     error::ApiError,
-    types::SearchResult,
     units::{RetrievalUnit, build_document_id},
 };
 
@@ -32,9 +31,24 @@ pub struct UnitDenseVector {
 }
 
 #[derive(Debug)]
-pub struct SearchOutput {
-    pub results: Vec<SearchResult>,
+pub struct SearchCandidatePoolOutput {
+    pub candidates: Vec<SearchCandidate>,
     pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchCandidate {
+    pub unit_id: String,
+    pub rrf_score: f64,
+    pub rrf_rank: usize,
+    pub dense_rank: Option<usize>,
+    pub dense_similarity: Option<f32>,
+    pub bm25_rank: Option<usize>,
+    pub bm25_score: Option<f64>,
+    pub content: String,
+    pub heading_path: Vec<String>,
+    pub source_path: String,
+    pub page_numbers: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +110,7 @@ struct SearchRawInput<'a> {
     fused_matches: &'a [FusedMatch],
     bm25_query: Option<&'a str>,
     candidate_limit: usize,
+    colbert_candidate_pool_size: u32,
     top_k: u32,
     rrf_k: u32,
     overfetch_multiplier: u32,
@@ -571,16 +586,16 @@ impl StorageRuntime {
         Ok(())
     }
 
-    /// Search with dense exact scan, SQLite FTS5 BM25, and RRF fusion.
+    /// Build the bounded first-stage candidate pool with dense exact scan, SQLite FTS5 BM25, and RRF fusion.
     ///
-    /// Public result scores are fused-rank scores, not dense similarities or BM25 values.
-    pub fn search(
+    /// ColBERT and later rerankers consume this pool before final public top-K truncation.
+    pub fn build_search_candidate_pool(
         &self,
         query: &str,
         query_vector: Vec<f32>,
         top_k: u32,
         retrieval: &RetrievalConfig,
-    ) -> Result<SearchOutput, ApiError> {
+    ) -> Result<SearchCandidatePoolOutput, ApiError> {
         let started = Instant::now();
         let query_vector = validate_vector(
             "search-query".to_string(),
@@ -588,7 +603,7 @@ impl StorageRuntime {
             self.dense_dimension,
         )
         .map_err(storage_operation_error)?;
-        let candidate_limit = candidate_limit(top_k, retrieval.candidate_overfetch_multiplier);
+        let candidate_limit = first_stage_candidate_limit(top_k, retrieval);
 
         let dense_started = Instant::now();
         let dense_matches = {
@@ -608,18 +623,22 @@ impl StorageRuntime {
         let fused_matches = fuse_matches(
             &dense_matches,
             &bm25_matches,
-            top_k as usize,
+            retrieval.colbert_candidate_pool_size as usize,
             retrieval.rrf_k,
         );
         let units = self.load_units_for_fused_matches(&fused_matches)?;
-        let results = fused_matches
+        let candidates = fused_matches
             .iter()
             .filter_map(|matched| {
                 let unit = units.iter().find(|unit| unit.unit_id == matched.unit_id)?;
-                Some(SearchResult {
+                Some(SearchCandidate {
                     unit_id: unit.unit_id.clone(),
-                    // After RRF fusion this score is a rank-fusion signal, not a dense cosine similarity or BM25 value.
-                    score: matched.score as f32,
+                    rrf_score: matched.score,
+                    rrf_rank: matched.rank,
+                    dense_rank: matched.dense_rank,
+                    dense_similarity: matched.dense_similarity,
+                    bm25_rank: matched.bm25_rank,
+                    bm25_score: matched.bm25_score,
                     content: unit.content.clone(),
                     heading_path: unit.heading_path.clone(),
                     source_path: unit.source_path.clone(),
@@ -627,7 +646,7 @@ impl StorageRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        if results.len() != fused_matches.len() {
+        if candidates.len() != fused_matches.len() {
             return Err(storage_operation_error(
                 "fused search result materialization missed one or more unit rows".to_string(),
             ));
@@ -640,6 +659,7 @@ impl StorageRuntime {
             fused_matches: &fused_matches,
             bm25_query: bm25_query.as_deref(),
             candidate_limit,
+            colbert_candidate_pool_size: retrieval.colbert_candidate_pool_size,
             top_k,
             rrf_k: retrieval.rrf_k,
             overfetch_multiplier: retrieval.candidate_overfetch_multiplier,
@@ -648,7 +668,7 @@ impl StorageRuntime {
             latency_ms,
         })?;
 
-        Ok(SearchOutput { results, raw })
+        Ok(SearchCandidatePoolOutput { candidates, raw })
     }
 
     /// Retrieve BM25-ranked candidates from the SQLite FTS5 index.
@@ -722,12 +742,13 @@ impl StorageRuntime {
 
         Ok(serde_json::json!({
             "retrieval": {
-                "mode": "dense_bm25_rrf",
+                "mode": "dense_bm25_rrf_candidate_pool",
                 "latencyMs": input.latency_ms,
                 "denseLatencyMs": input.dense_latency_ms,
                 "bm25LatencyMs": input.bm25_latency_ms,
                 "topK": input.top_k,
-                "candidateLimit": input.candidate_limit,
+                "firstStageCandidateLimit": input.candidate_limit,
+                "colbertCandidatePoolSize": input.colbert_candidate_pool_size,
                 "rrfK": input.rrf_k,
                 "candidateOverfetchMultiplier": input.overfetch_multiplier,
                 "query": {
@@ -946,7 +967,13 @@ impl DenseVectorCache {
     }
 }
 
-/// Return the configured candidate pool size for each first-stage retriever.
+/// Return the first-stage retrieval limit needed to fill the configured ColBERT pool.
+fn first_stage_candidate_limit(top_k: u32, retrieval: &RetrievalConfig) -> usize {
+    candidate_limit(top_k, retrieval.candidate_overfetch_multiplier)
+        .max(retrieval.colbert_candidate_pool_size as usize)
+}
+
+/// Return the top-K overfetch size used before ColBERT pool expansion.
 fn candidate_limit(top_k: u32, overfetch_multiplier: u32) -> usize {
     top_k.saturating_mul(overfetch_multiplier) as usize
 }

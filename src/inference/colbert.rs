@@ -26,9 +26,13 @@ const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 
 #[derive(Debug, Clone)]
 pub struct ColbertRuntime {
+    tokenizer: Tokenizer,
+    device: Device,
     input_path: ColbertInputPath,
     projection: ColbertProjection,
     encoder: ColbertEncoderRuntime,
+    query_max_tokens: usize,
+    document_max_tokens: usize,
     attention_smoke: ColbertAttentionSmoke,
     single_layer_smoke: ColbertLayerSmoke,
     full_encoder_smoke: ColbertFullEncoderSmoke,
@@ -38,6 +42,21 @@ pub struct ColbertRuntime {
     projection_dimension: usize,
     num_hidden_layers: usize,
     maxsim_score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColbertDocumentCandidate {
+    pub unit_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColbertCandidateScore {
+    pub unit_id: String,
+    pub score: f32,
+    pub rank: usize,
+    pub query_tokens: usize,
+    pub document_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -220,9 +239,13 @@ impl ColbertRuntime {
         let full_encoder_smoke = encoder.smoke(&query_hidden, &document_hidden, &projection)?;
 
         Ok(Self {
+            tokenizer,
+            device: device.clone(),
             input_path,
             projection,
             encoder,
+            query_max_tokens: config.query_max_tokens as usize,
+            document_max_tokens: config.document_max_tokens as usize,
             attention_smoke,
             single_layer_smoke,
             full_encoder_smoke,
@@ -284,6 +307,78 @@ impl ColbertRuntime {
                 self.full_encoder_smoke.document_max_abs
             ),
         ]
+    }
+
+    /// Score each candidate document with on-demand ColBERT token embeddings over a bounded RRF pool.
+    pub fn score_candidates(
+        &self,
+        query: &str,
+        candidates: &[ColbertDocumentCandidate],
+    ) -> Result<Vec<ColbertCandidateScore>, ApiError> {
+        let query_projection = self.encode_projected_query(query)?;
+        let (query_tokens, _) = query_projection.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT search query projection shape error: {source}"
+            ))
+        })?;
+        let mut scores = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let document_projection = self.encode_projected_document(&candidate.content)?;
+            let (document_tokens, _) = document_projection.dims2().map_err(|source| {
+                inference_error(format!(
+                    "ColBERT search document projection shape error for {}: {source}",
+                    candidate.unit_id
+                ))
+            })?;
+            let score = maxsim_score(&query_projection, &document_projection)?;
+            scores.push(ColbertCandidateScore {
+                unit_id: candidate.unit_id.clone(),
+                score,
+                rank: 0,
+                query_tokens,
+                document_tokens,
+            });
+        }
+        scores.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.unit_id.cmp(&right.unit_id))
+        });
+        for (index, score) in scores.iter_mut().enumerate() {
+            score.rank = index + 1;
+        }
+
+        Ok(scores)
+    }
+
+    /// Encode and project one search query using the ColBERT prompt contract.
+    fn encode_projected_query(&self, query: &str) -> Result<Tensor, ApiError> {
+        let token_ids = tokenize_formatted(
+            &self.tokenizer,
+            &format_query(query),
+            self.query_max_tokens,
+            "search query",
+        )?;
+        self.encode_projected_tokens(&token_ids, "search query")
+    }
+
+    /// Encode and project one candidate unit as a ColBERT document.
+    fn encode_projected_document(&self, document: &str) -> Result<Tensor, ApiError> {
+        let token_ids = tokenize_formatted(
+            &self.tokenizer,
+            &format_document(document),
+            self.document_max_tokens,
+            "search document",
+        )?;
+        self.encode_projected_tokens(&token_ids, "search document")
+    }
+
+    /// Run token IDs through input embeddings, the full encoder, and PyLate projection.
+    fn encode_projected_tokens(&self, token_ids: &[u32], label: &str) -> Result<Tensor, ApiError> {
+        let hidden = self.input_path.forward(token_ids, &self.device, label)?;
+        let encoded = self.encoder.encode(&hidden, label)?;
+        self.projection.project(&encoded)
     }
 }
 

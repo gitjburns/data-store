@@ -89,6 +89,8 @@ pub struct RetrievalConfig {
     pub max_top_k: u32,
     pub rrf_k: u32,
     pub candidate_overfetch_multiplier: u32,
+    #[serde(default = "default_colbert_candidate_pool_size")]
+    pub colbert_candidate_pool_size: u32,
     pub min_search_unit_chars: u32,
     pub max_unit_tokens: u32,
 }
@@ -157,6 +159,10 @@ impl ServiceConfig {
             "retrieval.candidate_overfetch_multiplier",
             self.retrieval.candidate_overfetch_multiplier,
         )?;
+        require_positive(
+            "retrieval.colbert_candidate_pool_size",
+            self.retrieval.colbert_candidate_pool_size,
+        )?;
         acknowledge_non_negative(
             "retrieval.min_search_unit_chars",
             self.retrieval.min_search_unit_chars,
@@ -170,9 +176,21 @@ impl ServiceConfig {
                         .to_string(),
             });
         }
+        if self.retrieval.colbert_candidate_pool_size < self.retrieval.max_top_k {
+            return Err(ApiError::InvalidConfig {
+                message:
+                    "retrieval.colbert_candidate_pool_size must be greater than or equal to retrieval.max_top_k"
+                        .to_string(),
+            });
+        }
 
         Ok(())
     }
+}
+
+/// Return the Phase 11F default bounded ColBERT reranking pool size.
+fn default_colbert_candidate_pool_size() -> u32 {
+    100
 }
 
 /// Resolve supported CLI options, falling back to `config.toml`.
