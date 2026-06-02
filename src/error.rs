@@ -53,6 +53,9 @@ pub enum ApiError {
     BadRequest { message: String },
 
     #[error("{message}")]
+    PayloadTooLarge { message: String },
+
+    #[error("{message}")]
     Unauthorized { message: String },
 }
 
@@ -71,6 +74,7 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConfigRead { .. }

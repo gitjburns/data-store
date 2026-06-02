@@ -9,12 +9,7 @@ use std::{
 
 use tokio::process::Command;
 
-use crate::{
-    config::DoclingConfig,
-    error::ApiError,
-    source::ResolvedSource,
-    types::{IngestOptions, IngestRequest},
-};
+use crate::{config::DoclingConfig, error::ApiError, source::ResolvedSource};
 
 static CONVERSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_DIAGNOSTIC_CHARS: usize = 16_000;
@@ -38,16 +33,15 @@ pub struct DoclingConversionResult {
     pub stderr: String,
 }
 
-/// Convert one resolved PDF source to markdown without fallback across requested Docling options.
+/// Convert one resolved PDF source to markdown using only service-configured Docling options.
 ///
 /// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
 pub async fn convert_source_to_markdown(
     config: &DoclingConfig,
     index_root: &Path,
-    request: &IngestRequest,
     source: ResolvedSource,
 ) -> Result<DoclingConversionResult, ApiError> {
-    let options = resolve_docling_options(config, request.options.as_ref())?;
+    let options = resolve_docling_options(config)?;
     let output_dir = create_conversion_output_dir(index_root)?;
     let args = build_docling_args(&output_dir, &source.absolute_path, &options);
     let output = run_docling(config, &args, index_root).await?;
@@ -82,30 +76,15 @@ pub async fn convert_source_to_markdown(
     })
 }
 
-/// Resolve request-level Docling options over service defaults.
-fn resolve_docling_options(
-    config: &DoclingConfig,
-    options: Option<&IngestOptions>,
-) -> Result<ResolvedDoclingOptions, ApiError> {
-    let pdf_backend = options
-        .and_then(|value| value.pdf_backend.as_ref())
-        .map_or_else(
-            || config.default_pdf_backend.clone(),
-            |value| value.trim().to_string(),
-        );
-    let ocr_mode = options
-        .and_then(|value| value.ocr_mode.as_ref())
-        .map_or_else(
-            || config.default_ocr_mode.clone(),
-            |value| value.trim().to_string(),
-        );
-    let page_batch_size = options
-        .and_then(|value| value.page_batch_size)
-        .or(config.page_batch_size);
+/// Resolve service-configured Docling options for one conversion attempt.
+fn resolve_docling_options(config: &DoclingConfig) -> Result<ResolvedDoclingOptions, ApiError> {
+    let pdf_backend = config.default_pdf_backend.trim().to_string();
+    let ocr_mode = config.default_ocr_mode.trim().to_string();
+    let page_batch_size = config.page_batch_size;
 
     if !matches!(ocr_mode.as_str(), "auto" | "on" | "off") {
-        return Err(ApiError::SourceResolution {
-            message: "options.ocrMode must be one of auto, on, or off".to_string(),
+        return Err(ApiError::DoclingConversion {
+            message: "docling.default_ocr_mode must be one of auto, on, or off".to_string(),
         });
     }
 

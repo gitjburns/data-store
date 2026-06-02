@@ -2,8 +2,8 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::HeaderMap,
+    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use tracing::info;
@@ -19,8 +19,8 @@ use crate::{
     state::AppState,
     storage::{SearchCandidate, UnitColbertDocumentVector, UnitDenseVector},
     types::{
-        HealthResponse, IngestRequest, IngestResponse, SearchRequest, SearchResponse, SearchResult,
-        ShutdownResponse,
+        HealthResponse, IngestRequest, IngestResponse, LimitsResponse, RequestLimitsResponse,
+        RetrievalLimitsResponse, SearchRequest, SearchResponse, SearchResult, ShutdownResponse,
     },
     units::{build_document_id, split_conversion_into_units},
 };
@@ -30,11 +30,15 @@ const BEARER_PREFIX: &str = "Bearer ";
 
 /// Build the Axum router for the versioned HTTP API and protected admin controls.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let max_request_body_bytes = state.config.server.max_request_body_bytes;
+
     Router::new()
         .route("/v1/health", get(get_health))
+        .route("/v1/limits", get(get_limits))
         .route("/v1/ingest", post(post_ingest))
         .route("/v1/search", post(post_search))
         .route("/admin/shutdown", post(post_admin_shutdown))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
 
@@ -43,12 +47,28 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(state.health())
 }
 
+/// Return public request and retrieval limits for caller-side request construction.
+async fn get_limits(State(state): State<Arc<AppState>>) -> Json<LimitsResponse> {
+    Json(LimitsResponse {
+        request: RequestLimitsResponse {
+            max_request_body_bytes: state.config.server.max_request_body_bytes,
+            max_ingest_source_chars: state.config.server.max_ingest_source_chars,
+            max_search_query_chars: state.config.server.max_search_query_chars,
+        },
+        retrieval: RetrievalLimitsResponse {
+            default_top_k: state.config.retrieval.default_top_k,
+            max_top_k: state.config.retrieval.max_top_k,
+        },
+    })
+}
+
 /// Run one synchronous ingest request while keeping file bytes inside the service-owned corpus.
 async fn post_ingest(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<IngestRequest>,
+    payload: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<Json<IngestResponse>, ApiError> {
-    request.validate()?;
+    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    request.validate(state.config.server.max_ingest_source_chars)?;
     state.inference()?;
     state.storage()?;
 
@@ -56,7 +76,6 @@ async fn post_ingest(
     let conversion = convert_source_to_markdown(
         &state.config.docling,
         &state.config.storage.index_root,
-        &request,
         source,
     )
     .await?;
@@ -154,10 +173,14 @@ async fn post_ingest(
 /// Run dense, BM25, RRF, bounded ColBERT reranking, and final Qwen3 reranking for one search request.
 async fn post_search(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<SearchRequest>,
+    payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let started = Instant::now();
-    request.validate(state.config.retrieval.max_top_k)?;
+    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    request.validate(
+        state.config.server.max_search_query_chars,
+        state.config.retrieval.max_top_k,
+    )?;
     let top_k = request
         .top_k
         .unwrap_or(state.config.retrieval.default_top_k);
@@ -381,4 +404,17 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Result<&str, ApiError> {
     }
 
     Ok(token)
+}
+
+/// Normalize JSON extractor failures into this service's explicit client-error response shape.
+fn json_rejection_to_api_error(rejection: JsonRejection) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::PayloadTooLarge {
+            message: rejection.body_text(),
+        };
+    }
+
+    ApiError::BadRequest {
+        message: rejection.body_text(),
+    }
 }

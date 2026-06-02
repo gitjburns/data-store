@@ -24,6 +24,9 @@ pub struct CliOptions {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
+    pub max_request_body_bytes: usize,
+    pub max_ingest_source_chars: u32,
+    pub max_search_query_chars: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +121,18 @@ impl ServiceConfig {
 
     /// Validate cross-field config invariants that TOML deserialization cannot express.
     fn validate(&self) -> Result<(), ApiError> {
+        require_positive_usize(
+            "server.max_request_body_bytes",
+            self.server.max_request_body_bytes,
+        )?;
+        require_positive(
+            "server.max_ingest_source_chars",
+            self.server.max_ingest_source_chars,
+        )?;
+        require_positive(
+            "server.max_search_query_chars",
+            self.server.max_search_query_chars,
+        )?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
         require_absolute_path("docling.python_path", &self.docling.python_path)?;
@@ -131,6 +146,11 @@ impl ServiceConfig {
             &self.docling.default_pdf_backend,
         )?;
         require_non_empty("docling.default_ocr_mode", &self.docling.default_ocr_mode)?;
+        if !matches!(self.docling.default_ocr_mode.trim(), "auto" | "on" | "off") {
+            return Err(ApiError::InvalidConfig {
+                message: "docling.default_ocr_mode must be one of auto, on, or off".to_string(),
+            });
+        }
         if self.docling.page_batch_size == Some(0) {
             return Err(ApiError::InvalidConfig {
                 message: "docling.page_batch_size must be greater than zero when set".to_string(),
@@ -257,6 +277,17 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), ApiError> {
 
 /// Ensure a numeric field is greater than zero.
 fn require_positive(label: &str, value: u32) -> Result<(), ApiError> {
+    if value > 0 {
+        return Ok(());
+    }
+
+    Err(ApiError::InvalidConfig {
+        message: format!("{label} must be greater than zero"),
+    })
+}
+
+/// Ensure a usize numeric field is greater than zero.
+fn require_positive_usize(label: &str, value: usize) -> Result<(), ApiError> {
     if value > 0 {
         return Ok(());
     }
