@@ -22,7 +22,8 @@ use crate::{
         build_versioned_document_id,
     },
     types::{
-        HealthResponse, IngestRequest, IngestResponse, LimitsResponse, RequestLimitsResponse,
+        DocumentVersionRollbackRequest, DocumentVersionRollbackResponse, HealthResponse,
+        IngestRequest, IngestResponse, LimitsResponse, RequestLimitsResponse,
         RetrievalLimitsResponse, SearchRequest, SearchResponse, SearchResult, ShutdownResponse,
     },
     units::{assign_units_to_document_version, split_conversion_into_units},
@@ -41,6 +42,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/ingest", post(post_ingest))
         .route("/v1/search", post(post_search))
         .route("/admin/shutdown", post(post_admin_shutdown))
+        .route("/admin/document-versions", get(get_admin_document_versions))
+        .route(
+            "/admin/document-versions/rollback",
+            post(post_admin_document_version_rollback),
+        )
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
@@ -431,6 +437,40 @@ async fn post_admin_shutdown(
 
     Ok(Json(ShutdownResponse {
         status: "shutting_down".to_string(),
+    }))
+}
+
+/// Authorize and return retained source-document version diagnostics.
+async fn get_admin_document_versions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<crate::storage::DocumentVersionListing>, ApiError> {
+    let token = bearer_token_from_headers(&headers)?;
+    state.authorize_admin_token(token)?;
+    let storage = state.storage()?;
+
+    Ok(Json(storage.list_document_versions()?))
+}
+
+/// Authorize and repoint one source document to an already-retained version.
+async fn post_admin_document_version_rollback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<DocumentVersionRollbackRequest>, JsonRejection>,
+) -> Result<Json<DocumentVersionRollbackResponse>, ApiError> {
+    let token = bearer_token_from_headers(&headers)?;
+    state.authorize_admin_token(token)?;
+    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    request.validate(state.config.server.max_ingest_source_chars)?;
+    let storage = state.storage()?;
+    let rollback = storage.rollback_document_version(&request.source, &request.version_label)?;
+
+    Ok(Json(DocumentVersionRollbackResponse {
+        source_path: rollback.source_path,
+        active_version_label: rollback.active_version_label,
+        published_at_ms: rollback.published_at_ms,
+        vector_count: rollback.vector_count,
+        status: "rolled_back".to_string(),
     }))
 }
 

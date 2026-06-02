@@ -7,6 +7,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -63,6 +64,107 @@ pub struct SearchCandidate {
     pub colbert_vector: Vec<f32>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DocumentVersionListing {
+    pub sources: Vec<SourceDocumentVersionListing>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceDocumentVersionListing {
+    #[serde(rename = "sourcePath")]
+    pub source_path: String,
+
+    #[serde(rename = "activeVersionLabel")]
+    pub active_version_label: Option<String>,
+
+    pub versions: Vec<DocumentVersionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocumentVersionRecord {
+    #[serde(rename = "versionLabel")]
+    pub version_label: String,
+
+    #[serde(rename = "documentId")]
+    pub document_id: String,
+
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+
+    #[serde(rename = "sourceSha256")]
+    pub source_sha256: Option<String>,
+
+    #[serde(rename = "markdownPath")]
+    pub markdown_path: String,
+
+    #[serde(rename = "markdownSha256")]
+    pub markdown_sha256: Option<String>,
+
+    #[serde(rename = "pdfBackend")]
+    pub pdf_backend: String,
+
+    #[serde(rename = "ocrMode")]
+    pub ocr_mode: String,
+
+    #[serde(rename = "pageBatchSize")]
+    pub page_batch_size: Option<u32>,
+
+    #[serde(rename = "unitsIngested")]
+    pub units_ingested: u32,
+
+    pub status: String,
+    pub diagnostics: serde_json::Value,
+
+    #[serde(rename = "createdAtMs")]
+    pub created_at_ms: u64,
+
+    #[serde(rename = "updatedAtMs")]
+    pub updated_at_ms: u64,
+
+    #[serde(rename = "denseVectorMetadata")]
+    pub dense_vector_metadata: Vec<DenseVectorMetadataRecord>,
+
+    #[serde(rename = "colbertVectorMetadata")]
+    pub colbert_vector_metadata: Vec<ColbertVectorMetadataRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DenseVectorMetadataRecord {
+    #[serde(rename = "modelPath")]
+    pub model_path: String,
+
+    #[serde(rename = "modelDimension")]
+    pub model_dimension: u32,
+
+    pub pooling: String,
+    pub format: String,
+
+    #[serde(rename = "vectorCount")]
+    pub vector_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ColbertVectorMetadataRecord {
+    #[serde(rename = "modelPath")]
+    pub model_path: String,
+
+    #[serde(rename = "modelDimension")]
+    pub model_dimension: u32,
+
+    pub format: String,
+
+    #[serde(rename = "vectorCount")]
+    pub vector_count: u32,
+}
+
+#[derive(Debug)]
+pub struct DocumentVersionRollbackResult {
+    pub source_path: String,
+    pub active_version_label: String,
+    pub published_at_ms: u64,
+    pub vector_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct DenseVectorCache {
     dimension: usize,
@@ -103,6 +205,25 @@ struct StoredColbertDocumentVector {
     token_count: usize,
     dimension: usize,
     vector: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct QueriedDocumentVersion {
+    source_path: String,
+    version_label: String,
+    document_id: String,
+    source_sha256: Option<String>,
+    markdown_path: String,
+    markdown_sha256: Option<String>,
+    pdf_backend: String,
+    ocr_mode: String,
+    page_batch_size: Option<i64>,
+    units_ingested: i64,
+    status: String,
+    diagnostics_json: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    is_active: bool,
 }
 
 #[derive(Debug)]
@@ -227,6 +348,67 @@ const LOAD_ACTIVE_DOCUMENT_VERSIONS_SQL: &str = "
 SELECT source_path, version_label
 FROM active_document_versions
 ORDER BY source_path ASC";
+const LIST_DOCUMENT_VERSIONS_SQL: &str = "
+SELECT
+  document_versions.source_path,
+  document_versions.version_label,
+  document_versions.document_id,
+  document_versions.source_sha256,
+  document_versions.markdown_path,
+  document_versions.markdown_sha256,
+  document_versions.pdf_backend,
+  document_versions.ocr_mode,
+  document_versions.page_batch_size,
+  document_versions.units_ingested,
+  document_versions.status,
+  document_versions.diagnostics_json,
+  document_versions.created_at_ms,
+  document_versions.updated_at_ms,
+  active_document_versions.version_label IS NOT NULL AS is_active
+FROM document_versions
+LEFT JOIN active_document_versions
+  ON active_document_versions.source_path = document_versions.source_path
+ AND active_document_versions.version_label = document_versions.version_label
+ORDER BY document_versions.source_path ASC, document_versions.created_at_ms DESC, document_versions.version_label DESC";
+const DOCUMENT_VERSION_EXISTS_SQL: &str = "
+SELECT 1
+FROM document_versions
+WHERE source_path = ?1
+  AND version_label = ?2
+LIMIT 1";
+const LOAD_DENSE_VECTORS_FOR_VERSION_SQL: &str = "
+SELECT
+  dense_vectors.unit_id,
+  dense_vectors.dimension,
+  dense_vectors.vector_blob,
+  dense_vectors.vector_norm
+FROM dense_vectors
+JOIN units ON units.unit_id = dense_vectors.unit_id
+WHERE units.source_path = ?1
+  AND units.version_label = ?2
+ORDER BY dense_vectors.unit_id ASC";
+const LOAD_DENSE_VECTOR_METADATA_FOR_VERSION_SQL: &str = "
+SELECT dense_vectors.model_path, dense_vectors.model_dimension, dense_vectors.pooling,
+       dense_vectors.format, COUNT(*)
+FROM dense_vectors
+JOIN units ON units.unit_id = dense_vectors.unit_id
+WHERE units.source_path = ?1
+  AND units.version_label = ?2
+GROUP BY dense_vectors.model_path, dense_vectors.model_dimension, dense_vectors.pooling,
+         dense_vectors.format
+ORDER BY dense_vectors.model_path ASC, dense_vectors.model_dimension ASC,
+         dense_vectors.pooling ASC, dense_vectors.format ASC";
+const LOAD_COLBERT_VECTOR_METADATA_FOR_VERSION_SQL: &str = "
+SELECT colbert_document_vectors.model_path, colbert_document_vectors.model_dimension,
+       colbert_document_vectors.format, COUNT(*)
+FROM colbert_document_vectors
+JOIN units ON units.unit_id = colbert_document_vectors.unit_id
+WHERE units.source_path = ?1
+  AND units.version_label = ?2
+GROUP BY colbert_document_vectors.model_path, colbert_document_vectors.model_dimension,
+         colbert_document_vectors.format
+ORDER BY colbert_document_vectors.model_path ASC, colbert_document_vectors.model_dimension ASC,
+         colbert_document_vectors.format ASC";
 const SCHEMA_OBJECT_EXISTS_SQL: &str = "
 SELECT 1
 FROM sqlite_master
@@ -714,6 +896,113 @@ impl StorageRuntime {
         }
     }
 
+    /// Return retained source-document versions and active-version diagnostics for admin inspection.
+    pub fn list_document_versions(&self) -> Result<DocumentVersionListing, ApiError> {
+        let connection = open_connection(&self.db_path)?;
+        let mut statement = connection
+            .prepare(LIST_DOCUMENT_VERSIONS_SQL)
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to prepare document-version listing: {source}"
+                ))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(QueriedDocumentVersion {
+                    source_path: row.get::<_, String>(0)?,
+                    version_label: row.get::<_, String>(1)?,
+                    document_id: row.get::<_, String>(2)?,
+                    source_sha256: row.get::<_, Option<String>>(3)?,
+                    markdown_path: row.get::<_, String>(4)?,
+                    markdown_sha256: row.get::<_, Option<String>>(5)?,
+                    pdf_backend: row.get::<_, String>(6)?,
+                    ocr_mode: row.get::<_, String>(7)?,
+                    page_batch_size: row.get::<_, Option<i64>>(8)?,
+                    units_ingested: row.get::<_, i64>(9)?,
+                    status: row.get::<_, String>(10)?,
+                    diagnostics_json: row.get::<_, String>(11)?,
+                    created_at_ms: row.get::<_, i64>(12)?,
+                    updated_at_ms: row.get::<_, i64>(13)?,
+                    is_active: row.get::<_, i64>(14)? != 0,
+                })
+            })
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to execute document-version listing: {source}"
+                ))
+            })?;
+        let mut sources = BTreeMap::<String, SourceDocumentVersionListing>::new();
+        for row in rows {
+            let version = row.map_err(|source| {
+                storage_operation_error(format!("failed to read document-version row: {source}"))
+            })?;
+            let record = version.to_record(
+                load_dense_vector_metadata_for_version(
+                    &connection,
+                    &version.source_path,
+                    &version.version_label,
+                )?,
+                load_colbert_vector_metadata_for_version(
+                    &connection,
+                    &version.source_path,
+                    &version.version_label,
+                )?,
+            )?;
+            let entry = sources
+                .entry(version.source_path.clone())
+                .or_insert_with(|| SourceDocumentVersionListing {
+                    source_path: version.source_path.clone(),
+                    active_version_label: None,
+                    versions: Vec::new(),
+                });
+            if record.is_active {
+                entry.active_version_label = Some(record.version_label.clone());
+            }
+            entry.versions.push(record);
+        }
+
+        Ok(DocumentVersionListing {
+            sources: sources.into_values().collect(),
+        })
+    }
+
+    /// Publish an older retained source-document version as active without rebuilding or deleting data.
+    pub fn rollback_document_version(
+        &self,
+        source_path: &str,
+        version_label: &str,
+    ) -> Result<DocumentVersionRollbackResult, ApiError> {
+        let connection = open_connection(&self.db_path)?;
+        if !document_version_exists(&connection, source_path, version_label)? {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "document version not found for source {source_path} and versionLabel {version_label}"
+                ),
+            });
+        }
+        let stored_vectors = load_dense_vectors_for_version(
+            &connection,
+            source_path,
+            version_label,
+            self.dense_dimension,
+        )?;
+        let vector_count = stored_vectors.len();
+        let published_at_ms =
+            self.publish_source_version_with_vectors(source_path, version_label, stored_vectors)?;
+
+        info!(
+            source_path,
+            version_label, vector_count, published_at_ms, "document version rolled back"
+        );
+
+        Ok(DocumentVersionRollbackResult {
+            source_path: source_path.to_string(),
+            active_version_label: version_label.to_string(),
+            published_at_ms,
+            vector_count,
+        })
+    }
+
     /// Persist one immutable document version, then publish it as the active search snapshot after commit.
     pub fn ingest_document(
         &self,
@@ -1064,18 +1353,35 @@ impl StorageRuntime {
         version_label: &str,
         vectors: Vec<StoredDenseVector>,
     ) -> Result<(), ApiError> {
+        self.publish_source_version_with_vectors(source_path, version_label, vectors)?;
+
+        Ok(())
+    }
+
+    /// Publish one source version by committing the active map and swapping the cache under one lock.
+    fn publish_source_version_with_vectors(
+        &self,
+        source_path: &str,
+        version_label: &str,
+        vectors: Vec<StoredDenseVector>,
+    ) -> Result<u64, ApiError> {
+        let published_at_ms = current_time_ms()?;
         let mut cache = self.cache.lock().map_err(|source| {
             storage_operation_error(format!("dense cache lock is poisoned: {source}"))
         })?;
-        let published_cache =
-            cache.with_published_source_version(source_path, version_label, vectors)?;
+        let published_cache = cache.with_published_source_version(
+            source_path,
+            version_label,
+            vectors,
+            published_at_ms,
+        )?;
         let mut connection = open_connection(&self.db_path)?;
         let tx = connection.transaction().map_err(|source| {
             storage_operation_error(format!("failed to begin active-version publish: {source}"))
         })?;
         tx.execute(
             PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL,
-            params![source_path, version_label, current_time_ms()? as i64],
+            params![source_path, version_label, published_at_ms as i64],
         )
         .map_err(|source| {
             storage_operation_error(format!(
@@ -1087,7 +1393,7 @@ impl StorageRuntime {
         })?;
         *cache = published_cache;
 
-        Ok(())
+        Ok(published_at_ms)
     }
 }
 
@@ -1195,6 +1501,7 @@ impl DenseVectorCache {
         source_path: &str,
         version_label: &str,
         replacement: Vec<StoredDenseVector>,
+        published_at_ms: u64,
     ) -> Result<Self, ApiError> {
         let started = Instant::now();
         let mut retained = self
@@ -1242,7 +1549,7 @@ impl DenseVectorCache {
             self.dimension,
             retained,
             active_versions,
-            current_time_ms()?,
+            published_at_ms,
             started.elapsed().as_millis() as u64,
         ))
     }
@@ -1460,6 +1767,237 @@ fn load_active_document_versions(
     }
 
     Ok(active_versions)
+}
+
+impl QueriedDocumentVersion {
+    /// Convert one SQLite document-version row into the admin-facing diagnostic record.
+    fn to_record(
+        &self,
+        dense_vector_metadata: Vec<DenseVectorMetadataRecord>,
+        colbert_vector_metadata: Vec<ColbertVectorMetadataRecord>,
+    ) -> Result<DocumentVersionRecord, ApiError> {
+        let diagnostics = serde_json::from_str(&self.diagnostics_json).map_err(|source| {
+            storage_operation_error(format!(
+                "document version {} {} has invalid diagnostics_json: {source}",
+                self.source_path, self.version_label
+            ))
+        })?;
+
+        Ok(DocumentVersionRecord {
+            version_label: self.version_label.clone(),
+            document_id: self.document_id.clone(),
+            is_active: self.is_active,
+            source_sha256: self.source_sha256.clone(),
+            markdown_path: self.markdown_path.clone(),
+            markdown_sha256: self.markdown_sha256.clone(),
+            pdf_backend: self.pdf_backend.clone(),
+            ocr_mode: self.ocr_mode.clone(),
+            page_batch_size: optional_i64_to_u32(
+                "document_versions.page_batch_size",
+                self.page_batch_size,
+            )?,
+            units_ingested: i64_to_u32("document_versions.units_ingested", self.units_ingested)?,
+            status: self.status.clone(),
+            diagnostics,
+            created_at_ms: i64_to_u64("document_versions.created_at_ms", self.created_at_ms)?,
+            updated_at_ms: i64_to_u64("document_versions.updated_at_ms", self.updated_at_ms)?,
+            dense_vector_metadata,
+            colbert_vector_metadata,
+        })
+    }
+}
+
+/// Return whether one retained source-document version exists in durable storage.
+fn document_version_exists(
+    connection: &Connection,
+    source_path: &str,
+    version_label: &str,
+) -> Result<bool, ApiError> {
+    connection
+        .query_row(
+            DOCUMENT_VERSION_EXISTS_SQL,
+            params![source_path, version_label],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to check document version {source_path} {version_label}: {source}"
+            ))
+        })
+}
+
+/// Load and validate dense vectors for one retained source-document version.
+fn load_dense_vectors_for_version(
+    connection: &Connection,
+    source_path: &str,
+    version_label: &str,
+    dimension: usize,
+) -> Result<Vec<StoredDenseVector>, ApiError> {
+    let mut statement = connection
+        .prepare(LOAD_DENSE_VECTORS_FOR_VERSION_SQL)
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to prepare dense vectors for version {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![source_path, version_label], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        })
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to read dense vectors for version {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let mut vectors = Vec::new();
+    for row in rows {
+        let (unit_id, row_dimension, blob, norm) = row.map_err(|source| {
+            storage_operation_error(format!(
+                "failed to read dense vector row for version {source_path} {version_label}: {source}"
+            ))
+        })?;
+        if row_dimension < 0 {
+            return Err(storage_operation_error(format!(
+                "dense vector {unit_id} has negative dimension {row_dimension}"
+            )));
+        }
+        let vector = decode_vector_blob(&unit_id, &blob, row_dimension as usize, dimension)
+            .map_err(storage_operation_error)?;
+        let norm = validate_norm(&unit_id, norm as f32).map_err(storage_operation_error)?;
+        vectors.push(StoredDenseVector {
+            unit_id,
+            vector,
+            norm,
+        });
+    }
+
+    Ok(vectors)
+}
+
+/// Load distinct dense vector model metadata for one source-document version.
+fn load_dense_vector_metadata_for_version(
+    connection: &Connection,
+    source_path: &str,
+    version_label: &str,
+) -> Result<Vec<DenseVectorMetadataRecord>, ApiError> {
+    let mut statement = connection
+        .prepare(LOAD_DENSE_VECTOR_METADATA_FOR_VERSION_SQL)
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to prepare dense vector metadata for {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![source_path, version_label], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to query dense vector metadata for {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let mut metadata = Vec::new();
+    for row in rows {
+        let (model_path, model_dimension, pooling, format, vector_count) =
+            row.map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to read dense vector metadata for {source_path} {version_label}: {source}"
+                ))
+            })?;
+        metadata.push(DenseVectorMetadataRecord {
+            model_path,
+            model_dimension: i64_to_u32("dense_vectors.model_dimension", model_dimension)?,
+            pooling,
+            format,
+            vector_count: i64_to_u32("dense_vectors vector count", vector_count)?,
+        });
+    }
+
+    Ok(metadata)
+}
+
+/// Load distinct ColBERT vector model metadata for one source-document version.
+fn load_colbert_vector_metadata_for_version(
+    connection: &Connection,
+    source_path: &str,
+    version_label: &str,
+) -> Result<Vec<ColbertVectorMetadataRecord>, ApiError> {
+    let mut statement = connection
+        .prepare(LOAD_COLBERT_VECTOR_METADATA_FOR_VERSION_SQL)
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to prepare ColBERT vector metadata for {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![source_path, version_label], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to query ColBERT vector metadata for {source_path} {version_label}: {source}"
+            ))
+        })?;
+    let mut metadata = Vec::new();
+    for row in rows {
+        let (model_path, model_dimension, format, vector_count) = row.map_err(|source| {
+            storage_operation_error(format!(
+                "failed to read ColBERT vector metadata for {source_path} {version_label}: {source}"
+            ))
+        })?;
+        metadata.push(ColbertVectorMetadataRecord {
+            model_path,
+            model_dimension: i64_to_u32(
+                "colbert_document_vectors.model_dimension",
+                model_dimension,
+            )?,
+            format,
+            vector_count: i64_to_u32("colbert_document_vectors vector count", vector_count)?,
+        });
+    }
+
+    Ok(metadata)
+}
+
+/// Convert a non-negative SQLite integer into an API u32 diagnostic value.
+fn i64_to_u32(label: &str, value: i64) -> Result<u32, ApiError> {
+    u32::try_from(value).map_err(|_| {
+        storage_operation_error(format!(
+            "{label} value {value} cannot be represented as u32"
+        ))
+    })
+}
+
+/// Convert a non-negative SQLite integer into an API u64 timestamp value.
+fn i64_to_u64(label: &str, value: i64) -> Result<u64, ApiError> {
+    u64::try_from(value).map_err(|_| {
+        storage_operation_error(format!(
+            "{label} value {value} cannot be represented as u64"
+        ))
+    })
+}
+
+/// Convert an optional SQLite integer into an optional API u32 diagnostic value.
+fn optional_i64_to_u32(label: &str, value: Option<i64>) -> Result<Option<u32>, ApiError> {
+    value.map(|inner| i64_to_u32(label, inner)).transpose()
 }
 
 /// Validate the durable SQLite contract before runtime operations proceed.

@@ -105,6 +105,32 @@ pub struct ShutdownResponse {
     pub status: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentVersionRollbackRequest {
+    pub source: String,
+
+    #[serde(rename = "versionLabel")]
+    pub version_label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocumentVersionRollbackResponse {
+    #[serde(rename = "sourcePath")]
+    pub source_path: String,
+
+    #[serde(rename = "activeVersionLabel")]
+    pub active_version_label: String,
+
+    #[serde(rename = "publishedAtMs")]
+    pub published_at_ms: u64,
+
+    #[serde(rename = "vectorCount")]
+    pub vector_count: usize,
+
+    pub status: String,
+}
+
 impl IngestRequest {
     /// Validate ingest request fields before the runtime pipeline consumes them.
     pub fn validate(&self, max_source_chars: u32) -> Result<(), ApiError> {
@@ -145,6 +171,43 @@ impl SearchRequest {
                     message: format!("topK must be between 1 and {max_top_k}"),
                 });
             }
+        }
+
+        Ok(())
+    }
+}
+
+impl DocumentVersionRollbackRequest {
+    /// Validate rollback target fields before the admin operation mutates active-version state.
+    pub fn validate(&self, max_source_chars: u32) -> Result<(), ApiError> {
+        if self.source.trim().is_empty() {
+            return Err(ApiError::BadRequest {
+                message: "source must be a non-empty corpus-relative reference".to_string(),
+            });
+        }
+
+        if self.source.trim() != self.source {
+            return Err(ApiError::BadRequest {
+                message: "source must not contain leading or trailing whitespace".to_string(),
+            });
+        }
+
+        if char_count_exceeds(&self.source, max_source_chars) {
+            return Err(ApiError::BadRequest {
+                message: format!("source must be at most {max_source_chars} characters"),
+            });
+        }
+
+        if self.version_label.trim().is_empty() {
+            return Err(ApiError::BadRequest {
+                message: "versionLabel must be non-empty".to_string(),
+            });
+        }
+
+        if self.version_label.trim() != self.version_label {
+            return Err(ApiError::BadRequest {
+                message: "versionLabel must not contain leading or trailing whitespace".to_string(),
+            });
         }
 
         Ok(())

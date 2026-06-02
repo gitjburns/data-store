@@ -99,14 +99,14 @@ impl AppState {
         self.search_admission.snapshot()
     }
 
-    /// Validate the admin shutdown token without exposing the expected value.
+    /// Validate the startup-scoped admin token without exposing the expected value.
     pub fn authorize_admin_token(&self, candidate: &str) -> Result<(), ApiError> {
         if constant_time_eq(candidate.as_bytes(), self.admin_shutdown_token.as_bytes()) {
             return Ok(());
         }
 
         Err(ApiError::Unauthorized {
-            message: "invalid admin shutdown token".to_string(),
+            message: "invalid admin token".to_string(),
         })
     }
 
