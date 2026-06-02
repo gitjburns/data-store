@@ -54,6 +54,9 @@ pub struct IngestResponse {
     #[serde(rename = "documentId")]
     pub document_id: String,
 
+    #[serde(rename = "versionLabel")]
+    pub version_label: String,
+
     #[serde(rename = "unitsIngested")]
     pub units_ingested: u32,
 

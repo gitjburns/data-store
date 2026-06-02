@@ -118,6 +118,26 @@ pub fn split_conversion_into_units(
     Ok(units)
 }
 
+/// Return units whose durable identifiers point at one immutable document version.
+pub fn assign_units_to_document_version(
+    units: &[RetrievalUnit],
+    versioned_document_id: &str,
+) -> Vec<RetrievalUnit> {
+    units
+        .iter()
+        .map(|unit| RetrievalUnit {
+            unit_id: format!("{versioned_document_id}:unit:{:06}", unit.sequence),
+            document_id: versioned_document_id.to_string(),
+            sequence: unit.sequence,
+            source_path: unit.source_path.clone(),
+            heading_path: unit.heading_path.clone(),
+            page_numbers: unit.page_numbers.clone(),
+            content: unit.content.clone(),
+            token_count: unit.token_count,
+        })
+        .collect()
+}
+
 impl UnitBuilder {
     /// Start a retrieval-unit builder from one parsed markdown block.
     fn from_block(block: MarkdownBlock, token_count: usize) -> Self {

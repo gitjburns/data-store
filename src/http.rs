@@ -17,12 +17,15 @@ use crate::{
     },
     source::resolve_source_reference,
     state::AppState,
-    storage::{SearchCandidate, UnitColbertDocumentVector, UnitDenseVector},
+    storage::{
+        SearchCandidate, UnitColbertDocumentVector, UnitDenseVector, allocate_version_label,
+        build_versioned_document_id,
+    },
     types::{
         HealthResponse, IngestRequest, IngestResponse, LimitsResponse, RequestLimitsResponse,
         RetrievalLimitsResponse, SearchRequest, SearchResponse, SearchResult, ShutdownResponse,
     },
-    units::{build_document_id, split_conversion_into_units},
+    units::{assign_units_to_document_version, split_conversion_into_units},
 };
 
 const AUTHORIZATION_HEADER: &str = "authorization";
@@ -79,11 +82,15 @@ async fn post_ingest(
         source,
     )
     .await?;
-    let units = split_conversion_into_units(
+    let base_units = split_conversion_into_units(
         &conversion,
         &state.config.retrieval,
         &state.config.models.colbert.path.join("tokenizer.json"),
     )?;
+    let version_label = allocate_version_label()?;
+    let versioned_document_id =
+        build_versioned_document_id(&conversion.source.relative_path, &version_label);
+    let units = assign_units_to_document_version(&base_units, &versioned_document_id);
     let inference = state.inference()?;
     let vectors = units
         .iter()
@@ -119,6 +126,7 @@ async fn post_ingest(
     let storage = state.storage()?;
     storage.ingest_document(
         &conversion,
+        &version_label,
         &units,
         vectors,
         colbert_vectors,
@@ -130,6 +138,7 @@ async fn post_ingest(
 
     info!(
         requested_source = %conversion.source.requested,
+        version_label = %version_label,
         relative_source = %conversion.source.relative_path.display(),
         absolute_source = %conversion.source.absolute_path.display(),
         output_dir = %conversion.output_dir.display(),
@@ -164,7 +173,8 @@ async fn post_ingest(
     Ok(Json(IngestResponse {
         document_id: first_unit
             .map(|unit| unit.document_id.clone())
-            .unwrap_or_else(|| build_document_id(&conversion.source.relative_path)),
+            .unwrap_or(versioned_document_id),
+        version_label,
         units_ingested: units.len() as u32,
         status: "ingested".to_string(),
     }))

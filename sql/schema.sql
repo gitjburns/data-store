@@ -1,6 +1,7 @@
-CREATE TABLE IF NOT EXISTS documents (
-  document_id TEXT PRIMARY KEY,
-  source_path TEXT NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS document_versions (
+  source_path TEXT NOT NULL,
+  version_label TEXT NOT NULL,
+  document_id TEXT NOT NULL UNIQUE,
   source_sha256 TEXT,
   markdown_path TEXT NOT NULL,
   markdown_sha256 TEXT,
@@ -11,16 +12,29 @@ CREATE TABLE IF NOT EXISTS documents (
   status TEXT NOT NULL,
   diagnostics_json TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (source_path, version_label)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_source_path
-ON documents(source_path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_document_versions_document_id
+ON document_versions(document_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_document_versions_source_version
+ON document_versions(source_path, version_label);
+
+CREATE TABLE IF NOT EXISTS active_document_versions (
+  source_path TEXT PRIMARY KEY,
+  version_label TEXT NOT NULL,
+  published_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (source_path, version_label)
+    REFERENCES document_versions(source_path, version_label)
+);
 
 CREATE TABLE IF NOT EXISTS units (
   unit_id TEXT PRIMARY KEY,
-  document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+  document_id TEXT NOT NULL REFERENCES document_versions(document_id) ON DELETE CASCADE,
   source_path TEXT NOT NULL,
+  version_label TEXT NOT NULL,
   sequence INTEGER NOT NULL,
   heading_path_json TEXT NOT NULL,
   page_numbers_json TEXT NOT NULL,
@@ -60,4 +74,4 @@ CREATE TABLE IF NOT EXISTS colbert_document_vectors (
 CREATE VIRTUAL TABLE IF NOT EXISTS units_fts
 USING fts5(content, content='units', content_rowid='rowid');
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;

@@ -6,7 +6,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -68,10 +68,26 @@ struct DenseVectorCache {
     dimension: usize,
     vectors: Vec<f32>,
     unit_ids: Vec<String>,
+    source_paths: Vec<String>,
+    version_labels: Vec<String>,
     norms: Vec<f32>,
+    active_versions: Vec<ActiveDocumentVersion>,
     loaded_at_ms: u64,
     load_duration_ms: u64,
     memory_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDocumentVersion {
+    source_path: String,
+    version_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct DenseCacheVector {
+    source_path: String,
+    version_label: String,
+    dense: StoredDenseVector,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +143,7 @@ struct StoredUnit {
 }
 
 struct SearchRawInput<'a> {
+    cache: &'a DenseVectorCache,
     query_vector: &'a StoredDenseVector,
     dense_matches: &'a [DenseMatch],
     bm25_matches: &'a [Bm25Match],
@@ -168,24 +185,48 @@ struct ForeignKeySpec {
     on_delete: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompositeForeignKeySpec {
+    table_name: &'static str,
+    from_columns: &'static [&'static str],
+    referenced_table: &'static str,
+    referenced_columns: &'static [&'static str],
+}
+
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
-const EXPECTED_SCHEMA_VERSION: i64 = 2;
+const EXPECTED_SCHEMA_VERSION: i64 = 3;
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
 const COLBERT_DOCUMENT_VECTOR_FORMAT: &str = "little_endian_f32_row_major";
 const STORAGE_SCHEMA_SQL: &str = include_str!("../sql/schema.sql");
 const ENABLE_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_keys = ON;";
 const GET_SCHEMA_VERSION_SQL: &str = "PRAGMA user_version;";
-const BM25_SEARCH_SQL: &str = "
+const BM25_SEARCH_SQL_PREFIX: &str = "
 SELECT units.unit_id, bm25(units_fts) AS bm25_score
 FROM units_fts
 JOIN units ON units.rowid = units_fts.rowid
-WHERE units_fts MATCH ?1
+WHERE units_fts MATCH ?
+  AND (";
+const BM25_SEARCH_SQL_SUFFIX: &str = ")
 ORDER BY bm25_score ASC, units.unit_id ASC
-LIMIT ?2";
+LIMIT ?";
 const LOAD_DENSE_VECTORS_SQL: &str = "
-SELECT unit_id, dimension, vector_blob, vector_norm
+SELECT
+  dense_vectors.unit_id,
+  dense_vectors.dimension,
+  dense_vectors.vector_blob,
+  dense_vectors.vector_norm,
+  units.source_path,
+  units.version_label
 FROM dense_vectors
-ORDER BY unit_id ASC";
+JOIN units ON units.unit_id = dense_vectors.unit_id
+JOIN active_document_versions AS active
+  ON active.source_path = units.source_path
+ AND active.version_label = units.version_label
+ORDER BY dense_vectors.unit_id ASC";
+const LOAD_ACTIVE_DOCUMENT_VERSIONS_SQL: &str = "
+SELECT source_path, version_label
+FROM active_document_versions
+ORDER BY source_path ASC";
 const SCHEMA_OBJECT_EXISTS_SQL: &str = "
 SELECT 1
 FROM sqlite_master
@@ -196,44 +237,42 @@ SELECT sql
 FROM sqlite_master
 WHERE name = ?1
 LIMIT 1";
-const DOCUMENTS_TABLE_INFO_SQL: &str = "PRAGMA table_info(documents);";
+const DOCUMENT_VERSIONS_TABLE_INFO_SQL: &str = "PRAGMA table_info(document_versions);";
+const ACTIVE_DOCUMENT_VERSIONS_TABLE_INFO_SQL: &str =
+    "PRAGMA table_info(active_document_versions);";
 const UNITS_TABLE_INFO_SQL: &str = "PRAGMA table_info(units);";
 const DENSE_VECTORS_TABLE_INFO_SQL: &str = "PRAGMA table_info(dense_vectors);";
 const COLBERT_DOCUMENT_VECTORS_TABLE_INFO_SQL: &str =
     "PRAGMA table_info(colbert_document_vectors);";
+const ACTIVE_DOCUMENT_VERSIONS_FOREIGN_KEYS_SQL: &str =
+    "PRAGMA foreign_key_list(active_document_versions);";
 const UNITS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(units);";
 const DENSE_VECTORS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(dense_vectors);";
 const COLBERT_DOCUMENT_VECTORS_FOREIGN_KEYS_SQL: &str =
     "PRAGMA foreign_key_list(colbert_document_vectors);";
-const DOCUMENTS_INDEX_LIST_SQL: &str = "PRAGMA index_list(documents);";
+const DOCUMENT_VERSIONS_INDEX_LIST_SQL: &str = "PRAGMA index_list(document_versions);";
 const UNITS_INDEX_LIST_SQL: &str = "PRAGMA index_list(units);";
-const DOCUMENTS_SOURCE_PATH_INDEX_INFO_SQL: &str = "PRAGMA index_info(idx_documents_source_path);";
+const DOCUMENT_VERSIONS_DOCUMENT_ID_INDEX_INFO_SQL: &str =
+    "PRAGMA index_info(idx_document_versions_document_id);";
+const DOCUMENT_VERSIONS_SOURCE_VERSION_INDEX_INFO_SQL: &str =
+    "PRAGMA index_info(idx_document_versions_source_version);";
 const UNITS_DOCUMENT_SEQUENCE_INDEX_INFO_SQL: &str =
     "PRAGMA index_info(idx_units_document_sequence);";
 const LOAD_UNIT_SQL: &str = "
 SELECT unit_id, source_path, heading_path_json, page_numbers_json, content
 FROM units
 WHERE unit_id = ?1";
-const DELETE_EXISTING_FTS_ROWS_SQL: &str = "
-DELETE FROM units_fts
-WHERE rowid IN (
-  SELECT units.rowid
-  FROM units
-  JOIN documents ON documents.document_id = units.document_id
-  WHERE documents.source_path = ?1
-)";
-const DELETE_EXISTING_DOCUMENT_SQL: &str = "DELETE FROM documents WHERE source_path = ?1";
 const INSERT_DOCUMENT_SQL: &str = "
-INSERT INTO documents (
-  document_id, source_path, source_sha256, markdown_path, markdown_sha256,
+INSERT INTO document_versions (
+  source_path, version_label, document_id, source_sha256, markdown_path, markdown_sha256,
   pdf_backend, ocr_mode, page_batch_size, units_ingested, status,
   diagnostics_json, created_at_ms, updated_at_ms
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ingested', ?10, ?11, ?12)";
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ingested', ?11, ?12, ?13)";
 const INSERT_UNIT_SQL: &str = "
 INSERT INTO units (
-  unit_id, document_id, source_path, sequence, heading_path_json,
-  page_numbers_json, token_count, content, content_chars
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+  unit_id, document_id, source_path, version_label, sequence,
+  heading_path_json, page_numbers_json, token_count, content, content_chars
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 const INSERT_UNIT_FTS_SQL: &str = "INSERT INTO units_fts(rowid, content) VALUES (?1, ?2)";
 const INSERT_DENSE_VECTOR_SQL: &str = "
 INSERT INTO dense_vectors (
@@ -249,96 +288,132 @@ const LOAD_COLBERT_DOCUMENT_VECTOR_SQL: &str = "
 SELECT token_count, dimension, vector_blob, model_dimension, format
 FROM colbert_document_vectors
 WHERE unit_id = ?1";
+const PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL: &str = "
+INSERT INTO active_document_versions (source_path, version_label, published_at_ms)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(source_path) DO UPDATE SET
+  version_label = excluded.version_label,
+  published_at_ms = excluded.published_at_ms";
 const EXPECTED_UNITS_FTS_SQL: &str =
     "CREATE VIRTUAL TABLE units_fts USING fts5(content, content='units', content_rowid='rowid')";
-const DOCUMENTS_COLUMNS: &[ColumnSpec] = &[
+const DOCUMENT_VERSIONS_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec {
-        table_name: "documents",
-        name: "document_id",
+        table_name: "document_versions",
+        name: "source_path",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 1,
     },
     ColumnSpec {
-        table_name: "documents",
-        name: "source_path",
+        table_name: "document_versions",
+        name: "version_label",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 2,
+    },
+    ColumnSpec {
+        table_name: "document_versions",
+        name: "document_id",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "source_sha256",
         declared_type: "TEXT",
         required: false,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "markdown_path",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "markdown_sha256",
         declared_type: "TEXT",
         required: false,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "pdf_backend",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "ocr_mode",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "page_batch_size",
         declared_type: "INTEGER",
         required: false,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "units_ingested",
         declared_type: "INTEGER",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "status",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "diagnostics_json",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "created_at_ms",
         declared_type: "INTEGER",
         required: true,
         primary_key_position: 0,
     },
     ColumnSpec {
-        table_name: "documents",
+        table_name: "document_versions",
         name: "updated_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+];
+const ACTIVE_DOCUMENT_VERSIONS_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "active_document_versions",
+        name: "source_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 1,
+    },
+    ColumnSpec {
+        table_name: "active_document_versions",
+        name: "version_label",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "active_document_versions",
+        name: "published_at_ms",
         declared_type: "INTEGER",
         required: true,
         primary_key_position: 0,
@@ -362,6 +437,13 @@ const UNITS_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec {
         table_name: "units",
         name: "source_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "units",
+        name: "version_label",
         declared_type: "TEXT",
         required: true,
         primary_key_position: 0,
@@ -549,9 +631,15 @@ const COLBERT_DOCUMENT_VECTORS_COLUMNS: &[ColumnSpec] = &[
 const UNITS_DOCUMENT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
     table_name: "units",
     from_column: "document_id",
-    referenced_table: "documents",
+    referenced_table: "document_versions",
     referenced_column: "document_id",
     on_delete: "CASCADE",
+};
+const ACTIVE_DOCUMENT_VERSION_FOREIGN_KEY: CompositeForeignKeySpec = CompositeForeignKeySpec {
+    table_name: "active_document_versions",
+    from_columns: &["source_path", "version_label"],
+    referenced_table: "document_versions",
+    referenced_columns: &["source_path", "version_label"],
 };
 const DENSE_VECTORS_UNIT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
     table_name: "dense_vectors",
@@ -613,7 +701,8 @@ impl StorageRuntime {
             Ok(cache) => vec![
                 format!("sqlite database ready: {}", self.db_path.display()),
                 format!(
-                    "dense cache ready: vectors {}, dim {}, memory_bytes {}, loaded_at_ms {}, load_duration_ms {}",
+                    "dense cache ready: active_sources {}, vectors {}, dim {}, memory_bytes {}, loaded_at_ms {}, load_duration_ms {}",
+                    cache.active_versions.len(),
                     cache.unit_ids.len(),
                     cache.dimension,
                     cache.memory_bytes,
@@ -625,10 +714,11 @@ impl StorageRuntime {
         }
     }
 
-    /// Persist one converted document, then replace its dense-cache entries only after the SQLite commit succeeds.
+    /// Persist one immutable document version, then publish it as the active search snapshot after commit.
     pub fn ingest_document(
         &self,
         conversion: &DoclingConversionResult,
+        version_label: &str,
         units: &[RetrievalUnit],
         vectors: Vec<UnitDenseVector>,
         colbert_vectors: Vec<UnitColbertDocumentVector>,
@@ -676,7 +766,12 @@ impl StorageRuntime {
         let markdown_sha256 = sha256_hex(conversion.markdown.as_bytes());
         let now_ms = current_time_ms()?;
         let diagnostics = build_ingest_diagnostics(conversion)?;
-        let document_id = build_document_id(&conversion.source.relative_path);
+        let document_id = units
+            .first()
+            .map(|unit| unit.document_id.clone())
+            .unwrap_or_else(|| {
+                build_versioned_document_id(&conversion.source.relative_path, version_label)
+            });
         if document_id.is_empty() {
             return Err(ApiError::StorageOperation {
                 message: format!(
@@ -685,16 +780,17 @@ impl StorageRuntime {
                 ),
             });
         }
+        let source_path = conversion.source.relative_path.display().to_string();
 
         let mut connection = open_connection(&self.db_path)?;
         let tx = connection.transaction().map_err(|source| {
             storage_operation_error(format!("failed to begin ingest transaction: {source}"))
         })?;
 
-        delete_existing_document(&tx, &conversion.source.relative_path.display().to_string())?;
         insert_document(
             &tx,
             conversion,
+            version_label,
             units.len(),
             &document_id,
             &source_sha256,
@@ -713,7 +809,7 @@ impl StorageRuntime {
                     unit.unit_id, vector.unit_id, colbert_vector.unit_id
                 )));
             }
-            insert_unit(&tx, unit)?;
+            insert_unit(&tx, unit, version_label)?;
             insert_dense_vector(&tx, vector, dense, now_ms)?;
             insert_colbert_document_vector(&tx, colbert_vector, colbert, now_ms)?;
         }
@@ -721,7 +817,7 @@ impl StorageRuntime {
         tx.commit().map_err(|source| {
             storage_operation_error(format!("failed to commit ingest transaction: {source}"))
         })?;
-        self.replace_document_cache(&document_id, stored_vectors)?;
+        self.publish_document_version(&source_path, version_label, stored_vectors)?;
 
         Ok(())
     }
@@ -744,20 +840,25 @@ impl StorageRuntime {
         )
         .map_err(storage_operation_error)?;
         let candidate_limit = first_stage_candidate_limit(top_k, retrieval);
-
-        let dense_started = Instant::now();
-        let dense_matches = {
+        let cache_snapshot = {
             let cache = self.cache.lock().map_err(|source| {
                 storage_operation_error(format!("dense cache lock is poisoned: {source}"))
             })?;
-            cache.search(&query_vector, candidate_limit)?
+            cache.clone()
         };
+
+        let dense_started = Instant::now();
+        let dense_matches = cache_snapshot.search(&query_vector, candidate_limit)?;
         let dense_latency_ms = dense_started.elapsed().as_millis() as u64;
 
         let bm25_started = Instant::now();
         // Treat user text as plain search terms, not FTS syntax, so operators cannot alter the query language boundary.
         let bm25_query = build_fts_query(query);
-        let bm25_matches = self.search_bm25(bm25_query.as_deref(), candidate_limit)?;
+        let bm25_matches = self.search_bm25(
+            bm25_query.as_deref(),
+            candidate_limit,
+            &cache_snapshot.active_versions,
+        )?;
         let bm25_latency_ms = bm25_started.elapsed().as_millis() as u64;
 
         let fused_matches = fuse_matches(
@@ -796,6 +897,7 @@ impl StorageRuntime {
         }
         let latency_ms = started.elapsed().as_millis() as u64;
         let raw = self.build_search_raw(SearchRawInput {
+            cache: &cache_snapshot,
             query_vector: &query_vector,
             dense_matches: &dense_matches,
             bm25_matches: &bm25_matches,
@@ -821,23 +923,37 @@ impl StorageRuntime {
         &self,
         fts_query: Option<&str>,
         limit: usize,
+        active_versions: &[ActiveDocumentVersion],
     ) -> Result<Vec<Bm25Match>, ApiError> {
         let Some(fts_query) = fts_query else {
             return Ok(Vec::new());
         };
-        if limit == 0 {
+        if limit == 0 || active_versions.is_empty() {
             return Ok(Vec::new());
         }
 
         let connection = open_connection(&self.db_path)?;
+        let active_filter = active_versions
+            .iter()
+            .map(|_| "(units.source_path = ? AND units.version_label = ?)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!("{BM25_SEARCH_SQL_PREFIX}{active_filter}{BM25_SEARCH_SQL_SUFFIX}");
+        let mut query_params = Vec::<Value>::with_capacity(2 + active_versions.len() * 2);
+        query_params.push(Value::from(fts_query.to_string()));
+        for active in active_versions {
+            query_params.push(Value::from(active.source_path.clone()));
+            query_params.push(Value::from(active.version_label.clone()));
+        }
+        query_params.push(Value::from(limit as i64));
         let mut statement = connection
             // ASC preserves SQLite FTS5's lower-is-better bm25() ordering.
-            .prepare(BM25_SEARCH_SQL)
+            .prepare(&sql)
             .map_err(|source| {
                 storage_operation_error(format!("failed to prepare BM25 search: {source}"))
             })?;
         let rows = statement
-            .query_map(params![fts_query, limit as i64], |row| {
+            .query_map(params_from_iter(query_params), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|source| {
@@ -883,10 +999,6 @@ impl StorageRuntime {
 
     /// Build raw search diagnostics without hiding per-stage rank inputs.
     fn build_search_raw(&self, input: SearchRawInput<'_>) -> Result<serde_json::Value, ApiError> {
-        let cache = self.cache.lock().map_err(|source| {
-            storage_operation_error(format!("dense cache lock is poisoned: {source}"))
-        })?;
-
         Ok(serde_json::json!({
             "retrieval": {
                 "mode": "dense_bm25_rrf_candidate_pool",
@@ -904,12 +1016,18 @@ impl StorageRuntime {
                     "fts": input.bm25_query
                 },
                 "cache": {
-                    "vectorCount": cache.unit_ids.len(),
-                    "dimension": cache.dimension,
-                    "memoryBytes": cache.memory_bytes,
-                    "loadedAtMs": cache.loaded_at_ms,
-                    "loadDurationMs": cache.load_duration_ms
+                    "vectorCount": input.cache.unit_ids.len(),
+                    "dimension": input.cache.dimension,
+                    "memoryBytes": input.cache.memory_bytes,
+                    "loadedAtMs": input.cache.loaded_at_ms,
+                    "loadDurationMs": input.cache.load_duration_ms
                 },
+                "activeVersions": input.cache.active_versions.iter().map(|active| {
+                    serde_json::json!({
+                        "sourcePath": active.source_path,
+                        "versionLabel": active.version_label
+                    })
+                }).collect::<Vec<_>>(),
                 "denseCandidates": input.dense_matches.iter().map(|matched| {
                     serde_json::json!({
                         "unitId": matched.unit_id,
@@ -939,24 +1057,45 @@ impl StorageRuntime {
         }))
     }
 
-    /// Replace all cache rows for one document prefix while leaving durable rows authoritative if cache validation fails.
-    fn replace_document_cache(
+    /// Publish one source version by committing the active map and swapping the in-memory search snapshot together.
+    fn publish_document_version(
         &self,
-        document_id: &str,
+        source_path: &str,
+        version_label: &str,
         vectors: Vec<StoredDenseVector>,
     ) -> Result<(), ApiError> {
-        let prefix = format!("{document_id}:unit:");
         let mut cache = self.cache.lock().map_err(|source| {
             storage_operation_error(format!("dense cache lock is poisoned: {source}"))
         })?;
-        cache.replace_document_vectors(&prefix, vectors)
+        let published_cache =
+            cache.with_published_source_version(source_path, version_label, vectors)?;
+        let mut connection = open_connection(&self.db_path)?;
+        let tx = connection.transaction().map_err(|source| {
+            storage_operation_error(format!("failed to begin active-version publish: {source}"))
+        })?;
+        tx.execute(
+            PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL,
+            params![source_path, version_label, current_time_ms()? as i64],
+        )
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to publish active document version: {source}"
+            ))
+        })?;
+        tx.commit().map_err(|source| {
+            storage_operation_error(format!("failed to commit active-version publish: {source}"))
+        })?;
+        *cache = published_cache;
+
+        Ok(())
     }
 }
 
 impl DenseVectorCache {
-    /// Load and validate all dense vectors from SQLite into a flat row-major cache.
+    /// Load and validate active dense vectors from SQLite into one flat row-major snapshot.
     fn load(connection: &Connection, dimension: usize) -> Result<Self, ApiError> {
         let started = Instant::now();
+        let active_versions = load_active_document_versions(connection)?;
         let mut statement = connection
             .prepare(LOAD_DENSE_VECTORS_SQL)
             .map_err(|source| {
@@ -969,6 +1108,8 @@ impl DenseVectorCache {
                     row.get::<_, i64>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, f64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|source| {
@@ -976,9 +1117,10 @@ impl DenseVectorCache {
             })?;
         let mut stored = Vec::new();
         for row in rows {
-            let (unit_id, row_dimension, blob, norm) = row.map_err(|source| {
-                storage_init_error(format!("failed to read dense vector row: {source}"))
-            })?;
+            let (unit_id, row_dimension, blob, norm, source_path, version_label) =
+                row.map_err(|source| {
+                    storage_init_error(format!("failed to read dense vector row: {source}"))
+                })?;
             if row_dimension < 0 {
                 return Err(storage_init_error(format!(
                     "dense vector {unit_id} has negative dimension {row_dimension}"
@@ -987,16 +1129,21 @@ impl DenseVectorCache {
             let vector = decode_vector_blob(&unit_id, &blob, row_dimension as usize, dimension)
                 .map_err(storage_init_error)?;
             let norm = validate_norm(&unit_id, norm as f32).map_err(storage_init_error)?;
-            stored.push(StoredDenseVector {
-                unit_id,
-                vector,
-                norm,
+            stored.push(DenseCacheVector {
+                source_path,
+                version_label,
+                dense: StoredDenseVector {
+                    unit_id,
+                    vector,
+                    norm,
+                },
             });
         }
 
         Ok(Self::from_vectors(
             dimension,
             stored,
+            active_versions,
             current_time_ms()?,
             started.elapsed().as_millis() as u64,
         ))
@@ -1005,69 +1152,99 @@ impl DenseVectorCache {
     /// Build a cache from already validated vectors and metadata.
     fn from_vectors(
         dimension: usize,
-        stored: Vec<StoredDenseVector>,
+        stored: Vec<DenseCacheVector>,
+        active_versions: Vec<ActiveDocumentVersion>,
         loaded_at_ms: u64,
         load_duration_ms: u64,
     ) -> Self {
         let mut vectors = Vec::with_capacity(stored.len() * dimension);
         let mut unit_ids = Vec::with_capacity(stored.len());
+        let mut source_paths = Vec::with_capacity(stored.len());
+        let mut version_labels = Vec::with_capacity(stored.len());
         let mut norms = Vec::with_capacity(stored.len());
         for value in stored {
-            unit_ids.push(value.unit_id);
-            norms.push(value.norm);
-            vectors.extend(value.vector);
+            source_paths.push(value.source_path);
+            version_labels.push(value.version_label);
+            unit_ids.push(value.dense.unit_id);
+            norms.push(value.dense.norm);
+            vectors.extend(value.dense.vector);
         }
         let memory_bytes = vectors.len() * std::mem::size_of::<f32>()
             + norms.len() * std::mem::size_of::<f32>()
-            + unit_ids.iter().map(String::len).sum::<usize>();
+            + unit_ids.iter().map(String::len).sum::<usize>()
+            + source_paths.iter().map(String::len).sum::<usize>()
+            + version_labels.iter().map(String::len).sum::<usize>();
 
         Self {
             dimension,
             vectors,
             unit_ids,
+            source_paths,
+            version_labels,
             norms,
+            active_versions,
             loaded_at_ms,
             load_duration_ms,
             memory_bytes,
         }
     }
 
-    /// Replace all vectors matching a document unit-id prefix and keep deterministic ordering.
-    fn replace_document_vectors(
-        &mut self,
-        prefix: &str,
-        mut replacement: Vec<StoredDenseVector>,
-    ) -> Result<(), ApiError> {
+    /// Return a new active snapshot where one source path points at the newly ingested version.
+    fn with_published_source_version(
+        &self,
+        source_path: &str,
+        version_label: &str,
+        replacement: Vec<StoredDenseVector>,
+    ) -> Result<Self, ApiError> {
         let started = Instant::now();
         let mut retained = self
             .unit_ids
             .iter()
             .enumerate()
             .filter_map(|(index, unit_id)| {
-                if unit_id.starts_with(prefix) {
+                if self.source_paths[index] == source_path {
                     return None;
                 }
 
                 let start = index * self.dimension;
                 let end = start + self.dimension;
-                Some(StoredDenseVector {
-                    unit_id: unit_id.clone(),
-                    vector: self.vectors[start..end].to_vec(),
-                    norm: self.norms[index],
+                Some(DenseCacheVector {
+                    source_path: self.source_paths[index].clone(),
+                    version_label: self.version_labels[index].clone(),
+                    dense: StoredDenseVector {
+                        unit_id: unit_id.clone(),
+                        vector: self.vectors[start..end].to_vec(),
+                        norm: self.norms[index],
+                    },
                 })
             })
             .collect::<Vec<_>>();
 
-        retained.append(&mut replacement);
-        retained.sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
-        *self = Self::from_vectors(
+        retained.extend(replacement.into_iter().map(|dense| DenseCacheVector {
+            source_path: source_path.to_string(),
+            version_label: version_label.to_string(),
+            dense,
+        }));
+        retained.sort_by(|left, right| left.dense.unit_id.cmp(&right.dense.unit_id));
+        let mut active_versions = self
+            .active_versions
+            .iter()
+            .filter(|active| active.source_path != source_path)
+            .cloned()
+            .collect::<Vec<_>>();
+        active_versions.push(ActiveDocumentVersion {
+            source_path: source_path.to_string(),
+            version_label: version_label.to_string(),
+        });
+        active_versions.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+
+        Ok(Self::from_vectors(
             self.dimension,
             retained,
+            active_versions,
             current_time_ms()?,
             started.elapsed().as_millis() as u64,
-        );
-
-        Ok(())
+        ))
     }
 
     /// Rank cached dense vectors by exact cosine similarity with deterministic tie-breaking.
@@ -1250,11 +1427,47 @@ fn open_connection(db_path: &Path) -> Result<Connection, ApiError> {
     Ok(connection)
 }
 
+/// Load the durable active-version map that defines the search-visible corpus.
+fn load_active_document_versions(
+    connection: &Connection,
+) -> Result<Vec<ActiveDocumentVersion>, ApiError> {
+    let mut statement = connection
+        .prepare(LOAD_ACTIVE_DOCUMENT_VERSIONS_SQL)
+        .map_err(|source| {
+            storage_init_error(format!("failed to prepare active-version load: {source}"))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ActiveDocumentVersion {
+                source_path: row.get::<_, String>(0)?,
+                version_label: row.get::<_, String>(1)?,
+            })
+        })
+        .map_err(|source| {
+            storage_init_error(format!("failed to read active document versions: {source}"))
+        })?;
+    let mut active_versions = Vec::new();
+    for row in rows {
+        let active = row.map_err(|source| {
+            storage_init_error(format!("failed to read active-version row: {source}"))
+        })?;
+        if active.source_path.trim().is_empty() || active.version_label.trim().is_empty() {
+            return Err(storage_init_error(
+                "active document version contains empty source_path or version_label".to_string(),
+            ));
+        }
+        active_versions.push(active);
+    }
+
+    Ok(active_versions)
+}
+
 /// Validate the durable SQLite contract before runtime operations proceed.
 fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
     validate_schema_version(connection)?;
     for table_name in [
-        "documents",
+        "document_versions",
+        "active_document_versions",
         "units",
         "dense_vectors",
         "colbert_document_vectors",
@@ -1262,7 +1475,16 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
     ] {
         validate_schema_object_exists(connection, table_name)?;
     }
-    validate_table_columns(connection, DOCUMENTS_TABLE_INFO_SQL, DOCUMENTS_COLUMNS)?;
+    validate_table_columns(
+        connection,
+        DOCUMENT_VERSIONS_TABLE_INFO_SQL,
+        DOCUMENT_VERSIONS_COLUMNS,
+    )?;
+    validate_table_columns(
+        connection,
+        ACTIVE_DOCUMENT_VERSIONS_TABLE_INFO_SQL,
+        ACTIVE_DOCUMENT_VERSIONS_COLUMNS,
+    )?;
     validate_table_columns(connection, UNITS_TABLE_INFO_SQL, UNITS_COLUMNS)?;
     validate_table_columns(
         connection,
@@ -1273,6 +1495,11 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
         connection,
         COLBERT_DOCUMENT_VECTORS_TABLE_INFO_SQL,
         COLBERT_DOCUMENT_VECTORS_COLUMNS,
+    )?;
+    validate_composite_foreign_key(
+        connection,
+        ACTIVE_DOCUMENT_VERSIONS_FOREIGN_KEYS_SQL,
+        ACTIVE_DOCUMENT_VERSION_FOREIGN_KEY,
     )?;
     validate_foreign_key(
         connection,
@@ -1291,11 +1518,19 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
     )?;
     validate_named_unique_index(
         connection,
-        DOCUMENTS_INDEX_LIST_SQL,
-        DOCUMENTS_SOURCE_PATH_INDEX_INFO_SQL,
-        "documents",
-        "idx_documents_source_path",
-        &["source_path"],
+        DOCUMENT_VERSIONS_INDEX_LIST_SQL,
+        DOCUMENT_VERSIONS_DOCUMENT_ID_INDEX_INFO_SQL,
+        "document_versions",
+        "idx_document_versions_document_id",
+        &["document_id"],
+    )?;
+    validate_named_unique_index(
+        connection,
+        DOCUMENT_VERSIONS_INDEX_LIST_SQL,
+        DOCUMENT_VERSIONS_SOURCE_VERSION_INDEX_INFO_SQL,
+        "document_versions",
+        "idx_document_versions_source_version",
+        &["source_path", "version_label"],
     )?;
     validate_units_document_sequence_index(connection)?;
     validate_units_fts_definition(connection)?;
@@ -1494,6 +1729,82 @@ fn validate_foreign_key(
         expected.referenced_table,
         expected.referenced_column,
         expected.on_delete
+    )))
+}
+
+/// Validate one expected composite foreign key and its ordered column mapping.
+fn validate_composite_foreign_key(
+    connection: &Connection,
+    foreign_keys_sql: &str,
+    expected: CompositeForeignKeySpec,
+) -> Result<(), ApiError> {
+    let mut statement = connection.prepare(foreign_keys_sql).map_err(|source| {
+        storage_init_error(format!(
+            "failed to prepare foreign-key inspection for {}: {source}",
+            expected.table_name
+        ))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|source| {
+            storage_init_error(format!(
+                "failed to inspect foreign keys for {}: {source}",
+                expected.table_name
+            ))
+        })?;
+    let mut grouped = BTreeMap::<i64, Vec<(i64, String, String, String)>>::new();
+    for row in rows {
+        let (id, sequence, referenced_table, from_column, referenced_column) =
+            row.map_err(|source| {
+                storage_init_error(format!(
+                    "failed to read foreign-key row for {}: {source}",
+                    expected.table_name
+                ))
+            })?;
+        grouped.entry(id).or_default().push((
+            sequence,
+            referenced_table,
+            from_column,
+            referenced_column,
+        ));
+    }
+
+    for mut rows in grouped.into_values() {
+        rows.sort_by_key(|(sequence, _, _, _)| *sequence);
+        let referenced_table = rows
+            .first()
+            .map(|(_, table, _, _)| table.as_str())
+            .unwrap_or_default();
+        let from_columns = rows
+            .iter()
+            .map(|(_, _, from, _)| from.as_str())
+            .collect::<Vec<_>>();
+        let referenced_columns = rows
+            .iter()
+            .map(|(_, _, _, column)| column.as_str())
+            .collect::<Vec<_>>();
+        if referenced_table == expected.referenced_table
+            && from_columns == expected.from_columns
+            && referenced_columns == expected.referenced_columns
+        {
+            return Ok(());
+        }
+    }
+
+    Err(storage_init_error(format!(
+        "SQLite table {} is missing composite foreign key {:?} -> {}.{:?}",
+        expected.table_name,
+        expected.from_columns,
+        expected.referenced_table,
+        expected.referenced_columns
     )))
 }
 
@@ -1748,27 +2059,11 @@ where
     })
 }
 
-/// Delete any existing document rows and corresponding external-content FTS rows.
-fn delete_existing_document(
-    tx: &rusqlite::Transaction<'_>,
-    source_path: &str,
-) -> Result<(), ApiError> {
-    tx.execute(DELETE_EXISTING_FTS_ROWS_SQL, [source_path])
-        .map_err(|source| {
-            storage_operation_error(format!("failed to delete existing FTS rows: {source}"))
-        })?;
-    tx.execute(DELETE_EXISTING_DOCUMENT_SQL, [source_path])
-        .map_err(|source| {
-            storage_operation_error(format!("failed to delete existing document: {source}"))
-        })?;
-
-    Ok(())
-}
-
-/// Insert the durable document row for one successful ingest.
+/// Insert the immutable durable document-version row for one successful ingest.
 fn insert_document(
     tx: &rusqlite::Transaction<'_>,
     conversion: &DoclingConversionResult,
+    version_label: &str,
     units_ingested: usize,
     document_id: &str,
     source_sha256: &str,
@@ -1779,8 +2074,9 @@ fn insert_document(
     tx.execute(
         INSERT_DOCUMENT_SQL,
         params![
-            document_id,
             conversion.source.relative_path.display().to_string(),
+            version_label,
+            document_id,
             source_sha256,
             conversion.markdown_path.display().to_string(),
             markdown_sha256,
@@ -1799,7 +2095,11 @@ fn insert_document(
 }
 
 /// Insert one retrieval unit and its external-content FTS row.
-fn insert_unit(tx: &rusqlite::Transaction<'_>, unit: &RetrievalUnit) -> Result<(), ApiError> {
+fn insert_unit(
+    tx: &rusqlite::Transaction<'_>,
+    unit: &RetrievalUnit,
+    version_label: &str,
+) -> Result<(), ApiError> {
     let heading_path_json = serde_json::to_string(&unit.heading_path).map_err(|source| {
         storage_operation_error(format!("failed to encode heading path: {source}"))
     })?;
@@ -1812,6 +2112,7 @@ fn insert_unit(tx: &rusqlite::Transaction<'_>, unit: &RetrievalUnit) -> Result<(
             &unit.unit_id,
             &unit.document_id,
             &unit.source_path,
+            version_label,
             unit.sequence as i64,
             heading_path_json,
             page_numbers_json,
@@ -2084,6 +2385,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
         result.push_str(&format!("{value:02x}"));
     }
     result
+}
+
+/// Allocate the source-document-scoped version label used for immutable ingest rows.
+pub fn allocate_version_label() -> Result<String, ApiError> {
+    format_utc_timestamp_ms(current_time_ms()?)
+}
+
+/// Build a durable document id that keeps old versions addressable after re-ingest.
+pub fn build_versioned_document_id(source_path: &Path, version_label: &str) -> String {
+    format!(
+        "{}:version:{}",
+        build_document_id(source_path),
+        version_label.replace(':', "-")
+    )
+}
+
+/// Format epoch milliseconds as an ISO-like UTC timestamp without adding a time dependency.
+fn format_utc_timestamp_ms(epoch_ms: u64) -> Result<String, ApiError> {
+    let total_seconds = epoch_ms / 1_000;
+    let millis = epoch_ms % 1_000;
+    let days = (total_seconds / 86_400) as i64;
+    let seconds_of_day = total_seconds % 86_400;
+    let (year, month, day) = civil_from_epoch_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    ))
+}
+
+/// Convert days since the Unix epoch to the Gregorian UTC date components.
+fn civil_from_epoch_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let shifted_days = days_since_epoch + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
+
+    (year, month as u32, day as u32)
 }
 
 /// Return current epoch milliseconds for durable timestamps and cache diagnostics.
