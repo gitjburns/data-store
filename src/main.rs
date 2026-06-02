@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_address = config.bind_address();
     let inference = InferenceRuntime::initialize(&config);
-    let storage = StorageRuntime::open(&config.storage, &config.models.dense);
+    let storage = StorageRuntime::open(
+        &config.storage,
+        &config.models.dense,
+        &config.models.colbert,
+    );
     let admin_shutdown_token = generate_admin_shutdown_token()?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let state = Arc::new(AppState::new(

@@ -45,18 +45,20 @@ pub struct ColbertRuntime {
 }
 
 #[derive(Debug, Clone)]
-pub struct ColbertDocumentCandidate {
-    pub unit_id: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ColbertCandidateScore {
     pub unit_id: String,
     pub score: f32,
     pub rank: usize,
     pub query_tokens: usize,
     pub document_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColbertDocumentEmbedding {
+    pub unit_id: String,
+    pub token_count: usize,
+    pub dimension: usize,
+    pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,11 +311,21 @@ impl ColbertRuntime {
         ]
     }
 
-    /// Score each candidate document with on-demand ColBERT token embeddings over a bounded RRF pool.
-    pub fn score_candidates(
+    /// Encode and flatten one unit's ColBERT document token matrix for durable storage.
+    pub fn embed_document(
+        &self,
+        unit_id: &str,
+        document: &str,
+    ) -> Result<ColbertDocumentEmbedding, ApiError> {
+        let document_projection = self.encode_projected_document(document)?;
+        tensor_to_document_embedding(unit_id, document_projection)
+    }
+
+    /// Score persisted ColBERT document token vectors over a bounded RRF pool.
+    pub fn score_persisted_candidates(
         &self,
         query: &str,
-        candidates: &[ColbertDocumentCandidate],
+        candidates: &[ColbertDocumentEmbedding],
     ) -> Result<Vec<ColbertCandidateScore>, ApiError> {
         let query_projection = self.encode_projected_query(query)?;
         let (query_tokens, _) = query_projection.dims2().map_err(|source| {
@@ -323,10 +335,14 @@ impl ColbertRuntime {
         })?;
         let mut scores = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let document_projection = self.encode_projected_document(&candidate.content)?;
-            let (document_tokens, _) = document_projection.dims2().map_err(|source| {
+            let document_projection = Tensor::from_vec(
+                candidate.vector.clone(),
+                (candidate.token_count, candidate.dimension),
+                &self.device,
+            )
+            .map_err(|source| {
                 inference_error(format!(
-                    "ColBERT search document projection shape error for {}: {source}",
+                    "failed to load persisted ColBERT document vector {} onto device: {source}",
                     candidate.unit_id
                 ))
             })?;
@@ -336,7 +352,7 @@ impl ColbertRuntime {
                 score,
                 rank: 0,
                 query_tokens,
-                document_tokens,
+                document_tokens: candidate.token_count,
             });
         }
         scores.sort_by(|left, right| {
@@ -1731,6 +1747,55 @@ fn tensor_abs_summary(
     }
 
     Ok((total_abs / count as f32, max_abs))
+}
+
+/// Move a ColBERT document token matrix to CPU and flatten it for SQLite persistence.
+fn tensor_to_document_embedding(
+    unit_id: &str,
+    tensor: Tensor,
+) -> Result<ColbertDocumentEmbedding, ApiError> {
+    let (token_count, dimension) = tensor.dims2().map_err(|source| {
+        inference_error(format!(
+            "ColBERT document projection shape error for {unit_id}: {source}"
+        ))
+    })?;
+    if token_count == 0 || dimension == 0 {
+        return Err(inference_error(format!(
+            "ColBERT document projection for {unit_id} has invalid shape [{token_count}, {dimension}]"
+        )));
+    }
+    let rows = tensor
+        .to_device(&Device::Cpu)
+        .and_then(|value| value.to_vec2::<f32>())
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to materialize ColBERT document projection for {unit_id}: {source}"
+            ))
+        })?;
+    let mut vector = Vec::with_capacity(token_count * dimension);
+    for row in rows {
+        if row.len() != dimension {
+            return Err(inference_error(format!(
+                "ColBERT document projection for {unit_id} has ragged row length {}, expected {dimension}",
+                row.len()
+            )));
+        }
+        for value in row {
+            if !value.is_finite() {
+                return Err(inference_error(format!(
+                    "ColBERT document projection for {unit_id} contains non-finite values"
+                )));
+            }
+            vector.push(value);
+        }
+    }
+
+    Ok(ColbertDocumentEmbedding {
+        unit_id: unit_id.to_string(),
+        token_count,
+        dimension,
+        vector,
+    })
 }
 
 /// Compute ColBERT MaxSim by summing each query token's best document-token dot product.

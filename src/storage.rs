@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::{
-    config::{DenseModelConfig, RetrievalConfig, StorageConfig},
+    config::{ColbertModelConfig, DenseModelConfig, RetrievalConfig, StorageConfig},
     docling::DoclingConversionResult,
     error::ApiError,
     units::{RetrievalUnit, build_document_id},
@@ -21,12 +21,21 @@ use crate::{
 pub struct StorageRuntime {
     db_path: PathBuf,
     dense_dimension: usize,
+    colbert_dimension: usize,
     cache: Arc<Mutex<DenseVectorCache>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UnitDenseVector {
     pub unit_id: String,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnitColbertDocumentVector {
+    pub unit_id: String,
+    pub token_count: usize,
+    pub dimension: usize,
     pub vector: Vec<f32>,
 }
 
@@ -49,6 +58,9 @@ pub struct SearchCandidate {
     pub heading_path: Vec<String>,
     pub source_path: String,
     pub page_numbers: Vec<u32>,
+    pub colbert_token_count: usize,
+    pub colbert_dimension: usize,
+    pub colbert_vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +79,14 @@ struct StoredDenseVector {
     unit_id: String,
     vector: Vec<f32>,
     norm: f32,
+}
+
+#[derive(Debug, Clone)]
+struct StoredColbertDocumentVector {
+    unit_id: String,
+    token_count: usize,
+    dimension: usize,
+    vector: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -101,6 +121,9 @@ struct StoredUnit {
     heading_path: Vec<String>,
     page_numbers: Vec<u32>,
     content: String,
+    colbert_token_count: usize,
+    colbert_dimension: usize,
+    colbert_vector: Vec<f32>,
 }
 
 struct SearchRawInput<'a> {
@@ -146,8 +169,9 @@ struct ForeignKeySpec {
 }
 
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
-const EXPECTED_SCHEMA_VERSION: i64 = 1;
+const EXPECTED_SCHEMA_VERSION: i64 = 2;
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
+const COLBERT_DOCUMENT_VECTOR_FORMAT: &str = "little_endian_f32_row_major";
 const STORAGE_SCHEMA_SQL: &str = include_str!("../sql/schema.sql");
 const ENABLE_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_keys = ON;";
 const GET_SCHEMA_VERSION_SQL: &str = "PRAGMA user_version;";
@@ -175,8 +199,12 @@ LIMIT 1";
 const DOCUMENTS_TABLE_INFO_SQL: &str = "PRAGMA table_info(documents);";
 const UNITS_TABLE_INFO_SQL: &str = "PRAGMA table_info(units);";
 const DENSE_VECTORS_TABLE_INFO_SQL: &str = "PRAGMA table_info(dense_vectors);";
+const COLBERT_DOCUMENT_VECTORS_TABLE_INFO_SQL: &str =
+    "PRAGMA table_info(colbert_document_vectors);";
 const UNITS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(units);";
 const DENSE_VECTORS_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_key_list(dense_vectors);";
+const COLBERT_DOCUMENT_VECTORS_FOREIGN_KEYS_SQL: &str =
+    "PRAGMA foreign_key_list(colbert_document_vectors);";
 const DOCUMENTS_INDEX_LIST_SQL: &str = "PRAGMA index_list(documents);";
 const UNITS_INDEX_LIST_SQL: &str = "PRAGMA index_list(units);";
 const DOCUMENTS_SOURCE_PATH_INDEX_INFO_SQL: &str = "PRAGMA index_info(idx_documents_source_path);";
@@ -212,6 +240,15 @@ INSERT INTO dense_vectors (
   unit_id, dimension, vector_blob, vector_norm, model_path,
   model_dimension, pooling, format, created_at_ms, updated_at_ms
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+const INSERT_COLBERT_DOCUMENT_VECTOR_SQL: &str = "
+INSERT INTO colbert_document_vectors (
+  unit_id, token_count, dimension, vector_blob, model_path,
+  model_dimension, format, created_at_ms, updated_at_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+const LOAD_COLBERT_DOCUMENT_VECTOR_SQL: &str = "
+SELECT token_count, dimension, vector_blob, model_dimension, format
+FROM colbert_document_vectors
+WHERE unit_id = ?1";
 const EXPECTED_UNITS_FTS_SQL: &str =
     "CREATE VIRTUAL TABLE units_fts USING fts5(content, content='units', content_rowid='rowid')";
 const DOCUMENTS_COLUMNS: &[ColumnSpec] = &[
@@ -444,6 +481,71 @@ const DENSE_VECTORS_COLUMNS: &[ColumnSpec] = &[
         primary_key_position: 0,
     },
 ];
+const COLBERT_DOCUMENT_VECTORS_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "unit_id",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 1,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "token_count",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "dimension",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "vector_blob",
+        declared_type: "BLOB",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "model_path",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "model_dimension",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "format",
+        declared_type: "TEXT",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "created_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+    ColumnSpec {
+        table_name: "colbert_document_vectors",
+        name: "updated_at_ms",
+        declared_type: "INTEGER",
+        required: true,
+        primary_key_position: 0,
+    },
+];
 const UNITS_DOCUMENT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
     table_name: "units",
     from_column: "document_id",
@@ -458,10 +560,21 @@ const DENSE_VECTORS_UNIT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
     referenced_column: "unit_id",
     on_delete: "CASCADE",
 };
+const COLBERT_DOCUMENT_VECTORS_UNIT_FOREIGN_KEY: ForeignKeySpec = ForeignKeySpec {
+    table_name: "colbert_document_vectors",
+    from_column: "unit_id",
+    referenced_table: "units",
+    referenced_column: "unit_id",
+    on_delete: "CASCADE",
+};
 
 impl StorageRuntime {
     /// Open existing storage, validate schema, and load the dense vector cache without runtime schema changes.
-    pub fn open(storage: &StorageConfig, dense: &DenseModelConfig) -> Result<Self, ApiError> {
+    pub fn open(
+        storage: &StorageConfig,
+        dense: &DenseModelConfig,
+        colbert: &ColbertModelConfig,
+    ) -> Result<Self, ApiError> {
         let db_path = database_path(storage);
         if !db_path.is_file() {
             return Err(ApiError::StorageInit {
@@ -489,6 +602,7 @@ impl StorageRuntime {
         Ok(Self {
             db_path,
             dense_dimension,
+            colbert_dimension: colbert.dimension as usize,
             cache: Arc::new(Mutex::new(cache)),
         })
     }
@@ -517,7 +631,9 @@ impl StorageRuntime {
         conversion: &DoclingConversionResult,
         units: &[RetrievalUnit],
         vectors: Vec<UnitDenseVector>,
+        colbert_vectors: Vec<UnitColbertDocumentVector>,
         dense: &DenseModelConfig,
+        colbert: &ColbertModelConfig,
     ) -> Result<(), ApiError> {
         if units.len() != vectors.len() {
             return Err(ApiError::StorageOperation {
@@ -528,6 +644,15 @@ impl StorageRuntime {
                 ),
             });
         }
+        if units.len() != colbert_vectors.len() {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "unit/ColBERT vector count mismatch during ingest: units={}, colbert_vectors={}",
+                    units.len(),
+                    colbert_vectors.len()
+                ),
+            });
+        }
 
         let stored_vectors = vectors
             .into_iter()
@@ -535,6 +660,10 @@ impl StorageRuntime {
                 validate_vector(value.unit_id, value.vector, self.dense_dimension)
                     .map_err(storage_operation_error)
             })
+            .collect::<Result<Vec<_>, _>>()?;
+        let stored_colbert_vectors = colbert_vectors
+            .into_iter()
+            .map(|value| validate_colbert_document_vector(value, self.colbert_dimension))
             .collect::<Result<Vec<_>, _>>()?;
         let source_bytes =
             fs::read(&conversion.source.absolute_path).map_err(|source| ApiError::InternalIo {
@@ -573,9 +702,20 @@ impl StorageRuntime {
             &diagnostics,
             now_ms,
         )?;
-        for (unit, vector) in units.iter().zip(stored_vectors.iter()) {
+        for ((unit, vector), colbert_vector) in units
+            .iter()
+            .zip(stored_vectors.iter())
+            .zip(stored_colbert_vectors.iter())
+        {
+            if unit.unit_id != vector.unit_id || unit.unit_id != colbert_vector.unit_id {
+                return Err(storage_operation_error(format!(
+                    "unit/vector id mismatch during ingest: unit={}, dense={}, colbert={}",
+                    unit.unit_id, vector.unit_id, colbert_vector.unit_id
+                )));
+            }
             insert_unit(&tx, unit)?;
             insert_dense_vector(&tx, vector, dense, now_ms)?;
+            insert_colbert_document_vector(&tx, colbert_vector, colbert, now_ms)?;
         }
 
         tx.commit().map_err(|source| {
@@ -643,6 +783,9 @@ impl StorageRuntime {
                     heading_path: unit.heading_path.clone(),
                     source_path: unit.source_path.clone(),
                     page_numbers: unit.page_numbers.clone(),
+                    colbert_token_count: unit.colbert_token_count,
+                    colbert_dimension: unit.colbert_dimension,
+                    colbert_vector: unit.colbert_vector.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -728,7 +871,11 @@ impl StorageRuntime {
         let connection = open_connection(&self.db_path)?;
         let mut units = Vec::with_capacity(matches.len());
         for matched in matches {
-            units.push(load_unit(&connection, &matched.unit_id)?);
+            units.push(load_unit(
+                &connection,
+                &matched.unit_id,
+                self.colbert_dimension,
+            )?);
         }
 
         Ok(units)
@@ -1106,7 +1253,13 @@ fn open_connection(db_path: &Path) -> Result<Connection, ApiError> {
 /// Validate the durable SQLite contract before runtime operations proceed.
 fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
     validate_schema_version(connection)?;
-    for table_name in ["documents", "units", "dense_vectors", "units_fts"] {
+    for table_name in [
+        "documents",
+        "units",
+        "dense_vectors",
+        "colbert_document_vectors",
+        "units_fts",
+    ] {
         validate_schema_object_exists(connection, table_name)?;
     }
     validate_table_columns(connection, DOCUMENTS_TABLE_INFO_SQL, DOCUMENTS_COLUMNS)?;
@@ -1115,6 +1268,11 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
         connection,
         DENSE_VECTORS_TABLE_INFO_SQL,
         DENSE_VECTORS_COLUMNS,
+    )?;
+    validate_table_columns(
+        connection,
+        COLBERT_DOCUMENT_VECTORS_TABLE_INFO_SQL,
+        COLBERT_DOCUMENT_VECTORS_COLUMNS,
     )?;
     validate_foreign_key(
         connection,
@@ -1125,6 +1283,11 @@ fn validate_schema(connection: &Connection) -> Result<(), ApiError> {
         connection,
         DENSE_VECTORS_FOREIGN_KEYS_SQL,
         DENSE_VECTORS_UNIT_FOREIGN_KEY,
+    )?;
+    validate_foreign_key(
+        connection,
+        COLBERT_DOCUMENT_VECTORS_FOREIGN_KEYS_SQL,
+        COLBERT_DOCUMENT_VECTORS_UNIT_FOREIGN_KEY,
     )?;
     validate_named_unique_index(
         connection,
@@ -1463,8 +1626,12 @@ fn normalize_schema_sql(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Load one durable unit row and decode its JSON metadata.
-fn load_unit(connection: &Connection, unit_id: &str) -> Result<StoredUnit, ApiError> {
+/// Load one durable unit row, its metadata, and its persisted ColBERT document vectors.
+fn load_unit(
+    connection: &Connection,
+    unit_id: &str,
+    colbert_dimension: usize,
+) -> Result<StoredUnit, ApiError> {
     let row = connection
         .query_row(LOAD_UNIT_SQL, [unit_id], |row| {
             Ok((
@@ -1484,6 +1651,7 @@ fn load_unit(connection: &Connection, unit_id: &str) -> Result<StoredUnit, ApiEr
             "dense search matched missing unit row {unit_id}"
         )));
     };
+    let colbert_vector = load_colbert_document_vector(connection, &unit_id, colbert_dimension)?;
 
     Ok(StoredUnit {
         unit_id,
@@ -1491,6 +1659,82 @@ fn load_unit(connection: &Connection, unit_id: &str) -> Result<StoredUnit, ApiEr
         heading_path: decode_json_array("heading_path_json", &heading_path_json)?,
         page_numbers: decode_json_array("page_numbers_json", &page_numbers_json)?,
         content,
+        colbert_token_count: colbert_vector.token_count,
+        colbert_dimension: colbert_vector.dimension,
+        colbert_vector: colbert_vector.vector,
+    })
+}
+
+/// Load and validate one persisted ColBERT document token matrix for search-time MaxSim.
+fn load_colbert_document_vector(
+    connection: &Connection,
+    unit_id: &str,
+    expected_dimension: usize,
+) -> Result<StoredColbertDocumentVector, ApiError> {
+    let row = connection
+        .query_row(LOAD_COLBERT_DOCUMENT_VECTOR_SQL, [unit_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .optional()
+        .map_err(|source| {
+            storage_operation_error(format!(
+                "failed to load ColBERT document vector {unit_id}: {source}"
+            ))
+        })?;
+    let Some((token_count, dimension, blob, model_dimension, format)) = row else {
+        return Err(storage_operation_error(format!(
+            "missing persisted ColBERT document vector for {unit_id}; re-ingest the source with the current schema"
+        )));
+    };
+    if token_count <= 0 {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {unit_id} has invalid token_count {token_count}"
+        )));
+    }
+    if dimension <= 0 {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {unit_id} has invalid dimension {dimension}"
+        )));
+    }
+    if model_dimension <= 0 {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {unit_id} has invalid model_dimension {model_dimension}"
+        )));
+    }
+
+    let token_count = token_count as usize;
+    let dimension = dimension as usize;
+    let model_dimension = model_dimension as usize;
+    if model_dimension != expected_dimension {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {unit_id} has model_dimension {model_dimension}, expected {expected_dimension}"
+        )));
+    }
+    if format != COLBERT_DOCUMENT_VECTOR_FORMAT {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {unit_id} has format {format}, expected {COLBERT_DOCUMENT_VECTOR_FORMAT}"
+        )));
+    }
+    let vector = decode_colbert_document_vector_blob(
+        unit_id,
+        &blob,
+        token_count,
+        dimension,
+        expected_dimension,
+    )
+    .map_err(storage_operation_error)?;
+
+    Ok(StoredColbertDocumentVector {
+        unit_id: unit_id.to_string(),
+        token_count,
+        dimension,
+        vector,
     })
 }
 
@@ -1623,6 +1867,37 @@ fn insert_dense_vector(
     Ok(())
 }
 
+/// Insert one persisted ColBERT document token matrix for later search-time MaxSim.
+fn insert_colbert_document_vector(
+    tx: &rusqlite::Transaction<'_>,
+    vector: &StoredColbertDocumentVector,
+    colbert: &ColbertModelConfig,
+    timestamp_ms: u64,
+) -> Result<(), ApiError> {
+    tx.execute(
+        INSERT_COLBERT_DOCUMENT_VECTOR_SQL,
+        params![
+            &vector.unit_id,
+            vector.token_count as i64,
+            vector.dimension as i64,
+            encode_vector_blob(&vector.vector),
+            colbert.path.display().to_string(),
+            colbert.dimension as i64,
+            COLBERT_DOCUMENT_VECTOR_FORMAT,
+            timestamp_ms as i64,
+            timestamp_ms as i64,
+        ],
+    )
+    .map_err(|source| {
+        storage_operation_error(format!(
+            "failed to insert ColBERT document vector {}: {source}",
+            vector.unit_id
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Build bounded JSON diagnostics for the document row.
 fn build_ingest_diagnostics(conversion: &DoclingConversionResult) -> Result<String, ApiError> {
     serde_json::to_string(&serde_json::json!({
@@ -1661,6 +1936,55 @@ fn validate_vector(
         unit_id,
         vector,
         norm,
+    })
+}
+
+/// Validate a ColBERT document token matrix and preserve its row-major token layout.
+fn validate_colbert_document_vector(
+    vector: UnitColbertDocumentVector,
+    expected_dimension: usize,
+) -> Result<StoredColbertDocumentVector, ApiError> {
+    if vector.token_count == 0 {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {} has zero tokens",
+            vector.unit_id
+        )));
+    }
+    if vector.dimension != expected_dimension {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {} has dimension {}, expected {}",
+            vector.unit_id, vector.dimension, expected_dimension
+        )));
+    }
+    let expected_values = vector
+        .token_count
+        .checked_mul(vector.dimension)
+        .ok_or_else(|| {
+            storage_operation_error(format!(
+                "ColBERT document vector {} token matrix size overflow",
+                vector.unit_id
+            ))
+        })?;
+    if vector.vector.len() != expected_values {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {} has {} values, expected {}",
+            vector.unit_id,
+            vector.vector.len(),
+            expected_values
+        )));
+    }
+    if vector.vector.iter().any(|value| !value.is_finite()) {
+        return Err(storage_operation_error(format!(
+            "ColBERT document vector {} contains non-finite values",
+            vector.unit_id
+        )));
+    }
+
+    Ok(StoredColbertDocumentVector {
+        unit_id: vector.unit_id,
+        token_count: vector.token_count,
+        dimension: vector.dimension,
+        vector: vector.vector,
     })
 }
 
@@ -1709,6 +2033,47 @@ fn decode_vector_blob(
         vector.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
     }
     validate_vector(unit_id.to_string(), vector, expected_dimension).map(|value| value.vector)
+}
+
+/// Decode and validate a persisted ColBERT token-vector matrix blob from SQLite.
+fn decode_colbert_document_vector_blob(
+    unit_id: &str,
+    blob: &[u8],
+    token_count: usize,
+    row_dimension: usize,
+    expected_dimension: usize,
+) -> Result<Vec<f32>, String> {
+    if row_dimension != expected_dimension {
+        return Err(format!(
+            "ColBERT document vector {unit_id} has dimension {row_dimension}, expected {expected_dimension}"
+        ));
+    }
+    let expected_values = token_count
+        .checked_mul(expected_dimension)
+        .ok_or_else(|| format!("ColBERT document vector {unit_id} token matrix size overflow"))?;
+    let expected_bytes = expected_values * std::mem::size_of::<f32>();
+    if blob.len() != expected_bytes {
+        return Err(format!(
+            "ColBERT document vector {unit_id} has byte length {}, expected {expected_bytes}",
+            blob.len()
+        ));
+    }
+
+    let mut vector = Vec::with_capacity(expected_values);
+    for bytes in blob.chunks_exact(std::mem::size_of::<f32>()) {
+        vector.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    }
+    validate_colbert_document_vector(
+        UnitColbertDocumentVector {
+            unit_id: unit_id.to_string(),
+            token_count,
+            dimension: expected_dimension,
+            vector,
+        },
+        expected_dimension,
+    )
+    .map(|value| value.vector)
+    .map_err(|source| source.to_string())
 }
 
 /// Return a lowercase SHA-256 hex digest for durable document metadata.

@@ -45,7 +45,19 @@ CREATE TABLE IF NOT EXISTS dense_vectors (
   updated_at_ms INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS colbert_document_vectors (
+  unit_id TEXT PRIMARY KEY REFERENCES units(unit_id) ON DELETE CASCADE,
+  token_count INTEGER NOT NULL,
+  dimension INTEGER NOT NULL,
+  vector_blob BLOB NOT NULL,
+  model_path TEXT NOT NULL,
+  model_dimension INTEGER NOT NULL,
+  format TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS units_fts
 USING fts5(content, content='units', content_rowid='rowid');
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

@@ -11,10 +11,10 @@ use tracing::info;
 use crate::{
     docling::convert_source_to_markdown,
     error::ApiError,
-    inference::{ColbertCandidateScore, ColbertDocumentCandidate},
+    inference::{ColbertCandidateScore, ColbertDocumentEmbedding},
     source::resolve_source_reference,
     state::AppState,
-    storage::{SearchCandidate, UnitDenseVector},
+    storage::{SearchCandidate, UnitColbertDocumentVector, UnitDenseVector},
     types::{
         HealthResponse, IngestRequest, IngestResponse, SearchRequest, SearchResponse, SearchResult,
         ShutdownResponse,
@@ -75,8 +75,34 @@ async fn post_ingest(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let colbert_vectors = units
+        .iter()
+        .map(|unit| {
+            inference
+                .colbert
+                .embed_document(&unit.unit_id, &unit.content)
+                .map(|embedding| UnitColbertDocumentVector {
+                    unit_id: embedding.unit_id,
+                    token_count: embedding.token_count,
+                    dimension: embedding.dimension,
+                    vector: embedding.vector,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let colbert_vector_count = colbert_vectors.len();
+    let colbert_vector_values = colbert_vectors
+        .iter()
+        .map(|value| value.vector.len())
+        .sum::<usize>();
     let storage = state.storage()?;
-    storage.ingest_document(&conversion, &units, vectors, &state.config.models.dense)?;
+    storage.ingest_document(
+        &conversion,
+        &units,
+        vectors,
+        colbert_vectors,
+        &state.config.models.dense,
+        &state.config.models.colbert,
+    )?;
     let first_unit = units.first();
     let last_unit = units.last();
 
@@ -108,7 +134,9 @@ async fn post_ingest(
         last_unit_tokens = last_unit.map(|unit| unit.token_count),
         last_unit_heading_path = ?last_unit.map(|unit| &unit.heading_path),
         last_unit_page_numbers = ?last_unit.map(|unit| &unit.page_numbers),
-        "Docling conversion, unit splitting, dense embedding, and SQLite ingest completed"
+        colbert_document_vectors = colbert_vector_count,
+        colbert_document_vector_values = colbert_vector_values,
+        "Docling conversion, unit splitting, dense embedding, ColBERT document embedding, and SQLite ingest completed"
     );
 
     Ok(Json(IngestResponse {
@@ -144,15 +172,17 @@ async fn post_search(
     let colbert_candidates = storage_output
         .candidates
         .iter()
-        .map(|candidate| ColbertDocumentCandidate {
+        .map(|candidate| ColbertDocumentEmbedding {
             unit_id: candidate.unit_id.clone(),
-            content: candidate.content.clone(),
+            token_count: candidate.colbert_token_count,
+            dimension: candidate.colbert_dimension,
+            vector: candidate.colbert_vector.clone(),
         })
         .collect::<Vec<_>>();
     let colbert_started = Instant::now();
     let colbert_scores = inference
         .colbert
-        .score_candidates(&request.query, &colbert_candidates)?;
+        .score_persisted_candidates(&request.query, &colbert_candidates)?;
     let colbert_latency_ms = colbert_started.elapsed().as_millis() as u64;
     let (results, final_result_raw) =
         build_colbert_results(&storage_output.candidates, &colbert_scores, top_k)?;
@@ -167,7 +197,8 @@ async fn post_search(
         },
         "storage": storage_output.raw,
         "colbert": {
-            "mode": "on_demand_candidate_pool_maxsim",
+            "mode": "persisted_candidate_pool_maxsim",
+            "documentVectorSource": "sqlite",
             "candidateCount": storage_output.candidates.len(),
             "scores": colbert_scores.iter().map(|score| {
                 serde_json::json!({
