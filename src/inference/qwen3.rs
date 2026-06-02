@@ -1,0 +1,637 @@
+use std::{fs, path::Path};
+
+use candle_core::{D, DType, Device, Tensor};
+use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_no_bias};
+use serde::Deserialize;
+
+use crate::{error::ApiError, inference::artifacts::ModelArtifacts};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Qwen3Config {
+    pub architectures: Vec<String>,
+    pub head_dim: usize,
+    pub hidden_act: String,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub model_type: String,
+    pub num_attention_heads: usize,
+    pub num_hidden_layers: usize,
+    pub num_key_value_heads: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub tie_word_embeddings: bool,
+    pub vocab_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3Model {
+    embeddings: Embedding,
+    embedding_weight: Tensor,
+    layers: Vec<Qwen3Layer>,
+    norm: MetalSafeRmsNorm,
+    config: Qwen3Config,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Layer {
+    input_layernorm: MetalSafeRmsNorm,
+    self_attn: Qwen3Attention,
+    post_attention_layernorm: MetalSafeRmsNorm,
+    mlp: Qwen3Mlp,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: MetalSafeRmsNorm,
+    k_norm: MetalSafeRmsNorm,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rope_theta: f64,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Mlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+#[derive(Debug, Clone)]
+struct MetalSafeRmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenLogit {
+    pub token_id: u32,
+    pub logit: f32,
+}
+
+impl Qwen3Model {
+    /// Load a Qwen3 causal model graph for hidden-state extraction or tied-embedding token scoring.
+    pub fn load(
+        label: &str,
+        config: &Qwen3Config,
+        artifacts: &ModelArtifacts,
+        device: &Device,
+        tensor_prefix: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        validate_qwen3_config(label, config)?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::BF16, device)
+        }
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to memory-map {label} safetensors from {}: {source}",
+                artifacts.root.display()
+            ))
+        })?;
+        let model_vb = tensor_prefix.map_or_else(|| vb.clone(), |prefix| vb.pp(prefix));
+        let embeddings = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            model_vb.pp("embed_tokens"),
+        )
+        .map_err(|source| {
+            inference_error(format!("failed to load {label} token embeddings: {source}"))
+        })?;
+        let embedding_weight = model_vb
+            .get(
+                (config.vocab_size, config.hidden_size),
+                "embed_tokens.weight",
+            )
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to load {label} tied token embedding weight: {source}"
+                ))
+            })?;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for index in 0..config.num_hidden_layers {
+            layers.push(Qwen3Layer::load(
+                label,
+                config,
+                model_vb.pp(format!("layers.{index}")),
+            )?);
+        }
+        let norm =
+            MetalSafeRmsNorm::load(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))
+                .map_err(|source| {
+                    inference_error(format!("failed to load {label} final norm: {source}"))
+                })?;
+
+        Ok(Self {
+            embeddings,
+            embedding_weight,
+            layers,
+            norm,
+            config: config.clone(),
+        })
+    }
+
+    /// Return the configured hidden size for runtime diagnostics and output validation.
+    pub fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    /// Run token IDs through Qwen3 and return final hidden states.
+    pub fn forward_hidden(&self, input_ids: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+        let mut hidden_states = self.embeddings.forward(input_ids).map_err(|source| {
+            inference_error(format!("{label} embedding lookup failed: {source}"))
+        })?;
+        for layer in &self.layers {
+            hidden_states = layer.forward(label, &hidden_states)?;
+        }
+        self.norm
+            .forward(&hidden_states)
+            .map_err(|source| inference_error(format!("{label} final norm failed: {source}")))
+    }
+
+    /// Score selected next-token logits from the final prompt position using tied output embeddings.
+    pub fn selected_token_logits(
+        &self,
+        input_ids: &[u32],
+        token_ids: &[u32],
+        device: &Device,
+        label: &str,
+    ) -> Result<Vec<TokenLogit>, ApiError> {
+        if !self.config.tie_word_embeddings {
+            return Err(inference_error(format!(
+                "{label} selected-token scoring requires tied word embeddings"
+            )));
+        }
+        let input = Tensor::new(input_ids, device)
+            .map_err(|source| {
+                inference_error(format!("failed to build {label} input tensor: {source}"))
+            })?
+            .unsqueeze(0)
+            .map_err(|source| {
+                inference_error(format!("failed to batch {label} input tensor: {source}"))
+            })?;
+        let hidden = self.forward_hidden(&input, label)?;
+        let (_, seq_len, hidden_size) = hidden.dims3().map_err(|source| {
+            inference_error(format!("{label} hidden state shape error: {source}"))
+        })?;
+        let final_hidden = hidden
+            .narrow(1, seq_len - 1, 1)
+            .and_then(|tensor| tensor.reshape((hidden_size,)))
+            .and_then(|tensor| tensor.to_dtype(DType::F32))
+            .and_then(|tensor| tensor.to_device(&Device::Cpu))
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to extract {label} final hidden state: {source}"
+                ))
+            })?;
+        let mut logits = Vec::with_capacity(token_ids.len());
+        for token_id in token_ids {
+            let token_embedding = self
+                .embedding_weight
+                .narrow(0, *token_id as usize, 1)
+                .and_then(|tensor| tensor.reshape((hidden_size,)))
+                .and_then(|tensor| tensor.to_dtype(DType::F32))
+                .and_then(|tensor| tensor.to_device(&Device::Cpu))
+                .and_then(|tensor| tensor.to_vec1::<f32>())
+                .map_err(|source| {
+                    inference_error(format!(
+                        "failed to extract {label} tied embedding for token {token_id}: {source}"
+                    ))
+                })?;
+            let logit = final_hidden
+                .iter()
+                .zip(token_embedding.iter())
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            logits.push(TokenLogit {
+                token_id: *token_id,
+                logit,
+            });
+        }
+
+        Ok(logits)
+    }
+}
+
+impl Qwen3Layer {
+    /// Load one Qwen3 decoder layer from Hugging Face tensor names.
+    fn load(label: &str, config: &Qwen3Config, vb: VarBuilder) -> Result<Self, ApiError> {
+        let input_layernorm = MetalSafeRmsNorm::load(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("input_layernorm"),
+        )
+        .map_err(|source| {
+            inference_error(format!("failed to load {label} input layernorm: {source}"))
+        })?;
+        let self_attn = Qwen3Attention::load(label, config, vb.pp("self_attn"))?;
+        let post_attention_layernorm = MetalSafeRmsNorm::load(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )
+        .map_err(|source| {
+            inference_error(format!(
+                "failed to load {label} post-attention layernorm: {source}"
+            ))
+        })?;
+        let mlp = Qwen3Mlp::load(label, config, vb.pp("mlp"))?;
+
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
+    /// Apply one causal decoder layer and preserve the hidden-state contract.
+    fn forward(&self, label: &str, hidden_states: &Tensor) -> Result<Tensor, ApiError> {
+        let residual = hidden_states;
+        let attention_input = self
+            .input_layernorm
+            .forward(hidden_states)
+            .map_err(|source| {
+                inference_error(format!("{label} input layernorm failed: {source}"))
+            })?;
+        let attention_output = self.self_attn.forward(label, &attention_input)?;
+        let hidden_states = (attention_output + residual).map_err(|source| {
+            inference_error(format!("{label} attention residual failed: {source}"))
+        })?;
+
+        let residual = &hidden_states;
+        let mlp_input = self
+            .post_attention_layernorm
+            .forward(&hidden_states)
+            .map_err(|source| {
+                inference_error(format!("{label} post-attention layernorm failed: {source}"))
+            })?;
+        let mlp_output = self.mlp.forward(label, &mlp_input)?;
+        (mlp_output + residual)
+            .map_err(|source| inference_error(format!("{label} mlp residual failed: {source}")))
+    }
+}
+
+impl Qwen3Attention {
+    /// Load Qwen3 grouped-query attention projections and per-head norms.
+    fn load(label: &str, config: &Qwen3Config, vb: VarBuilder) -> Result<Self, ApiError> {
+        let q_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            vb.pp("q_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} q_proj: {source}")))?;
+        let k_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            vb.pp("k_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} k_proj: {source}")))?;
+        let v_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            vb.pp("v_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} v_proj: {source}")))?;
+        let o_proj = linear_no_bias(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            vb.pp("o_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} o_proj: {source}")))?;
+        let q_norm = MetalSafeRmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("q_norm"))
+            .map_err(|source| {
+                inference_error(format!("failed to load {label} q_norm: {source}"))
+            })?;
+        let k_norm = MetalSafeRmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("k_norm"))
+            .map_err(|source| {
+                inference_error(format!("failed to load {label} k_norm: {source}"))
+            })?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads: config.num_attention_heads,
+            num_key_value_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rope_theta: config.rope_theta,
+        })
+    }
+
+    /// Apply causal grouped-query attention for a full prompt.
+    fn forward(&self, label: &str, hidden_states: &Tensor) -> Result<Tensor, ApiError> {
+        let (batch_size, seq_len, _) = hidden_states.dims3().map_err(|source| {
+            inference_error(format!("{label} attention input shape error: {source}"))
+        })?;
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .and_then(|tensor| {
+                tensor.reshape((batch_size, seq_len, self.num_attention_heads, self.head_dim))
+            })
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .and_then(|tensor| self.q_norm.forward(&tensor))
+            .map_err(|source| inference_error(format!("{label} q projection failed: {source}")))?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .and_then(|tensor| {
+                tensor.reshape((batch_size, seq_len, self.num_key_value_heads, self.head_dim))
+            })
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .and_then(|tensor| self.k_norm.forward(&tensor))
+            .map_err(|source| inference_error(format!("{label} k projection failed: {source}")))?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .and_then(|tensor| {
+                tensor.reshape((batch_size, seq_len, self.num_key_value_heads, self.head_dim))
+            })
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .map_err(|source| inference_error(format!("{label} v projection failed: {source}")))?;
+
+        let q = apply_rope(&q, self.rope_theta, label)?;
+        let k = apply_rope(&k, self.rope_theta, label)?;
+        let k = repeat_kv_heads(
+            &k,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            label,
+        )?;
+        let v = repeat_kv_heads(
+            &v,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            label,
+        )?;
+        let attention_scores = q
+            .matmul(&k.t().map_err(|source| {
+                inference_error(format!("{label} key transpose failed: {source}"))
+            })?)
+            .and_then(|tensor| {
+                (tensor / (self.head_dim as f64).sqrt()).map_err(candle_core::Error::from)
+            })
+            .and_then(|tensor| apply_causal_mask(&tensor, seq_len))
+            .map_err(|source| {
+                inference_error(format!("{label} attention scores failed: {source}"))
+            })?;
+        let attention_probs = softmax_last_dim_metal_safe(&attention_scores).map_err(|source| {
+            inference_error(format!("{label} attention softmax failed: {source}"))
+        })?;
+        let attention_output = attention_probs
+            .matmul(&v)
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .and_then(|tensor| {
+                tensor.reshape((
+                    batch_size,
+                    seq_len,
+                    self.num_attention_heads * self.head_dim,
+                ))
+            })
+            .map_err(|source| {
+                inference_error(format!("{label} attention output failed: {source}"))
+            })?;
+
+        self.o_proj
+            .forward(&attention_output)
+            .map_err(|source| inference_error(format!("{label} o projection failed: {source}")))
+    }
+}
+
+impl Qwen3Mlp {
+    /// Load Qwen3 gated MLP projections.
+    fn load(label: &str, config: &Qwen3Config, vb: VarBuilder) -> Result<Self, ApiError> {
+        let gate_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("gate_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} gate_proj: {source}")))?;
+        let up_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("up_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} up_proj: {source}")))?;
+        let down_proj = linear_no_bias(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("down_proj"),
+        )
+        .map_err(|source| inference_error(format!("failed to load {label} down_proj: {source}")))?;
+
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    /// Apply the Qwen3 SiLU-gated feed-forward block.
+    fn forward(&self, label: &str, hidden_states: &Tensor) -> Result<Tensor, ApiError> {
+        let gate = self.gate_proj.forward(hidden_states).map_err(|source| {
+            inference_error(format!("{label} gate projection failed: {source}"))
+        })?;
+        let up = self
+            .up_proj
+            .forward(hidden_states)
+            .map_err(|source| inference_error(format!("{label} up projection failed: {source}")))?;
+        let activated = candle_nn::ops::silu(&gate)
+            .and_then(|tensor| tensor.mul(&up))
+            .map_err(|source| {
+                inference_error(format!("{label} gated activation failed: {source}"))
+            })?;
+
+        self.down_proj
+            .forward(&activated)
+            .map_err(|source| inference_error(format!("{label} down projection failed: {source}")))
+    }
+}
+
+impl MetalSafeRmsNorm {
+    /// Load RMSNorm weights while avoiding Candle's Metal-unsupported fused op.
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(Self {
+            weight: vb.get(size, "weight")?,
+            eps,
+        })
+    }
+
+    /// Apply RMSNorm with primitive tensor operations that are available on Metal.
+    fn forward(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
+        let variance = hidden_states.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = hidden_states.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        normed.broadcast_mul(&self.weight)
+    }
+}
+
+/// Load the Hugging Face Qwen3 config subset used by service-local adapters.
+pub fn load_qwen3_config(label: &str, path: &Path) -> Result<Qwen3Config, ApiError> {
+    let raw = fs::read_to_string(path).map_err(|source| ApiError::InferenceInit {
+        message: format!(
+            "failed to read {label} config at {}: {source}",
+            path.display()
+        ),
+    })?;
+    serde_json::from_str(&raw).map_err(|source| ApiError::InferenceInit {
+        message: format!(
+            "failed to parse {label} config at {}: {source}",
+            path.display()
+        ),
+    })
+}
+
+/// Validate Qwen3 model metadata before graph loading relies on local adapter assumptions.
+fn validate_qwen3_config(label: &str, config: &Qwen3Config) -> Result<(), ApiError> {
+    if config.model_type != "qwen3" {
+        return Err(inference_error(format!(
+            "{label} model_type must be qwen3, got {}",
+            config.model_type
+        )));
+    }
+    if !config
+        .architectures
+        .iter()
+        .any(|architecture| architecture == "Qwen3ForCausalLM")
+    {
+        return Err(inference_error(format!(
+            "{label} architectures must include Qwen3ForCausalLM"
+        )));
+    }
+    if config.hidden_act != "silu" {
+        return Err(inference_error(format!(
+            "{label} hidden_act must be silu, got {}",
+            config.hidden_act
+        )));
+    }
+    if config.num_attention_heads % config.num_key_value_heads != 0 {
+        return Err(inference_error(format!(
+            "{label} num_attention_heads must be divisible by num_key_value_heads"
+        )));
+    }
+    if config.head_dim == 0 {
+        return Err(inference_error(format!(
+            "{label} head_dim must be positive"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply Qwen/Llama rotary position embeddings to query or key states.
+fn apply_rope(states: &Tensor, theta: f64, label: &str) -> Result<Tensor, ApiError> {
+    let (_, _, seq_len, head_dim) = states
+        .dims4()
+        .map_err(|source| inference_error(format!("{label} rope shape error: {source}")))?;
+    let device = states.device();
+    let dtype = states.dtype();
+    let half_dim = head_dim / 2;
+    let mut cos = Vec::with_capacity(seq_len * head_dim);
+    let mut sin = Vec::with_capacity(seq_len * head_dim);
+    for position in 0..seq_len {
+        for dim in 0..head_dim {
+            let freq_index = dim % half_dim;
+            let inv_freq = theta.powf(-(2.0 * freq_index as f64) / head_dim as f64);
+            let angle = position as f64 * inv_freq;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+
+    let cos = Tensor::from_vec(cos, (1, 1, seq_len, head_dim), device)
+        .and_then(|tensor| tensor.to_dtype(dtype))
+        .map_err(|source| {
+            inference_error(format!("failed to build {label} rope cosines: {source}"))
+        })?;
+    let sin = Tensor::from_vec(sin, (1, 1, seq_len, head_dim), device)
+        .and_then(|tensor| tensor.to_dtype(dtype))
+        .map_err(|source| {
+            inference_error(format!("failed to build {label} rope sines: {source}"))
+        })?;
+    let rotated = rotate_half(states, label)?;
+    states
+        .broadcast_mul(&cos)
+        .and_then(|left| rotated.broadcast_mul(&sin).and_then(|right| left + right))
+        .map_err(|source| inference_error(format!("failed to apply {label} rope: {source}")))
+}
+
+/// Rotate the final dimension as `[-x2, x1]` for rotary embedding.
+fn rotate_half(states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+    let (_, _, _, head_dim) = states
+        .dims4()
+        .map_err(|source| inference_error(format!("{label} rotate-half shape error: {source}")))?;
+    let half_dim = head_dim / 2;
+    let first = states.narrow(3, 0, half_dim).map_err(|source| {
+        inference_error(format!("{label} rotate-half first split failed: {source}"))
+    })?;
+    let second = states
+        .narrow(3, half_dim, half_dim)
+        .and_then(|tensor| tensor.neg())
+        .map_err(|source| {
+            inference_error(format!("{label} rotate-half second split failed: {source}"))
+        })?;
+
+    Tensor::cat(&[&second, &first], 3)
+        .map_err(|source| inference_error(format!("{label} rotate-half concat failed: {source}")))
+}
+
+/// Repeat grouped key/value heads so attention heads can consume them directly.
+fn repeat_kv_heads(
+    states: &Tensor,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    label: &str,
+) -> Result<Tensor, ApiError> {
+    if num_attention_heads == num_key_value_heads {
+        return Ok(states.clone());
+    }
+
+    let repeat_count = num_attention_heads / num_key_value_heads;
+    let mut heads = Vec::with_capacity(num_attention_heads);
+    for head_index in 0..num_key_value_heads {
+        let head = states
+            .narrow(1, head_index, 1)
+            .map_err(|source| inference_error(format!("{label} kv head split failed: {source}")))?;
+        for _ in 0..repeat_count {
+            heads.push(head.clone());
+        }
+    }
+    let head_refs = heads.iter().collect::<Vec<_>>();
+    Tensor::cat(&head_refs, 1)
+        .map_err(|source| inference_error(format!("{label} kv head repeat failed: {source}")))
+}
+
+/// Add an upper-triangular causal mask to attention scores.
+fn apply_causal_mask(scores: &Tensor, seq_len: usize) -> candle_core::Result<Tensor> {
+    let device = scores.device();
+    let mut values = Vec::with_capacity(seq_len * seq_len);
+    for row in 0..seq_len {
+        for col in 0..seq_len {
+            values.push(if col > row { f32::NEG_INFINITY } else { 0.0 });
+        }
+    }
+    let mask =
+        Tensor::from_vec(values, (1, 1, seq_len, seq_len), device)?.to_dtype(scores.dtype())?;
+    scores.broadcast_add(&mask)
+}
+
+/// Apply softmax over the final dimension without Candle's Metal-unsupported fused op.
+fn softmax_last_dim_metal_safe(scores: &Tensor) -> candle_core::Result<Tensor> {
+    let output_dtype = scores.dtype();
+    let scores = scores.to_dtype(DType::F32)?;
+    let exp = scores.exp()?;
+    let denominator = exp.sum_keepdim(D::Minus1)?;
+    exp.broadcast_div(&denominator)?.to_dtype(output_dtype)
+}
+
+/// Convert a Candle or tokenizer failure into the service inference error shape.
+fn inference_error(message: String) -> ApiError {
+    ApiError::InferenceInit { message }
+}

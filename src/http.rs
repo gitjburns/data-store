@@ -11,7 +11,10 @@ use tracing::info;
 use crate::{
     docling::convert_source_to_markdown,
     error::ApiError,
-    inference::{ColbertCandidateScore, ColbertDocumentEmbedding},
+    inference::{
+        ColbertCandidateScore, ColbertDocumentEmbedding, RerankerCandidateInput,
+        RerankerCandidateScore,
+    },
     source::resolve_source_reference,
     state::AppState,
     storage::{SearchCandidate, UnitColbertDocumentVector, UnitDenseVector},
@@ -148,7 +151,7 @@ async fn post_ingest(
     }))
 }
 
-/// Run dense, BM25, RRF, and bounded ColBERT reranking for one search request.
+/// Run dense, BM25, RRF, bounded ColBERT reranking, and final Qwen3 reranking for one search request.
 async fn post_search(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SearchRequest>,
@@ -184,15 +187,27 @@ async fn post_search(
         .colbert
         .score_persisted_candidates(&request.query, &colbert_candidates)?;
     let colbert_latency_ms = colbert_started.elapsed().as_millis() as u64;
-    let (results, final_result_raw) =
-        build_colbert_results(&storage_output.candidates, &colbert_scores, top_k)?;
+    let reranker_candidates =
+        build_reranker_candidates(&storage_output.candidates, &colbert_scores)?;
+    let reranker_started = Instant::now();
+    let reranker_scores = inference
+        .reranker
+        .score_candidates(&request.query, &reranker_candidates)?;
+    let reranker_latency_ms = reranker_started.elapsed().as_millis() as u64;
+    let (results, final_result_raw) = build_reranker_results(
+        &storage_output.candidates,
+        &colbert_scores,
+        &reranker_scores,
+        top_k,
+    )?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::json!({
         "search": {
-            "mode": "dense_bm25_rrf_colbert",
+            "mode": "dense_bm25_rrf_colbert_reranker",
             "topK": top_k,
             "embeddingLatencyMs": embedding_latency_ms,
             "colbertLatencyMs": colbert_latency_ms,
+            "rerankerLatencyMs": reranker_latency_ms,
             "latencyMs": latency_ms
         },
         "storage": storage_output.raw,
@@ -209,6 +224,22 @@ async fn post_search(
                     "documentTokens": score.document_tokens
                 })
             }).collect::<Vec<_>>(),
+            "rankedCandidateCount": colbert_scores.len()
+        },
+        "reranker": {
+            "mode": "qwen3_yes_no_candidate_rerank",
+            "candidateSource": "colbert_ranked_candidate_pool",
+            "candidateCount": reranker_scores.len(),
+            "scores": reranker_scores.iter().map(|score| {
+                serde_json::json!({
+                    "unitId": score.unit_id,
+                    "score": score.score,
+                    "rank": score.rank,
+                    "trueLogit": score.true_logit,
+                    "falseLogit": score.false_logit,
+                    "tokenCount": score.token_count
+                })
+            }).collect::<Vec<_>>(),
             "finalResults": final_result_raw
         }
     });
@@ -220,19 +251,17 @@ async fn post_search(
     }))
 }
 
-/// Materialize public results from ColBERT-ranked candidates while preserving first-stage score context.
-fn build_colbert_results(
+/// Build final reranker inputs from the ColBERT-ranked candidate pool while preserving candidate identity.
+fn build_reranker_candidates(
     candidates: &[SearchCandidate],
     colbert_scores: &[ColbertCandidateScore],
-    top_k: u32,
-) -> Result<(Vec<SearchResult>, Vec<serde_json::Value>), ApiError> {
+) -> Result<Vec<RerankerCandidateInput>, ApiError> {
     let candidate_by_id = candidates
         .iter()
         .map(|candidate| (candidate.unit_id.as_str(), candidate))
         .collect::<HashMap<_, _>>();
-    let mut results = Vec::new();
-    let mut raw = Vec::new();
-    for score in colbert_scores.iter().take(top_k as usize) {
+    let mut reranker_candidates = Vec::with_capacity(colbert_scores.len());
+    for score in colbert_scores {
         let Some(candidate) = candidate_by_id.get(score.unit_id.as_str()) else {
             return Err(ApiError::StorageOperation {
                 message: format!(
@@ -241,9 +270,52 @@ fn build_colbert_results(
                 ),
             });
         };
+        reranker_candidates.push(RerankerCandidateInput {
+            unit_id: candidate.unit_id.clone(),
+            content: candidate.content.clone(),
+        });
+    }
+
+    Ok(reranker_candidates)
+}
+
+/// Materialize public results from reranker-ranked candidates while preserving previous-stage score context.
+fn build_reranker_results(
+    candidates: &[SearchCandidate],
+    colbert_scores: &[ColbertCandidateScore],
+    reranker_scores: &[RerankerCandidateScore],
+    top_k: u32,
+) -> Result<(Vec<SearchResult>, Vec<serde_json::Value>), ApiError> {
+    let candidate_by_id = candidates
+        .iter()
+        .map(|candidate| (candidate.unit_id.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let colbert_by_id = colbert_scores
+        .iter()
+        .map(|score| (score.unit_id.as_str(), score))
+        .collect::<HashMap<_, _>>();
+    let mut results = Vec::new();
+    let mut raw = Vec::new();
+    for score in reranker_scores.iter().take(top_k as usize) {
+        let Some(candidate) = candidate_by_id.get(score.unit_id.as_str()) else {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "reranker score referenced missing candidate {}",
+                    score.unit_id
+                ),
+            });
+        };
+        let Some(colbert_score) = colbert_by_id.get(score.unit_id.as_str()) else {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "reranker score referenced candidate without ColBERT score {}",
+                    score.unit_id
+                ),
+            });
+        };
         results.push(SearchResult {
             unit_id: candidate.unit_id.clone(),
-            // Phase 11F makes ColBERT MaxSim the public score after first-stage RRF candidate generation.
+            // Phase 14 makes Qwen3 yes/no reranker probability the public score after ColBERT candidate reranking.
             score: score.score,
             content: candidate.content.clone(),
             heading_path: candidate.heading_path.clone(),
@@ -252,8 +324,15 @@ fn build_colbert_results(
         });
         raw.push(serde_json::json!({
             "unitId": candidate.unit_id,
-            "colbertScore": score.score,
-            "colbertRank": score.rank,
+            "rerankerScore": score.score,
+            "rerankerRank": score.rank,
+            "rerankerTrueLogit": score.true_logit,
+            "rerankerFalseLogit": score.false_logit,
+            "rerankerTokenCount": score.token_count,
+            "colbertScore": colbert_score.score,
+            "colbertRank": colbert_score.rank,
+            "colbertQueryTokens": colbert_score.query_tokens,
+            "colbertDocumentTokens": colbert_score.document_tokens,
             "rrfScore": candidate.rrf_score,
             "rrfRank": candidate.rrf_rank,
             "denseRank": candidate.dense_rank,

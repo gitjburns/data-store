@@ -2,6 +2,8 @@ mod artifacts;
 mod colbert;
 mod dense;
 mod device;
+mod qwen3;
+mod reranker;
 
 use crate::{config::ServiceConfig, error::ApiError};
 
@@ -9,6 +11,7 @@ pub use artifacts::ModelArtifactSet;
 pub use colbert::{ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime};
 pub use dense::DenseEmbeddingRuntime;
 pub use device::SelectedDevice;
+pub use reranker::{RerankerCandidateInput, RerankerCandidateScore, RerankerRuntime};
 
 #[derive(Debug, Clone)]
 pub struct InferenceRuntime {
@@ -16,6 +19,7 @@ pub struct InferenceRuntime {
     pub artifacts: ModelArtifactSet,
     pub dense: DenseEmbeddingRuntime,
     pub colbert: ColbertRuntime,
+    pub reranker: RerankerRuntime,
 }
 
 impl InferenceRuntime {
@@ -27,12 +31,15 @@ impl InferenceRuntime {
             DenseEmbeddingRuntime::load(&artifacts.dense, &config.models.dense, &device.candle)?;
         let colbert =
             ColbertRuntime::load(&artifacts.colbert, &config.models.colbert, &device.candle)?;
+        let reranker =
+            RerankerRuntime::load(&artifacts.reranker, &config.models.reranker, &device.candle)?;
 
         Ok(Self {
             device,
             artifacts,
             dense,
             colbert,
+            reranker,
         })
     }
 
@@ -42,6 +49,7 @@ impl InferenceRuntime {
         details.extend(self.artifacts.health_details());
         details.extend(self.dense.health_details());
         details.extend(self.colbert.health_details());
+        details.extend(self.reranker.health_details());
         details
     }
 }
