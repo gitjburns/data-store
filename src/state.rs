@@ -133,24 +133,24 @@ impl AppState {
             Ok(runtime) => HealthComponent {
                 name: "inference".to_string(),
                 ready: true,
-                details: runtime.health_details(),
+                details: readiness_details("readiness-critical", runtime.health_details()),
             },
             Err(error) => HealthComponent {
                 name: "inference".to_string(),
                 ready: false,
-                details: vec![error.to_string()],
+                details: readiness_details("readiness-critical", vec![error.to_string()]),
             },
         };
         let storage_component = match &self.storage {
             Ok(runtime) => HealthComponent {
                 name: "storage_cache".to_string(),
                 ready: true,
-                details: runtime.health_details(),
+                details: readiness_details("readiness-critical", runtime.health_details()),
             },
             Err(error) => HealthComponent {
                 name: "storage_cache".to_string(),
                 ready: false,
-                details: vec![error.to_string()],
+                details: readiness_details("readiness-critical", vec![error.to_string()]),
             },
         };
         let ingest_admission = self.ingest_admission_snapshot();
@@ -158,7 +158,7 @@ impl AppState {
         let admission_component = HealthComponent {
             name: "admission".to_string(),
             ready: true,
-            details: vec![
+            details: readiness_details("diagnostic-only", vec![
                 format!(
                     "ingest in-flight {}/{}",
                     ingest_admission.in_flight, ingest_admission.max_in_flight
@@ -167,10 +167,33 @@ impl AppState {
                     "search in-flight {}/{}",
                     search_admission.in_flight, search_admission.max_in_flight
                 ),
-            ],
+                "saturated ingest/search requests fail fast with 503 instead of changing service readiness".to_string(),
+            ]),
         };
-        let components = vec![inference_component, storage_component, admission_component];
-        let ready = components.iter().all(|component| component.ready);
+        let logging_component = HealthComponent {
+            name: "logging".to_string(),
+            ready: true,
+            details: readiness_details(
+                "diagnostic-only",
+                vec![
+                    format!(
+                        "file logging initialized before HTTP bind: {}",
+                        self.config.logging.resolved_file_path().display()
+                    ),
+                    format!("level {}", self.config.logging.level.as_str()),
+                ],
+            ),
+        };
+        // Only components that gate ingest/search readiness determine the
+        // top-level flag. Diagnostic-only components remain visible without
+        // making a running service appear unavailable.
+        let ready = inference_component.ready && storage_component.ready;
+        let components = vec![
+            inference_component,
+            storage_component,
+            admission_component,
+            logging_component,
+        ];
 
         HealthResponse {
             service: "data-store".to_string(),
@@ -178,6 +201,14 @@ impl AppState {
             components,
         }
     }
+}
+
+/// Prefix health details with the component's readiness role for operators.
+fn readiness_details(role: &str, details: Vec<String>) -> Vec<String> {
+    let mut output = Vec::with_capacity(details.len() + 1);
+    output.push(format!("role: {role}"));
+    output.extend(details);
+    output
 }
 
 impl AdmissionGate {
