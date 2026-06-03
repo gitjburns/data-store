@@ -359,7 +359,7 @@ Fields:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `source` | string | yes | Corpus-relative source path. Must not be empty, trimmed, or over `maxIngestSourceChars`. |
+| `source` | string | yes | Corpus-relative source path matching a retained document version. Must be non-empty, must not contain leading or trailing whitespace, and must not exceed `maxIngestSourceChars`. |
 | `versionLabel` | string | yes | Retained version label. Must not be empty or padded with whitespace. |
 
 Response:
@@ -410,4 +410,3 @@ Consumers should rely on documented request/response field names, status
 strings, auth behavior, and version/snapshot semantics. Additional diagnostic
 fields can be added to `raw`, health details, and admin diagnostics without
 changing the core protocol.
-
