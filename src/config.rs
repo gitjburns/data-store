@@ -30,6 +30,8 @@ pub struct CliOptions {
     pub smoke_dense: bool,
     /// Create or validate the development SQLite schema through the explicit setup path.
     pub setup_storage: bool,
+    /// Keep the HTTP service attached to the current terminal instead of daemonizing.
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,6 +332,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     let mut config_path = PathBuf::from("config.toml");
     let mut smoke_dense = false;
     let mut setup_storage = false;
+    let mut foreground = false;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -352,6 +355,11 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
             continue;
         }
 
+        if arg == "--foreground" {
+            foreground = true;
+            continue;
+        }
+
         return Err(ApiError::InvalidCli {
             message: format!("unknown argument: {arg}"),
         });
@@ -361,6 +369,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
         config_path,
         smoke_dense,
         setup_storage,
+        foreground,
     })
 }
 

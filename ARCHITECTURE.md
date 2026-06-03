@@ -191,11 +191,18 @@ Readiness-critical components are:
 
 Diagnostic-only components include admission counters and logging state.
 
-Startup prints bootstrap details to stdout, including the one-time admin token.
-After file logging is initialized, operational events go to the configured log
-file. Logs summarize operation status, counts, and timings; they must not store
-the admin token, document contents, vector values, or oversized retrieval
-internals.
+Normal startup forks a detached background service after printing bootstrap
+handoff and readiness details to stdout, including the one-time admin token.
+`--foreground` keeps the service attached to the current terminal for
+debugging.
+
+The startup handoff reports config/log paths, file logging initialization,
+bind address, background child PID, inference readiness, storage/cache
+readiness, HTTP bind/listening state, final top-level readiness, and the
+`/v1/health` URL. After file logging is initialized, operational events go to
+the configured log file. Logs summarize operation status, counts, and timings;
+they must not store the admin token, document contents, vector values, or
+oversized retrieval internals.
 
 ## Admin Token
 
@@ -221,4 +228,3 @@ version changes.
 - Admin tokens are startup-scoped, memory-only secrets.
 - Public API strings and persisted metadata values are contracts; change them
   deliberately.
-

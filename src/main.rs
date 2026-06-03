@@ -10,7 +10,12 @@ mod storage;
 mod types;
 mod units;
 
-use std::sync::Arc;
+use std::{
+    fs::OpenOptions,
+    io::{BufRead, BufReader, Write},
+    os::unix::{io::AsRawFd, net::UnixStream},
+    sync::Arc,
+};
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -19,6 +24,7 @@ use tracing::{error, info};
 
 use crate::{
     config::{CliOptions, ServiceConfig, resolve_cli_options_from_args},
+    error::ApiError,
     http::build_router,
     inference::InferenceRuntime,
     logging::init_file_logging,
@@ -26,9 +32,67 @@ use crate::{
     storage::{StorageRuntime, setup_storage},
 };
 
+enum ServiceProcessRole {
+    ParentComplete,
+    Service(StartupReporter),
+}
+
+enum StartupReporter {
+    Stdout,
+    Pipe(UnixStream),
+}
+
+const STDIN_FILENO: i32 = 0;
+const STDOUT_FILENO: i32 = 1;
+const STDERR_FILENO: i32 = 2;
+
+unsafe extern "C" {
+    fn fork() -> i32;
+    fn setsid() -> i32;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+}
+
+impl StartupReporter {
+    /// Return the human-readable execution mode for startup handoff output.
+    fn mode_label(&self) -> &'static str {
+        match self {
+            Self::Stdout => "foreground",
+            Self::Pipe(_) => "background",
+        }
+    }
+
+    /// Emit one operator-visible startup status line.
+    fn report(&mut self, message: impl AsRef<str>) -> Result<(), ApiError> {
+        match self {
+            Self::Stdout => {
+                println!("{}", message.as_ref());
+                std::io::stdout()
+                    .flush()
+                    .map_err(|source| ApiError::InternalIo {
+                        message: format!("failed to flush startup stdout: {source}"),
+                    })?;
+            }
+            Self::Pipe(stream) => {
+                writeln!(stream, "{}", message.as_ref()).map_err(|source| {
+                    ApiError::InternalIo {
+                        message: format!("failed to write startup status to parent: {source}"),
+                    }
+                })?;
+                stream.flush().map_err(|source| ApiError::InternalIo {
+                    message: format!("failed to flush startup status to parent: {source}"),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Close the startup handoff channel so the background parent can exit.
+    fn close(self) {}
+}
+
 /// Start the standalone Data Store service.
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli_options = resolve_cli_options_from_args()?;
     // Bootstrap output stays on stdout so a launcher can find config/log
     // diagnostics before it backgrounds the service.
@@ -84,44 +148,99 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let admin_shutdown_token = generate_admin_shutdown_token()?;
     let bind_address = config.bind_address();
-    // Model and storage initialization can be slow, so print the bind target
-    // before those readiness checks begin.
     println!("data-store bootstrap bind_address={bind_address}");
+    // The admin token is intentionally stdout-only; it must not be persisted in
+    // config, SQLite, or the service log file. It is generated before the fork
+    // so the background child inherits the same in-memory secret.
+    println!("admin_shutdown_token={admin_shutdown_token}");
+
+    let process_role = enter_service_process(cli_options.foreground)?;
+    let reporter = match process_role {
+        ServiceProcessRole::ParentComplete => return Ok(()),
+        ServiceProcessRole::Service(reporter) => reporter,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_http_service(config, admin_shutdown_token, reporter))
+}
+
+/// Initialize service dependencies, bind HTTP, report readiness, and serve until shutdown.
+async fn run_http_service(
+    config: ServiceConfig,
+    admin_shutdown_token: String,
+    mut reporter: StartupReporter,
+) -> anyhow::Result<()> {
+    let bind_address = config.bind_address();
+    reporter.report(format!(
+        "data-store startup mode={} bind_address={bind_address}",
+        reporter.mode_label()
+    ))?;
     info!(
         event = "service.initializing",
         %bind_address,
         "initializing inference and storage"
     );
+
+    reporter.report("data-store startup inference=initializing")?;
     let inference = InferenceRuntime::initialize(&config);
+    match &inference {
+        Ok(runtime) => {
+            reporter.report(format!(
+                "data-store startup inference=ready details=\"{}\"",
+                runtime.health_details().join(" | ")
+            ))?;
+            info!(
+                event = "inference.initialized",
+                "inference initialized successfully"
+            );
+        }
+        Err(source) => {
+            reporter.report(format!(
+                "data-store startup inference=not_ready error=\"{source}\""
+            ))?;
+            error!(
+                event = "inference.initialization_failed",
+                error = %source,
+                "inference initialization failed"
+            );
+        }
+    }
+
+    reporter.report("data-store startup storage_cache=initializing")?;
     let storage = StorageRuntime::open(
         &config.storage,
         &config.models.dense,
         &config.models.colbert,
     );
-    match &inference {
-        Ok(_) => info!(
-            event = "inference.initialized",
-            "inference initialized successfully"
-        ),
-        Err(source) => error!(
-            event = "inference.initialization_failed",
-            error = %source,
-            "inference initialization failed"
-        ),
-    }
     match &storage {
-        Ok(_) => info!(
-            event = "storage.initialized",
-            "storage initialized successfully"
-        ),
-        Err(source) => error!(
-            event = "storage.initialization_failed",
-            error = %source,
-            "storage initialization failed"
-        ),
+        Ok(runtime) => {
+            reporter.report(format!(
+                "data-store startup storage_cache=ready details=\"{}\"",
+                runtime.health_details().join(" | ")
+            ))?;
+            info!(
+                event = "storage.initialized",
+                "storage initialized successfully"
+            );
+        }
+        Err(source) => {
+            reporter.report(format!(
+                "data-store startup storage_cache=not_ready error=\"{source}\""
+            ))?;
+            error!(
+                event = "storage.initialization_failed",
+                error = %source,
+                "storage initialization failed"
+            );
+        }
     }
-    let admin_shutdown_token = generate_admin_shutdown_token()?;
+    let inference_ready = inference.is_ok();
+    let storage_ready = storage.is_ok();
+    let ready = inference_ready && storage_ready;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let state = Arc::new(AppState::new(
         config,
@@ -131,20 +250,164 @@ async fn main() -> anyhow::Result<()> {
         shutdown_sender,
     ));
     let app = build_router(state).layer(TraceLayer::new_for_http());
-    let listener = TcpListener::bind(bind_address).await?;
+    reporter.report(format!(
+        "data-store startup http=binding bind_address={bind_address}"
+    ))?;
+    let listener = match TcpListener::bind(bind_address).await {
+        Ok(listener) => listener,
+        Err(source) => {
+            reporter.report(format!(
+                "data-store startup http=bind_failed bind_address={bind_address} error=\"{source}\""
+            ))?;
+            return Err(source.into());
+        }
+    };
 
-    // The admin token is intentionally stdout-only; it must not be persisted in
-    // config, SQLite, or the service log file.
-    println!("admin_shutdown_token={admin_shutdown_token}");
+    reporter.report(format!(
+        "data-store startup http=listening bind_address={bind_address}"
+    ))?;
+    reporter.report(format!(
+        "data-store startup ready={ready} inference={inference_ready} storage_cache={storage_ready} health_url=http://{bind_address}/v1/health"
+    ))?;
+    reporter.close();
     info!(
         event = "service.listening",
         %bind_address,
+        ready,
+        inference_ready,
+        storage_ready,
         "data store service listening"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_receiver))
         .await?;
     info!(event = "service.stopped", "data store service stopped");
+
+    Ok(())
+}
+
+/// Decide whether this invocation should continue as the service or relay child startup output as the original parent.
+fn enter_service_process(foreground: bool) -> Result<ServiceProcessRole, ApiError> {
+    if foreground {
+        println!("data-store bootstrap mode=foreground");
+        return Ok(ServiceProcessRole::Service(StartupReporter::Stdout));
+    }
+
+    enter_background_process()
+}
+
+#[cfg(unix)]
+/// Fork the service into a detached child while the original parent relays startup status.
+fn enter_background_process() -> Result<ServiceProcessRole, ApiError> {
+    let (parent_stream, child_stream) =
+        UnixStream::pair().map_err(|source| ApiError::InternalIo {
+            message: format!("failed to create startup status pipe: {source}"),
+        })?;
+    let fork_result = unsafe { fork() };
+    if fork_result < 0 {
+        return Err(ApiError::InternalIo {
+            message: "failed to fork background service process".to_string(),
+        });
+    }
+    if fork_result > 0 {
+        drop(child_stream);
+        println!(
+            "data-store bootstrap mode=background parent_pid={} child_pid={fork_result}",
+            std::process::id()
+        );
+        let startup_failed = relay_startup_status(parent_stream)?;
+        if startup_failed {
+            return Err(ApiError::InternalIo {
+                message: "background service failed during startup".to_string(),
+            });
+        }
+        return Ok(ServiceProcessRole::ParentComplete);
+    }
+
+    drop(parent_stream);
+    if let Err(error) = detach_child_process() {
+        report_background_fatal(&child_stream, &error)?;
+        return Err(error);
+    }
+    Ok(ServiceProcessRole::Service(StartupReporter::Pipe(
+        child_stream,
+    )))
+}
+
+#[cfg(not(unix))]
+/// Report the unsupported background mode clearly on non-Unix targets.
+fn enter_background_process() -> Result<ServiceProcessRole, ApiError> {
+    Err(ApiError::InvalidCli {
+        message: "--foreground is required on non-Unix targets".to_string(),
+    })
+}
+
+/// Relay newline-delimited startup status from the background child to the invoking terminal.
+fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut startup_failed = false;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("failed to read background startup status: {source}"),
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        if line.contains("data-store startup fatal=")
+            || line.contains("data-store startup http=bind_failed")
+        {
+            startup_failed = true;
+        }
+        print!("{line}");
+        std::io::stdout()
+            .flush()
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("failed to flush startup status stdout: {source}"),
+            })?;
+    }
+
+    Ok(startup_failed)
+}
+
+/// Send a fatal pre-service startup failure to the original parent before the child exits.
+fn report_background_fatal(mut stream: &UnixStream, error: &ApiError) -> Result<(), ApiError> {
+    writeln!(stream, "data-store startup fatal=\"{error}\"").map_err(|source| {
+        ApiError::InternalIo {
+            message: format!("failed to report fatal background startup error: {source}"),
+        }
+    })?;
+    stream.flush().map_err(|source| ApiError::InternalIo {
+        message: format!("failed to flush fatal background startup error: {source}"),
+    })
+}
+
+#[cfg(unix)]
+/// Detach the service child from the invoking terminal and redirect inherited stdio to `/dev/null`.
+fn detach_child_process() -> Result<(), ApiError> {
+    if unsafe { setsid() } < 0 {
+        return Err(ApiError::InternalIo {
+            message: "failed to create background service session".to_string(),
+        });
+    }
+
+    let dev_null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("failed to open /dev/null for background stdio: {source}"),
+        })?;
+    for fd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+        if unsafe { dup2(dev_null.as_raw_fd(), fd) } < 0 {
+            return Err(ApiError::InternalIo {
+                message: format!("failed to redirect fd {fd} for background service"),
+            });
+        }
+    }
 
     Ok(())
 }

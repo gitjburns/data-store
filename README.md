@@ -64,15 +64,30 @@ error, stop the service and run the setup command intentionally.
 cargo run --features metal -- --config config.toml
 ```
 
+Normal startup forks a detached background service after printing bootstrap
+handoff details to stdout. Use `--foreground` to keep the service attached to
+the current terminal while debugging startup:
+
+```bash
+cargo run --features metal -- --config config.toml --foreground
+```
+
 ## Build A Binary
 
 `cargo run` is convenient during development because it builds and starts the
 service in one command. For sustained manual operation, build a reusable release
-binary and run it directly:
+binary and run it directly. By default, the release binary backgrounds itself
+after the startup handoff completes:
 
 ```bash
 cargo build --release --features metal
 ./target/release/data-store-service --config config.toml
+```
+
+Run the release binary in the foreground when needed:
+
+```bash
+./target/release/data-store-service --config config.toml --foreground
 ```
 
 The compiled binary uses the same command-line flags as `cargo run`. Run
@@ -82,7 +97,8 @@ first-time storage setup with the release binary when needed:
 ./target/release/data-store-service --config config.toml --setup-storage
 ```
 
-Startup prints bootstrap details to stdout during startup:
+Startup prints bootstrap and readiness details to stdout before the invoking
+parent process exits:
 
 - config path
 - configured and resolved log path
@@ -90,6 +106,11 @@ Startup prints bootstrap details to stdout during startup:
 - file logging initialization
 - bind address
 - `admin_shutdown_token=<token>`
+- background child PID, unless `--foreground` is used
+- inference initialization start and ready/not-ready state
+- storage/cache initialization start and ready/not-ready state
+- HTTP bind/listening state
+- final readiness summary and `/v1/health` URL
 
 Capture the admin shutdown token from stdout. It is kept only in memory and is
 not written to config, SQLite, or the service log.
