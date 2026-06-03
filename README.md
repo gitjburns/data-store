@@ -72,17 +72,17 @@ binary and run it directly:
 
 ```bash
 cargo build --release --features metal
-./target/release/data-store --config config.toml
+./target/release/data-store-service --config config.toml
 ```
 
 The compiled binary uses the same command-line flags as `cargo run`. Run
 first-time storage setup with the release binary when needed:
 
 ```bash
-./target/release/data-store --config config.toml --setup-storage
+./target/release/data-store-service --config config.toml --setup-storage
 ```
 
-Startup prints bootstrap details to stdout before the service binds:
+Startup prints bootstrap details to stdout during startup:
 
 - config path
 - configured and resolved log path
