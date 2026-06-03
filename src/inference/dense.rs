@@ -13,6 +13,7 @@ use crate::{
 const QUERY_INSTRUCTION_PREFIX: &str =
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
 const SMOKE_TEXT: &str = "dense embedding readiness smoke check";
+const DENSE_POOLING_LAST_TOKEN: &str = "last_token";
 
 #[derive(Debug, Clone)]
 pub struct DenseEmbeddingRuntime {
@@ -148,10 +149,10 @@ impl DenseEmbeddingRuntime {
 
 /// Validate dense-model config values that are semantic, not only syntactic.
 fn validate_dense_config(config: &DenseModelConfig) -> Result<(), ApiError> {
-    if config.pooling != "last_token" {
+    if config.pooling != DENSE_POOLING_LAST_TOKEN {
         return Err(ApiError::InferenceInit {
             message: format!(
-                "models.dense.pooling must be last_token for Qwen3 embeddings, got {}",
+                "models.dense.pooling must be {DENSE_POOLING_LAST_TOKEN} for Qwen3 embeddings, got {}",
                 config.pooling
             ),
         });

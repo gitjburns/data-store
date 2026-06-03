@@ -8,7 +8,7 @@ use crate::{
     config::RerankerModelConfig,
     error::ApiError,
     inference::{
-        artifacts::ModelArtifacts,
+        artifacts::{CONFIG_FILE_NAME, ModelArtifacts},
         qwen3::{Qwen3Model, load_qwen3_config},
     },
 };
@@ -20,6 +20,7 @@ const PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</thi
 const SMOKE_QUERY: &str = "clear writing style rules";
 const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 const SMOKE_DISTRACTOR_DOCUMENT: &str = "A recipe lists ingredients and oven temperatures.";
+const LOGIT_SCORE_DIR_NAME: &str = "1_LogitScore";
 
 #[derive(Debug, Clone)]
 pub struct RerankerRuntime {
@@ -86,8 +87,12 @@ impl RerankerRuntime {
             ))
         })?;
         let qwen_config = load_qwen3_config("reranker", &artifacts.config_path)?;
-        let logit_config =
-            load_logit_score_config(&artifacts.root.join("1_LogitScore/config.json"))?;
+        let logit_config = load_logit_score_config(
+            &artifacts
+                .root
+                .join(LOGIT_SCORE_DIR_NAME)
+                .join(CONFIG_FILE_NAME),
+        )?;
         let model = Qwen3Model::load("reranker", &qwen_config, artifacts, device, Some("model"))?;
         let mut runtime = Self {
             tokenizer,

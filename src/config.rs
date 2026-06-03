@@ -98,9 +98,9 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DoclingConfig {
-    /// Python executable used to launch Docling.
+    /// Python executable recorded for the configured Docling environment.
     pub python_path: PathBuf,
-    /// Docling executable used for PDF conversion.
+    /// Docling executable launched directly for PDF conversion.
     pub docling_path: PathBuf,
     /// PDF backend selected by service config rather than callers.
     pub default_pdf_backend: String,

@@ -31,6 +31,14 @@ use crate::{
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+const INGEST_STATUS_INGESTED: &str = "ingested";
+const SHUTDOWN_STATUS_SHUTTING_DOWN: &str = "shutting_down";
+const ROLLBACK_STATUS_ROLLED_BACK: &str = "rolled_back";
+const SEARCH_MODE_FULL_RETRIEVAL: &str = "dense_bm25_rrf_colbert_reranker";
+const COLBERT_MODE_PERSISTED_MAXSIM: &str = "persisted_candidate_pool_maxsim";
+const COLBERT_DOCUMENT_VECTOR_SOURCE_SQLITE: &str = "sqlite";
+const RERANKER_MODE_QWEN3_YES_NO: &str = "qwen3_yes_no_candidate_rerank";
+const RERANKER_CANDIDATE_SOURCE_COLBERT_POOL: &str = "colbert_ranked_candidate_pool";
 
 /// Build the Axum router for the versioned HTTP API and protected admin controls.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -210,7 +218,7 @@ async fn post_ingest(
             .unwrap_or(versioned_document_id),
         version_label,
         units_ingested: units.len() as u32,
-        status: "ingested".to_string(),
+        status: INGEST_STATUS_INGESTED.to_string(),
     }))
 }
 
@@ -293,7 +301,7 @@ async fn post_search(
     let latency_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::json!({
         "search": {
-            "mode": "dense_bm25_rrf_colbert_reranker",
+            "mode": SEARCH_MODE_FULL_RETRIEVAL,
             "topK": top_k,
             "admission": {
                 "inFlight": admission.in_flight,
@@ -306,8 +314,8 @@ async fn post_search(
         },
         "storage": storage_output.raw,
         "colbert": {
-            "mode": "persisted_candidate_pool_maxsim",
-            "documentVectorSource": "sqlite",
+            "mode": COLBERT_MODE_PERSISTED_MAXSIM,
+            "documentVectorSource": COLBERT_DOCUMENT_VECTOR_SOURCE_SQLITE,
             "candidateCount": storage_output.candidates.len(),
             "scores": colbert_scores.iter().map(|score| {
                 serde_json::json!({
@@ -321,8 +329,8 @@ async fn post_search(
             "rankedCandidateCount": colbert_scores.len()
         },
         "reranker": {
-            "mode": "qwen3_yes_no_candidate_rerank",
-            "candidateSource": "colbert_ranked_candidate_pool",
+            "mode": RERANKER_MODE_QWEN3_YES_NO,
+            "candidateSource": RERANKER_CANDIDATE_SOURCE_COLBERT_POOL,
             "candidateCount": reranker_scores.len(),
             "scores": reranker_scores.iter().map(|score| {
                 serde_json::json!({
@@ -426,7 +434,7 @@ fn build_reranker_results(
         };
         results.push(SearchResult {
             unit_id: candidate.unit_id.clone(),
-            // Phase 14 makes Qwen3 yes/no reranker probability the public score after ColBERT candidate reranking.
+            // The public score is the final Qwen3 yes/no probability after ColBERT candidate reranking.
             score: score.score,
             content: candidate.content.clone(),
             heading_path: candidate.heading_path.clone(),
@@ -467,7 +475,7 @@ async fn post_admin_shutdown(
     info!(event = "admin.shutdown.accepted", "admin shutdown accepted");
 
     Ok(Json(ShutdownResponse {
-        status: "shutting_down".to_string(),
+        status: SHUTDOWN_STATUS_SHUTTING_DOWN.to_string(),
     }))
 }
 
@@ -513,7 +521,7 @@ async fn post_admin_document_version_rollback(
         active_version_label: rollback.active_version_label,
         published_at_ms: rollback.published_at_ms,
         vector_count: rollback.vector_count,
-        status: "rolled_back".to_string(),
+        status: ROLLBACK_STATUS_ROLLED_BACK.to_string(),
     }))
 }
 

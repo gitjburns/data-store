@@ -31,9 +31,9 @@ corpus_root = "/absolute/path/to/corpus"
 index_root = "/absolute/path/to/indexes"
 
 [docling]
-# Python executable used to launch the configured Docling command.
+# Python executable recorded for the configured Docling environment.
 python_path = "/absolute/path/to/python"
-# Docling executable used for PDF-to-markdown conversion.
+# Docling executable launched directly for PDF-to-markdown conversion.
 docling_path = "/absolute/path/to/docling"
 # Service-selected PDF backend; callers cannot override this per request.
 default_pdf_backend = "docling_parse"

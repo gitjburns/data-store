@@ -318,6 +318,9 @@ const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
 const EXPECTED_SCHEMA_VERSION: i64 = 3;
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
 const COLBERT_DOCUMENT_VECTOR_FORMAT: &str = "little_endian_f32_row_major";
+const DOCUMENT_STATUS_INGESTED: &str = "ingested";
+const RETRIEVAL_MODE_DENSE_BM25_RRF_POOL: &str = "dense_bm25_rrf_candidate_pool";
+const F32_BYTE_WIDTH: usize = std::mem::size_of::<f32>();
 const STORAGE_SCHEMA_SQL: &str = include_str!("../sql/schema.sql");
 const ENABLE_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_keys = ON;";
 const GET_SCHEMA_VERSION_SQL: &str = "PRAGMA user_version;";
@@ -449,7 +452,7 @@ INSERT INTO document_versions (
   source_path, version_label, document_id, source_sha256, markdown_path, markdown_sha256,
   pdf_backend, ocr_mode, page_batch_size, units_ingested, status,
   diagnostics_json, created_at_ms, updated_at_ms
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ingested', ?11, ?12, ?13)";
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 const INSERT_UNIT_SQL: &str = "
 INSERT INTO units (
   unit_id, document_id, source_path, version_label, sequence,
@@ -1311,7 +1314,7 @@ impl StorageRuntime {
     fn build_search_raw(&self, input: SearchRawInput<'_>) -> Result<serde_json::Value, ApiError> {
         Ok(serde_json::json!({
             "retrieval": {
-                "mode": "dense_bm25_rrf_candidate_pool",
+                "mode": RETRIEVAL_MODE_DENSE_BM25_RRF_POOL,
                 "latencyMs": input.latency_ms,
                 "denseLatencyMs": input.dense_latency_ms,
                 "bm25LatencyMs": input.bm25_latency_ms,
@@ -2643,6 +2646,7 @@ fn insert_document(
             &conversion.options.ocr_mode,
             conversion.options.page_batch_size.map(i64::from),
             units_ingested as i64,
+            DOCUMENT_STATUS_INGESTED,
             diagnostics_json,
             timestamp_ms as i64,
             timestamp_ms as i64,
@@ -2861,7 +2865,12 @@ fn validate_norm(unit_id: &str, norm: f32) -> Result<f32, String> {
 
 /// Encode one vector as contiguous little-endian f32 bytes.
 fn encode_vector_blob(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    encode_f32_blob(vector)
+}
+
+/// Encode contiguous f32 values using the SQLite little-endian blob contract.
+fn encode_f32_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * F32_BYTE_WIDTH);
     for value in vector {
         bytes.extend(value.to_le_bytes());
     }
@@ -2880,18 +2889,7 @@ fn decode_vector_blob(
             "dense vector {unit_id} has dimension {row_dimension}, expected {expected_dimension}"
         ));
     }
-    let expected_bytes = expected_dimension * std::mem::size_of::<f32>();
-    if blob.len() != expected_bytes {
-        return Err(format!(
-            "dense vector {unit_id} has byte length {}, expected {expected_bytes}",
-            blob.len()
-        ));
-    }
-
-    let mut vector = Vec::with_capacity(expected_dimension);
-    for bytes in blob.chunks_exact(std::mem::size_of::<f32>()) {
-        vector.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-    }
+    let vector = decode_f32_blob(blob, expected_dimension, &format!("dense vector {unit_id}"))?;
     validate_vector(unit_id.to_string(), vector, expected_dimension).map(|value| value.vector)
 }
 
@@ -2911,18 +2909,11 @@ fn decode_colbert_document_vector_blob(
     let expected_values = token_count
         .checked_mul(expected_dimension)
         .ok_or_else(|| format!("ColBERT document vector {unit_id} token matrix size overflow"))?;
-    let expected_bytes = expected_values * std::mem::size_of::<f32>();
-    if blob.len() != expected_bytes {
-        return Err(format!(
-            "ColBERT document vector {unit_id} has byte length {}, expected {expected_bytes}",
-            blob.len()
-        ));
-    }
-
-    let mut vector = Vec::with_capacity(expected_values);
-    for bytes in blob.chunks_exact(std::mem::size_of::<f32>()) {
-        vector.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-    }
+    let vector = decode_f32_blob(
+        blob,
+        expected_values,
+        &format!("ColBERT document vector {unit_id}"),
+    )?;
     validate_colbert_document_vector(
         UnitColbertDocumentVector {
             unit_id: unit_id.to_string(),
@@ -2934,6 +2925,25 @@ fn decode_colbert_document_vector_blob(
     )
     .map(|value| value.vector)
     .map_err(|source| source.to_string())
+}
+
+/// Decode contiguous little-endian f32 values before domain-specific vector validation.
+fn decode_f32_blob(blob: &[u8], expected_values: usize, label: &str) -> Result<Vec<f32>, String> {
+    let expected_bytes = expected_values
+        .checked_mul(F32_BYTE_WIDTH)
+        .ok_or_else(|| format!("{label} byte length overflow"))?;
+    if blob.len() != expected_bytes {
+        return Err(format!(
+            "{label} has byte length {}, expected {expected_bytes}",
+            blob.len()
+        ));
+    }
+
+    let mut vector = Vec::with_capacity(expected_values);
+    for bytes in blob.chunks_exact(F32_BYTE_WIDTH) {
+        vector.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    }
+    Ok(vector)
 }
 
 /// Return a lowercase SHA-256 hex digest for durable document metadata.

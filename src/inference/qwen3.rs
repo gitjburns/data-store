@@ -4,7 +4,13 @@ use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_no_bias};
 use serde::Deserialize;
 
-use crate::{error::ApiError, inference::artifacts::ModelArtifacts};
+use crate::{
+    error::ApiError,
+    inference::{
+        artifacts::ModelArtifacts,
+        tensor_ops::{apply_rope, softmax_last_dim_metal_safe},
+    },
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3Config {
@@ -358,8 +364,10 @@ impl Qwen3Attention {
             .and_then(|tensor| tensor.transpose(1, 2))
             .map_err(|source| inference_error(format!("{label} v projection failed: {source}")))?;
 
-        let q = apply_rope(&q, self.rope_theta, label)?;
-        let k = apply_rope(&k, self.rope_theta, label)?;
+        let q = apply_rope(&q, self.rope_theta)
+            .map_err(|source| inference_error(format!("{label} query rope failed: {source}")))?;
+        let k = apply_rope(&k, self.rope_theta)
+            .map_err(|source| inference_error(format!("{label} key rope failed: {source}")))?;
         let k = repeat_kv_heads(
             &k,
             self.num_attention_heads,
@@ -525,63 +533,6 @@ fn validate_qwen3_config(label: &str, config: &Qwen3Config) -> Result<(), ApiErr
     Ok(())
 }
 
-/// Apply Qwen/Llama rotary position embeddings to query or key states.
-fn apply_rope(states: &Tensor, theta: f64, label: &str) -> Result<Tensor, ApiError> {
-    let (_, _, seq_len, head_dim) = states
-        .dims4()
-        .map_err(|source| inference_error(format!("{label} rope shape error: {source}")))?;
-    let device = states.device();
-    let dtype = states.dtype();
-    let half_dim = head_dim / 2;
-    let mut cos = Vec::with_capacity(seq_len * head_dim);
-    let mut sin = Vec::with_capacity(seq_len * head_dim);
-    for position in 0..seq_len {
-        for dim in 0..head_dim {
-            let freq_index = dim % half_dim;
-            let inv_freq = theta.powf(-(2.0 * freq_index as f64) / head_dim as f64);
-            let angle = position as f64 * inv_freq;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-
-    let cos = Tensor::from_vec(cos, (1, 1, seq_len, head_dim), device)
-        .and_then(|tensor| tensor.to_dtype(dtype))
-        .map_err(|source| {
-            inference_error(format!("failed to build {label} rope cosines: {source}"))
-        })?;
-    let sin = Tensor::from_vec(sin, (1, 1, seq_len, head_dim), device)
-        .and_then(|tensor| tensor.to_dtype(dtype))
-        .map_err(|source| {
-            inference_error(format!("failed to build {label} rope sines: {source}"))
-        })?;
-    let rotated = rotate_half(states, label)?;
-    states
-        .broadcast_mul(&cos)
-        .and_then(|left| rotated.broadcast_mul(&sin).and_then(|right| left + right))
-        .map_err(|source| inference_error(format!("failed to apply {label} rope: {source}")))
-}
-
-/// Rotate the final dimension as `[-x2, x1]` for rotary embedding.
-fn rotate_half(states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
-    let (_, _, _, head_dim) = states
-        .dims4()
-        .map_err(|source| inference_error(format!("{label} rotate-half shape error: {source}")))?;
-    let half_dim = head_dim / 2;
-    let first = states.narrow(3, 0, half_dim).map_err(|source| {
-        inference_error(format!("{label} rotate-half first split failed: {source}"))
-    })?;
-    let second = states
-        .narrow(3, half_dim, half_dim)
-        .and_then(|tensor| tensor.neg())
-        .map_err(|source| {
-            inference_error(format!("{label} rotate-half second split failed: {source}"))
-        })?;
-
-    Tensor::cat(&[&second, &first], 3)
-        .map_err(|source| inference_error(format!("{label} rotate-half concat failed: {source}")))
-}
-
 /// Repeat grouped key/value heads so attention heads can consume them directly.
 fn repeat_kv_heads(
     states: &Tensor,
@@ -620,15 +571,6 @@ fn apply_causal_mask(scores: &Tensor, seq_len: usize) -> candle_core::Result<Ten
     let mask =
         Tensor::from_vec(values, (1, 1, seq_len, seq_len), device)?.to_dtype(scores.dtype())?;
     scores.broadcast_add(&mask)
-}
-
-/// Apply softmax over the final dimension without Candle's Metal-unsupported fused op.
-fn softmax_last_dim_metal_safe(scores: &Tensor) -> candle_core::Result<Tensor> {
-    let output_dtype = scores.dtype();
-    let scores = scores.to_dtype(DType::F32)?;
-    let exp = scores.exp()?;
-    let denominator = exp.sum_keepdim(D::Minus1)?;
-    exp.broadcast_div(&denominator)?.to_dtype(output_dtype)
 }
 
 /// Convert a Candle or tokenizer failure into the service inference error shape.

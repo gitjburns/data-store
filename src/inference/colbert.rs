@@ -10,7 +10,14 @@ use safetensors::{Dtype as SafeTensorDType, SafeTensors};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::{config::ColbertModelConfig, error::ApiError, inference::artifacts::ModelArtifacts};
+use crate::{
+    config::ColbertModelConfig,
+    error::ApiError,
+    inference::{
+        artifacts::{CONFIG_FILE_NAME, ModelArtifacts, TOKENIZER_FILE_NAME},
+        tensor_ops::{apply_rope, softmax_last_dim_metal_safe},
+    },
+};
 
 const QUERY_PROMPT: &str = "search_query: ";
 const DOCUMENT_PROMPT: &str = "search_document: ";
@@ -23,6 +30,10 @@ const EXPECTED_PROJECTION_DIMENSION: usize = 128;
 const EXPECTED_TOKENIZER_MAX_LENGTH: usize = 518;
 const SMOKE_QUERY: &str = "clear writing style rules";
 const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
+const PROJECTION_DIR_NAME: &str = "1_Dense";
+const PROJECTION_MODEL_FILE_NAME: &str = "model.safetensors";
+const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
+const SENTENCE_BERT_CONFIG_FILE_NAME: &str = "sentence_bert_config.json";
 
 #[derive(Debug, Clone)]
 pub struct ColbertRuntime {
@@ -635,8 +646,12 @@ impl ColbertAttentionPrimitive {
         let q = self.split_attention_projection(&qkv, 0, seq_len, label, "query")?;
         let k = self.split_attention_projection(&qkv, hidden_size, seq_len, label, "key")?;
         let v = self.split_attention_projection(&qkv, hidden_size * 2, seq_len, label, "value")?;
-        let q = apply_rope(&q, self.rope_theta, label)?;
-        let k = apply_rope(&k, self.rope_theta, label)?;
+        let q = apply_rope(&q, self.rope_theta).map_err(|source| {
+            inference_error(format!("ColBERT {label} query rope failed: {source}"))
+        })?;
+        let k = apply_rope(&k, self.rope_theta).map_err(|source| {
+            inference_error(format!("ColBERT {label} key rope failed: {source}"))
+        })?;
         let attention_output = self.attention_output_by_head(&q, &k, &v, seq_len, label)?;
         let projected = self.out_proj.forward(&attention_output).map_err(|source| {
             inference_error(format!(
@@ -1092,9 +1107,9 @@ impl ColbertProjection {
         config: &ColbertModelConfig,
         device: &Device,
     ) -> Result<Self, ApiError> {
-        let projection_dir = artifacts.root.join("1_Dense");
-        let projection_config_path = projection_dir.join("config.json");
-        let projection_path = projection_dir.join("model.safetensors");
+        let projection_dir = artifacts.root.join(PROJECTION_DIR_NAME);
+        let projection_config_path = projection_dir.join(CONFIG_FILE_NAME);
+        let projection_path = projection_dir.join(PROJECTION_MODEL_FILE_NAME);
         let projection_config = load_projection_config(&projection_config_path)?;
         validate_projection_config(&projection_config, config)?;
         validate_projection_safetensor(&projection_path, &projection_config)?;
@@ -1294,20 +1309,21 @@ fn validate_tokenizer_contract(
     artifacts: &ModelArtifacts,
     config: &ColbertModelConfig,
 ) -> Result<(), ApiError> {
-    let tokenizer_json = read_json_file(&artifacts.tokenizer_path, "ColBERT tokenizer.json")?;
+    let tokenizer_label = format!("ColBERT {TOKENIZER_FILE_NAME}");
+    let tokenizer_json = read_json_file(&artifacts.tokenizer_path, &tokenizer_label)?;
     let tokenizer_max = json_usize_at(
         &tokenizer_json,
         &["truncation", "max_length"],
         "tokenizer.json truncation.max_length",
     )?;
-    let tokenizer_config_path = artifacts.root.join("tokenizer_config.json");
+    let tokenizer_config_path = artifacts.root.join(TOKENIZER_CONFIG_FILE_NAME);
     let tokenizer_config = read_json_file(&tokenizer_config_path, "ColBERT tokenizer_config.json")?;
     let tokenizer_config_max = json_usize_at(
         &tokenizer_config,
         &["model_max_length"],
         "tokenizer_config.json model_max_length",
     )?;
-    let sentence_config_path = artifacts.root.join("sentence_bert_config.json");
+    let sentence_config_path = artifacts.root.join(SENTENCE_BERT_CONFIG_FILE_NAME);
     let sentence_config =
         read_json_file(&sentence_config_path, "ColBERT sentence_bert_config.json")?;
     let sentence_max = json_usize_at(
@@ -1603,76 +1619,6 @@ fn tokenize_formatted(
     Ok(ids)
 }
 
-/// Apply ModernBERT rotary position embeddings to query or key states.
-fn apply_rope(states: &Tensor, theta: f64, label: &str) -> Result<Tensor, ApiError> {
-    let (_, _, seq_len, head_dim) = states
-        .dims4()
-        .map_err(|source| inference_error(format!("ColBERT {label} rope shape error: {source}")))?;
-    let device = states.device();
-    let dtype = states.dtype();
-    let half_dim = head_dim / 2;
-    let mut cos = Vec::with_capacity(seq_len * head_dim);
-    let mut sin = Vec::with_capacity(seq_len * head_dim);
-    for position in 0..seq_len {
-        for dim in 0..head_dim {
-            let freq_index = dim % half_dim;
-            let inv_freq = theta.powf(-(2.0 * freq_index as f64) / head_dim as f64);
-            let angle = position as f64 * inv_freq;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-
-    let cos = Tensor::from_vec(cos, (1, 1, seq_len, head_dim), device)
-        .and_then(|tensor| tensor.to_dtype(dtype))
-        .map_err(|source| {
-            inference_error(format!(
-                "failed to build ColBERT {label} rope cosines: {source}"
-            ))
-        })?;
-    let sin = Tensor::from_vec(sin, (1, 1, seq_len, head_dim), device)
-        .and_then(|tensor| tensor.to_dtype(dtype))
-        .map_err(|source| {
-            inference_error(format!(
-                "failed to build ColBERT {label} rope sines: {source}"
-            ))
-        })?;
-    let rotated = rotate_half(states, label)?;
-    states
-        .broadcast_mul(&cos)
-        .and_then(|left| rotated.broadcast_mul(&sin).and_then(|right| left + right))
-        .map_err(|source| {
-            inference_error(format!("failed to apply ColBERT {label} rope: {source}"))
-        })
-}
-
-/// Rotate the final dimension as `[-x2, x1]` for rotary embedding.
-fn rotate_half(states: &Tensor, label: &str) -> Result<Tensor, ApiError> {
-    let (_, _, _, head_dim) = states.dims4().map_err(|source| {
-        inference_error(format!("ColBERT {label} rotate-half shape error: {source}"))
-    })?;
-    let half_dim = head_dim / 2;
-    let first = states.narrow(3, 0, half_dim).map_err(|source| {
-        inference_error(format!(
-            "ColBERT {label} rotate-half first split failed: {source}"
-        ))
-    })?;
-    let second = states
-        .narrow(3, half_dim, half_dim)
-        .and_then(|tensor| tensor.neg())
-        .map_err(|source| {
-            inference_error(format!(
-                "ColBERT {label} rotate-half second split failed: {source}"
-            ))
-        })?;
-
-    Tensor::cat(&[&second, &first], 3).map_err(|source| {
-        inference_error(format!(
-            "ColBERT {label} rotate-half concat failed: {source}"
-        ))
-    })
-}
-
 /// Apply ModernBERT's local bidirectional window mask to attention scores.
 fn apply_local_attention_mask(
     scores: &Tensor,
@@ -1699,15 +1645,6 @@ fn apply_local_attention_mask(
     }
     let mask = Tensor::from_vec(values, (seq_len, seq_len), device)?.to_dtype(scores.dtype())?;
     scores.broadcast_add(&mask)
-}
-
-/// Apply softmax over the final dimension without relying on fused kernels.
-fn softmax_last_dim_metal_safe(scores: &Tensor) -> candle_core::Result<Tensor> {
-    let output_dtype = scores.dtype();
-    let scores = scores.to_dtype(DType::F32)?;
-    let exp = scores.exp()?;
-    let denominator = exp.sum_keepdim(D::Minus1)?;
-    exp.broadcast_div(&denominator)?.to_dtype(output_dtype)
 }
 
 /// Verify that one smoke tensor is finite and return compact magnitude diagnostics.

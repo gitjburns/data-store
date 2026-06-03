@@ -36,7 +36,7 @@ and should point at:
 - local model directories for Qwen3 embedding, ColBERT-Zero, and Qwen3 reranker
 - a service-owned corpus root for source files
 - a service-owned index root for SQLite and Docling conversion artifacts
-- Python and Docling executables
+- the Python executable for environment diagnostics and the directly launched Docling executable
 - the selected accelerator backend and device index
 - required request, retrieval, admission, and logging limits
 

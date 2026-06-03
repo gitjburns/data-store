@@ -7,6 +7,10 @@ use tokenizers::Tokenizer;
 
 use crate::{config::ModelConfig, error::ApiError};
 
+pub const CONFIG_FILE_NAME: &str = "config.json";
+pub const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
+pub const SAFETENSORS_EXTENSION: &str = "safetensors";
+
 #[derive(Debug, Clone)]
 pub struct ModelArtifactSet {
     pub dense: ModelArtifacts,
@@ -52,11 +56,11 @@ impl ModelArtifacts {
             });
         }
 
-        let config_path = root.join("config.json");
-        require_file(name, "config.json", &config_path)?;
+        let config_path = root.join(CONFIG_FILE_NAME);
+        require_file(name, CONFIG_FILE_NAME, &config_path)?;
 
-        let tokenizer_path = root.join("tokenizer.json");
-        require_file(name, "tokenizer.json", &tokenizer_path)?;
+        let tokenizer_path = root.join(TOKENIZER_FILE_NAME);
+        require_file(name, TOKENIZER_FILE_NAME, &tokenizer_path)?;
         Tokenizer::from_file(&tokenizer_path).map_err(|source| ApiError::InferenceInit {
             message: format!(
                 "failed to load {name} tokenizer at {}: {source}",
@@ -119,7 +123,8 @@ fn find_safetensors(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
 
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors") {
+        if path.extension().and_then(|extension| extension.to_str()) == Some(SAFETENSORS_EXTENSION)
+        {
             paths.push(path);
         }
     }

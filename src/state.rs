@@ -252,15 +252,12 @@ impl AdmissionGate {
     }
 }
 
-/// Compare secrets without data-dependent early return.
+/// Compare one submitted token against the expected token without short-circuiting mismatched bytes.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (left_value, right_value) in left.iter().zip(right.iter()) {
-        diff |= left_value ^ right_value;
+    let mut diff = left.len() ^ right.len();
+    for (index, right_value) in right.iter().enumerate() {
+        let left_value = left.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_value ^ right_value);
     }
 
     diff == 0

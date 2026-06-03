@@ -4,6 +4,7 @@ mod dense;
 mod device;
 mod qwen3;
 mod reranker;
+mod tensor_ops;
 
 use crate::{config::ServiceConfig, error::ApiError};
 

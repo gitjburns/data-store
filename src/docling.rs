@@ -156,7 +156,7 @@ fn build_docling_args(
     args
 }
 
-/// Run Docling as a child process with no stdin and no shell interpretation.
+/// Run the configured Docling executable directly with no stdin and no shell interpretation.
 ///
 /// The caller owns diagnostic truncation so success and failure paths preserve the same output shape.
 async fn run_docling(
@@ -174,7 +174,7 @@ async fn run_docling(
         .await
         .map_err(|source| ApiError::DoclingUnavailable {
             message: format!(
-                "Docling CLI failed to start at {} with python_path {}: {source}",
+                "Docling CLI failed to start at {}; configured python_path is {}: {source}",
                 config.docling_path.display(),
                 config.python_path.display()
             ),
