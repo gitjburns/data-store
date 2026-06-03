@@ -9,6 +9,9 @@ Node-backed Data Store.
 Backend/frontend integration is later scope. Do not expect this service to be
 started or managed by the Node app yet.
 
+Run commands in this document from `service/data-store/` unless stated
+otherwise.
+
 ## Capabilities
 
 - Axum/Tokio HTTP API for health, limits, ingest, search, protected admin
@@ -29,9 +32,8 @@ started or managed by the Node app yet.
 
 ## Prerequisites
 
-Create a local `service/data-store/config.toml` from
-`service/data-store/config.example.toml`. The local config is machine-specific
-and should point at:
+Create a local `config.toml` from `config.example.toml`. The local config is
+machine-specific and should point at:
 
 - local model directories for Qwen3 embedding, ColBERT-Zero, and Qwen3 reranker
 - a service-owned corpus root for source files
@@ -49,7 +51,7 @@ work; this runbook documents the locally used Metal path.
 Run schema setup deliberately before normal service startup:
 
 ```bash
-cargo run --manifest-path service/data-store/Cargo.toml -- --config service/data-store/config.toml --setup-storage
+cargo run -- --config config.toml --setup-storage
 ```
 
 Normal runtime never creates tables, runs migrations, or repairs stale schemas.
@@ -59,7 +61,25 @@ error, stop the service and run the setup command intentionally.
 ## Start The Service
 
 ```bash
-cargo run --manifest-path service/data-store/Cargo.toml --features metal -- --config service/data-store/config.toml
+cargo run --features metal -- --config config.toml
+```
+
+## Build A Binary
+
+`cargo run` is convenient during development because it builds and starts the
+service in one command. For sustained manual operation, build a reusable release
+binary and run it directly:
+
+```bash
+cargo build --release --features metal
+./target/release/data-store --config config.toml
+```
+
+The compiled binary uses the same command-line flags as `cargo run`. Run
+first-time storage setup with the release binary when needed:
+
+```bash
+./target/release/data-store --config config.toml --setup-storage
 ```
 
 Startup prints bootstrap details to stdout before the service binds:
@@ -76,8 +96,8 @@ not written to config, SQLite, or the service log.
 
 Operational events after file logging initialization are written to the
 configured `[logging].file_path`. Relative log paths resolve from the Rust
-service root, so `logs/data-store.log` resolves to
-`service/data-store/logs/data-store.log`.
+service root, so `logs/data-store.log` resolves to `logs/data-store.log` inside
+this directory.
 
 ## Health And Limits
 
@@ -182,9 +202,9 @@ requiring a process signal.
 ## Verify
 
 ```bash
-cargo fmt --manifest-path service/data-store/Cargo.toml
-cargo check --manifest-path service/data-store/Cargo.toml
-cargo check --manifest-path service/data-store/Cargo.toml --features metal
+cargo fmt
+cargo check
+cargo check --features metal
 ```
 
 ## Common Operator Diagnostics
