@@ -6,97 +6,168 @@ use crate::error::ApiError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
+    /// HTTP bind address, request limits, and synchronous admission limits.
     pub server: ServerConfig,
+    /// File-backed service logging settings used after bootstrap stdout output.
+    pub logging: LoggingConfig,
+    /// Accelerator selection for all model runtimes.
     pub inference: InferenceConfig,
+    /// Corpus and durable index/artifact paths owned by the service.
     pub storage: StorageConfig,
+    /// Docling executable and PDF conversion defaults.
     pub docling: DoclingConfig,
+    /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,
+    /// Retrieval ranking, candidate-pool, and unit-sizing parameters.
     pub retrieval: RetrievalConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct CliOptions {
+    /// TOML config path supplied on the command line or defaulted to config.toml.
     pub config_path: PathBuf,
+    /// Run inference readiness smoke checks without binding HTTP.
     pub smoke_dense: bool,
+    /// Create or validate the development SQLite schema through the explicit setup path.
     pub setup_storage: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    /// Socket address where Axum binds the standalone service.
     pub bind_address: SocketAddr,
+    /// HTTP body limit applied before request JSON is accepted.
     pub max_request_body_bytes: usize,
+    /// Maximum length of an ingest source reference after JSON parsing.
     pub max_ingest_source_chars: u32,
+    /// Maximum length of a search query after JSON parsing.
     pub max_search_query_chars: u32,
+    /// Non-queueing limit for concurrent synchronous ingest operations.
     pub max_in_flight_ingest: u32,
+    /// Non-queueing limit for concurrent synchronous search operations.
     pub max_in_flight_search: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    /// Service log file path; relative paths are resolved against the Rust service root.
+    pub file_path: PathBuf,
+    /// Minimum event level written to the service log file.
+    pub level: LoggingLevel,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingLevel {
+    /// Include every tracing event, including very verbose diagnostics.
+    Trace,
+    /// Include debug, info, warning, and error events.
+    Debug,
+    /// Include normal operational events, warnings, and errors.
+    Info,
+    /// Include warnings and errors only.
+    Warn,
+    /// Include errors only.
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct InferenceConfig {
+    /// Explicit accelerator backend. CPU fallback is intentionally unsupported.
     pub device: InferenceDeviceKind,
+    /// Device index passed to the selected accelerator backend.
     pub device_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceDeviceKind {
+    /// NVIDIA CUDA backend selected by the cuda Cargo feature.
     Cuda,
+    /// Apple Silicon Metal backend selected by the metal Cargo feature.
     Metal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
+    /// Root directory for corpus-relative source references.
     pub corpus_root: PathBuf,
+    /// Service-owned root for SQLite storage and generated conversion artifacts.
     pub index_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DoclingConfig {
+    /// Python executable used to launch Docling.
     pub python_path: PathBuf,
+    /// Docling executable used for PDF conversion.
     pub docling_path: PathBuf,
+    /// PDF backend selected by service config rather than callers.
     pub default_pdf_backend: String,
+    /// OCR behavior selected by service config: auto, on, or off.
     pub default_ocr_mode: String,
+    /// Optional Docling page batch size for conversion resource control.
     pub page_batch_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
+    /// Dense embedding model configuration.
     pub dense: DenseModelConfig,
+    /// ColBERT late-interaction model configuration.
     pub colbert: ColbertModelConfig,
+    /// Qwen3 yes/no reranker model configuration.
     pub reranker: RerankerModelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DenseModelConfig {
+    /// Local model artifact directory for Qwen3 dense embeddings.
     pub path: PathBuf,
+    /// Expected dense vector width.
     pub dimension: u32,
+    /// Runtime token cap for dense embedding inputs.
     pub max_tokens: u32,
+    /// Pooling contract validated by the service-local dense adapter.
     pub pooling: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ColbertModelConfig {
+    /// Local model artifact directory for ColBERT-Zero.
     pub path: PathBuf,
+    /// Expected ColBERT token-vector width.
     pub dimension: u32,
+    /// Runtime token cap for ColBERT query inputs.
     pub query_max_tokens: u32,
+    /// Runtime token cap for ColBERT document/unit inputs.
     pub document_max_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RerankerModelConfig {
+    /// Local model artifact directory for Qwen3 reranking.
     pub path: PathBuf,
+    /// Runtime token cap for reranker query/document pairs.
     pub max_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetrievalConfig {
+    /// Default public result count when callers omit topK.
     pub default_top_k: u32,
+    /// Maximum public result count allowed for one search request.
     pub max_top_k: u32,
+    /// Reciprocal Rank Fusion constant for dense and BM25 candidate lists.
     pub rrf_k: u32,
+    /// First-stage dense/BM25 over-fetch multiplier before RRF and reranking.
     pub candidate_overfetch_multiplier: u32,
     #[serde(default = "default_colbert_candidate_pool_size")]
+    /// Bounded RRF candidate pool size sent into ColBERT MaxSim.
     pub colbert_candidate_pool_size: u32,
+    /// Minimum unit text length retained as searchable content.
     pub min_search_unit_chars: u32,
+    /// Unit tokenizer cap aligned to ColBERT document capacity.
     pub max_unit_tokens: u32,
 }
 
@@ -143,6 +214,7 @@ impl ServiceConfig {
             "server.max_in_flight_search",
             self.server.max_in_flight_search,
         )?;
+        require_non_empty_path("logging.file_path", &self.logging.file_path)?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
         require_absolute_path("docling.python_path", &self.docling.python_path)?;
@@ -218,6 +290,35 @@ impl ServiceConfig {
     }
 }
 
+impl LoggingConfig {
+    /// Resolve the configured log path against the Rust service root when it is relative.
+    pub fn resolved_file_path(&self) -> PathBuf {
+        if self.file_path.is_absolute() {
+            return self.file_path.clone();
+        }
+
+        service_root().join(&self.file_path)
+    }
+}
+
+impl LoggingLevel {
+    /// Return the lowercase config spelling for bootstrap output and log diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Return the Rust crate root used as the base for service-relative paths.
+fn service_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
 /// Return the Phase 11F default bounded ColBERT reranking pool size.
 fn default_colbert_candidate_pool_size() -> u32 {
     100
@@ -271,6 +372,17 @@ fn require_absolute_path(label: &str, path: &PathBuf) -> Result<(), ApiError> {
 
     Err(ApiError::InvalidConfig {
         message: format!("{label} must be an absolute path"),
+    })
+}
+
+/// Ensure a path field is not the empty path.
+fn require_non_empty_path(label: &str, path: &PathBuf) -> Result<(), ApiError> {
+    if !path.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::InvalidConfig {
+        message: format!("{label} must be a non-empty path"),
     })
 }
 

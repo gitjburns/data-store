@@ -76,6 +76,7 @@ async fn post_ingest(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<Json<IngestResponse>, ApiError> {
+    let started = Instant::now();
     let Json(request) = payload.map_err(json_rejection_to_api_error)?;
     request.validate(state.config.server.max_ingest_source_chars)?;
     let _admission_permit = match state.try_acquire_ingest_admission() {
@@ -83,6 +84,7 @@ async fn post_ingest(
         Err(error) => {
             let admission = state.ingest_admission_snapshot();
             info!(
+                event = "ingest.admission_rejected",
                 in_flight = admission.in_flight,
                 max_in_flight = admission.max_in_flight,
                 error = %error,
@@ -93,6 +95,7 @@ async fn post_ingest(
     };
     let admission = state.ingest_admission_snapshot();
     info!(
+        event = "ingest.admitted",
         in_flight = admission.in_flight,
         max_in_flight = admission.max_in_flight,
         "ingest request admitted"
@@ -100,23 +103,32 @@ async fn post_ingest(
     state.inference()?;
     state.storage()?;
 
+    // Ingest stage timings isolate the slow external and model-backed work so a
+    // background service log can explain long synchronous requests.
+    let source_started = Instant::now();
     let source = resolve_source_reference(&state.config.storage, &request.source)?;
+    let source_resolution_latency_ms = source_started.elapsed().as_millis() as u64;
+    let conversion_started = Instant::now();
     let conversion = convert_source_to_markdown(
         &state.config.docling,
         &state.config.storage.index_root,
         source,
     )
     .await?;
+    let conversion_latency_ms = conversion_started.elapsed().as_millis() as u64;
+    let splitting_started = Instant::now();
     let base_units = split_conversion_into_units(
         &conversion,
         &state.config.retrieval,
         &state.config.models.colbert.path.join("tokenizer.json"),
     )?;
+    let splitting_latency_ms = splitting_started.elapsed().as_millis() as u64;
     let version_label = allocate_version_label()?;
     let versioned_document_id =
         build_versioned_document_id(&conversion.source.relative_path, &version_label);
     let units = assign_units_to_document_version(&base_units, &versioned_document_id);
     let inference = state.inference()?;
+    let dense_embedding_started = Instant::now();
     let vectors = units
         .iter()
         .map(|unit| {
@@ -129,6 +141,8 @@ async fn post_ingest(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let dense_embedding_latency_ms = dense_embedding_started.elapsed().as_millis() as u64;
+    let colbert_embedding_started = Instant::now();
     let colbert_vectors = units
         .iter()
         .map(|unit| {
@@ -149,6 +163,8 @@ async fn post_ingest(
         .map(|value| value.vector.len())
         .sum::<usize>();
     let storage = state.storage()?;
+    let colbert_embedding_latency_ms = colbert_embedding_started.elapsed().as_millis() as u64;
+    let storage_started = Instant::now();
     storage.ingest_document(
         &conversion,
         &version_label,
@@ -158,41 +174,34 @@ async fn post_ingest(
         &state.config.models.dense,
         &state.config.models.colbert,
     )?;
+    let storage_latency_ms = storage_started.elapsed().as_millis() as u64;
+    let latency_ms = started.elapsed().as_millis() as u64;
     let first_unit = units.first();
-    let last_unit = units.last();
 
+    // The log records an operational summary only. Full conversion diagnostics
+    // stay in durable ingest metadata rather than expanding the service log.
     info!(
+        event = "ingest.completed",
+        status = 200,
         requested_source = %conversion.source.requested,
         version_label = %version_label,
         relative_source = %conversion.source.relative_path.display(),
-        absolute_source = %conversion.source.absolute_path.display(),
-        output_dir = %conversion.output_dir.display(),
-        markdown_path = %conversion.markdown_path.display(),
         markdown_chars = conversion.markdown.chars().count(),
         pdf_backend = %conversion.options.pdf_backend,
         ocr_mode = %conversion.options.ocr_mode,
         page_batch_size = ?conversion.options.page_batch_size,
-        docling_args = ?conversion.args,
-        stdout = %conversion.stdout,
-        stderr = %conversion.stderr,
         units = units.len(),
-        first_unit_id = first_unit.map(|unit| unit.unit_id.as_str()).unwrap_or("none"),
-        first_unit_sequence = first_unit.map(|unit| unit.sequence),
-        first_unit_document_id = first_unit.map(|unit| unit.document_id.as_str()).unwrap_or("none"),
-        first_unit_source_path = first_unit.map(|unit| unit.source_path.as_str()).unwrap_or("none"),
-        first_unit_chars = first_unit.map(|unit| unit.content.chars().count()),
-        first_unit_tokens = first_unit.map(|unit| unit.token_count),
-        first_unit_heading_path = ?first_unit.map(|unit| &unit.heading_path),
-        first_unit_page_numbers = ?first_unit.map(|unit| &unit.page_numbers),
-        last_unit_id = last_unit.map(|unit| unit.unit_id.as_str()).unwrap_or("none"),
-        last_unit_sequence = last_unit.map(|unit| unit.sequence),
-        last_unit_chars = last_unit.map(|unit| unit.content.chars().count()),
-        last_unit_tokens = last_unit.map(|unit| unit.token_count),
-        last_unit_heading_path = ?last_unit.map(|unit| &unit.heading_path),
-        last_unit_page_numbers = ?last_unit.map(|unit| &unit.page_numbers),
+        document_id = first_unit.map(|unit| unit.document_id.as_str()).unwrap_or("none"),
         colbert_document_vectors = colbert_vector_count,
         colbert_document_vector_values = colbert_vector_values,
-        "Docling conversion, unit splitting, dense embedding, ColBERT document embedding, and SQLite ingest completed"
+        source_resolution_latency_ms,
+        conversion_latency_ms,
+        splitting_latency_ms,
+        dense_embedding_latency_ms,
+        colbert_embedding_latency_ms,
+        storage_latency_ms,
+        latency_ms,
+        "ingest completed"
     );
 
     Ok(Json(IngestResponse {
@@ -221,6 +230,7 @@ async fn post_search(
         Err(error) => {
             let admission = state.search_admission_snapshot();
             info!(
+                event = "search.admission_rejected",
                 in_flight = admission.in_flight,
                 max_in_flight = admission.max_in_flight,
                 error = %error,
@@ -231,6 +241,7 @@ async fn post_search(
     };
     let admission = state.search_admission_snapshot();
     info!(
+        event = "search.admitted",
         in_flight = admission.in_flight,
         max_in_flight = admission.max_in_flight,
         "search request admitted"
@@ -243,6 +254,8 @@ async fn post_search(
     let embedding_started = Instant::now();
     let query_vector = inference.dense.embed_query_vector(&request.query)?;
     let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
+    // Storage builds the dense/BM25/RRF pool and returns raw retrieval
+    // diagnostics for the API response; the log keeps only summary counts.
     let storage_output = storage.build_search_candidate_pool(
         &request.query,
         query_vector,
@@ -324,6 +337,23 @@ async fn post_search(
             "finalResults": final_result_raw
         }
     });
+    // Search logs avoid content and full candidate lists; the authoritative
+    // lossless retrieval diagnostics remain in SearchResponse.raw.
+    info!(
+        event = "search.completed",
+        status = 200,
+        top_k,
+        query_chars = request.query.chars().count(),
+        first_stage_candidates = storage_output.candidates.len(),
+        colbert_candidates = colbert_scores.len(),
+        reranker_candidates = reranker_scores.len(),
+        results = results.len(),
+        embedding_latency_ms,
+        colbert_latency_ms,
+        reranker_latency_ms,
+        latency_ms,
+        "search completed"
+    );
 
     Ok(Json(SearchResponse {
         results,
@@ -434,6 +464,7 @@ async fn post_admin_shutdown(
     let token = bearer_token_from_headers(&headers)?;
     state.authorize_admin_token(token)?;
     state.request_shutdown()?;
+    info!(event = "admin.shutdown.accepted", "admin shutdown accepted");
 
     Ok(Json(ShutdownResponse {
         status: "shutting_down".to_string(),
@@ -448,6 +479,10 @@ async fn get_admin_document_versions(
     let token = bearer_token_from_headers(&headers)?;
     state.authorize_admin_token(token)?;
     let storage = state.storage()?;
+    info!(
+        event = "admin.document_versions.listed",
+        "admin document versions listed"
+    );
 
     Ok(Json(storage.list_document_versions()?))
 }
@@ -464,6 +499,14 @@ async fn post_admin_document_version_rollback(
     request.validate(state.config.server.max_ingest_source_chars)?;
     let storage = state.storage()?;
     let rollback = storage.rollback_document_version(&request.source, &request.version_label)?;
+    info!(
+        event = "admin.document_version_rollback.completed",
+        source_path = %rollback.source_path,
+        active_version_label = %rollback.active_version_label,
+        published_at_ms = rollback.published_at_ms,
+        vector_count = rollback.vector_count,
+        "admin document version rollback completed"
+    );
 
     Ok(Json(DocumentVersionRollbackResponse {
         source_path: rollback.source_path,

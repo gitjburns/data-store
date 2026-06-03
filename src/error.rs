@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 use thiserror::Error;
+use tracing::{error, warn};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -93,16 +94,57 @@ impl ApiError {
             | Self::StorageOperation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// Return a stable error-kind label for service logs.
+    fn error_kind(&self) -> &'static str {
+        match self {
+            Self::ConfigRead { .. } => "config_read",
+            Self::ConfigParse { .. } => "config_parse",
+            Self::InvalidConfig { .. } => "invalid_config",
+            Self::InvalidCli { .. } => "invalid_cli",
+            Self::InferenceInit { .. } => "inference_init",
+            Self::SourceResolution { .. } => "source_resolution",
+            Self::DoclingUnavailable { .. } => "docling_unavailable",
+            Self::DoclingConversion { .. } => "docling_conversion",
+            Self::InternalIo { .. } => "internal_io",
+            Self::UnitSplitting { .. } => "unit_splitting",
+            Self::StorageInit { .. } => "storage_init",
+            Self::StorageOperation { .. } => "storage_operation",
+            Self::BadRequest { .. } => "bad_request",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::ServiceUnavailable { .. } => "service_unavailable",
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
     /// Render service errors as explicit JSON API responses.
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let error_kind = self.error_kind();
+        let message = self.to_string();
+        // Central response logging guarantees every failed HTTP request is
+        // visible even when the failing stage returned before its completion log.
+        if status.is_server_error() {
+            error!(
+                event = "api.error_response",
+                status = status.as_u16(),
+                error_kind,
+                error = %message,
+                "API error response"
+            );
+        } else {
+            warn!(
+                event = "api.error_response",
+                status = status.as_u16(),
+                error_kind,
+                error = %message,
+                "API error response"
+            );
+        }
         let body = ErrorBody {
-            error: ErrorDetail {
-                message: self.to_string(),
-            },
+            error: ErrorDetail { message },
         };
 
         (status, Json(body)).into_response()

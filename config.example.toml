@@ -1,47 +1,85 @@
 [server]
+# Socket address where the standalone HTTP service binds.
 bind_address = "127.0.0.1:8091"
+# Maximum accepted HTTP request body size before Axum returns 413.
 max_request_body_bytes = 16384
+# Maximum corpus-relative source reference length accepted by /v1/ingest.
 max_ingest_source_chars = 2048
+# Maximum query text length accepted by /v1/search.
 max_search_query_chars = 4096
+# Maximum number of synchronous ingest operations allowed to run at once.
 max_in_flight_ingest = 1
+# Maximum number of synchronous search operations allowed to run at once.
 max_in_flight_search = 1
 
+[logging]
+# Service log file. Relative paths resolve from the Rust service root.
+file_path = "logs/data-store.log"
+# Minimum service log level: trace, debug, info, warn, or error.
+level = "info"
+
 [inference]
+# Accelerator backend to use for model inference. CPU fallback is not supported.
 device = "metal"
+# Accelerator device index for the selected backend.
 device_index = 0
 
 [storage]
+# Corpus root containing source files addressed by corpus-relative ingest references.
 corpus_root = "/absolute/path/to/corpus"
+# Service-owned index root for SQLite storage and Docling conversion artifacts.
 index_root = "/absolute/path/to/indexes"
 
 [docling]
+# Python executable used to launch the configured Docling command.
 python_path = "/absolute/path/to/python"
+# Docling executable used for PDF-to-markdown conversion.
 docling_path = "/absolute/path/to/docling"
+# Service-selected PDF backend; callers cannot override this per request.
 default_pdf_backend = "docling_parse"
+# Service-selected OCR mode: auto lets Docling choose, on forces OCR, off disables it.
 default_ocr_mode = "auto"
+# Optional Docling page batch size for PDF conversion throughput/resource control.
 page_batch_size = 10
 
 [models.dense]
+# Local Qwen3 dense embedding model directory.
 path = "/absolute/path/to/qwen3-embedding-8b"
+# Expected dense embedding vector dimension.
 dimension = 4096
+# Maximum token count accepted by the dense runtime.
 max_tokens = 8192
+# Dense pooling contract; this service currently expects last-token pooling.
 pooling = "last_token"
 
 [models.colbert]
+# Local ColBERT-Zero model directory.
 path = "/absolute/path/to/colbert-zero"
+# Expected ColBERT token-vector dimension.
 dimension = 128
+# Maximum encoded query tokens for ColBERT query embedding.
 query_max_tokens = 512
+# Maximum encoded document/unit tokens for ColBERT document embedding.
 document_max_tokens = 512
 
 [models.reranker]
+# Local Qwen3 reranker model directory.
 path = "/absolute/path/to/qwen3-reranker-4b"
+# Maximum token count accepted by the reranker runtime.
 max_tokens = 32768
 
 [retrieval]
+# Default result count when /v1/search omits topK.
 default_top_k = 10
+# Maximum result count callers may request.
 max_top_k = 100
+# Reciprocal Rank Fusion constant used to combine dense and BM25 candidates.
 rrf_k = 60
+# Dense/BM25 first-stage over-fetch multiplier before RRF and reranking.
 candidate_overfetch_multiplier = 3
+# Maximum RRF candidate pool sent into ColBERT MaxSim reranking.
 colbert_candidate_pool_size = 100
+# Minimum unit content length retained as searchable text.
 min_search_unit_chars = 400
+# Maximum retrieval-unit size, aligned to ColBERT document token capacity.
 max_unit_tokens = 512

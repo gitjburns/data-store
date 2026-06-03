@@ -860,7 +860,11 @@ impl StorageRuntime {
         let dense_dimension = dense.dimension as usize;
         let cache = DenseVectorCache::load(&connection, dense_dimension)?;
 
+        // This startup event is the durable/cache readiness boundary for
+        // background operators: schema validation succeeded and active vectors
+        // are resident in memory.
         info!(
+            event = "storage.opened",
             db_path = %db_path.display(),
             vectors = cache.unit_ids.len(),
             dimension = cache.dimension,
@@ -990,9 +994,15 @@ impl StorageRuntime {
         let published_at_ms =
             self.publish_source_version_with_vectors(source_path, version_label, stored_vectors)?;
 
+        // Rollback publishes an already-retained immutable version; it never
+        // rewrites embeddings or deletes inactive versions.
         info!(
+            event = "storage.document_version_rollback.published",
             source_path,
-            version_label, vector_count, published_at_ms, "document version rolled back"
+            version_label,
+            vector_count,
+            published_at_ms,
+            "document version rolled back"
         );
 
         Ok(DocumentVersionRollbackResult {
@@ -1107,6 +1117,17 @@ impl StorageRuntime {
             storage_operation_error(format!("failed to commit ingest transaction: {source}"))
         })?;
         self.publish_document_version(&source_path, version_label, stored_vectors)?;
+        // Publish is logged after both the durable transaction and active-cache
+        // swap complete, so search requests admitted after this event can see
+        // the new version.
+        info!(
+            event = "storage.ingest_version.published",
+            source_path,
+            version_label,
+            document_id,
+            units = units.len(),
+            "ingested document version published"
+        );
 
         Ok(())
     }
