@@ -32,6 +32,30 @@ impl InferenceRuntime {
         Self::initialize_with_progress(config, &mut progress)
     }
 
+    /// Initialize only the configured accelerator and ColBERT runtime for isolated diagnostics.
+    #[allow(dead_code)]
+    pub fn initialize_colbert_only_with_progress(
+        config: &ServiceConfig,
+        progress: InferenceProgress<'_>,
+    ) -> Result<ColbertRuntime, ApiError> {
+        progress("device_initializing")?;
+        let device = device::initialize_device(&config.inference)?;
+        progress(&format!("device_ready details=\"{}\"", device.label()))?;
+        progress("colbert_artifacts_validating")?;
+        let artifacts = artifacts::ModelArtifacts::load("colbert", &config.models.colbert.path)?;
+        progress("colbert_artifacts_ready")?;
+        progress("colbert_loading")?;
+        let colbert = ColbertRuntime::load_with_progress(
+            &artifacts,
+            &config.models.colbert,
+            &device.candle,
+            progress,
+        )?;
+        progress("colbert_ready")?;
+
+        Ok(colbert)
+    }
+
     /// Initialize inference while emitting operator-visible startup progress.
     pub fn initialize_with_progress(
         config: &ServiceConfig,

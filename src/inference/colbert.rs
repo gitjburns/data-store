@@ -35,6 +35,7 @@ const PROJECTION_DIR_NAME: &str = "1_Dense";
 const PROJECTION_MODEL_FILE_NAME: &str = "model.safetensors";
 const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
 const SENTENCE_BERT_CONFIG_FILE_NAME: &str = "sentence_bert_config.json";
+const TOKEN_VECTOR_NORM_EPS: f64 = 1e-12;
 
 #[derive(Debug, Clone)]
 pub struct ColbertRuntime {
@@ -1267,7 +1268,7 @@ impl ColbertProjection {
         })
     }
 
-    /// Apply the projection boundary from `[tokens, 768]` hidden states to `[tokens, 128]` ColBERT vectors.
+    /// Apply the projection boundary and L2-normalize each token vector for ColBERT MaxSim.
     fn project(&self, hidden_states: &Tensor) -> Result<Tensor, ApiError> {
         let (_, hidden_size) = hidden_states.dims2().map_err(|source| {
             inference_error(format!(
@@ -1296,8 +1297,21 @@ impl ColbertProjection {
             )));
         }
 
-        Ok(projected)
+        l2_normalize_last_dim(&projected, "projection output")
     }
+}
+
+/// Normalize vectors across the final dimension so MaxSim uses cosine-like ColBERT token scores.
+fn l2_normalize_last_dim(tensor: &Tensor, label: &str) -> Result<Tensor, ApiError> {
+    let squared_norm = tensor
+        .sqr()
+        .and_then(|values| values.sum_keepdim(D::Minus1));
+    let denominator = squared_norm
+        .and_then(|values| (values + TOKEN_VECTOR_NORM_EPS)?.sqrt())
+        .map_err(|source| inference_error(format!("ColBERT {label} norm failed: {source}")))?;
+    tensor.broadcast_div(&denominator).map_err(|source| {
+        inference_error(format!("ColBERT {label} normalization failed: {source}"))
+    })
 }
 
 #[derive(Debug, Clone)]

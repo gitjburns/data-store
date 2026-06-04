@@ -49,7 +49,7 @@ impl ModelArtifactSet {
 
 impl ModelArtifacts {
     /// Validate the minimum Hugging Face-style files required before graph loading.
-    fn load(name: &'static str, root: &Path) -> Result<Self, ApiError> {
+    pub(super) fn load(name: &'static str, root: &Path) -> Result<Self, ApiError> {
         if !root.is_dir() {
             return Err(ApiError::InferenceInit {
                 message: format!("models.{name}.path is not a directory: {}", root.display()),
