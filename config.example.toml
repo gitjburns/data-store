@@ -22,6 +22,10 @@ level = "info"
 # Runtime admin bearer token file. Relative paths resolve from the Rust service root.
 token_file_path = ".data-store-admin-token"
 
+[client]
+# Maximum time the interactive CLI waits for one streamed operation.
+operation_timeout_seconds = 3600
+
 [inference]
 # Accelerator backend to use for model inference. CPU fallback is not supported.
 device = "metal"
@@ -39,6 +43,8 @@ index_root = "/absolute/path/to/indexes"
 python_path = "/absolute/path/to/python"
 # Docling executable launched directly for PDF-to-markdown conversion.
 docling_path = "/absolute/path/to/docling"
+# Per-document Docling conversion timeout passed to the Docling CLI.
+document_timeout_seconds = 3600
 # Service-selected PDF backend; callers cannot override this per request.
 default_pdf_backend = "docling_parse"
 # Service-selected OCR mode: auto lets Docling choose, on forces OCR, off disables it.

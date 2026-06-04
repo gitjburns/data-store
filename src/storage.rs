@@ -1017,7 +1017,7 @@ impl StorageRuntime {
     }
 
     /// Persist one immutable document version, then publish it as the active search snapshot after commit.
-    pub fn ingest_document(
+    pub fn ingest_document<F>(
         &self,
         conversion: &DoclingConversionResult,
         version_label: &str,
@@ -1026,7 +1026,11 @@ impl StorageRuntime {
         colbert_vectors: Vec<UnitColbertDocumentVector>,
         dense: &DenseModelConfig,
         colbert: &ColbertModelConfig,
-    ) -> Result<(), ApiError> {
+        mut progress: Option<F>,
+    ) -> Result<(), ApiError>
+    where
+        F: FnMut(&'static str, u64, u64) -> Result<(), ApiError>,
+    {
         if units.len() != vectors.len() {
             return Err(ApiError::StorageOperation {
                 message: format!(
@@ -1100,10 +1104,12 @@ impl StorageRuntime {
             &diagnostics,
             now_ms,
         )?;
-        for ((unit, vector), colbert_vector) in units
+        emit_ingest_storage_progress(&mut progress, "persisting document metadata", 1, 1)?;
+        for (index, ((unit, vector), colbert_vector)) in units
             .iter()
             .zip(stored_vectors.iter())
             .zip(stored_colbert_vectors.iter())
+            .enumerate()
         {
             if unit.unit_id != vector.unit_id || unit.unit_id != colbert_vector.unit_id {
                 return Err(storage_operation_error(format!(
@@ -1114,12 +1120,20 @@ impl StorageRuntime {
             insert_unit(&tx, unit, version_label)?;
             insert_dense_vector(&tx, vector, dense, now_ms)?;
             insert_colbert_document_vector(&tx, colbert_vector, colbert, now_ms)?;
+            emit_ingest_storage_progress(
+                &mut progress,
+                "persisting units and vectors",
+                (index + 1) as u64,
+                units.len() as u64,
+            )?;
         }
 
         tx.commit().map_err(|source| {
             storage_operation_error(format!("failed to commit ingest transaction: {source}"))
         })?;
+        emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)?;
         self.publish_document_version(&source_path, version_label, stored_vectors)?;
+        emit_ingest_storage_progress(&mut progress, "publishing active search snapshot", 1, 1)?;
         // Publish is logged after both the durable transaction and active-cache
         // swap complete, so search requests admitted after this event can see
         // the new version.
@@ -2653,6 +2667,23 @@ fn insert_document(
         ],
     )
     .map_err(|source| storage_operation_error(format!("failed to insert document: {source}")))?;
+
+    Ok(())
+}
+
+/// Report one storage progress checkpoint when the operation stream requested it.
+fn emit_ingest_storage_progress<F>(
+    progress: &mut Option<F>,
+    message: &'static str,
+    current: u64,
+    total: u64,
+) -> Result<(), ApiError>
+where
+    F: FnMut(&'static str, u64, u64) -> Result<(), ApiError>,
+{
+    if let Some(progress) = progress {
+        progress(message, current, total)?;
+    }
 
     Ok(())
 }

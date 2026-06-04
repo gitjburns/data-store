@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::{
-    docling::convert_source_to_markdown,
+    docling::{DoclingProgressUpdate, convert_source_to_markdown},
     error::ApiError,
     inference::{
         ColbertCandidateScore, ColbertDocumentEmbedding, RerankerCandidateInput,
@@ -166,12 +166,38 @@ async fn execute_ingest(
         "converting source document",
     )
     .await?;
-    let conversion = convert_source_to_markdown(
+    let (docling_progress_sender, mut docling_progress_receiver) =
+        mpsc::channel(OPERATION_STREAM_CHANNEL_CAPACITY);
+    let progress_sender = if emitter.is_some() {
+        Some(docling_progress_sender)
+    } else {
+        None
+    };
+    let conversion_future = convert_source_to_markdown(
         &state.config.docling,
         &state.config.storage.index_root,
         source,
-    )
-    .await?;
+        progress_sender,
+    );
+    tokio::pin!(conversion_future);
+    let mut docling_progress_open = emitter.is_some();
+    let conversion = loop {
+        tokio::select! {
+            result = &mut conversion_future => {
+                let conversion = result?;
+                drain_docling_progress(&mut emitter, &mut docling_progress_receiver).await?;
+                break conversion;
+            }
+            progress = docling_progress_receiver.recv(), if docling_progress_open => {
+                match progress {
+                    Some(progress) => emit_docling_progress(&mut emitter, progress).await?,
+                    None => {
+                        docling_progress_open = false;
+                    }
+                }
+            }
+        }
+    };
     let conversion_latency_ms = conversion_started.elapsed().as_millis() as u64;
     let splitting_started = Instant::now();
     emit_operation_status(
@@ -185,6 +211,14 @@ async fn execute_ingest(
         &state.config.retrieval,
         &state.config.models.colbert.path.join("tokenizer.json"),
     )?;
+    emit_operation_progress(
+        &mut emitter,
+        "unit_splitting",
+        "retrieval units ready",
+        base_units.len() as u64,
+        base_units.len() as u64,
+    )
+    .await?;
     let splitting_latency_ms = splitting_started.elapsed().as_millis() as u64;
     let version_label = allocate_version_label()?;
     let versioned_document_id =
@@ -260,6 +294,11 @@ async fn execute_ingest(
         colbert_vectors,
         &state.config.models.dense,
         &state.config.models.colbert,
+        emitter.as_deref_mut().map(|emitter| {
+            move |message: &'static str, current: u64, total: u64| {
+                emitter.progress_blocking("storage_publishing", message, current, total)
+            }
+        }),
     )?;
     let storage_latency_ms = storage_started.elapsed().as_millis() as u64;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -618,6 +657,23 @@ impl OperationEmitter {
         self.send(event).await
     }
 
+    /// Emit one uncounted progress event through the async operation stream.
+    async fn progress_message(
+        &mut self,
+        stage: &'static str,
+        message: String,
+    ) -> Result<(), ApiError> {
+        let event = OperationEvent::Progress {
+            operation_id: self.operation_id.clone(),
+            sequence: self.next_sequence(),
+            stage: Some(stage.to_string()),
+            message: Some(message),
+            current: None,
+            total: None,
+        };
+        self.send(event).await
+    }
+
     /// Emit one counted progress event from synchronous model-scoring loops.
     fn progress_blocking(
         &mut self,
@@ -713,6 +769,53 @@ async fn emit_operation_progress(
 ) -> Result<(), ApiError> {
     if let Some(emitter) = emitter.as_deref_mut() {
         emitter.progress(stage, message, current, total).await?;
+    }
+
+    Ok(())
+}
+
+/// Emit one uncounted progress event only when the pipeline serves an operation stream.
+async fn emit_operation_progress_message(
+    emitter: &mut Option<&mut OperationEmitter>,
+    stage: &'static str,
+    message: String,
+) -> Result<(), ApiError> {
+    if let Some(emitter) = emitter.as_deref_mut() {
+        emitter.progress_message(stage, message).await?;
+    }
+
+    Ok(())
+}
+
+/// Forward one parsed Docling progress update to the operation stream.
+async fn emit_docling_progress(
+    emitter: &mut Option<&mut OperationEmitter>,
+    progress: DoclingProgressUpdate,
+) -> Result<(), ApiError> {
+    match progress.percentage {
+        Some(percentage) => {
+            emit_operation_progress(
+                emitter,
+                "docling_converting",
+                "converting source document",
+                percentage,
+                100,
+            )
+            .await
+        }
+        None => {
+            emit_operation_progress_message(emitter, "docling_converting", progress.message).await
+        }
+    }
+}
+
+/// Flush any parsed Docling progress that arrived immediately before process completion.
+async fn drain_docling_progress(
+    emitter: &mut Option<&mut OperationEmitter>,
+    receiver: &mut mpsc::Receiver<DoclingProgressUpdate>,
+) -> Result<(), ApiError> {
+    while let Ok(progress) = receiver.try_recv() {
+        emit_docling_progress(emitter, progress).await?;
     }
 
     Ok(())

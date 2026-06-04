@@ -112,6 +112,9 @@ pub struct DoclingConfig {
     pub python_path: PathBuf,
     /// Docling executable launched directly for PDF conversion.
     pub docling_path: PathBuf,
+    /// Per-document Docling conversion timeout in seconds.
+    #[serde(default = "default_docling_document_timeout_seconds")]
+    pub document_timeout_seconds: u64,
     /// PDF backend selected by service config rather than callers.
     pub default_pdf_backend: String,
     /// OCR behavior selected by service config: auto, on, or off.
@@ -230,6 +233,10 @@ impl ServiceConfig {
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
         require_absolute_path("docling.python_path", &self.docling.python_path)?;
         require_absolute_path("docling.docling_path", &self.docling.docling_path)?;
+        require_positive_u64(
+            "docling.document_timeout_seconds",
+            self.docling.document_timeout_seconds,
+        )?;
         require_absolute_path("models.dense.path", &self.models.dense.path)?;
         require_absolute_path("models.colbert.path", &self.models.colbert.path)?;
         require_absolute_path("models.reranker.path", &self.models.reranker.path)?;
@@ -346,6 +353,11 @@ fn default_colbert_candidate_pool_size() -> u32 {
     100
 }
 
+/// Return the default one-hour Docling document timeout used by existing operators.
+fn default_docling_document_timeout_seconds() -> u64 {
+    3_600
+}
+
 /// Resolve supported CLI options, falling back to `config.toml`.
 pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     let mut args = env::args().skip(1);
@@ -439,6 +451,17 @@ fn require_positive(label: &str, value: u32) -> Result<(), ApiError> {
 
 /// Ensure a usize numeric field is greater than zero.
 fn require_positive_usize(label: &str, value: usize) -> Result<(), ApiError> {
+    if value > 0 {
+        return Ok(());
+    }
+
+    Err(ApiError::InvalidConfig {
+        message: format!("{label} must be greater than zero"),
+    })
+}
+
+/// Ensure an unsigned 64-bit integer field is greater than zero.
+fn require_positive_u64(label: &str, value: u64) -> Result<(), ApiError> {
     if value > 0 {
         return Ok(());
     }

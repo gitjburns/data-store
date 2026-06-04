@@ -299,10 +299,16 @@ Representative event sequence:
 ```json
 {"type":"status","operationId":"op-1","sequence":1,"stage":"source_resolving","message":"resolving source reference"}
 {"type":"status","operationId":"op-1","sequence":2,"stage":"docling_converting","message":"converting source document"}
-{"type":"status","operationId":"op-1","sequence":3,"stage":"unit_splitting","message":"splitting document into retrieval units"}
-{"type":"progress","operationId":"op-1","sequence":4,"stage":"dense_embedding","message":"embedding document units","current":12,"total":43}
-{"type":"progress","operationId":"op-1","sequence":5,"stage":"colbert_embedding","message":"embedding ColBERT document vectors","current":12,"total":43}
-{"type":"status","operationId":"op-1","sequence":6,"stage":"storage_publishing","message":"publishing document version"}
+{"type":"progress","operationId":"op-1","sequence":3,"stage":"docling_converting","message":"converting source document","current":42,"total":100}
+{"type":"status","operationId":"op-1","sequence":4,"stage":"unit_splitting","message":"splitting document into retrieval units"}
+{"type":"progress","operationId":"op-1","sequence":5,"stage":"unit_splitting","message":"retrieval units ready","current":43,"total":43}
+{"type":"status","operationId":"op-1","sequence":6,"stage":"dense_embedding","message":"embedding document units"}
+{"type":"progress","operationId":"op-1","sequence":7,"stage":"dense_embedding","message":"embedding document units","current":12,"total":43}
+{"type":"status","operationId":"op-1","sequence":8,"stage":"colbert_embedding","message":"embedding ColBERT document vectors"}
+{"type":"progress","operationId":"op-1","sequence":9,"stage":"colbert_embedding","message":"embedding ColBERT document vectors","current":12,"total":43}
+{"type":"status","operationId":"op-1","sequence":10,"stage":"storage_publishing","message":"publishing document version"}
+{"type":"progress","operationId":"op-1","sequence":11,"stage":"storage_publishing","message":"persisting units and vectors","current":12,"total":43}
+{"type":"progress","operationId":"op-1","sequence":12,"stage":"storage_publishing","message":"publishing active search snapshot","current":1,"total":1}
 ```
 
 Result payload:
@@ -324,7 +330,10 @@ Ingest semantics:
 - Re-ingesting a source does not delete older versions.
 - Existing active versions remain searchable until the new version publishes.
 - Conversion options are service-configured; callers cannot override Docling
-  backend, OCR mode, or page batch size per request.
+  backend, OCR mode, page batch size, or document timeout per request.
+- The service emits Docling percentage progress when Docling reports it, unit
+  counts after splitting, dense and ColBERT embedding counts, and storage
+  publish checkpoints.
 
 ### `search`
 

@@ -41,9 +41,10 @@ All operational service behavior is config-backed in the service TOML config:
 - HTTP bind address, request body limits, field limits, and admission limits.
 - File logging path and level.
 - Admin token-file path for local startup-scoped credential handoff.
+- CLI operation-stream timeout.
 - Accelerator device kind and device index.
 - Corpus root and index root.
-- Docling executable and PDF conversion defaults.
+- Docling executable, document timeout, and PDF conversion defaults.
 - Local model artifact paths and model shape limits.
 - Retrieval defaults, candidate-pool sizes, and unit sizing.
 
@@ -162,7 +163,8 @@ The `ingest` operation is synchronous and streamed. The high-level stages are:
 1. Validate JSON shape and field limits.
 2. Acquire the non-queueing ingest admission permit.
 3. Resolve the corpus-relative source inside the configured corpus root.
-4. Convert PDF to markdown through Docling using service-configured options.
+4. Convert PDF to markdown through Docling using service-configured options,
+   including the configured document timeout.
 5. Split markdown into deterministic retrieval units.
 6. Allocate a version label and versioned document/unit IDs.
 7. Generate dense passage vectors for every unit.
@@ -171,6 +173,12 @@ The `ingest` operation is synchronous and streamed. The high-level stages are:
    vectors, and FTS rows in SQLite.
 10. Publish the active version and swap the active dense cache.
 11. Emit the terminal ingest result.
+
+Ingest progress is part of the operation stream contract. The service emits
+Docling conversion progress parsed from Docling stderr when available, unit
+counts after splitting, per-unit dense and ColBERT embedding progress, and
+storage/publish checkpoints. Clients may render progress compactly, but must
+not replace the raw NDJSON events as the authoritative record.
 
 Conversion failures, source-resolution failures, model failures, and storage
 failures are explicit. The service does not silently switch PDF backends, OCR
@@ -251,16 +259,19 @@ shutdown or version changes.
 ## CLI Client
 
 The `data-store` binary is an interactive REPL client over the documented HTTP
-API. It reads `server.bind_address` and `admin.token_file_path` from the service
-config, constructs `http://<bind_address>`, and sends operation requests to the
-service. It does not share process memory, bypass authorization, access SQLite
-directly, or reimplement domain behavior.
+API. It reads `server.bind_address`, `admin.token_file_path`, and
+`client.operation_timeout_seconds` from the service config, constructs
+`http://<bind_address>`, and sends operation requests to the service. It does
+not share process memory, bypass authorization, access SQLite directly, or
+reimplement domain behavior.
 
 Public commands send unauthenticated operations. Protected commands read the
 current token file immediately before sending the request and use the same
 bearer-token header required by curl clients. Client output is human-readable:
-it renders streamed status/progress events and terminal results/errors. Raw
-protocol payloads remain available through the HTTP API itself.
+it renders streamed status/progress events in place for the active stage,
+prints a newline when each stage completes, and then prints terminal
+results/errors. Raw protocol payloads remain available through the HTTP API
+itself.
 
 ## Hard Invariants
 

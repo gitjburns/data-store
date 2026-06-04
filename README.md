@@ -40,6 +40,7 @@ machine-specific and should point at:
 - a service-owned corpus root for source files
 - a service-owned index root for SQLite and Docling conversion artifacts
 - the Python executable for environment diagnostics and the directly launched Docling executable
+- the CLI operation timeout and Docling document timeout
 - the selected accelerator backend and device index
 - required request, retrieval, admission, logging, and admin token-file settings
 
@@ -134,10 +135,11 @@ For a release build, run:
 ./target/release/data-store --config config.toml
 ```
 
-The client reads `server.bind_address` and `admin.token_file_path` from the
-same config file. Public commands send unauthenticated operations. Protected
-commands read the configured token file immediately before sending the
-operation. If the token file is missing, start or restart the service.
+The client reads `server.bind_address`, `admin.token_file_path`, and
+`client.operation_timeout_seconds` from the same config file. Public commands
+send unauthenticated operations. Protected commands read the configured token
+file immediately before sending the operation. If the token file is missing,
+start or restart the service.
 
 At the prompt, run `help` to show the available commands and syntax:
 
@@ -162,8 +164,10 @@ data-store> exit
 
 `search` prints excerpts. `search-full` prints the full matched unit content.
 Quote multi-word queries and any argument containing spaces. Long operations
-stream status and counted progress while they run. The `shutdown` command asks
-for typed confirmation before it sends the protected shutdown operation.
+stream status and counted progress while they run. The CLI updates the current
+stage line in place and prints a newline when each stage completes. The
+`shutdown` command asks for typed confirmation before it sends the protected
+shutdown operation.
 
 The client prints human-readable output and stores readline history in
 `.data-store.history`.
@@ -244,6 +248,12 @@ curl -N -X POST \
 A successful ingest creates a new immutable source-document version, persists
 units and vectors, updates the active-version map, and publishes a new active
 search snapshot only after the new version is durable and cache-ready.
+
+PDF conversion progress comes from Docling stderr progress lines when Docling
+emits them. The service passes `[docling].document_timeout_seconds` to Docling
+as `--document-timeout`; the example config sets it to `3600`. The interactive
+CLI uses `[client].operation_timeout_seconds`, also `3600` in the example
+config, as the HTTP stream timeout for one operation.
 
 ## Search
 

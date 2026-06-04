@@ -2,23 +2,31 @@ use std::{
     fs,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    sync::mpsc,
+    task::JoinHandle,
+    time::timeout,
+};
 
 use crate::{config::DoclingConfig, error::ApiError, source::ResolvedSource};
 
 static CONVERSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_DIAGNOSTIC_CHARS: usize = 16_000;
+const CHILD_OUTPUT_READ_CHUNK_BYTES: usize = 8_192;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDoclingOptions {
     pub pdf_backend: String,
     pub ocr_mode: String,
     pub page_batch_size: Option<u32>,
+    pub document_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +41,19 @@ pub struct DoclingConversionResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DoclingProgressUpdate {
+    pub message: String,
+    pub percentage: Option<u64>,
+}
+
+struct DoclingRunOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
 /// Convert one resolved PDF source to markdown using only service-configured Docling options.
 ///
 /// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
@@ -40,18 +61,25 @@ pub async fn convert_source_to_markdown(
     config: &DoclingConfig,
     index_root: &Path,
     source: ResolvedSource,
+    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
 ) -> Result<DoclingConversionResult, ApiError> {
     let options = resolve_docling_options(config)?;
     let output_dir = create_conversion_output_dir(index_root)?;
     let args = build_docling_args(&output_dir, &source.absolute_path, &options);
-    let output = run_docling(config, &args, index_root).await?;
-    let stdout = truncate_diagnostic_text(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_diagnostic_text(&String::from_utf8_lossy(&output.stderr));
+    let output = run_docling(config, &args, index_root, progress_sender).await?;
+    let stdout = truncate_diagnostic_text(&output.stdout);
+    let stderr = truncate_diagnostic_text(&output.stderr);
 
-    if !output.status.success() {
+    if output.timed_out || !output.status.success() {
+        let timeout_context = if output.timed_out {
+            format!(" after timeoutSeconds={}", options.document_timeout_seconds)
+        } else {
+            String::new()
+        };
         return Err(ApiError::DoclingConversion {
             message: format!(
-                "Docling conversion failed for {} with status {}; args={}; stderr={}; stdout={}",
+                "Docling conversion failed{} for {} with status {}; args={}; stderr={}; stdout={}",
+                timeout_context,
                 source.absolute_path.display(),
                 format_exit_status(output.status.code(), output.status.signal()),
                 args.join(" "),
@@ -81,6 +109,7 @@ fn resolve_docling_options(config: &DoclingConfig) -> Result<ResolvedDoclingOpti
     let pdf_backend = config.default_pdf_backend.trim().to_string();
     let ocr_mode = config.default_ocr_mode.trim().to_string();
     let page_batch_size = config.page_batch_size;
+    let document_timeout_seconds = config.document_timeout_seconds;
 
     if !matches!(ocr_mode.as_str(), "auto" | "on" | "off") {
         return Err(ApiError::DoclingConversion {
@@ -92,6 +121,7 @@ fn resolve_docling_options(config: &DoclingConfig) -> Result<ResolvedDoclingOpti
         pdf_backend,
         ocr_mode,
         page_batch_size,
+        document_timeout_seconds,
     })
 }
 
@@ -139,6 +169,8 @@ fn build_docling_args(
         "placeholder".to_string(),
         "--pdf-backend".to_string(),
         options.pdf_backend.clone(),
+        "--document-timeout".to_string(),
+        options.document_timeout_seconds.to_string(),
     ];
 
     if options.ocr_mode == "on" {
@@ -163,22 +195,193 @@ async fn run_docling(
     config: &DoclingConfig,
     args: &[String],
     index_root: &Path,
-) -> Result<std::process::Output, ApiError> {
-    Command::new(&config.docling_path)
+    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+) -> Result<DoclingRunOutput, ApiError> {
+    let mut child = Command::new(&config.docling_path)
         .args(args)
         .current_dir(index_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await
+        .spawn()
         .map_err(|source| ApiError::DoclingUnavailable {
             message: format!(
                 "Docling CLI failed to start at {}; configured python_path is {}: {source}",
                 config.docling_path.display(),
                 config.python_path.display()
             ),
-        })
+        })?;
+    let stdout = child.stdout.take().ok_or_else(|| ApiError::InternalIo {
+        message: "Docling child stdout pipe was not available".to_string(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| ApiError::InternalIo {
+        message: "Docling child stderr pipe was not available".to_string(),
+    })?;
+    let stdout_reader = tokio::spawn(read_child_output(stdout, None));
+    let stderr_reader = tokio::spawn(read_child_output(stderr, progress_sender));
+    let wait_result = timeout(
+        Duration::from_secs(config.document_timeout_seconds),
+        child.wait(),
+    )
+    .await;
+    let (status, timed_out) = match wait_result {
+        Ok(result) => (
+            result.map_err(|source| ApiError::InternalIo {
+                message: format!("failed while waiting for Docling CLI: {source}"),
+            })?,
+            false,
+        ),
+        Err(_) => {
+            let kill_result = child.start_kill();
+            let status = child.wait().await.map_err(|source| ApiError::InternalIo {
+                message: format!("failed while waiting for timed-out Docling CLI: {source}"),
+            })?;
+            if let Err(source) = kill_result {
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to kill timed-out Docling CLI: {source}"),
+                });
+            }
+            (status, true)
+        }
+    };
+    let stdout = join_child_output(stdout_reader, "stdout").await?;
+    let stderr = join_child_output(stderr_reader, "stderr").await?;
+
+    Ok(DoclingRunOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+/// Read one child-process pipe while preserving bounded diagnostics and optional progress.
+async fn read_child_output<R>(
+    mut reader: R,
+    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+) -> Result<String, ApiError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = String::new();
+    let mut buffer = [0_u8; CHILD_OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("failed to read Docling child output: {source}"),
+            })?;
+        if bytes_read == 0 {
+            return Ok(output);
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+        output = append_bounded_diagnostic_text(&output, &chunk);
+        if let Some(sender) = progress_sender.as_ref() {
+            emit_docling_progress_from_chunk(sender, &chunk).await?;
+        }
+    }
+}
+
+/// Join one child-output reader task and label failures with the pipe name.
+async fn join_child_output(
+    handle: JoinHandle<Result<String, ApiError>>,
+    label: &'static str,
+) -> Result<String, ApiError> {
+    handle.await.map_err(|source| ApiError::InternalIo {
+        message: format!("Docling {label} reader task failed: {source}"),
+    })?
+}
+
+/// Emit parsed Docling progress from one stderr chunk.
+async fn emit_docling_progress_from_chunk(
+    sender: &mpsc::Sender<DoclingProgressUpdate>,
+    chunk: &str,
+) -> Result<(), ApiError> {
+    for line in chunk.split(['\r', '\n']) {
+        if let Some(progress) = parse_docling_progress_line(line) {
+            sender
+                .send(progress)
+                .await
+                .map_err(|_| ApiError::InternalIo {
+                    message: "operation response stream closed before Docling progress delivery"
+                        .to_string(),
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert one Docling diagnostic line into user-visible progress when possible.
+fn parse_docling_progress_line(line: &str) -> Option<DoclingProgressUpdate> {
+    let message = strip_ansi_sequences(line).trim().to_string();
+    if message.is_empty() {
+        return None;
+    }
+
+    if let Some(percentage) = extract_percentage(&message) {
+        return Some(DoclingProgressUpdate {
+            message,
+            percentage: Some(percentage),
+        });
+    }
+    if contains_case_insensitive(&message, "processing")
+        || contains_case_insensitive(&message, "converting")
+        || contains_case_insensitive(&message, "saving")
+    {
+        return Some(DoclingProgressUpdate {
+            message,
+            percentage: None,
+        });
+    }
+
+    None
+}
+
+/// Return whether one string contains a case-insensitive ASCII needle.
+fn contains_case_insensitive(value: &str, needle: &str) -> bool {
+    value.to_ascii_lowercase().contains(needle)
+}
+
+/// Extract a rounded percentage from one progress line.
+fn extract_percentage(message: &str) -> Option<u64> {
+    let percent_index = message.find('%')?;
+    let prefix = message[..percent_index].trim_end();
+    let start = prefix
+        .rfind(|value: char| !(value.is_ascii_digit() || value == '.'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let raw = &prefix[start..];
+    let parsed = raw.parse::<f64>().ok()?;
+    if !parsed.is_finite() || !(0.0..=100.0).contains(&parsed) {
+        return None;
+    }
+
+    Some(parsed.round() as u64)
+}
+
+/// Remove common ANSI escape sequences from Docling terminal diagnostics.
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut stripped = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            stripped.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+
+    stripped
 }
 
 /// Locate the markdown artifact Docling produced for one source file.
@@ -313,6 +516,22 @@ fn truncate_diagnostic_text(value: &str) -> String {
         truncated.push_str("...");
     }
     truncated
+}
+
+/// Append one diagnostic chunk while keeping the most recent bounded text.
+fn append_bounded_diagnostic_text(current: &str, chunk: &str) -> String {
+    let next = format!("{current}{chunk}");
+    if next.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return next;
+    }
+
+    next.chars()
+        .rev()
+        .take(MAX_DIAGNOSTIC_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }
 
 /// Format child-process exit status fields for diagnostics.

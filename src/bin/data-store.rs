@@ -3,7 +3,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +21,8 @@ const OPERATIONS_PATH: &str = "/v1/operations";
 struct ClientConfig {
     server: ServerConfig,
     admin: AdminConfig,
+    #[serde(default)]
+    client: ClientRuntimeConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +33,12 @@ struct ServerConfig {
 #[derive(Debug, Deserialize)]
 struct AdminConfig {
     token_file_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientRuntimeConfig {
+    #[serde(default = "default_operation_timeout_seconds")]
+    operation_timeout_seconds: u64,
 }
 
 #[derive(Debug)]
@@ -282,7 +290,7 @@ struct ErrorDetail {
 }
 
 struct StreamRenderer {
-    active_progress: bool,
+    active_line: bool,
 }
 
 /// Start the interactive client after resolving service config and local history.
@@ -292,7 +300,7 @@ fn main() -> Result<()> {
     let context = ClientContext {
         base_url: base_url_for_bind_address(config.server.bind_address),
         token_file_path: resolve_service_root_path(&config.admin.token_file_path),
-        http: Client::new(),
+        http: build_http_client(&config.client)?,
     };
     run_repl(context)
 }
@@ -323,8 +331,33 @@ fn load_config(path: &Path) -> Result<ClientConfig> {
     if config.admin.token_file_path.as_os_str().is_empty() {
         bail!("admin.token_file_path must be a non-empty path");
     }
+    if config.client.operation_timeout_seconds == 0 {
+        bail!("client.operation_timeout_seconds must be greater than zero");
+    }
 
     Ok(config)
+}
+
+impl Default for ClientRuntimeConfig {
+    /// Keep existing local configs usable while matching the documented one-hour operation cap.
+    fn default() -> Self {
+        Self {
+            operation_timeout_seconds: default_operation_timeout_seconds(),
+        }
+    }
+}
+
+/// Return the default CLI operation timeout in seconds.
+fn default_operation_timeout_seconds() -> u64 {
+    3_600
+}
+
+/// Build the blocking HTTP client with the configured operation timeout.
+fn build_http_client(config: &ClientRuntimeConfig) -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(config.operation_timeout_seconds))
+        .build()
+        .context("failed to build HTTP client")
 }
 
 /// Resolve service-relative local paths through Cargo's manifest root.
@@ -823,12 +856,10 @@ fn format_error_detail(error: &ErrorDetail) -> String {
 impl StreamRenderer {
     /// Create a renderer that tracks whether the terminal cursor is on an overwritten progress line.
     fn new() -> Self {
-        Self {
-            active_progress: false,
-        }
+        Self { active_line: false }
     }
 
-    /// Render one status event as a durable line after closing any active progress line.
+    /// Render one status event as the active in-place stage line.
     fn render_status(
         &mut self,
         operation_id: &str,
@@ -838,18 +869,19 @@ impl StreamRenderer {
     ) -> Result<()> {
         self.finish_progress_line()?;
         let stage = stage.unwrap_or_else(|| "status".to_string());
-        match message {
+        let line = match message {
             Some(message) => {
-                println!("[{operation_id} #{sequence}] {stage}: {message}");
+                format!("[{operation_id} #{sequence}] {stage}: {message}")
             }
             None => {
-                println!("[{operation_id} #{sequence}] {stage}");
+                format!("[{operation_id} #{sequence}] {stage}")
             }
-        }
+        };
+        self.render_active_line(&line)?;
         Ok(())
     }
 
-    /// Render one progress event, overwriting the current line when counted progress is available.
+    /// Render one progress event by updating the active in-place stage line.
     fn render_progress(
         &mut self,
         operation_id: &str,
@@ -861,30 +893,43 @@ impl StreamRenderer {
     ) -> Result<()> {
         let stage = stage.unwrap_or_else(|| "progress".to_string());
         let message = message.unwrap_or_else(|| "working".to_string());
-        match (current, total) {
+        let line = match (current, total) {
             (Some(current), Some(total)) => {
-                print!("\r[{operation_id} #{sequence}] {stage}: {message} {current}/{total}");
-                io::stdout()
-                    .flush()
-                    .context("failed to flush progress line")?;
-                self.active_progress = true;
+                let percent = if total > 0 {
+                    (current.saturating_mul(100)) / total
+                } else {
+                    0
+                };
+                format!(
+                    "[{operation_id} #{sequence}] {stage}: {message} {current}/{total} ({percent}%)"
+                )
             }
             _ => {
-                self.finish_progress_line()?;
-                println!("[{operation_id} #{sequence}] {stage}: {message}");
+                format!("[{operation_id} #{sequence}] {stage}: {message}")
             }
-        }
+        };
+        self.render_active_line(&line)?;
+        Ok(())
+    }
+
+    /// Write one complete terminal line in place without advancing to the next line.
+    fn render_active_line(&mut self, line: &str) -> Result<()> {
+        print!("\r\x1b[2K{line}");
+        io::stdout()
+            .flush()
+            .context("failed to flush progress line")?;
+        self.active_line = true;
         Ok(())
     }
 
     /// Finish an overwritten progress line before printing normal output.
     fn finish_progress_line(&mut self) -> Result<()> {
-        if self.active_progress {
+        if self.active_line {
             println!();
             io::stdout()
                 .flush()
                 .context("failed to flush completed progress line")?;
-            self.active_progress = false;
+            self.active_line = false;
         }
         Ok(())
     }
