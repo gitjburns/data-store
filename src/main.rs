@@ -39,7 +39,7 @@ enum ServiceProcessRole {
 }
 
 enum StartupReporter {
-    Stdout,
+    Stdout { progress_active: bool },
     Pipe(UnixStream),
 }
 
@@ -63,7 +63,7 @@ impl StartupReporter {
     /// Return the human-readable execution mode for startup handoff output.
     fn mode_label(&self) -> &'static str {
         match self {
-            Self::Stdout => "foreground",
+            Self::Stdout { .. } => "foreground",
             Self::Pipe(_) => "background",
         }
     }
@@ -71,8 +71,12 @@ impl StartupReporter {
     /// Emit one operator-visible startup status line.
     fn report(&mut self, message: impl AsRef<str>) -> Result<(), ApiError> {
         match self {
-            Self::Stdout => {
-                println!("\r\u{1b}[2K{}", message.as_ref());
+            Self::Stdout { progress_active } => {
+                if *progress_active {
+                    println!();
+                    *progress_active = false;
+                }
+                println!("{}", message.as_ref());
                 std::io::stdout()
                     .flush()
                     .map_err(|source| ApiError::InternalIo {
@@ -97,8 +101,9 @@ impl StartupReporter {
     /// Emit a transient startup progress update that the terminal can overwrite in place.
     fn report_progress(&mut self, message: impl AsRef<str>) -> Result<(), ApiError> {
         match self {
-            Self::Stdout => {
+            Self::Stdout { progress_active } => {
                 print!("\r\u{1b}[2K{}", message.as_ref());
+                *progress_active = true;
                 std::io::stdout()
                     .flush()
                     .map_err(|source| ApiError::InternalIo {
@@ -121,7 +126,14 @@ impl StartupReporter {
     }
 
     /// Close the startup handoff channel so the background parent can exit.
-    fn close(self) {}
+    fn close(self) {
+        if let Self::Stdout {
+            progress_active: true,
+        } = self
+        {
+            println!();
+        }
+    }
 }
 
 /// Start the standalone Data Store service.
@@ -230,8 +242,14 @@ async fn run_http_service(
     );
 
     reporter.report("data-store startup inference=initializing")?;
-    let mut report_inference_progress =
-        |message: &str| reporter.report_progress(format!("data-store startup inference={message}"));
+    let mut report_inference_progress = |message: &str| {
+        let startup_message = format!("data-store startup inference={message}");
+        if uses_count_progress(message) {
+            reporter.report_progress(startup_message)
+        } else {
+            reporter.report(startup_message)
+        }
+    };
     let inference =
         InferenceRuntime::initialize_with_progress(&config, &mut report_inference_progress);
     drop(report_inference_progress);
@@ -438,7 +456,9 @@ impl AdminTokenFile {
 fn enter_service_process(foreground: bool) -> Result<ServiceProcessRole, ApiError> {
     if foreground {
         println!("data-store bootstrap mode=foreground");
-        return Ok(ServiceProcessRole::Service(StartupReporter::Stdout));
+        return Ok(ServiceProcessRole::Service(StartupReporter::Stdout {
+            progress_active: false,
+        }));
     }
 
     enter_background_process()
@@ -517,7 +537,7 @@ fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
             continue;
         }
         if progress_active {
-            print!("\r\u{1b}[2K");
+            println!();
             progress_active = false;
         }
         if line.contains("data-store startup fatal=")
@@ -537,6 +557,21 @@ fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
     }
 
     Ok(startup_failed)
+}
+
+fn uses_count_progress(message: &str) -> bool {
+    message.split_whitespace().any(|field| {
+        let Some((_, value)) = field.split_once('=') else {
+            return false;
+        };
+        let Some((current, total)) = value.split_once('/') else {
+            return false;
+        };
+        !current.is_empty()
+            && !total.is_empty()
+            && current.chars().all(|value| value.is_ascii_digit())
+            && total.chars().all(|value| value.is_ascii_digit())
+    })
 }
 
 /// Send a fatal pre-service startup failure to the original parent before the child exits.
