@@ -6,10 +6,10 @@ developers and operators working on the service itself.
 ## Purpose
 
 The Data Store service provides document ingestion and retrieval over a
-service-owned HTTP API. It owns source-file resolution, PDF conversion, unit
-splitting, model inference, durable storage, search indexes, active document
-versioning, retrieval ranking, service config, readiness, logging, and protected
-admin controls.
+service-owned operation-stream HTTP API. It owns source-file resolution, PDF
+conversion, unit splitting, model inference, durable storage, search indexes,
+active document versioning, retrieval ranking, service config, readiness,
+logging, and protected admin controls.
 
 The service is an independent Rust application under `service/data-store/`.
 It is not a library facade over another process, and its storage, corpus,
@@ -56,7 +56,8 @@ are startup configuration errors.
 ## Model Runtime
 
 The service loads local model artifacts at startup and reports readiness through
-`/v1/health`.
+the `health` operation. The retained `/v1/health` route reports the same
+readiness data during migration compatibility.
 
 | Runtime | Model role | Output |
 |---|---|---|
@@ -74,6 +75,27 @@ marker, and MaxSim scores are computed only over a bounded candidate pool.
 The reranker renders the service-local Qwen3 chat prompt shape and scores final
 next-token logits for the configured yes/no token IDs. Public search scores are
 the reranker yes probabilities.
+
+## Operation Protocol
+
+The documented consumer API is:
+
+```http
+POST /v1/operations
+Accept: application/x-ndjson
+Content-Type: application/json
+```
+
+Each request starts one named operation. The service streams operation-scoped
+newline-delimited JSON events with monotonic per-operation sequence numbers.
+Events are `status`, `progress`, `result`, and `error`; `result` and `error`
+are terminal.
+
+Supported operations are `health`, `limits`, `ingest`, `search`, `versions`,
+`rollback`, and `shutdown`. `versions`, `rollback`, and `shutdown` require the
+startup-scoped bearer token. The route-specific `/v1/...` and `/admin/...`
+endpoints remain available during migration as compatibility routes, but the
+operation stream is the documented consumer contract.
 
 ## Storage Model
 
@@ -135,7 +157,7 @@ same captured snapshot for the lifetime of the request.
 
 ## Ingestion Pipeline
 
-`POST /v1/ingest` is synchronous. The high-level stages are:
+The `ingest` operation is synchronous and streamed. The high-level stages are:
 
 1. Validate JSON shape and field limits.
 2. Acquire the non-queueing ingest admission permit.
@@ -148,7 +170,7 @@ same captured snapshot for the lifetime of the request.
 9. Persist the immutable document version, units, dense vectors, ColBERT
    vectors, and FTS rows in SQLite.
 10. Publish the active version and swap the active dense cache.
-11. Return the ingest response.
+11. Emit the terminal ingest result.
 
 Conversion failures, source-resolution failures, model failures, and storage
 failures are explicit. The service does not silently switch PDF backends, OCR
@@ -156,7 +178,7 @@ modes, devices, models, or vector sources.
 
 ## Retrieval Pipeline
 
-`POST /v1/search` is synchronous. The high-level stages are:
+The `search` operation is synchronous and streamed. The high-level stages are:
 
 1. Validate JSON shape and field limits.
 2. Acquire the non-queueing search admission permit.
@@ -169,7 +191,7 @@ modes, devices, models, or vector sources.
 9. Load persisted ColBERT document vectors for the bounded RRF pool.
 10. Embed the query with ColBERT and MaxSim-rerank the candidate pool.
 11. Rerank the ColBERT-ranked candidates with the Qwen3 yes/no reranker.
-12. Return public top-K results and raw diagnostics for every stage.
+12. Emit public top-K results and raw diagnostics for every stage.
 
 Dense tie-breaking is deterministic by `unitId` ascending. Public result scores
 are final reranker scores, while dense, BM25, RRF, and ColBERT scores remain
@@ -178,15 +200,16 @@ visible in `raw`.
 ## Admission And Backpressure
 
 Ingest and search have separate config-backed maximum in-flight counts.
-Admission uses immediate permit acquisition. Saturated endpoints return
-`503 Service Unavailable` rather than waiting in a hidden queue.
+Admission uses immediate permit acquisition. Saturated operations emit terminal
+errors with status `503 Service Unavailable` rather than waiting in a hidden
+queue.
 
-`/v1/health`, `/v1/limits`, and protected admin endpoints do not consume
-ingest/search admission permits.
+`health`, `limits`, and protected admin operations do not consume ingest/search
+admission permits.
 
 ## Readiness And Logging
 
-`/v1/health` reports top-level readiness and component diagnostics.
+The `health` operation reports top-level readiness and component diagnostics.
 Readiness-critical components are:
 
 - `inference`: accelerator, model artifacts, model loading, and startup smoke.
@@ -221,22 +244,23 @@ graceful shutdown when it still contains the current service token. If the
 service crashes, a stale token file may remain; that stale token is not accepted
 by any later service process and is replaced on the next startup.
 
-Admin endpoints require `Authorization: Bearer <token>`. Missing, malformed,
-or invalid authorization fails explicitly and does not trigger shutdown or
-version changes.
+Protected operations require `Authorization: Bearer <token>`. Missing,
+malformed, or invalid authorization fails explicitly and does not trigger
+shutdown or version changes.
 
 ## CLI Client
 
 The `data-store` binary is an interactive REPL client over the documented HTTP
 API. It reads `server.bind_address` and `admin.token_file_path` from the service
-config, constructs `http://<bind_address>`, and sends normal HTTP requests to
-the service. It does not share process memory, bypass authorization, access
-SQLite directly, or reimplement domain behavior.
+config, constructs `http://<bind_address>`, and sends operation requests to the
+service. It does not share process memory, bypass authorization, access SQLite
+directly, or reimplement domain behavior.
 
-Public commands use `/v1` endpoints without authentication. Admin commands read
-the current token file immediately before sending the request and use the same
-bearer-token header required by curl clients. Client output is human-readable
-only; raw protocol payloads remain available through the HTTP API itself.
+Public commands send unauthenticated operations. Protected commands read the
+current token file immediately before sending the request and use the same
+bearer-token header required by curl clients. Client output is human-readable:
+it renders streamed status/progress events and terminal results/errors. Raw
+protocol payloads remain available through the HTTP API itself.
 
 ## Hard Invariants
 

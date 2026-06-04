@@ -164,14 +164,28 @@ impl RerankerRuntime {
         )]
     }
 
-    /// Score candidate documents with the reranker prompt and deterministic rank ordering.
+    /// Score candidate documents without per-candidate progress reporting.
     pub fn score_candidates(
         &self,
         query: &str,
         candidates: &[RerankerCandidateInput],
     ) -> Result<Vec<RerankerCandidateScore>, ApiError> {
+        self.score_candidates_with_progress(query, candidates, |_, _| Ok(()))
+    }
+
+    /// Score candidate documents while reporting completed reranker candidates.
+    pub fn score_candidates_with_progress<F>(
+        &self,
+        query: &str,
+        candidates: &[RerankerCandidateInput],
+        mut progress: F,
+    ) -> Result<Vec<RerankerCandidateScore>, ApiError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ApiError>,
+    {
+        let total = candidates.len() as u64;
         let mut scores = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
             let pair_score = self.score_pair(query, &candidate.content)?;
             scores.push(RerankerCandidateScore {
                 unit_id: candidate.unit_id.clone(),
@@ -181,6 +195,7 @@ impl RerankerRuntime {
                 false_logit: pair_score.false_logit,
                 token_count: pair_score.token_count,
             });
+            progress((index + 1) as u64, total)?;
         }
         scores.sort_by(|left, right| {
             right

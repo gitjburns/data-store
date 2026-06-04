@@ -1,14 +1,13 @@
 use std::{
     env, fs,
-    net::SocketAddr,
+    io::{self, BufRead, BufReader, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{
-    StatusCode,
-    blocking::{Client, RequestBuilder},
-};
+use reqwest::{StatusCode, blocking::Client};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -16,6 +15,7 @@ const PROMPT: &str = "data-store> ";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
 const SEARCH_EXCERPT_CHARS: usize = 800;
+const OPERATIONS_PATH: &str = "/v1/operations";
 
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
@@ -223,6 +223,52 @@ struct ShutdownResponse {
     status: String,
 }
 
+#[derive(Debug, Serialize)]
+struct OperationRequest {
+    #[serde(rename = "operationId", skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+    operation: &'static str,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OperationEvent {
+    #[serde(rename = "status")]
+    Status {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        stage: Option<String>,
+        message: Option<String>,
+    },
+    #[serde(rename = "progress")]
+    Progress {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        stage: Option<String>,
+        message: Option<String>,
+        current: Option<u64>,
+        total: Option<u64>,
+    },
+    #[serde(rename = "result")]
+    Result {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        payload: serde_json::Value,
+    },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        stage: Option<String>,
+        error: ErrorDetail,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -230,7 +276,13 @@ struct ErrorBody {
 
 #[derive(Debug, Deserialize)]
 struct ErrorDetail {
+    status: Option<u16>,
+    kind: Option<String>,
     message: String,
+}
+
+struct StreamRenderer {
+    active_progress: bool,
 }
 
 /// Start the interactive client after resolving service config and local history.
@@ -238,7 +290,7 @@ fn main() -> Result<()> {
     let config_path = resolve_config_path()?;
     let config = load_config(&config_path)?;
     let context = ClientContext {
-        base_url: format!("http://{}", config.server.bind_address),
+        base_url: base_url_for_bind_address(config.server.bind_address),
         token_file_path: resolve_service_root_path(&config.admin.token_file_path),
         http: Client::new(),
     };
@@ -284,6 +336,16 @@ fn resolve_service_root_path(path: &Path) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
+/// Build the HTTP base URL while converting bind-all addresses to loopback clients can dial.
+fn base_url_for_bind_address(bind_address: SocketAddr) -> String {
+    let ip = match bind_address.ip() {
+        IpAddr::V4(value) if value.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(value) if value.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    };
+    format!("http://{}", SocketAddr::new(ip, bind_address.port()))
+}
+
 /// Run the readline loop until the user exits or input closes.
 fn run_repl(context: ClientContext) -> Result<()> {
     println!("Data Store client connected to {}", context.base_url);
@@ -307,7 +369,7 @@ fn run_repl(context: ClientContext) -> Result<()> {
                             break;
                         }
                     }
-                    Err(source) => eprintln!("error: {source}"),
+                    Err(source) => print_error(&source),
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -322,6 +384,14 @@ fn run_repl(context: ClientContext) -> Result<()> {
         .save_history(&history_path)
         .with_context(|| format!("failed to save history at {}", history_path.display()))?;
     Ok(())
+}
+
+/// Print an error plus its cause chain without collapsing transport diagnostics.
+fn print_error(error: &anyhow::Error) {
+    eprintln!("error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("  caused by: {cause}");
+    }
 }
 
 /// Convert one REPL line into a typed command before any HTTP request is sent.
@@ -465,21 +535,51 @@ fn split_shell_like(line: &str) -> Result<Vec<String>> {
 /// Execute one parsed command and return whether the REPL should continue.
 fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
     match command {
-        Command::Health => render_health(public_get(context, "/v1/health")?),
-        Command::Limits => render_limits(public_get(context, "/v1/limits")?),
+        Command::Health => {
+            render_health(send_operation(context, "health", empty_payload(), false)?)
+        }
+        Command::Limits => {
+            render_limits(send_operation(context, "limits", empty_payload(), false)?)
+        }
         Command::Ingest { source } => {
             let request = IngestRequest { source };
-            render_ingest(public_post_json(context, "/v1/ingest", &request)?);
+            render_ingest(send_operation(
+                context,
+                "ingest",
+                serde_json::to_value(request)
+                    .context("failed to encode ingest operation payload")?,
+                false,
+            )?);
         }
         Command::Search { query, top_k } => {
             let request = SearchRequest { query, top_k };
-            render_search(public_post_json(context, "/v1/search", &request)?, false);
+            render_search(
+                send_operation(
+                    context,
+                    "search",
+                    serde_json::to_value(request)
+                        .context("failed to encode search operation payload")?,
+                    false,
+                )?,
+                false,
+            );
         }
         Command::SearchFull { query, top_k } => {
             let request = SearchRequest { query, top_k };
-            render_search(public_post_json(context, "/v1/search", &request)?, true);
+            render_search(
+                send_operation(
+                    context,
+                    "search",
+                    serde_json::to_value(request)
+                        .context("failed to encode search operation payload")?,
+                    false,
+                )?,
+                true,
+            );
         }
-        Command::Versions => render_versions(admin_get(context, "/admin/document-versions")?),
+        Command::Versions => {
+            render_versions(send_operation(context, "versions", empty_payload(), true)?);
+        }
         Command::Rollback {
             source,
             version_label,
@@ -488,15 +588,17 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 source,
                 version_label,
             };
-            render_rollback(admin_post_json(
+            render_rollback(send_operation(
                 context,
-                "/admin/document-versions/rollback",
-                &request,
+                "rollback",
+                serde_json::to_value(request)
+                    .context("failed to encode rollback operation payload")?,
+                true,
             )?);
         }
         Command::Shutdown => {
             if confirm_shutdown()? {
-                render_shutdown(admin_post_empty(context, "/admin/shutdown")?);
+                render_shutdown(send_operation(context, "shutdown", empty_payload(), true)?);
             } else {
                 println!("shutdown cancelled");
             }
@@ -506,57 +608,6 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
     }
 
     Ok(true)
-}
-
-/// Send an unauthenticated GET request to a versioned public endpoint.
-fn public_get<T>(context: &ClientContext, path: &str) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    send_json(context.http.get(url(context, path)))
-}
-
-/// Send an unauthenticated JSON POST request to a versioned public endpoint.
-fn public_post_json<T, B>(context: &ClientContext, path: &str, body: &B) -> Result<T>
-where
-    T: DeserializeOwned,
-    B: Serialize,
-{
-    send_json(context.http.post(url(context, path)).json(body))
-}
-
-/// Send an authenticated GET request to a protected admin endpoint.
-fn admin_get<T>(context: &ClientContext, path: &str) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let token = read_admin_token(context)?;
-    send_json(context.http.get(url(context, path)).bearer_auth(token))
-}
-
-/// Send an authenticated JSON POST request to a protected admin endpoint.
-fn admin_post_json<T, B>(context: &ClientContext, path: &str, body: &B) -> Result<T>
-where
-    T: DeserializeOwned,
-    B: Serialize,
-{
-    let token = read_admin_token(context)?;
-    send_json(
-        context
-            .http
-            .post(url(context, path))
-            .bearer_auth(token)
-            .json(body),
-    )
-}
-
-/// Send an authenticated empty POST request to a protected admin endpoint.
-fn admin_post_empty<T>(context: &ClientContext, path: &str) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let token = read_admin_token(context)?;
-    send_json(context.http.post(url(context, path)).bearer_auth(token))
 }
 
 /// Read the current startup token immediately before an admin command uses it.
@@ -578,38 +629,265 @@ fn read_admin_token(context: &ClientContext) -> Result<String> {
     Ok(token)
 }
 
+/// Build the operation payload for commands that do not accept arguments.
+fn empty_payload() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Send one operation request and read its NDJSON event stream to a terminal event.
+fn send_operation<T>(
+    context: &ClientContext,
+    operation: &'static str,
+    payload: serde_json::Value,
+    protected: bool,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let method = "POST";
+    let target_url = url(context, OPERATIONS_PATH);
+    let request = OperationRequest {
+        operation_id: None,
+        operation,
+        payload,
+    };
+    let mut builder = context
+        .http
+        .post(&target_url)
+        .header("Accept", "application/x-ndjson")
+        .json(&request);
+    if protected {
+        builder = builder.bearer_auth(read_admin_token(context)?);
+    }
+
+    println!("Operation: {operation}");
+    println!("{method} {target_url}");
+    let started = Instant::now();
+    let response = builder
+        .send()
+        .with_context(|| format!("{method} {target_url} failed to send HTTP request"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().with_context(|| {
+            format!("{method} {target_url} failed to read HTTP error response body")
+        })?;
+        return Err(service_error(method, &target_url, status, &text));
+    }
+
+    let payload = match read_operation_stream(response, operation, method, &target_url) {
+        Ok(payload) => payload,
+        Err(source) => {
+            println!("Elapsed: {} ms", started.elapsed().as_millis());
+            return Err(source);
+        }
+    };
+    println!("Elapsed: {} ms", started.elapsed().as_millis());
+    serde_json::from_value(payload)
+        .with_context(|| format!("failed to parse {operation} result payload"))
+}
+
+/// Read streamed operation events until the service emits a terminal result or error.
+fn read_operation_stream(
+    response: reqwest::blocking::Response,
+    operation: &str,
+    method: &str,
+    target_url: &str,
+) -> Result<serde_json::Value> {
+    let mut renderer = StreamRenderer::new();
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("{method} {target_url} failed while reading NDJSON stream"))?;
+        if bytes_read == 0 {
+            renderer.finish_progress_line()?;
+            bail!(
+                "{method} {target_url} operation `{operation}` stream ended before a terminal event"
+            );
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event: OperationEvent = serde_json::from_str(trimmed).with_context(|| {
+            format!("{method} {target_url} operation `{operation}` returned invalid NDJSON")
+        })?;
+        match event {
+            OperationEvent::Status {
+                operation_id,
+                sequence,
+                stage,
+                message,
+            } => renderer.render_status(&operation_id, sequence, stage, message)?,
+            OperationEvent::Progress {
+                operation_id,
+                sequence,
+                stage,
+                message,
+                current,
+                total,
+            } => {
+                renderer.render_progress(&operation_id, sequence, stage, message, current, total)?
+            }
+            OperationEvent::Result {
+                operation_id,
+                sequence,
+                payload,
+            } => {
+                renderer.finish_progress_line()?;
+                println!("Result: operationId={operation_id} sequence={sequence}");
+                return Ok(payload);
+            }
+            OperationEvent::Error {
+                operation_id,
+                sequence,
+                stage,
+                error,
+            } => {
+                renderer.finish_progress_line()?;
+                return Err(operation_error(
+                    operation,
+                    &operation_id,
+                    sequence,
+                    stage.as_deref(),
+                    &error,
+                ));
+            }
+        }
+    }
+}
+
 /// Build a service URL from the configured base URL and a protocol path.
 fn url(context: &ClientContext, path: &str) -> String {
     format!("{}{}", context.base_url, path)
 }
 
-/// Send one HTTP request and parse either a success body or a service error body.
-fn send_json<T>(request: RequestBuilder) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let response = request.send().context("failed to send HTTP request")?;
-    let status = response.status();
-    let text = response
-        .text()
-        .context("failed to read HTTP response body")?;
-    if status.is_success() {
-        return serde_json::from_str(&text).context("failed to parse service response");
-    }
-
-    Err(service_error(status, &text))
-}
-
 /// Convert a non-success HTTP response into an operator-facing error.
-fn service_error(status: StatusCode, text: &str) -> anyhow::Error {
+fn service_error(method: &str, target_url: &str, status: StatusCode, text: &str) -> anyhow::Error {
     if let Ok(body) = serde_json::from_str::<ErrorBody>(text) {
-        return anyhow!("HTTP {}: {}", status.as_u16(), body.error.message);
+        return anyhow!(
+            "{} {} HTTP {}: {}",
+            method,
+            target_url,
+            status.as_u16(),
+            format_error_detail(&body.error)
+        );
     }
     if text.trim().is_empty() {
-        return anyhow!("HTTP {} with empty response body", status.as_u16());
+        return anyhow!(
+            "{} {} HTTP {} with empty response body",
+            method,
+            target_url,
+            status.as_u16()
+        );
     }
 
-    anyhow!("HTTP {}: {}", status.as_u16(), text.trim())
+    anyhow!(
+        "{} {} HTTP {}: {}",
+        method,
+        target_url,
+        status.as_u16(),
+        text.trim()
+    )
+}
+
+/// Convert a terminal operation error event into a complete operator-facing error.
+fn operation_error(
+    operation: &str,
+    operation_id: &str,
+    sequence: u64,
+    stage: Option<&str>,
+    error: &ErrorDetail,
+) -> anyhow::Error {
+    let stage = stage.unwrap_or("unknown");
+    anyhow!(
+        "operation `{operation}` failed: operationId={operation_id} sequence={sequence} stage={stage} {}",
+        format_error_detail(error)
+    )
+}
+
+/// Format structured service errors while tolerating legacy message-only error bodies.
+fn format_error_detail(error: &ErrorDetail) -> String {
+    match (&error.status, &error.kind) {
+        (Some(status), Some(kind)) => {
+            format!("status={status} kind={kind} message={}", error.message)
+        }
+        (Some(status), None) => format!("status={status} message={}", error.message),
+        (None, Some(kind)) => format!("kind={kind} message={}", error.message),
+        (None, None) => error.message.clone(),
+    }
+}
+
+impl StreamRenderer {
+    /// Create a renderer that tracks whether the terminal cursor is on an overwritten progress line.
+    fn new() -> Self {
+        Self {
+            active_progress: false,
+        }
+    }
+
+    /// Render one status event as a durable line after closing any active progress line.
+    fn render_status(
+        &mut self,
+        operation_id: &str,
+        sequence: u64,
+        stage: Option<String>,
+        message: Option<String>,
+    ) -> Result<()> {
+        self.finish_progress_line()?;
+        let stage = stage.unwrap_or_else(|| "status".to_string());
+        match message {
+            Some(message) => {
+                println!("[{operation_id} #{sequence}] {stage}: {message}");
+            }
+            None => {
+                println!("[{operation_id} #{sequence}] {stage}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Render one progress event, overwriting the current line when counted progress is available.
+    fn render_progress(
+        &mut self,
+        operation_id: &str,
+        sequence: u64,
+        stage: Option<String>,
+        message: Option<String>,
+        current: Option<u64>,
+        total: Option<u64>,
+    ) -> Result<()> {
+        let stage = stage.unwrap_or_else(|| "progress".to_string());
+        let message = message.unwrap_or_else(|| "working".to_string());
+        match (current, total) {
+            (Some(current), Some(total)) => {
+                print!("\r[{operation_id} #{sequence}] {stage}: {message} {current}/{total}");
+                io::stdout()
+                    .flush()
+                    .context("failed to flush progress line")?;
+                self.active_progress = true;
+            }
+            _ => {
+                self.finish_progress_line()?;
+                println!("[{operation_id} #{sequence}] {stage}: {message}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish an overwritten progress line before printing normal output.
+    fn finish_progress_line(&mut self) -> Result<()> {
+        if self.active_progress {
+            println!();
+            io::stdout()
+                .flush()
+                .context("failed to flush completed progress line")?;
+            self.active_progress = false;
+        }
+        Ok(())
+    }
 }
 
 /// Print service readiness and component diagnostics in a compact form.

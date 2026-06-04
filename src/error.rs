@@ -68,14 +68,18 @@ struct ErrorBody {
     error: ErrorDetail,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorDetail {
+#[derive(Debug, Clone, Serialize)]
+pub struct OperationErrorDetail {
+    pub status: u16,
+    pub kind: String,
     message: String,
 }
 
+type ErrorDetail = OperationErrorDetail;
+
 impl ApiError {
     /// Return the HTTP status code that corresponds to this error.
-    fn status_code(&self) -> StatusCode {
+    pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -96,7 +100,7 @@ impl ApiError {
     }
 
     /// Return a stable error-kind label for service logs.
-    fn error_kind(&self) -> &'static str {
+    pub fn error_kind(&self) -> &'static str {
         match self {
             Self::ConfigRead { .. } => "config_read",
             Self::ConfigParse { .. } => "config_parse",
@@ -114,6 +118,15 @@ impl ApiError {
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::Unauthorized { .. } => "unauthorized",
             Self::ServiceUnavailable { .. } => "service_unavailable",
+        }
+    }
+
+    /// Build the structured error payload used by HTTP errors and operation streams.
+    pub fn operation_error_detail(&self) -> OperationErrorDetail {
+        OperationErrorDetail {
+            status: self.status_code().as_u16(),
+            kind: self.error_kind().to_string(),
+            message: self.to_string(),
         }
     }
 }
@@ -144,7 +157,11 @@ impl IntoResponse for ApiError {
             );
         }
         let body = ErrorBody {
-            error: ErrorDetail { message },
+            error: ErrorDetail {
+                status: status.as_u16(),
+                kind: error_kind.to_string(),
+                message,
+            },
         };
 
         (status, Json(body)).into_response()

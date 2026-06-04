@@ -48,9 +48,18 @@ The service has an implemented standalone runtime with ingestion, retrieval,
 storage, version management, admin shutdown, runtime token-file handoff, and the
 interactive `data-store` client.
 
-The server spec and protocol have since been revised around a universal
-operation-stream contract. The next scope of work is implementing that contract
-in the service and migrating the CLI to consume it.
+The service now exposes the universal operation-stream contract through
+`POST /v1/operations` while preserving the route-specific endpoints during
+migration. The `data-store` CLI consumes the operation stream, and long ingest
+and search operations emit real status/progress events where real stage
+boundaries and counts are available.
+
+Operator documentation has been aligned with the implemented operation-stream
+behavior. `README.md` and `ARCHITECTURE.md` now document `POST /v1/operations`
+as the consumer API and describe retained route-specific endpoints as migration
+compatibility routes.
+
+The next scope of work is manual runtime verification against a running service.
 
 ## Completed Capability Areas
 
@@ -146,13 +155,18 @@ ingest, search, admin operations, and shutdown behavior.
    before considering ANN/indexing.
 2. CUDA verification remains environment-dependent and should be performed on a
    CUDA host before relying on CUDA deployment behavior.
-3. The universal operation-stream protocol must be implemented and verified once
-   its implementation phase is approved.
+3. Manual runtime verification of the operation-stream protocol remains pending
+   because it depends on local config, model artifacts, Docling, and a running
+   service.
 
-## Next Scope: Operation-Stream API Contract
+## Completed Scope: Operation-Stream API Contract
 
 Implement the data-store operation protocol documented in `PROTOCOL.md` and
 `SPEC-SERVER.md`.
+
+Status: complete. Server operation foundation, client operation migration, and
+server real progress instrumentation are implemented. Manual runtime
+verification remains pending.
 
 ### Goals
 
@@ -194,6 +208,13 @@ Implement the data-store operation protocol documented in `PROTOCOL.md` and
 ### Progress Instrumentation
 
 Add real server-side status/progress events without fake percentages.
+
+Status: complete for the operation stream. Ingest emits status boundaries for
+source resolution, Docling conversion, unit splitting, dense embedding, ColBERT
+embedding, and storage publish, with counted dense and ColBERT per-unit
+progress. Search emits status boundaries for query embedding, candidate
+retrieval, ColBERT scoring, reranker scoring, and result assembly, with counted
+ColBERT and reranker per-candidate progress.
 
 Ingest:
 
@@ -265,6 +286,35 @@ Manual verification:
 7. Confirm operation errors include status, kind, message, operation, and stage.
 8. Confirm transport failures include method, URL, and cause chain.
 9. Confirm protected operations do not print or log the bearer token.
+
+## Completed Scope: Documentation Alignment And Verification
+
+Align operator-facing docs with the implemented operation-stream behavior.
+
+Status: complete.
+
+Included:
+
+- Update `README.md` and `ARCHITECTURE.md` to describe `/v1/operations` as the
+  current documented consumer API.
+- Clearly describe retained route-specific endpoints as migration
+  compatibility behavior if they remain documented.
+- Keep manual runtime verification explicit because it depends on local config,
+  models, Docling, and a running service.
+- Keep `PROTOCOL.md`, `SPEC-SERVER.md`, and `SPEC-CLIENT.md` as the target
+  operation-stream contract unless implementation inspection shows drift.
+
+Verified from `service/data-store/`:
+
+```bash
+cargo fmt --check
+cargo check
+cargo check --bin data-store
+cargo check --features metal
+```
+
+Manual runtime verification remains pending because it depends on local config,
+models, Docling, and a running service.
 
 ## Session Procedure
 

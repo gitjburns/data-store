@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, OperationErrorDetail};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -129,6 +129,70 @@ pub struct DocumentVersionRollbackResponse {
     pub vector_count: usize,
 
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationRequest {
+    #[serde(rename = "operationId")]
+    pub operation_id: Option<String>,
+
+    pub operation: String,
+
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum OperationEvent {
+    #[serde(rename = "status")]
+    Status {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    #[serde(rename = "progress")]
+    #[allow(dead_code)]
+    Progress {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+    },
+    #[serde(rename = "result")]
+    Result {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        payload: serde_json::Value,
+    },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        sequence: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        error: OperationErrorDetail,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationControlRequest {
+    #[serde(rename = "type")]
+    pub control_type: String,
 }
 
 impl IngestRequest {

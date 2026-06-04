@@ -10,13 +10,13 @@ The work must preserve the service as the single source of truth. The client
 only reads config, reads the runtime token file for admin commands, sends HTTP
 requests, and renders responses for humans.
 
-The next approved design direction migrates the CLI from route-specific HTTP
-calls to the universal streamed operation protocol documented in `PROTOCOL.md`.
+The CLI has been migrated from route-specific HTTP calls to the universal
+streamed operation protocol documented in `PROTOCOL.md`.
 
 ## Status
 
-Initial implementation complete. Operation-stream migration is the next planned
-scope.
+Initial implementation complete. Operation-stream migration is complete.
+Operator documentation alignment is complete.
 
 Completed:
 
@@ -29,11 +29,16 @@ Completed:
 - Human-readable response rendering.
 - Documentation and local gitignore updates.
 - Cargo dependency and lockfile updates.
+- Operation-stream client transport through `POST /v1/operations`.
+- NDJSON `status`, `progress`, `result`, and `error` event parsing.
+- Human rendering of streamed status/progress and terminal results.
+- Transport, stream, and operation-error reporting with operation/stage/status
+  context and HTTP method/URL cause chains.
 
 Verified:
 
 ```bash
-cargo fmt
+cargo fmt --check
 cargo check
 cargo check --bin data-store
 cargo check --features metal
@@ -43,12 +48,8 @@ Not yet manually verified against a running service.
 
 Next scope:
 
-- Replace route-specific client calls with `POST /v1/operations`.
-- Render operation-scoped NDJSON `status`, `progress`, `result`, and `error`
-  events.
-- Improve transport, stream, and service-error reporting.
-- Keep protected operations on the startup bearer token read from the runtime
-  token file.
+- Manual runtime verification against a running service with local config,
+  model artifacts, and Docling available.
 
 ## Historical Scope
 
@@ -74,8 +75,7 @@ Excluded:
 - External consumer integration.
 
 The following phases document the completed initial client implementation. They
-are retained as implementation history; the next target contract is the
-operation-stream migration below.
+are retained as implementation history.
 
 ## Historical Phase 1: Config And Local Files
 
@@ -391,13 +391,18 @@ Manual verification:
 9. Restart the service and verify a stale token file is replaced.
 10. Restart the client and confirm command history is available.
 
-## Next Scope: Operation-Stream Protocol Migration
+## Completed Scope: Operation-Stream Protocol Migration
 
 Migrate the client to the universal streamed operation protocol documented in
 `PROTOCOL.md` and `SPEC-CLIENT.md`.
 
 This is a protocol migration, not a new client-specific API. The CLI must use
 the same `/v1/operations` NDJSON stream protocol available to all consumers.
+
+Status: complete. The CLI sends service commands through `POST /v1/operations`,
+renders streamed status/progress events, deserializes terminal result payloads
+into existing human renderers, and reports operation, stream, and transport
+errors with the documented context.
 
 ### Included
 
@@ -709,7 +714,7 @@ Historical implementation order:
 This order brings up the service credential handoff before the client depends on
 it, then builds the client from startup through rendering.
 
-Next implementation order:
+Completed operation-stream implementation order:
 
 1. Protocol DTOs and structured errors.
 2. Operation dispatcher.
@@ -722,3 +727,29 @@ Next implementation order:
 9. CLI error reporting.
 10. Control endpoint placeholder.
 11. Docs and verification.
+
+## Completed Scope: Documentation Alignment And Verification
+
+Align operator-facing docs with the implemented operation-stream behavior.
+
+Status: complete.
+
+Included:
+
+- Update `README.md` and `ARCHITECTURE.md` to describe `/v1/operations` as the
+  current documented consumer API.
+- Ensure CLI runbook text describes streamed status/progress behavior through
+  the operation protocol.
+- Clearly describe retained route-specific endpoints as migration
+  compatibility behavior if they remain documented.
+- Keep manual runtime verification explicit because it depends on local config,
+  model artifacts, Docling, and a running service.
+
+Verified from `service/data-store/`:
+
+```bash
+cargo fmt --check
+cargo check
+cargo check --bin data-store
+cargo check --features metal
+```

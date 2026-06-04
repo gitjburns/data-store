@@ -356,20 +356,34 @@ impl ColbertRuntime {
         tensor_to_document_embedding(unit_id, document_projection)
     }
 
-    /// Score persisted ColBERT document token vectors over a bounded RRF pool.
+    /// Score persisted ColBERT document token vectors without per-candidate progress reporting.
     pub fn score_persisted_candidates(
         &self,
         query: &str,
         candidates: &[ColbertDocumentEmbedding],
     ) -> Result<Vec<ColbertCandidateScore>, ApiError> {
+        self.score_persisted_candidates_with_progress(query, candidates, |_, _| Ok(()))
+    }
+
+    /// Score persisted ColBERT document token vectors while reporting completed candidates.
+    pub fn score_persisted_candidates_with_progress<F>(
+        &self,
+        query: &str,
+        candidates: &[ColbertDocumentEmbedding],
+        mut progress: F,
+    ) -> Result<Vec<ColbertCandidateScore>, ApiError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ApiError>,
+    {
         let query_projection = self.encode_projected_query(query)?;
         let (query_tokens, _) = query_projection.dims2().map_err(|source| {
             inference_error(format!(
                 "ColBERT search query projection shape error: {source}"
             ))
         })?;
+        let total = candidates.len() as u64;
         let mut scores = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
             let document_projection = Tensor::from_vec(
                 candidate.vector.clone(),
                 (candidate.token_count, candidate.dimension),
@@ -389,6 +403,7 @@ impl ColbertRuntime {
                 query_tokens,
                 document_tokens: candidate.token_count,
             });
+            progress((index + 1) as u64, total)?;
         }
         scores.sort_by(|left, right| {
             right

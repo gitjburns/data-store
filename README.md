@@ -14,8 +14,8 @@ otherwise.
 
 ## Capabilities
 
-- Axum/Tokio HTTP API for health, limits, ingest, search, protected admin
-  version controls, and protected shutdown.
+- Axum/Tokio operation-stream HTTP API for health, limits, ingest, search,
+  protected admin version controls, and protected shutdown.
 - Interactive `data-store` CLI client for operating the documented HTTP API.
 - Explicit Metal/CUDA accelerator selection with no CPU fallback.
 - Local Qwen3 dense embedding, ColBERT, and Qwen3 reranker runtimes through
@@ -100,7 +100,8 @@ first-time storage setup with the release binary when needed:
 
 Startup prints bootstrap and readiness details to stdout before the invoking
 parent process exits. It includes the current `admin_shutdown_token=<token>` for
-manual admin requests and a `/v1/health` URL for readiness checks.
+manual protected operations and a `/v1/health` compatibility URL for readiness
+checks.
 
 The default example config uses:
 
@@ -119,9 +120,9 @@ this directory.
 
 ## Use The CLI Client
 
-The `data-store` client is an interactive REPL over the same HTTP API shown in
-this runbook. Start the service first, then start the client from this
-directory:
+The `data-store` client is an interactive REPL over the same
+`POST /v1/operations` stream API shown in this runbook. Start the service
+first, then start the client from this directory:
 
 ```bash
 cargo run --bin data-store -- --config config.toml
@@ -134,9 +135,9 @@ For a release build, run:
 ```
 
 The client reads `server.bind_address` and `admin.token_file_path` from the
-same config file. Public commands call `/v1` endpoints without authentication.
-Admin commands use the configured token file. If the token file is missing,
-start or restart the service.
+same config file. Public commands send unauthenticated operations. Protected
+commands read the configured token file immediately before sending the
+operation. If the token file is missing, start or restart the service.
 
 At the prompt, run `help` to show the available commands and syntax:
 
@@ -160,19 +161,46 @@ data-store> exit
 ```
 
 `search` prints excerpts. `search-full` prints the full matched unit content.
-Quote multi-word queries and any argument containing spaces. The `shutdown`
-command asks for typed confirmation before it sends the protected shutdown
-request.
+Quote multi-word queries and any argument containing spaces. Long operations
+stream status and counted progress while they run. The `shutdown` command asks
+for typed confirmation before it sends the protected shutdown operation.
 
 The client prints human-readable output and stores readline history in
 `.data-store.history`.
+
+## Operation API
+
+The documented consumer API is one streamed operation endpoint:
+
+```http
+POST /v1/operations
+Accept: application/x-ndjson
+Content-Type: application/json
+```
+
+Each request starts one operation. The response is newline-delimited JSON with
+`status`, `progress`, `result`, and `error` events. The stream ends after one
+terminal `result` or `error` event. See `PROTOCOL.md` for the complete event
+contract.
+
+Public operations do not require authentication. Protected operations require
+the startup-scoped bearer token printed as `admin_shutdown_token=<token>` or
+written to the configured admin token file.
+
+Route-specific endpoints such as `/v1/health`, `/v1/limits`, `/v1/ingest`,
+`/v1/search`, and `/admin/...` remain available during migration as
+compatibility routes. New consumers should use `/v1/operations`.
 
 ## Health And Limits
 
 Check readiness:
 
 ```bash
-curl http://127.0.0.1:8091/v1/health
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -d '{"operation":"health","payload":{}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 The top-level `ready` flag is based on readiness-critical components:
@@ -190,7 +218,11 @@ Fetch request and retrieval limits before constructing ingest or search
 requests:
 
 ```bash
-curl http://127.0.0.1:8091/v1/limits
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -d '{"operation":"limits","payload":{}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 Oversized bodies return `413 Payload Too Large`. Oversized fields, unknown JSON
@@ -202,10 +234,11 @@ Ingest uses a corpus-relative source reference. File bytes do not cross the
 HTTP API; the service resolves the source inside its configured corpus root.
 
 ```bash
-curl -X POST \
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
   -H "Content-Type: application/json" \
-  -d '{"source":"The_Elements_of_Style.pdf"}' \
-  http://127.0.0.1:8091/v1/ingest
+  -d '{"operation":"ingest","payload":{"source":"The_Elements_of_Style.pdf"}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 A successful ingest creates a new immutable source-document version, persists
@@ -215,41 +248,47 @@ search snapshot only after the new version is durable and cache-ready.
 ## Search
 
 ```bash
-curl -X POST \
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
   -H "Content-Type: application/json" \
-  -d '{"query":"clear writing style rules","topK":3}' \
-  http://127.0.0.1:8091/v1/search
+  -d '{"operation":"search","payload":{"query":"clear writing style rules","topK":3}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 Search is synchronous. It captures the active document-version snapshot at
 request admission and uses that same snapshot through dense retrieval, BM25,
-RRF, ColBERT MaxSim, Qwen3 reranking, and result materialization. The response
-contains public results plus raw stage diagnostics.
+RRF, ColBERT MaxSim, Qwen3 reranking, and result materialization. The terminal
+`result` event contains public results plus raw stage diagnostics.
 
 If the configured ingest/search admission gate is saturated, the endpoint
-returns `503 Service Unavailable` immediately. The service does not hide work
-in an unbounded queue.
+emits a terminal `error` event with status `503 Service Unavailable`. The
+service does not hide work in an unbounded queue.
 
 ## Version Administration
 
-Admin endpoints require the startup-scoped bearer token printed as
+Protected operations require the startup-scoped bearer token printed as
 `admin_shutdown_token=<token>` or written to the configured admin token file.
 
 List retained document versions:
 
 ```bash
-curl -H "Authorization: Bearer <token>" \
-  http://127.0.0.1:8091/admin/document-versions
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"operation":"versions","payload":{}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 Rollback one source document to an already-retained version:
 
 ```bash
-curl -X POST \
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"source":"The_Elements_of_Style.pdf","versionLabel":"2026-06-01T21:37:22.184Z"}' \
-  http://127.0.0.1:8091/admin/document-versions/rollback
+  -d '{"operation":"rollback","payload":{"source":"The_Elements_of_Style.pdf","versionLabel":"2026-06-01T21:37:22.184Z"}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 Rollback repoints `active_document_versions` and publishes a new active search
@@ -261,14 +300,19 @@ cleanup.
 Use the startup token for graceful shutdown:
 
 ```bash
-curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8091/admin/shutdown
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"operation":"shutdown","payload":{}}' \
+  http://127.0.0.1:8091/v1/operations
 ```
 
 Accepted shutdown requests drain through Axum graceful shutdown instead of
 requiring a process signal.
 
 The CLI `shutdown` command asks for typed confirmation before sending the same
-protected admin request.
+protected operation.
 
 ## Verify
 
@@ -290,8 +334,8 @@ cargo check --features metal
   `config.toml`; readiness must fail clearly rather than falling back.
 - Docling conversion failure: inspect the API error and service log. The service
   does not silently switch PDF backends or OCR modes.
-- `401 Unauthorized` on admin endpoints: use the current startup token from
-  stdout or the configured admin token file; tokens do not survive restart.
+- `401 Unauthorized` on protected operations: use the current startup token
+  from stdout or the configured admin token file; tokens do not survive restart.
 - Missing admin token file for the CLI: start or restart the service with a
   config that includes `[admin].token_file_path`.
 - `503 Service Unavailable` on ingest/search: the configured in-flight limit is
