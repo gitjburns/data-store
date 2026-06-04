@@ -202,11 +202,14 @@ attached to the current terminal for debugging.
 
 The startup handoff reports config/log paths, file logging initialization,
 bind address, background child PID, admin token-file path/write status,
-inference readiness, storage/cache readiness, HTTP bind/listening state, final
-top-level readiness, and the `/v1/health` URL. After file logging is
-initialized, operational events go to the configured log file. Logs summarize
-operation status, counts, and timings; they must not store the admin token,
-document contents, vector values, or oversized retrieval internals.
+inference progress and readiness, storage/cache readiness, HTTP bind/listening
+state, final top-level readiness, and the `/v1/health` URL. Inference progress
+uses an updating terminal line and includes accelerator, artifact, model-load,
+every model layer, and smoke-check milestones so long model initialization does
+not appear frozen. After file logging is initialized, operational events go to
+the configured log file. Logs summarize operation status, counts, and timings;
+they must not store the admin token, document contents, vector values, or
+oversized retrieval internals.
 
 ## Admin Token
 

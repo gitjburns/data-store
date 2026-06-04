@@ -51,6 +51,7 @@ struct AdminTokenFile {
 const STDIN_FILENO: i32 = 0;
 const STDOUT_FILENO: i32 = 1;
 const STDERR_FILENO: i32 = 2;
+const STARTUP_PROGRESS_PREFIX: &str = "__data_store_progress__";
 
 unsafe extern "C" {
     fn fork() -> i32;
@@ -71,7 +72,7 @@ impl StartupReporter {
     fn report(&mut self, message: impl AsRef<str>) -> Result<(), ApiError> {
         match self {
             Self::Stdout => {
-                println!("{}", message.as_ref());
+                println!("\r\u{1b}[2K{}", message.as_ref());
                 std::io::stdout()
                     .flush()
                     .map_err(|source| ApiError::InternalIo {
@@ -86,6 +87,32 @@ impl StartupReporter {
                 })?;
                 stream.flush().map_err(|source| ApiError::InternalIo {
                     message: format!("failed to flush startup status to parent: {source}"),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Emit a transient startup progress update that the terminal can overwrite in place.
+    fn report_progress(&mut self, message: impl AsRef<str>) -> Result<(), ApiError> {
+        match self {
+            Self::Stdout => {
+                print!("\r\u{1b}[2K{}", message.as_ref());
+                std::io::stdout()
+                    .flush()
+                    .map_err(|source| ApiError::InternalIo {
+                        message: format!("failed to flush startup progress stdout: {source}"),
+                    })?;
+            }
+            Self::Pipe(stream) => {
+                writeln!(stream, "{STARTUP_PROGRESS_PREFIX}{}", message.as_ref()).map_err(
+                    |source| ApiError::InternalIo {
+                        message: format!("failed to write startup progress to parent: {source}"),
+                    },
+                )?;
+                stream.flush().map_err(|source| ApiError::InternalIo {
+                    message: format!("failed to flush startup progress to parent: {source}"),
                 })?;
             }
         }
@@ -203,7 +230,11 @@ async fn run_http_service(
     );
 
     reporter.report("data-store startup inference=initializing")?;
-    let inference = InferenceRuntime::initialize(&config);
+    let mut report_inference_progress =
+        |message: &str| reporter.report_progress(format!("data-store startup inference={message}"));
+    let inference =
+        InferenceRuntime::initialize_with_progress(&config, &mut report_inference_progress);
+    drop(report_inference_progress);
     match &inference {
         Ok(runtime) => {
             reporter.report(format!(
@@ -464,6 +495,7 @@ fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut startup_failed = false;
+    let mut progress_active = false;
     loop {
         line.clear();
         let bytes_read = reader
@@ -473,6 +505,20 @@ fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
             })?;
         if bytes_read == 0 {
             break;
+        }
+        if let Some(progress) = line.strip_prefix(STARTUP_PROGRESS_PREFIX) {
+            print!("\r\u{1b}[2K{}", progress.trim_end_matches(['\r', '\n']));
+            std::io::stdout()
+                .flush()
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("failed to flush startup progress stdout: {source}"),
+                })?;
+            progress_active = true;
+            continue;
+        }
+        if progress_active {
+            print!("\r\u{1b}[2K");
+            progress_active = false;
         }
         if line.contains("data-store startup fatal=")
             || line.contains("data-store startup http=bind_failed")
@@ -485,6 +531,9 @@ fn relay_startup_status(stream: UnixStream) -> Result<bool, ApiError> {
             .map_err(|source| ApiError::InternalIo {
                 message: format!("failed to flush startup status stdout: {source}"),
             })?;
+    }
+    if progress_active {
+        println!();
     }
 
     Ok(startup_failed)

@@ -99,25 +99,8 @@ first-time storage setup with the release binary when needed:
 ```
 
 Startup prints bootstrap and readiness details to stdout before the invoking
-parent process exits:
-
-- config path
-- configured and resolved log path
-- log level
-- file logging initialization
-- bind address
-- `admin_shutdown_token=<token>`
-- configured admin token-file path and write status
-- background child PID, unless `--foreground` is used
-- inference initialization start and ready/not-ready state
-- storage/cache initialization start and ready/not-ready state
-- HTTP bind/listening state
-- final readiness summary and `/v1/health` URL
-
-Capture the admin shutdown token from stdout when using curl directly. The same
-startup-scoped token is also written to the configured
-`[admin].token_file_path` for the local CLI client. The token is not written to
-config, SQLite, or the service log.
+parent process exits. It includes the current `admin_shutdown_token=<token>` for
+manual admin requests and a `/v1/health` URL for readiness checks.
 
 The default example config uses:
 
@@ -126,10 +109,8 @@ The default example config uses:
 token_file_path = ".data-store-admin-token"
 ```
 
-Relative admin token-file paths resolve from the Rust service root. The service
-replaces stale token files on startup, creates the token file with owner-only
-permissions, fails startup if the file cannot be written securely, and removes
-the file on graceful shutdown when it still contains the current token.
+The CLI client reads the same startup-scoped admin token from this file.
+Relative admin token-file paths resolve from the Rust service root.
 
 Operational events after file logging initialization are written to the
 configured `[logging].file_path`. Relative log paths resolve from the Rust
@@ -154,20 +135,16 @@ For a release build, run:
 
 The client reads `server.bind_address` and `admin.token_file_path` from the
 same config file. Public commands call `/v1` endpoints without authentication.
-Admin commands read the current token file immediately before sending the
-request and use the same bearer-token authentication as curl.
+Admin commands use the configured token file. If the token file is missing,
+start or restart the service.
 
-The service must be running with a config that includes:
+At the prompt, run `help` to show the available commands and syntax:
 
-```toml
-[admin]
-token_file_path = ".data-store-admin-token"
+```text
+data-store> help
 ```
 
-If the configured token file is missing, start or restart the service. The
-client does not ask for or store admin tokens.
-
-At the prompt, use:
+Common commands:
 
 ```text
 data-store> health
@@ -182,29 +159,13 @@ data-store> help
 data-store> exit
 ```
 
-Command reference:
-
-```text
-health
-limits
-ingest <source>
-search <query> [topK]
-search-full <query> [topK]
-versions
-rollback <source> <versionLabel>
-shutdown
-help
-exit
-```
-
 `search` prints excerpts. `search-full` prints the full matched unit content.
 Quote multi-word queries and any argument containing spaces. The `shutdown`
 command asks for typed confirmation before it sends the protected shutdown
 request.
 
-The client prints human-readable output only. It stores readline history in
-`.data-store.history`; both the history file and `.data-store-admin-token` are
-local ignored files.
+The client prints human-readable output and stores readline history in
+`.data-store.history`.
 
 ## Health And Limits
 

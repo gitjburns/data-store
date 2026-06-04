@@ -14,6 +14,7 @@ use crate::{
     config::ColbertModelConfig,
     error::ApiError,
     inference::{
+        InferenceProgress,
         artifacts::{CONFIG_FILE_NAME, ModelArtifacts, TOKENIZER_FILE_NAME},
         tensor_ops::{apply_rope, softmax_last_dim_metal_safe},
     },
@@ -207,28 +208,45 @@ struct TensorMetadata {
 }
 
 impl ColbertRuntime {
-    /// Validate the ColBERT artifact contract and run incremental ColBERT runtime smoke checks.
-    pub fn load(
+    /// Load ColBERT while reporting tokenizer, encoder, projection, and smoke-check progress.
+    pub fn load_with_progress(
         artifacts: &ModelArtifacts,
         config: &ColbertModelConfig,
         device: &Device,
+        progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         validate_colbert_config(config)?;
 
+        progress("colbert_tokenizer_loading")?;
         let tokenizer = Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|source| {
             inference_error(format!(
                 "failed to load ColBERT tokenizer at {}: {source}",
                 artifacts.tokenizer_path.display()
             ))
         })?;
+        progress("colbert_tokenizer_ready")?;
+        progress("colbert_config_loading")?;
         let model_config = load_modernbert_config(&artifacts.config_path)?;
         validate_modernbert_config(&model_config, config)?;
+        progress("colbert_config_ready")?;
+        progress("colbert_tokenizer_contract_validating")?;
         validate_tokenizer_contract(artifacts, config)?;
+        progress("colbert_tokenizer_contract_ready")?;
+        progress("colbert_safetensors_validating")?;
         validate_root_safetensors(artifacts, &model_config)?;
+        progress("colbert_safetensors_ready")?;
+        progress("colbert_input_path_loading")?;
         let input_path = ColbertInputPath::load(artifacts, &model_config, device)?;
+        progress("colbert_input_path_ready")?;
+        progress("colbert_projection_loading")?;
         let projection = ColbertProjection::load(artifacts, config, device)?;
-        let encoder = ColbertEncoderRuntime::load(artifacts, &model_config, device)?;
+        progress("colbert_projection_ready")?;
+        progress("colbert_encoder_loading")?;
+        let encoder =
+            ColbertEncoderRuntime::load_with_progress(artifacts, &model_config, device, progress)?;
+        progress("colbert_encoder_ready")?;
 
+        progress("colbert_smoke_tokenizing")?;
         let query_token_ids = tokenize_formatted(
             &tokenizer,
             &format_query(SMOKE_QUERY),
@@ -241,15 +259,21 @@ impl ColbertRuntime {
             config.document_max_tokens as usize,
             "document",
         )?;
+        progress("colbert_smoke_input_path")?;
         let query_hidden = input_path.forward(&query_token_ids, device, "query")?;
         let document_hidden = input_path.forward(&document_token_ids, device, "document")?;
+        progress("colbert_smoke_projection")?;
         let query_projection = projection.project(&query_hidden)?;
         let document_projection = projection.project(&document_hidden)?;
         let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
         let first_layer = encoder.first_layer()?;
+        progress("colbert_smoke_attention")?;
         let attention_smoke = first_layer.attention.smoke(&query_hidden, "query")?;
+        progress("colbert_smoke_single_layer")?;
         let single_layer_smoke = first_layer.smoke(&query_hidden, "query")?;
+        progress("colbert_smoke_full_encoder")?;
         let full_encoder_smoke = encoder.smoke(&query_hidden, &document_hidden, &projection)?;
+        progress("colbert_smoke_ready")?;
 
         Ok(Self {
             tokenizer,
@@ -871,12 +895,14 @@ impl ColbertLayerPrimitive {
 }
 
 impl ColbertEncoderRuntime {
-    /// Load the full ModernBERT encoder stack and final normalization used for ColBERT token vectors.
-    fn load(
+    /// Load the full ModernBERT encoder stack while reporting layer progress.
+    fn load_with_progress(
         artifacts: &ModelArtifacts,
         config: &ModernBertConfig,
         device: &Device,
+        progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
+        progress("colbert_encoder_memory_mapping")?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::F32, device)
         }
@@ -886,8 +912,14 @@ impl ColbertEncoderRuntime {
                 artifacts.root.display()
             ))
         })?;
+        progress("colbert_encoder_memory_mapped")?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_index in 0..config.num_hidden_layers {
+            progress(&format!(
+                "colbert_encoder_layer_loading layer={}/{}",
+                layer_index + 1,
+                config.num_hidden_layers
+            ))?;
             layers.push(ColbertLayerPrimitive::load(
                 artifacts,
                 config,
@@ -895,11 +927,17 @@ impl ColbertEncoderRuntime {
                 device,
             )?);
         }
+        progress(&format!(
+            "colbert_encoder_layers_ready count={}",
+            config.num_hidden_layers
+        ))?;
+        progress("colbert_encoder_final_norm_loading")?;
         let final_norm =
             MetalSafeLayerNorm::load(config.hidden_size, config.norm_eps, vb.pp("final_norm"))
                 .map_err(|source| {
                     inference_error(format!("failed to load ColBERT final norm: {source}"))
                 })?;
+        progress("colbert_encoder_final_norm_ready")?;
 
         Ok(Self {
             layers,

@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::{
     error::ApiError,
     inference::{
+        InferenceProgress,
         artifacts::ModelArtifacts,
         tensor_ops::{apply_rope, softmax_last_dim_metal_safe},
     },
@@ -80,15 +81,17 @@ pub struct TokenLogit {
 }
 
 impl Qwen3Model {
-    /// Load a Qwen3 causal model graph for hidden-state extraction or tied-embedding token scoring.
-    pub fn load(
+    /// Load a Qwen3 graph while reporting long model-load substeps to startup.
+    pub fn load_with_progress(
         label: &str,
         config: &Qwen3Config,
         artifacts: &ModelArtifacts,
         device: &Device,
         tensor_prefix: Option<&str>,
+        progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         validate_qwen3_config(label, config)?;
+        progress(&format!("{label}_model_memory_mapping"))?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::BF16, device)
         }
@@ -98,7 +101,9 @@ impl Qwen3Model {
                 artifacts.root.display()
             ))
         })?;
+        progress(&format!("{label}_model_memory_mapped"))?;
         let model_vb = tensor_prefix.map_or_else(|| vb.clone(), |prefix| vb.pp(prefix));
+        progress(&format!("{label}_model_embeddings_loading"))?;
         let embeddings = embedding(
             config.vocab_size,
             config.hidden_size,
@@ -117,19 +122,31 @@ impl Qwen3Model {
                     "failed to load {label} tied token embedding weight: {source}"
                 ))
             })?;
+        progress(&format!("{label}_model_embeddings_ready"))?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
+            progress(&format!(
+                "{label}_model_layer_loading layer={}/{}",
+                index + 1,
+                config.num_hidden_layers
+            ))?;
             layers.push(Qwen3Layer::load(
                 label,
                 config,
                 model_vb.pp(format!("layers.{index}")),
             )?);
         }
+        progress(&format!(
+            "{label}_model_layers_ready count={}",
+            config.num_hidden_layers
+        ))?;
+        progress(&format!("{label}_model_final_norm_loading"))?;
         let norm =
             MetalSafeRmsNorm::load(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))
                 .map_err(|source| {
                     inference_error(format!("failed to load {label} final norm: {source}"))
                 })?;
+        progress(&format!("{label}_model_final_norm_ready"))?;
 
         Ok(Self {
             embeddings,

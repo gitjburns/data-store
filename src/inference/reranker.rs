@@ -8,6 +8,7 @@ use crate::{
     config::RerankerModelConfig,
     error::ApiError,
     inference::{
+        InferenceProgress,
         artifacts::{CONFIG_FILE_NAME, ModelArtifacts},
         qwen3::{Qwen3Model, load_qwen3_config},
     },
@@ -72,20 +73,24 @@ struct PairScore {
 }
 
 impl RerankerRuntime {
-    /// Load the Qwen3 reranker graph and run a yes/no scoring smoke check.
-    pub fn load(
+    /// Load the reranker runtime while reporting tokenizer, model, and smoke-check progress.
+    pub fn load_with_progress(
         artifacts: &ModelArtifacts,
         config: &RerankerModelConfig,
         device: &Device,
+        progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         validate_reranker_config(config)?;
 
+        progress("reranker_tokenizer_loading")?;
         let tokenizer = Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|source| {
             inference_error(format!(
                 "failed to load reranker tokenizer at {}: {source}",
                 artifacts.tokenizer_path.display()
             ))
         })?;
+        progress("reranker_tokenizer_ready")?;
+        progress("reranker_config_loading")?;
         let qwen_config = load_qwen3_config("reranker", &artifacts.config_path)?;
         let logit_config = load_logit_score_config(
             &artifacts
@@ -93,7 +98,17 @@ impl RerankerRuntime {
                 .join(LOGIT_SCORE_DIR_NAME)
                 .join(CONFIG_FILE_NAME),
         )?;
-        let model = Qwen3Model::load("reranker", &qwen_config, artifacts, device, Some("model"))?;
+        progress("reranker_config_ready")?;
+        progress("reranker_model_loading")?;
+        let model = Qwen3Model::load_with_progress(
+            "reranker",
+            &qwen_config,
+            artifacts,
+            device,
+            Some("model"),
+            progress,
+        )?;
+        progress("reranker_model_ready")?;
         let mut runtime = Self {
             tokenizer,
             model,
@@ -108,6 +123,7 @@ impl RerankerRuntime {
                 token_count: 0,
             },
         };
+        progress("reranker_smoke_scoring")?;
         let smoke_candidates = vec![
             RerankerCandidateInput {
                 unit_id: "smoke-relevant".to_string(),
@@ -128,6 +144,7 @@ impl RerankerRuntime {
             false_logit: smoke.false_logit,
             token_count: smoke.token_count,
         };
+        progress("reranker_smoke_ready")?;
 
         Ok(runtime)
     }

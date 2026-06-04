@@ -5,6 +5,7 @@ use crate::{
     config::DenseModelConfig,
     error::ApiError,
     inference::{
+        InferenceProgress,
         artifacts::ModelArtifacts,
         qwen3::{Qwen3Model, load_qwen3_config},
     },
@@ -31,14 +32,16 @@ struct DenseEmbeddingOutput {
 }
 
 impl DenseEmbeddingRuntime {
-    /// Load the dense tokenizer and Qwen3 embedding graph, then verify query and passage formatting paths.
-    pub fn load(
+    /// Load the dense runtime while reporting tokenizer, model, and smoke-check progress.
+    pub fn load_with_progress(
         artifacts: &ModelArtifacts,
         config: &DenseModelConfig,
         device: &Device,
+        progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         validate_dense_config(config)?;
 
+        progress("dense_tokenizer_loading")?;
         let tokenizer = Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|source| {
             ApiError::InferenceInit {
                 message: format!(
@@ -47,8 +50,20 @@ impl DenseEmbeddingRuntime {
                 ),
             }
         })?;
+        progress("dense_tokenizer_ready")?;
+        progress("dense_config_loading")?;
         let qwen_config = load_qwen3_config("dense", &artifacts.config_path)?;
-        let model = Qwen3Model::load("dense", &qwen_config, artifacts, device, None)?;
+        progress("dense_config_ready")?;
+        progress("dense_model_loading")?;
+        let model = Qwen3Model::load_with_progress(
+            "dense",
+            &qwen_config,
+            artifacts,
+            device,
+            None,
+            progress,
+        )?;
+        progress("dense_model_ready")?;
         let mut runtime = Self {
             tokenizer,
             model,
@@ -57,7 +72,9 @@ impl DenseEmbeddingRuntime {
             dimension: config.dimension as usize,
             smoke_norm: 0.0,
         };
+        progress("dense_smoke_passage")?;
         let passage_smoke = runtime.embed_passage(SMOKE_TEXT)?;
+        progress("dense_smoke_query")?;
         let query_smoke = runtime.embed_query(SMOKE_TEXT)?;
         if passage_smoke.vector.len() != runtime.dimension {
             return Err(ApiError::InferenceInit {
@@ -78,6 +95,7 @@ impl DenseEmbeddingRuntime {
             });
         }
         runtime.smoke_norm = l2_norm(&passage_smoke.vector);
+        progress("dense_smoke_ready")?;
 
         Ok(runtime)
     }
