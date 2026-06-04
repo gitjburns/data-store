@@ -166,8 +166,10 @@ data-store> exit
 Quote multi-word queries and any argument containing spaces. Long operations
 stream status and counted progress while they run. The CLI updates the current
 stage line in place and prints a newline when each stage completes. The
-`shutdown` command asks for typed confirmation before it sends the protected
-shutdown operation.
+`shutdown` command sends the protected operation directly and prints the
+server-authored `shutdown_complete` confirmation from the terminal result
+event. Any shutdown stream error or non-completion status is reported as an
+operator-visible error.
 
 The client prints human-readable output and stores readline history in
 `.data-store.history`.
@@ -210,7 +212,7 @@ curl -N -X POST \
 The top-level `ready` flag is based on readiness-critical components:
 
 - `inference`: accelerator, model artifacts, tokenizer/model load, and startup
-  smoke checks
+  smoke checks, including ColBERT max-capacity document encoding
 - `storage_cache`: SQLite schema validation and active dense-cache load
 
 Diagnostic-only components remain visible without making the service unready:
@@ -318,11 +320,15 @@ curl -N -X POST \
   http://127.0.0.1:8091/v1/operations
 ```
 
-Accepted shutdown requests drain through Axum graceful shutdown instead of
-requiring a process signal.
+Shutdown requests drain through Axum graceful shutdown instead of requiring a
+process signal. The operation stream's terminal result is the authoritative
+shutdown confirmation and contains `status: "shutdown_complete"` plus a
+server-authored message emitted as the final confirmation before process
+termination. If shutdown cannot be requested, the stream emits a terminal
+`error` with the reason.
 
-The CLI `shutdown` command asks for typed confirmation before sending the same
-protected operation.
+The CLI `shutdown` command sends the same protected operation and requires the
+`shutdown_complete` terminal result before displaying the confirmation.
 
 ## Verify
 

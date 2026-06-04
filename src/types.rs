@@ -103,6 +103,7 @@ pub struct SearchResult {
 #[derive(Debug, Serialize)]
 pub struct ShutdownResponse {
     pub status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -16,6 +16,7 @@ const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
 const SEARCH_EXCERPT_CHARS: usize = 800;
 const OPERATIONS_PATH: &str = "/v1/operations";
+const SHUTDOWN_STATUS_COMPLETE: &str = "shutdown_complete";
 
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
@@ -229,6 +230,7 @@ struct DocumentVersionRollbackResponse {
 #[derive(Debug, Deserialize)]
 struct ShutdownResponse {
     status: String,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -630,11 +632,7 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
             )?);
         }
         Command::Shutdown => {
-            if confirm_shutdown()? {
-                render_shutdown(send_operation(context, "shutdown", empty_payload(), true)?);
-            } else {
-                println!("shutdown cancelled");
-            }
+            render_shutdown(send_operation(context, "shutdown", empty_payload(), true)?)?;
         }
         Command::Help => render_help(),
         Command::Exit => return Ok(false),
@@ -1053,9 +1051,19 @@ fn render_rollback(response: DocumentVersionRollbackResponse) {
     println!("Vector count: {}", response.vector_count);
 }
 
-/// Print the accepted shutdown status.
-fn render_shutdown(response: ShutdownResponse) {
+/// Print the server-authored shutdown completion confirmation or fail on an ambiguous result.
+fn render_shutdown(response: ShutdownResponse) -> Result<()> {
+    if response.status != SHUTDOWN_STATUS_COMPLETE {
+        bail!(
+            "shutdown command returned ambiguous status `{}`: {}",
+            response.status,
+            response.message
+        );
+    }
+
     println!("Status: {}", response.status);
+    println!("{}", response.message);
+    Ok(())
 }
 
 /// Print command syntax without describing hidden or unsupported shell behavior.
@@ -1071,17 +1079,6 @@ fn render_help() {
     println!("  shutdown");
     println!("  help");
     println!("  exit");
-}
-
-/// Require an explicit typed confirmation before stopping the service.
-fn confirm_shutdown() -> Result<bool> {
-    println!("Type `shutdown` to stop the service.");
-    let mut editor = DefaultEditor::new().context("failed to initialize confirmation prompt")?;
-    match editor.readline("confirm> ") {
-        Ok(value) => Ok(value.trim() == "shutdown"),
-        Err(ReadlineError::Interrupted | ReadlineError::Eof) => Ok(false),
-        Err(source) => Err(source).context("failed to read shutdown confirmation"),
-    }
 }
 
 /// Render boolean readiness flags without adding presentation-only state to DTOs.

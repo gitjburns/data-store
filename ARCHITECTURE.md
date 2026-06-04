@@ -72,6 +72,9 @@ for documents, last-token pooling, and L2 normalization.
 ColBERT formatting is part of the runtime contract. Queries use the configured
 query prompt and marker, documents use the configured document prompt and
 marker, and MaxSim scores are computed only over a bounded candidate pool.
+Startup smoke checks include max-capacity ColBERT document encoding so
+long-sequence accelerator failures are reported through readiness rather than
+after ingest work has already completed conversion and dense embedding.
 
 The reranker renders the service-local Qwen3 chat prompt shape and scores final
 next-token logits for the configured yes/no token IDs. Public search scores are
@@ -220,7 +223,8 @@ admission permits.
 The `health` operation reports top-level readiness and component diagnostics.
 Readiness-critical components are:
 
-- `inference`: accelerator, model artifacts, model loading, and startup smoke.
+- `inference`: accelerator, model artifacts, model loading, and startup smoke,
+  including ColBERT max-capacity document encoding.
 - `storage_cache`: SQLite validation and active dense-cache load.
 
 Diagnostic-only components include admission counters and logging state.
@@ -256,6 +260,12 @@ Protected operations require `Authorization: Bearer <token>`. Missing,
 malformed, or invalid authorization fails explicitly and does not trigger
 shutdown or version changes.
 
+The protected shutdown operation emits a terminal operation-stream result with
+`status: "shutdown_complete"` and a server-authored message as the final
+confirmation before process termination. If shutdown cannot be requested, the
+operation emits a terminal error event with the reason instead of leaving the
+client to infer completion.
+
 ## CLI Client
 
 The `data-store` binary is an interactive REPL client over the documented HTTP
@@ -270,7 +280,9 @@ current token file immediately before sending the request and use the same
 bearer-token header required by curl clients. Client output is human-readable:
 it renders streamed status/progress events in place for the active stage,
 prints a newline when each stage completes, and then prints terminal
-results/errors. Raw protocol payloads remain available through the HTTP API
+results/errors. The `shutdown` command sends the protected operation directly
+and displays only the server-authored `shutdown_complete` terminal result as
+confirmation. Raw protocol payloads remain available through the HTTP API
 itself.
 
 ## Hard Invariants

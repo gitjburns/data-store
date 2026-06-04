@@ -46,7 +46,8 @@ use crate::{
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 const INGEST_STATUS_INGESTED: &str = "ingested";
-const SHUTDOWN_STATUS_SHUTTING_DOWN: &str = "shutting_down";
+const SHUTDOWN_STATUS_COMPLETE: &str = "shutdown_complete";
+const SHUTDOWN_COMPLETE_MESSAGE: &str = "shutdown complete; service process is terminating";
 const ROLLBACK_STATUS_ROLLED_BACK: &str = "rolled_back";
 const SEARCH_MODE_FULL_RETRIEVAL: &str = "dense_bm25_rrf_colbert_reranker";
 const COLBERT_MODE_PERSISTED_MAXSIM: &str = "persisted_candidate_pool_maxsim";
@@ -1155,10 +1156,14 @@ async fn post_admin_shutdown(
 /// Request graceful shutdown after the caller has passed admin authorization.
 fn execute_shutdown(state: &AppState) -> Result<ShutdownResponse, ApiError> {
     state.request_shutdown()?;
-    info!(event = "admin.shutdown.accepted", "admin shutdown accepted");
+    info!(
+        event = "admin.shutdown.confirmed",
+        "admin shutdown confirmation emitted"
+    );
 
     Ok(ShutdownResponse {
-        status: SHUTDOWN_STATUS_SHUTTING_DOWN.to_string(),
+        status: SHUTDOWN_STATUS_COMPLETE.to_string(),
+        message: SHUTDOWN_COMPLETE_MESSAGE.to_string(),
     })
 }
 

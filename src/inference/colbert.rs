@@ -48,6 +48,7 @@ pub struct ColbertRuntime {
     attention_smoke: ColbertAttentionSmoke,
     single_layer_smoke: ColbertLayerSmoke,
     full_encoder_smoke: ColbertFullEncoderSmoke,
+    document_capacity_smoke: ColbertDocumentCapacitySmoke,
     query_tokens: usize,
     document_tokens: usize,
     hidden_size: usize,
@@ -159,6 +160,15 @@ struct ColbertFullEncoderSmoke {
     query_max_abs: f32,
     document_mean_abs: f32,
     document_max_abs: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ColbertDocumentCapacitySmoke {
+    document_tokens: usize,
+    hidden_size: usize,
+    projection_dimension: usize,
+    projection_mean_abs: f32,
+    projection_max_abs: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +283,16 @@ impl ColbertRuntime {
         let single_layer_smoke = first_layer.smoke(&query_hidden, "query")?;
         progress("colbert_smoke_full_encoder")?;
         let full_encoder_smoke = encoder.smoke(&query_hidden, &document_hidden, &projection)?;
+        progress("colbert_smoke_document_capacity")?;
+        let capacity_document_token_ids = repeat_token_ids_to_capacity(
+            &document_token_ids,
+            config.document_max_tokens as usize,
+            "document capacity",
+        )?;
+        let capacity_document_hidden =
+            input_path.forward(&capacity_document_token_ids, device, "document capacity")?;
+        let document_capacity_smoke =
+            encoder.document_capacity_smoke(&capacity_document_hidden, &projection)?;
         progress("colbert_smoke_ready")?;
 
         Ok(Self {
@@ -286,6 +306,7 @@ impl ColbertRuntime {
             attention_smoke,
             single_layer_smoke,
             full_encoder_smoke,
+            document_capacity_smoke,
             query_tokens: query_token_ids.len(),
             document_tokens: document_token_ids.len(),
             hidden_size: model_config.hidden_size,
@@ -342,6 +363,14 @@ impl ColbertRuntime {
                 self.full_encoder_smoke.query_max_abs,
                 self.full_encoder_smoke.document_mean_abs,
                 self.full_encoder_smoke.document_max_abs
+            ),
+            format!(
+                "colbert document capacity ready: document_tokens {}, hidden {}, projection {}, projection_mean_abs {:.6}, projection_max_abs {:.6}",
+                self.document_capacity_smoke.document_tokens,
+                self.document_capacity_smoke.hidden_size,
+                self.document_capacity_smoke.projection_dimension,
+                self.document_capacity_smoke.projection_mean_abs,
+                self.document_capacity_smoke.projection_max_abs
             ),
         ]
     }
@@ -660,21 +689,22 @@ impl ColbertAttentionPrimitive {
             )));
         }
 
-        let batched = hidden_states
-            .reshape((1, seq_len, hidden_size))
-            .map_err(|source| {
-                inference_error(format!(
-                    "failed to batch ColBERT {label} attention input: {source}"
-                ))
-            })?;
         let attention_input = match &self.attn_norm {
-            Some(norm) => norm.forward(&batched).map_err(|source| {
-                inference_error(format!(
-                    "ColBERT {label} attention norm failed for layer {}: {source}",
-                    self.layer_index
-                ))
-            })?,
-            None => batched,
+            Some(norm) => {
+                let normalized = norm.forward(hidden_states).map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT {label} attention norm failed for layer {}: {source}",
+                        self.layer_index
+                    ))
+                })?;
+                normalized.reshape((seq_len, hidden_size)).map_err(|source| {
+                    inference_error(format!(
+                        "failed to flatten ColBERT {label} attention norm output for layer {}: {source}",
+                        self.layer_index
+                    ))
+                })?
+            }
+            None => hidden_states.clone(),
         };
         let qkv = self.qkv_proj.forward(&attention_input).map_err(|source| {
             inference_error(format!(
@@ -682,6 +712,14 @@ impl ColbertAttentionPrimitive {
                 self.layer_index
             ))
         })?;
+        let qkv = qkv
+            .reshape((1, seq_len, hidden_size * 3))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to batch ColBERT {label} fused QKV projection for layer {}: {source}",
+                    self.layer_index
+                ))
+            })?;
         let q = self.split_attention_projection(&qkv, 0, seq_len, label, "query")?;
         let k = self.split_attention_projection(&qkv, hidden_size, seq_len, label, "key")?;
         let v = self.split_attention_projection(&qkv, hidden_size * 2, seq_len, label, "value")?;
@@ -692,16 +730,17 @@ impl ColbertAttentionPrimitive {
             inference_error(format!("ColBERT {label} key rope failed: {source}"))
         })?;
         let attention_output = self.attention_output_by_head(&q, &k, &v, seq_len, label)?;
-        let projected = self.out_proj.forward(&attention_output).map_err(|source| {
+        let attention_output = attention_output.reshape((seq_len, hidden_size)).map_err(
+            |source| {
+                inference_error(format!(
+                    "failed to flatten ColBERT {label} attention output before projection: {source}"
+                ))
+            },
+        )?;
+        self.out_proj.forward(&attention_output).map_err(|source| {
             inference_error(format!(
                 "ColBERT {label} attention output projection failed for layer {}: {source}",
                 self.layer_index
-            ))
-        })?;
-
-        projected.reshape((seq_len, hidden_size)).map_err(|source| {
-            inference_error(format!(
-                "failed to flatten ColBERT {label} attention output: {source}"
             ))
         })
     }
@@ -1020,6 +1059,41 @@ impl ColbertEncoderRuntime {
             query_max_abs,
             document_mean_abs,
             document_max_abs,
+        })
+    }
+
+    /// Run a max-capacity document through the real encoder path so readiness covers long-sequence Metal kernels.
+    fn document_capacity_smoke(
+        &self,
+        document_hidden: &Tensor,
+        projection: &ColbertProjection,
+    ) -> Result<ColbertDocumentCapacitySmoke, ApiError> {
+        let document_encoded = self.encode(document_hidden, "document capacity")?;
+        let document_projection = projection.project(&document_encoded)?;
+        let (document_tokens, projection_dimension) =
+            document_projection.dims2().map_err(|source| {
+                inference_error(format!(
+                    "ColBERT document capacity projection shape error: {source}"
+                ))
+            })?;
+        if projection_dimension != projection.out_features {
+            return Err(inference_error(format!(
+                "ColBERT document capacity projection dimension was {projection_dimension}, expected {}",
+                projection.out_features
+            )));
+        }
+        let (projection_mean_abs, projection_max_abs) = tensor_abs_summary(
+            &document_projection,
+            "document capacity",
+            "projection output",
+        )?;
+
+        Ok(ColbertDocumentCapacitySmoke {
+            document_tokens,
+            hidden_size: self.hidden_size,
+            projection_dimension,
+            projection_mean_abs,
+            projection_max_abs,
         })
     }
 
@@ -1667,6 +1741,32 @@ fn tokenize_formatted(
         return Err(inference_error(format!(
             "ColBERT {label} tokenization produced no tokens"
         )));
+    }
+
+    Ok(ids)
+}
+
+/// Repeat valid smoke token IDs to the configured capacity so startup tests the longest supported sequence shape.
+fn repeat_token_ids_to_capacity(
+    seed: &[u32],
+    capacity: usize,
+    label: &str,
+) -> Result<Vec<u32>, ApiError> {
+    if capacity == 0 {
+        return Err(inference_error(format!(
+            "ColBERT {label} token capacity must be greater than zero"
+        )));
+    }
+    if seed.is_empty() {
+        return Err(inference_error(format!(
+            "ColBERT {label} seed tokenization produced no tokens"
+        )));
+    }
+
+    let mut ids = Vec::with_capacity(capacity);
+    while ids.len() < capacity {
+        let remaining = capacity - ids.len();
+        ids.extend(seed.iter().copied().take(remaining));
     }
 
     Ok(ids)

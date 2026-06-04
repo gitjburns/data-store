@@ -276,6 +276,11 @@ The top-level `ready` flag depends on readiness-critical components. Diagnostic
 components, such as admission counters and logging state, can be present
 without controlling top-level readiness.
 
+The inference component includes accelerator, model-artifact, model-load, and
+startup smoke diagnostics. ColBERT readiness includes a max-capacity document
+encoding smoke check so long-sequence document-vector failures are reported
+before ingest is accepted as ready.
+
 ### `ingest`
 
 Authentication: none.
@@ -519,11 +524,15 @@ Result payload:
 
 ```json
 {
-  "status": "shutting_down"
+  "status": "shutdown_complete",
+  "message": "shutdown complete; service process is terminating"
 }
 ```
 
-Accepted shutdown drains through the HTTP server graceful-shutdown path.
+The `shutdown_complete` result is the server-authored terminal confirmation
+emitted as the final operation result before process termination. If shutdown
+cannot be requested, the operation emits a terminal `error` event with the
+reason. Accepted shutdown drains through the HTTP server graceful-shutdown path.
 
 ## Concurrency Behavior
 
