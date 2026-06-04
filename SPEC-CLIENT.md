@@ -3,14 +3,13 @@
 ## Purpose
 
 Build a simple interactive command-line client for operating the standalone Data
-Store service. The client is an operator/developer interface over the service's
-documented HTTP API. It must not introduce a second authentication path,
-service-side backdoor, hidden client state, or alternate domain behavior.
+Store service. The client is an operator/developer interface over the same
+documented operation protocol used by all consumers.
 
-The service remains the source of truth for validation, persistence, retrieval,
-version management, and shutdown behavior. The client only sends HTTP requests,
-renders responses for humans, and reads the configured runtime admin token file
-when protected admin commands require authentication.
+The client must not introduce a second authentication path, service-side
+backdoor, hidden client state, or alternate domain behavior. The service remains
+the source of truth for validation, persistence, retrieval, version management,
+progress reporting, and shutdown behavior.
 
 ## Binary
 
@@ -50,7 +49,7 @@ The client reads:
 
 - `server.bind_address` to construct the base HTTP URL.
 - `admin.token_file_path` to locate the current startup-scoped admin bearer
-  token for protected admin commands.
+  token for protected operations.
 
 The client must not require operators to manually provide the admin token during
 normal use.
@@ -78,8 +77,7 @@ only a local credential handoff mechanism for the client.
 
 Service token-file lifecycle:
 
-- On startup, the service generates its startup-scoped admin token as it does
-  today.
+- On startup, the service generates its startup-scoped admin token.
 - The service writes that token to the configured token file.
 - The service replaces any stale token file from an earlier run.
 - The token file must be created with owner-only permissions.
@@ -93,11 +91,44 @@ Service token-file lifecycle:
 
 The recommended token file must be gitignored.
 
+## Service Protocol
+
+The client uses the same operation protocol documented in `PROTOCOL.md`:
+
+```http
+POST /v1/operations
+Accept: application/x-ndjson
+Content-Type: application/json
+```
+
+Every client command sends one operation request and reads the streamed NDJSON
+operation events until the service emits a terminal `result` or `error` event.
+
+Protected operations use:
+
+```http
+Authorization: Bearer <token>
+```
+
+The token is read from the configured token file immediately before each
+protected operation. The client must not cache the token for the whole REPL
+session.
+
+The control endpoint is reserved for cancellation or future client-to-server
+operation messages:
+
+```http
+POST /v1/operations/{operationId}/control
+```
+
+The first client version does not need an interactive cancel command unless the
+service implementation supports cancellation.
+
 ## Interaction Model
 
 The client is a REPL-style interactive CLI, not a menu-driven TUI.
 
-The prompt should be concise and stable, for example:
+The prompt should be concise and stable:
 
 ```text
 data-store>
@@ -142,84 +173,100 @@ request.
 
 ## Commands
 
-The first client version exposes only the current documented service API plus
-basic REPL controls.
+The first client version exposes the service operations plus basic REPL
+controls.
 
 ### `health`
 
-Calls:
-
-```http
-GET /v1/health
-```
+Operation: `health`
 
 Authentication: none.
+
+Payload:
+
+```json
+{}
+```
 
 Output: human-readable readiness summary and component details.
 
 ### `limits`
 
-Calls:
-
-```http
-GET /v1/limits
-```
+Operation: `limits`
 
 Authentication: none.
+
+Payload:
+
+```json
+{}
+```
 
 Output: labeled request and retrieval limits.
 
 ### `ingest <source>`
 
-Calls:
-
-```http
-POST /v1/ingest
-```
+Operation: `ingest`
 
 Authentication: none.
 
-Output: document ID, version label, units ingested, and status.
+Payload:
+
+```json
+{
+  "source": "<source>"
+}
+```
+
+Output: streamed operation status and progress, followed by document ID,
+version label, units ingested, and status.
 
 ### `search <query> [topK]`
 
-Calls:
-
-```http
-POST /v1/search
-```
+Operation: `search`
 
 Authentication: none.
 
-Output: ranked results with score, source path, unit ID, page numbers, heading
-path when present, and a bounded excerpt of matched content.
+Payload:
+
+```json
+{
+  "query": "<query>",
+  "topK": 3
+}
+```
+
+Output: streamed operation status and progress, followed by ranked results with
+score, source path, unit ID, page numbers, heading path when present, and a
+bounded excerpt of matched content.
 
 The client rendering is excerpted only; service search behavior is unchanged.
 
 ### `search-full <query> [topK]`
 
-Calls:
-
-```http
-POST /v1/search
-```
+Operation: `search`
 
 Authentication: none.
+
+Payload is the same as `search`.
 
 Output: same metadata as `search`, but prints the full matched unit content for
 each result.
 
-The client rendering is full-content only; service search behavior is unchanged.
+The client rendering is full-content only; service search behavior is
+unchanged.
 
 ### `versions`
 
-Calls:
-
-```http
-GET /admin/document-versions
-```
+Operation: `versions`
 
 Authentication: bearer token read from `admin.token_file_path`.
+
+Payload:
+
+```json
+{}
+```
 
 Output: grouped source-document version listing. Active versions must be clearly
 marked. Include version label, document ID, status, units ingested, timestamps,
@@ -227,36 +274,42 @@ and vector metadata counts/dimensions.
 
 ### `rollback <source> <versionLabel>`
 
-Calls:
-
-```http
-POST /admin/document-versions/rollback
-```
+Operation: `rollback`
 
 Authentication: bearer token read from `admin.token_file_path`.
 
-Output: source path, active version label, publish timestamp, vector count, and
-status.
+Payload:
+
+```json
+{
+  "source": "<source>",
+  "versionLabel": "<versionLabel>"
+}
+```
+
+Output: streamed operation status, followed by source path, active version
+label, publish timestamp, vector count, and status.
 
 ### `shutdown`
 
-Calls:
-
-```http
-POST /admin/shutdown
-```
+Operation: `shutdown`
 
 Authentication: bearer token read from `admin.token_file_path`.
 
+Payload:
+
+```json
+{}
+```
+
 Because this command stops the running service, the REPL must ask for typed
-confirmation before sending the request. Confirmation should require an explicit
-word such as:
+confirmation before sending the request. Confirmation should require:
 
 ```text
 shutdown
 ```
 
-Output: shutdown status.
+Output: streamed operation status and shutdown status.
 
 ### `help`
 
@@ -266,8 +319,7 @@ Prints the available commands, syntax, and a short description of each command.
 
 Exits the REPL cleanly.
 
-Aliases such as `quit` may be accepted if they do not complicate the parser, but
-they are not required.
+Aliases such as `quit` may be accepted if they do not complicate the parser.
 
 ## Output Requirements
 
@@ -276,8 +328,17 @@ the first version.
 
 Client output should be concise but complete enough for operation:
 
-- Show HTTP status and service error message for failed API calls.
-- Do not hide service errors behind generic client messages.
+- Show operation start, status, progress, terminal result, and elapsed time.
+- Render status events as newline-terminated lines.
+- Render counted progress events with `current` and `total` by overwriting the
+  current line.
+- Finalize any overwritten progress line before printing the next status,
+  result, or error.
+- Show HTTP method and URL for transport failures.
+- Show operation, stage, server error kind, status, and message for operation
+  errors.
+- Print the full client-side cause chain for transport, response parsing, and
+  stream parsing failures.
 - Do not print the bearer token.
 - Do not log the bearer token.
 - Do not print raw JSON responses as the normal interface.
@@ -288,23 +349,15 @@ implementation detail, but it should be a fixed constant in the client.
 
 ## HTTP Behavior
 
-The client uses the service HTTP protocol as documented in `PROTOCOL.md`.
+The client uses the operation protocol as documented in `PROTOCOL.md`.
 
 Base URL construction:
 
 - Use `server.bind_address` from config.
 - Construct `http://<bind_address>`.
+- If the configured bind host is an unspecified address such as `0.0.0.0` or
+  `::`, connect to the equivalent loopback address on the same port.
 - HTTPS support is not required for the first version.
-
-Protected admin requests use:
-
-```http
-Authorization: Bearer <token>
-```
-
-The token is read from the configured token file immediately before admin
-commands that need it. This allows the client to handle service restarts during
-a long client session without caching a stale token.
 
 The client should use a real HTTP client dependency rather than hand-rolled
 `TcpStream` HTTP.
@@ -322,19 +375,28 @@ Examples:
 
 - Config file missing or invalid.
 - Missing required config fields.
-- Token file missing for an admin command.
+- Token file missing for a protected operation.
 - Token file unreadable.
 - Invalid REPL command syntax.
 - HTTP connection failure.
-- Non-success HTTP response.
+- Operation stream line is not valid JSON.
+- Operation stream ends before a terminal event.
+- Terminal operation error event.
 
-For non-success HTTP responses, print:
+For terminal operation errors, print:
 
-- HTTP status code.
-- Service error message when the response body contains the documented error
-  shape.
-- Raw response text only as a fallback when the body cannot be parsed into a
-  known error shape.
+- Operation name.
+- Stage when available.
+- Error kind.
+- Error status.
+- Error message.
+
+For transport and stream errors, print:
+
+- HTTP method.
+- URL.
+- Top-level error.
+- Cause chain.
 
 ## Documentation Updates
 
@@ -344,6 +406,7 @@ Implementation should update the operator documentation to describe:
 - How to run it with `--config config.toml`.
 - The required `[admin] token_file_path` config.
 - Token-file lifecycle and security behavior.
+- The operation-stream protocol at a user-facing level.
 - The REPL commands.
 - The `.data-store.history` and `.data-store-admin-token` gitignored local
   files.
@@ -358,22 +421,4 @@ The first version must not include:
 - Client-side saved base URLs or saved tokens.
 - Alternate admin authentication.
 - Unix socket admin channel.
-- Long-lived static admin secret.
-- Shell command execution.
-- Pipes, redirects, globbing, variables, or scripting language features.
-- Hidden fallback behavior if token-file creation fails.
-- Frontend or Node backend integration.
-
-## Verification
-
-After implementation, run from `service/data-store/`:
-
-```bash
-cargo fmt
-cargo check
-cargo check --features metal
-```
-
-Manual verification should include starting the service, running the client,
-checking public commands, checking admin commands through the token file, and
-confirming graceful shutdown removes the current token file.
+- External consumer integration.

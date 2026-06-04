@@ -1,25 +1,28 @@
 # Data Store Protocol
 
-This document is the HTTP protocol reference for consumers of the standalone
-Data Store service.
+This document is the consumer protocol reference for the standalone Data Store
+service.
 
 ## Base Protocol
 
-The service exposes JSON HTTP endpoints. Versioned ingestion and retrieval
-endpoints live under `/v1`. Admin lifecycle and version-management endpoints
-live under `/admin`.
+The service exposes one versioned operation endpoint:
 
-Consumers should fetch `GET /v1/limits` before their first ingest or search
-request and use those limits when constructing requests.
+```http
+POST /v1/operations
+```
 
-All request bodies and responses shown here use JSON. Request DTOs reject
-unknown fields.
+Each request starts one operation. The response body is an operation-scoped
+newline-delimited JSON stream. Each line is one operation event. The stream ends
+after the server emits a terminal `result` or `error` event.
+
+Request and event bodies use JSON. Request DTOs reject unknown fields unless a
+payload object explicitly documents otherwise.
 
 ## Authentication
 
-Versioned `/v1` endpoints do not use bearer authentication.
+Public operations do not require bearer authentication.
 
-Admin endpoints require:
+Protected operations require:
 
 ```http
 Authorization: Bearer <startup-token>
@@ -31,33 +34,195 @@ The startup token is printed once during service bootstrap as:
 admin_shutdown_token=<token>
 ```
 
-Tokens are valid only for the current process lifetime.
+When configured, the service also writes the same process-scoped token to its
+runtime admin token file. The token remains the only admin authentication
+mechanism. Tokens are valid only for the current process lifetime.
 
-## Errors
+## Operation Request
 
-Errors are explicit JSON responses with HTTP status codes.
+Endpoint:
 
-Common statuses:
+```http
+POST /v1/operations
+Accept: application/x-ndjson
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "operationId": "client-generated-id",
+  "operation": "search",
+  "payload": {
+    "query": "clear writing style rules",
+    "topK": 3
+  }
+}
+```
+
+Fields:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `operationId` | string | no | Client-generated correlation ID. If omitted, the service assigns one. |
+| `operation` | string | yes | Operation name. |
+| `payload` | object | yes | Operation-specific request body. Use `{}` for operations with no parameters. |
+
+The `operationId` is an opaque correlation value. Consumers must not infer
+ordering, timing, or operation type from it.
+
+## Operation Events
+
+Every response line is one JSON object with a `type` field.
+
+Common fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | Event type: `status`, `progress`, `result`, or `error`. |
+| `operationId` | string | Correlation ID for the operation. |
+| `sequence` | integer | Monotonic sequence number within the operation stream, starting at 1. |
+| `stage` | string | Current operation stage when applicable. |
+| `message` | string | Human-readable status text when applicable. |
+
+### Status Event
+
+Status events mark named phases. They are newline-worthy in human interfaces.
+
+```json
+{
+  "type": "status",
+  "operationId": "op-1",
+  "sequence": 1,
+  "stage": "docling_converting",
+  "message": "converting source document"
+}
+```
+
+### Progress Event
+
+Progress events report repeated counted work. Human interfaces may overwrite
+the current line while `current` and `total` are present.
+
+```json
+{
+  "type": "progress",
+  "operationId": "op-1",
+  "sequence": 8,
+  "stage": "dense_embedding",
+  "message": "embedding document units",
+  "current": 12,
+  "total": 80
+}
+```
+
+### Result Event
+
+`result` is terminal. The stream ends after this event.
+
+```json
+{
+  "type": "result",
+  "operationId": "op-1",
+  "sequence": 17,
+  "payload": {
+    "status": "ingested",
+    "unitsIngested": 80
+  }
+}
+```
+
+### Error Event
+
+`error` is terminal. The stream ends after this event.
+
+```json
+{
+  "type": "error",
+  "operationId": "op-1",
+  "sequence": 5,
+  "stage": "docling_converting",
+  "error": {
+    "status": 422,
+    "kind": "docling_conversion",
+    "message": "failed to convert source document"
+  }
+}
+```
+
+Error fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | integer | HTTP-equivalent status code for the failed operation. |
+| `kind` | string | Stable machine-readable error kind. |
+| `message` | string | Diagnostic operator-facing message. |
+
+Consumers should display `kind`, `status`, and `message`. Consumers must not
+depend on exact message text unless this protocol explicitly documents that text
+as stable.
+
+## HTTP Status Codes
+
+Transport-level HTTP success means the operation stream was accepted and opened.
+Operation failure is reported by a terminal `error` event.
+
+Common transport statuses:
 
 | Status | Meaning |
 |---:|---|
-| 400 | Invalid JSON shape, unknown field, oversized field, invalid field value, or invalid rollback target |
-| 401 | Missing, malformed, or invalid admin bearer token |
-| 413 | Request body exceeds `request.maxRequestBodyBytes` |
-| 500 | Configuration, inference, storage, conversion, or internal operation failure |
-| 503 | Ingest or search admission gate is saturated |
+| 200 | Operation stream opened. Read events for operation result or error. |
+| 400 | Invalid operation request envelope. |
+| 401 | Missing, malformed, or invalid bearer token for a protected operation. The stream is not opened. |
+| 413 | Request body exceeds `request.maxRequestBodyBytes`. |
+| 500 | Internal failure before an operation stream could be opened. |
 
-Error message bodies are diagnostic and intended for operators and developers.
-Consumers must not depend on exact error text unless a field is explicitly
-documented in this protocol.
+Common operation error statuses:
 
-## Limits
+| Status | Meaning |
+|---:|---|
+| 400 | Invalid payload shape, unknown field, oversized field, invalid field value, or invalid rollback target. |
+| 413 | Request body exceeds `request.maxRequestBodyBytes`. |
+| 422 | Source conversion failed. |
+| 500 | Configuration, inference, storage, or internal operation failure. |
+| 503 | Ingest or search admission gate is saturated. |
 
-### `GET /v1/limits`
+## Control Messages
 
-Returns request-construction and retrieval limits.
+The service reserves a companion endpoint for client-to-server operation
+control:
 
-Response:
+```http
+POST /v1/operations/{operationId}/control
+Content-Type: application/json
+```
+
+Control request:
+
+```json
+{
+  "type": "cancel"
+}
+```
+
+The first implementation may reject unsupported control messages explicitly.
+The endpoint exists so future operations can support cancellation or
+mid-operation input without changing the streaming response protocol.
+
+## Operations
+
+### `limits`
+
+Authentication: none.
+
+Payload:
+
+```json
+{}
+```
+
+Result payload:
 
 ```json
 {
@@ -73,16 +238,20 @@ Response:
 }
 ```
 
-Consumers should apply these limits before sending ingest or search requests.
+Consumers should apply these limits before sending ingest or search operations.
 The service still validates all requests authoritatively.
 
-## Health
+### `health`
 
-### `GET /v1/health`
+Authentication: none.
 
-Returns service readiness and component diagnostics.
+Payload:
 
-Response:
+```json
+{}
+```
+
+Result payload:
 
 ```json
 {
@@ -107,14 +276,11 @@ The top-level `ready` flag depends on readiness-critical components. Diagnostic
 components, such as admission counters and logging state, can be present
 without controlling top-level readiness.
 
-## Ingest
+### `ingest`
 
-### `POST /v1/ingest`
+Authentication: none.
 
-Synchronously ingests one corpus-relative source file. The request carries only
-a source reference; source file bytes do not cross the HTTP API.
-
-Request:
+Payload:
 
 ```json
 {
@@ -122,13 +288,24 @@ Request:
 }
 ```
 
-Fields:
+Payload fields:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `source` | string | yes | Non-empty corpus-relative source reference. Must not exceed `maxIngestSourceChars`. |
 
-Response:
+Representative event sequence:
+
+```json
+{"type":"status","operationId":"op-1","sequence":1,"stage":"source_resolving","message":"resolving source reference"}
+{"type":"status","operationId":"op-1","sequence":2,"stage":"docling_converting","message":"converting source document"}
+{"type":"status","operationId":"op-1","sequence":3,"stage":"unit_splitting","message":"splitting document into retrieval units"}
+{"type":"progress","operationId":"op-1","sequence":4,"stage":"dense_embedding","message":"embedding document units","current":12,"total":43}
+{"type":"progress","operationId":"op-1","sequence":5,"stage":"colbert_embedding","message":"embedding ColBERT document vectors","current":12,"total":43}
+{"type":"status","operationId":"op-1","sequence":6,"stage":"storage_publishing","message":"publishing document version"}
+```
+
+Result payload:
 
 ```json
 {
@@ -149,13 +326,11 @@ Ingest semantics:
 - Conversion options are service-configured; callers cannot override Docling
   backend, OCR mode, or page batch size per request.
 
-## Search
+### `search`
 
-### `POST /v1/search`
+Authentication: none.
 
-Synchronously searches active document versions.
-
-Request:
+Payload:
 
 ```json
 {
@@ -164,14 +339,23 @@ Request:
 }
 ```
 
-Fields:
+Payload fields:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `query` | string | yes | Non-empty search text. Must not exceed `maxSearchQueryChars`. |
 | `topK` | integer | no | Result count. Defaults to `retrieval.defaultTopK`. Must be between `1` and `retrieval.maxTopK`. |
 
-Response:
+Representative event sequence:
+
+```json
+{"type":"status","operationId":"op-2","sequence":1,"stage":"embedding_query","message":"embedding search query"}
+{"type":"status","operationId":"op-2","sequence":2,"stage":"retrieving_candidates","message":"retrieving candidate units"}
+{"type":"progress","operationId":"op-2","sequence":3,"stage":"colbert_scoring","message":"scoring ColBERT candidates","current":12,"total":80}
+{"type":"progress","operationId":"op-2","sequence":4,"stage":"reranking","message":"reranking candidates","current":12,"total":40}
+```
+
+Result payload:
 
 ```json
 {
@@ -189,48 +373,11 @@ Response:
   "raw": {
     "search": {
       "mode": "dense_bm25_rrf_colbert_reranker",
-      "topK": 3,
-      "admission": {
-        "inFlight": 1,
-        "maxInFlight": 1
-      },
-      "embeddingLatencyMs": 120,
-      "colbertLatencyMs": 20700,
-      "rerankerLatencyMs": 73500,
-      "latencyMs": 103500
-    },
-    "storage": {
-      "retrieval": {
-        "mode": "dense_bm25_rrf_candidate_pool",
-        "activeVersions": [
-          {
-            "sourcePath": "The_Elements_of_Style.pdf",
-            "versionLabel": "2026-06-01T21:37:22.184Z"
-          }
-        ]
-      }
-    },
-    "colbert": {
-      "mode": "persisted_candidate_pool_maxsim",
-      "documentVectorSource": "sqlite"
-    },
-    "reranker": {
-      "mode": "qwen3_yes_no_candidate_rerank"
+      "topK": 3
     }
   }
 }
 ```
-
-Result fields:
-
-| Field | Type | Notes |
-|---|---|---|
-| `unitId` | string | Stable identifier for the matched retrieval unit version. |
-| `score` | number | Final Qwen3 reranker yes-probability score. |
-| `content` | string | Retrieval unit content. |
-| `headingPath` | string array | Parsed markdown heading hierarchy for the unit. |
-| `sourcePath` | string | Corpus-relative source path. |
-| `pageNumbers` | integer array | Page numbers when explicit page markers were available during splitting. |
 
 Search semantics:
 
@@ -248,41 +395,17 @@ Consumers should treat `raw` as diagnostic data. Its top-level stage objects and
 documented mode strings are stable operational signals, but individual
 diagnostic fields may grow as observability improves.
 
-## Admin Shutdown
+### `versions`
 
-### `POST /admin/shutdown`
+Authentication: bearer token required.
 
-Requests graceful service shutdown.
-
-Headers:
-
-```http
-Authorization: Bearer <startup-token>
-```
-
-Response:
+Payload:
 
 ```json
-{
-  "status": "shutting_down"
-}
+{}
 ```
 
-Accepted shutdown drains through the HTTP server graceful-shutdown path.
-
-## Document Version Listing
-
-### `GET /admin/document-versions`
-
-Lists retained source-document versions and active-version state.
-
-Headers:
-
-```http
-Authorization: Bearer <startup-token>
-```
-
-Response:
+Result payload:
 
 ```json
 {
@@ -333,20 +456,11 @@ Response:
 Version listing is diagnostic and administrative. It can expose absolute paths
 inside the service environment.
 
-## Document Version Rollback
+### `rollback`
 
-### `POST /admin/document-versions/rollback`
+Authentication: bearer token required.
 
-Publishes an already-retained source-document version as active.
-
-Headers:
-
-```http
-Authorization: Bearer <startup-token>
-Content-Type: application/json
-```
-
-Request:
+Payload:
 
 ```json
 {
@@ -355,14 +469,14 @@ Request:
 }
 ```
 
-Fields:
+Payload fields:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `source` | string | yes | Corpus-relative source path matching a retained document version. Must be non-empty, must not contain leading or trailing whitespace, and must not exceed `maxIngestSourceChars`. |
 | `versionLabel` | string | yes | Retained version label. Must not be empty or padded with whitespace. |
 
-Response:
+Result payload:
 
 ```json
 {
@@ -382,15 +496,35 @@ Rollback semantics:
 - Rollback does not delete versions, rebuild embeddings, alter immutable
   version rows, or perform automatic cleanup.
 
+### `shutdown`
+
+Authentication: bearer token required.
+
+Payload:
+
+```json
+{}
+```
+
+Result payload:
+
+```json
+{
+  "status": "shutting_down"
+}
+```
+
+Accepted shutdown drains through the HTTP server graceful-shutdown path.
+
 ## Concurrency Behavior
 
-Ingest and search are synchronous. Each endpoint has a separate configured
-maximum in-flight count. When the limit is saturated, the service returns
-`503 Service Unavailable` immediately.
+Ingest and search each have a separate configured maximum in-flight count. When
+the limit is saturated, the service emits a terminal `error` event with status
+`503`.
 
-Consumers should retry saturated requests after active work completes. The
-service does not provide queue position, cancellation, or async job polling in
-the current protocol.
+Consumers should retry saturated operations after active work completes. The
+first implementation does not guarantee cancellation support, queue position, or
+resumable streams.
 
 ## Source Reference Rules
 
@@ -399,14 +533,3 @@ absolute, or parent-traversing references and resolves accepted references
 inside the configured corpus root.
 
 Source bytes are never sent in the request body.
-
-## Compatibility Notes
-
-The `/v1` protocol is the versioned ingestion and retrieval API. Admin endpoints
-are intentionally outside `/v1` because they control process lifecycle and
-retained-version state rather than document ingestion or search semantics.
-
-Consumers should rely on documented request/response field names, status
-strings, auth behavior, and version/snapshot semantics. Additional diagnostic
-fields can be added to `raw`, health details, and admin diagnostics without
-changing the core protocol.
