@@ -18,6 +18,10 @@ file_path = "logs/data-store.log"
 # Minimum service log level: trace, debug, info, warn, or error.
 level = "info"
 
+[admin]
+# Runtime admin bearer token file. Relative paths resolve from the Rust service root.
+token_file_path = ".data-store-admin-token"
+
 [inference]
 # Accelerator backend to use for model inference. CPU fallback is not supported.
 device = "metal"

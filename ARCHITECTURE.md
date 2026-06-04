@@ -23,6 +23,7 @@ model runtime, and operational lifecycle are service-local concerns.
 - Dense retrieval: exact cosine scan over an in-memory active-vector cache.
 - Conversion: Docling launched as a configured executable.
 - Logging: file-backed `tracing` events after bootstrap stdout output.
+- CLI: separate `data-store` REPL binary over the documented HTTP API.
 
 CPU inference is intentionally unsupported. The configured accelerator must be
 available and compiled into the binary through the matching Cargo feature:
@@ -39,16 +40,18 @@ All operational service behavior is config-backed in the service TOML config:
 
 - HTTP bind address, request body limits, field limits, and admission limits.
 - File logging path and level.
+- Admin token-file path for local startup-scoped credential handoff.
 - Accelerator device kind and device index.
 - Corpus root and index root.
 - Docling executable and PDF conversion defaults.
 - Local model artifact paths and model shape limits.
 - Retrieval defaults, candidate-pool sizes, and unit sizing.
 
-Required paths are absolute except for `logging.file_path`, where relative paths
-resolve against the Rust service root. Normal runtime validates config before
-binding HTTP. Missing required limits or invalid cross-field values are startup
-configuration errors.
+Required paths are absolute except for `logging.file_path` and
+`admin.token_file_path`, where relative paths resolve against the Rust service
+root. Normal runtime validates config before binding HTTP. Missing required
+limits, missing admin token-file configuration, or invalid cross-field values
+are startup configuration errors.
 
 ## Model Runtime
 
@@ -193,26 +196,44 @@ Diagnostic-only components include admission counters and logging state.
 
 Normal startup forks a detached background service after printing bootstrap
 handoff and readiness details to stdout, including the one-time admin token.
-`--foreground` keeps the service attached to the current terminal for
-debugging.
+The service process also writes that same token to the configured owner-only
+admin token file for the local CLI client. `--foreground` keeps the service
+attached to the current terminal for debugging.
 
 The startup handoff reports config/log paths, file logging initialization,
-bind address, background child PID, inference readiness, storage/cache
-readiness, HTTP bind/listening state, final top-level readiness, and the
-`/v1/health` URL. After file logging is initialized, operational events go to
-the configured log file. Logs summarize operation status, counts, and timings;
-they must not store the admin token, document contents, vector values, or
-oversized retrieval internals.
+bind address, background child PID, admin token-file path/write status,
+inference readiness, storage/cache readiness, HTTP bind/listening state, final
+top-level readiness, and the `/v1/health` URL. After file logging is
+initialized, operational events go to the configured log file. Logs summarize
+operation status, counts, and timings; they must not store the admin token,
+document contents, vector values, or oversized retrieval internals.
 
 ## Admin Token
 
 Each service start generates one cryptographically random admin token. The
 token is printed once as `admin_shutdown_token=<token>` during bootstrap and
-kept only in memory.
+written to the configured admin token file for local client use. The token file
+is replaced on startup, created with owner-only permissions, and removed on
+graceful shutdown when it still contains the current service token. If the
+service crashes, a stale token file may remain; that stale token is not accepted
+by any later service process and is replaced on the next startup.
 
 Admin endpoints require `Authorization: Bearer <token>`. Missing, malformed,
 or invalid authorization fails explicitly and does not trigger shutdown or
 version changes.
+
+## CLI Client
+
+The `data-store` binary is an interactive REPL client over the documented HTTP
+API. It reads `server.bind_address` and `admin.token_file_path` from the service
+config, constructs `http://<bind_address>`, and sends normal HTTP requests to
+the service. It does not share process memory, bypass authorization, access
+SQLite directly, or reimplement domain behavior.
+
+Public commands use `/v1` endpoints without authentication. Admin commands read
+the current token file immediately before sending the request and use the same
+bearer-token header required by curl clients. Client output is human-readable
+only; raw protocol payloads remain available through the HTTP API itself.
 
 ## Hard Invariants
 
@@ -225,6 +246,9 @@ version changes.
 - Durable state and in-memory active cache updates must publish together.
 - Source files are addressed by corpus-relative references; ingest request
   bodies never carry source file bytes.
-- Admin tokens are startup-scoped, memory-only secrets.
+- Admin tokens are startup-scoped secrets exposed only through bootstrap stdout
+  and the configured owner-only runtime token file.
+- The CLI client operates through the documented HTTP API and must not bypass
+  service validation, storage, or authentication.
 - Public API strings and persisted metadata values are contracts; change them
   deliberately.

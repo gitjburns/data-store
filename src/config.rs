@@ -10,6 +10,8 @@ pub struct ServiceConfig {
     pub server: ServerConfig,
     /// File-backed service logging settings used after bootstrap stdout output.
     pub logging: LoggingConfig,
+    /// Startup-scoped admin credential handoff settings.
+    pub admin: AdminConfig,
     /// Accelerator selection for all model runtimes.
     pub inference: InferenceConfig,
     /// Corpus and durable index/artifact paths owned by the service.
@@ -56,6 +58,12 @@ pub struct LoggingConfig {
     pub file_path: PathBuf,
     /// Minimum event level written to the service log file.
     pub level: LoggingLevel,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminConfig {
+    /// Runtime file where the service writes the current startup-scoped admin bearer token.
+    pub token_file_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -217,6 +225,7 @@ impl ServiceConfig {
             self.server.max_in_flight_search,
         )?;
         require_non_empty_path("logging.file_path", &self.logging.file_path)?;
+        require_non_empty_path("admin.token_file_path", &self.admin.token_file_path)?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
         require_absolute_path("docling.python_path", &self.docling.python_path)?;
@@ -300,6 +309,17 @@ impl LoggingConfig {
         }
 
         service_root().join(&self.file_path)
+    }
+}
+
+impl AdminConfig {
+    /// Resolve the configured token file path against the Rust service root when it is relative.
+    pub fn resolved_token_file_path(&self) -> PathBuf {
+        if self.token_file_path.is_absolute() {
+            return self.token_file_path.clone();
+        }
+
+        service_root().join(&self.token_file_path)
     }
 }
 

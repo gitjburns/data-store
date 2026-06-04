@@ -11,16 +11,17 @@ mod types;
 mod units;
 
 use std::{
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Write},
-    os::unix::{io::AsRawFd, net::UnixStream},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd, net::UnixStream},
+    path::PathBuf,
     sync::Arc,
 };
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     config::{CliOptions, ServiceConfig, resolve_cli_options_from_args},
@@ -40,6 +41,11 @@ enum ServiceProcessRole {
 enum StartupReporter {
     Stdout,
     Pipe(UnixStream),
+}
+
+struct AdminTokenFile {
+    path: PathBuf,
+    token: String,
 }
 
 const STDIN_FILENO: i32 = 0;
@@ -151,9 +157,9 @@ fn main() -> anyhow::Result<()> {
     let admin_shutdown_token = generate_admin_shutdown_token()?;
     let bind_address = config.bind_address();
     println!("data-store bootstrap bind_address={bind_address}");
-    // The admin token is intentionally stdout-only; it must not be persisted in
-    // config, SQLite, or the service log file. It is generated before the fork
-    // so the background child inherits the same in-memory secret.
+    // The admin token is generated before the fork so the background child
+    // inherits the same in-memory secret and can publish it to the configured
+    // runtime credential file.
     println!("admin_shutdown_token={admin_shutdown_token}");
 
     let process_role = enter_service_process(cli_options.foreground)?;
@@ -178,6 +184,17 @@ async fn run_http_service(
     reporter.report(format!(
         "data-store startup mode={} bind_address={bind_address}",
         reporter.mode_label()
+    ))?;
+    let admin_token_file = match AdminTokenFile::write_current(&config, &admin_shutdown_token) {
+        Ok(token_file) => token_file,
+        Err(source) => {
+            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+            return Err(source.into());
+        }
+    };
+    reporter.report(format!(
+        "data-store startup admin_token_file=ready path={}",
+        admin_token_file.path.display()
     ))?;
     info!(
         event = "service.initializing",
@@ -259,6 +276,7 @@ async fn run_http_service(
             reporter.report(format!(
                 "data-store startup http=bind_failed bind_address={bind_address} error=\"{source}\""
             ))?;
+            admin_token_file.cleanup_if_current();
             return Err(source.into());
         }
     };
@@ -278,12 +296,111 @@ async fn run_http_service(
         storage_ready,
         "data store service listening"
     );
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_receiver))
-        .await?;
+        .await;
+    admin_token_file.cleanup_if_current();
+    serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
     Ok(())
+}
+
+impl AdminTokenFile {
+    /// Publish the current startup-scoped admin token to the configured owner-only runtime file.
+    fn write_current(config: &ServiceConfig, token: &str) -> Result<Self, ApiError> {
+        let path = config.admin.resolved_token_file_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ApiError::InternalIo {
+                message: format!(
+                    "failed to create admin token file directory {}: {source}",
+                    parent.display()
+                ),
+            })?;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ApiError::InternalIo {
+                    message: format!(
+                        "failed to replace stale admin token file {}: {source}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|source| ApiError::InternalIo {
+                message: format!(
+                    "failed to create admin token file {}: {source}",
+                    path.display()
+                ),
+            })?;
+        writeln!(file, "{token}").map_err(|source| ApiError::InternalIo {
+            message: format!(
+                "failed to write admin token file {}: {source}",
+                path.display()
+            ),
+        })?;
+        file.sync_all().map_err(|source| ApiError::InternalIo {
+            message: format!(
+                "failed to flush admin token file {}: {source}",
+                path.display()
+            ),
+        })?;
+
+        Ok(Self {
+            path,
+            token: token.to_string(),
+        })
+    }
+
+    /// Remove the runtime token file only when it still contains this service's current token.
+    fn cleanup_if_current(&self) {
+        let mut contents = String::new();
+        let read_result = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .and_then(|mut file| {
+                file.read_to_string(&mut contents)?;
+                Ok(())
+            });
+        match read_result {
+            Ok(()) => {
+                if contents.trim_end_matches(['\r', '\n']) != self.token {
+                    warn!(
+                        event = "admin_token_file.cleanup_skipped",
+                        path = %self.path.display(),
+                        "admin token file did not contain the current service token"
+                    );
+                    return;
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return,
+            Err(source) => {
+                warn!(
+                    event = "admin_token_file.cleanup_failed",
+                    path = %self.path.display(),
+                    error = %source,
+                    "failed to read admin token file before cleanup"
+                );
+                return;
+            }
+        }
+        if let Err(source) = fs::remove_file(&self.path) {
+            warn!(
+                event = "admin_token_file.cleanup_failed",
+                path = %self.path.display(),
+                error = %source,
+                "failed to remove admin token file"
+            );
+        }
+    }
 }
 
 /// Decide whether this invocation should continue as the service or relay child startup output as the original parent.

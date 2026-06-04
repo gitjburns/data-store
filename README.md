@@ -16,6 +16,7 @@ otherwise.
 
 - Axum/Tokio HTTP API for health, limits, ingest, search, protected admin
   version controls, and protected shutdown.
+- Interactive `data-store` CLI client for operating the documented HTTP API.
 - Explicit Metal/CUDA accelerator selection with no CPU fallback.
 - Local Qwen3 dense embedding, ColBERT, and Qwen3 reranker runtimes through
   Candle.
@@ -40,7 +41,7 @@ machine-specific and should point at:
 - a service-owned index root for SQLite and Docling conversion artifacts
 - the Python executable for environment diagnostics and the directly launched Docling executable
 - the selected accelerator backend and device index
-- required request, retrieval, admission, and logging limits
+- required request, retrieval, admission, logging, and admin token-file settings
 
 The service has no CPU inference fallback. If `inference.device = "metal"`, run
 with `--features metal`. CUDA support is separate operational verification
@@ -106,19 +107,104 @@ parent process exits:
 - file logging initialization
 - bind address
 - `admin_shutdown_token=<token>`
+- configured admin token-file path and write status
 - background child PID, unless `--foreground` is used
 - inference initialization start and ready/not-ready state
 - storage/cache initialization start and ready/not-ready state
 - HTTP bind/listening state
 - final readiness summary and `/v1/health` URL
 
-Capture the admin shutdown token from stdout. It is kept only in memory and is
-not written to config, SQLite, or the service log.
+Capture the admin shutdown token from stdout when using curl directly. The same
+startup-scoped token is also written to the configured
+`[admin].token_file_path` for the local CLI client. The token is not written to
+config, SQLite, or the service log.
+
+The default example config uses:
+
+```toml
+[admin]
+token_file_path = ".data-store-admin-token"
+```
+
+Relative admin token-file paths resolve from the Rust service root. The service
+replaces stale token files on startup, creates the token file with owner-only
+permissions, fails startup if the file cannot be written securely, and removes
+the file on graceful shutdown when it still contains the current token.
 
 Operational events after file logging initialization are written to the
 configured `[logging].file_path`. Relative log paths resolve from the Rust
 service root, so `logs/data-store.log` resolves to `logs/data-store.log` inside
 this directory.
+
+## Use The CLI Client
+
+The `data-store` client is an interactive REPL over the same HTTP API shown in
+this runbook. Start the service first, then start the client from this
+directory:
+
+```bash
+cargo run --bin data-store -- --config config.toml
+```
+
+For a release build, run:
+
+```bash
+./target/release/data-store --config config.toml
+```
+
+The client reads `server.bind_address` and `admin.token_file_path` from the
+same config file. Public commands call `/v1` endpoints without authentication.
+Admin commands read the current token file immediately before sending the
+request and use the same bearer-token authentication as curl.
+
+The service must be running with a config that includes:
+
+```toml
+[admin]
+token_file_path = ".data-store-admin-token"
+```
+
+If the configured token file is missing, start or restart the service. The
+client does not ask for or store admin tokens.
+
+At the prompt, use:
+
+```text
+data-store> health
+data-store> limits
+data-store> ingest The_Elements_of_Style.pdf
+data-store> search "clear writing style rules" 3
+data-store> search-full "clear writing style rules" 3
+data-store> versions
+data-store> rollback The_Elements_of_Style.pdf 2026-06-01T21:37:22.184Z
+data-store> shutdown
+data-store> help
+data-store> exit
+```
+
+Command reference:
+
+```text
+health
+limits
+ingest <source>
+search <query> [topK]
+search-full <query> [topK]
+versions
+rollback <source> <versionLabel>
+shutdown
+help
+exit
+```
+
+`search` prints excerpts. `search-full` prints the full matched unit content.
+Quote multi-word queries and any argument containing spaces. The `shutdown`
+command asks for typed confirmation before it sends the protected shutdown
+request.
+
+The client prints human-readable output only. It stores readline history in
+`.data-store.history`; both the history file and `.data-store-admin-token` are
+local ignored files.
 
 ## Health And Limits
 
@@ -186,7 +272,7 @@ in an unbounded queue.
 ## Version Administration
 
 Admin endpoints require the startup-scoped bearer token printed as
-`admin_shutdown_token=<token>`.
+`admin_shutdown_token=<token>` or written to the configured admin token file.
 
 List retained document versions:
 
@@ -220,6 +306,9 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8091/admin/shut
 Accepted shutdown requests drain through Axum graceful shutdown instead of
 requiring a process signal.
 
+The CLI `shutdown` command asks for typed confirmation before sending the same
+protected admin request.
+
 ## Verify
 
 ```bash
@@ -241,6 +330,8 @@ cargo check --features metal
 - Docling conversion failure: inspect the API error and service log. The service
   does not silently switch PDF backends or OCR modes.
 - `401 Unauthorized` on admin endpoints: use the current startup token from
-  stdout; tokens do not survive restart.
+  stdout or the configured admin token file; tokens do not survive restart.
+- Missing admin token file for the CLI: start or restart the service with a
+  config that includes `[admin].token_file_path`.
 - `503 Service Unavailable` on ingest/search: the configured in-flight limit is
   saturated. Retry after active work finishes or change the config deliberately.

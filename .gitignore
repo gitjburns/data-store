@@ -1,2 +1,4 @@
 target/
 config.toml
+.data-store-admin-token
+.data-store.history
