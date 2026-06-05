@@ -1,5 +1,8 @@
+use std::time::Instant;
+
 use candle_core::{DType, Device, Tensor};
 use tokenizers::Tokenizer;
+use tracing::{error, info};
 
 use crate::{
     config::DenseModelConfig,
@@ -29,6 +32,7 @@ pub struct DenseEmbeddingRuntime {
 #[derive(Debug, Clone)]
 struct DenseEmbeddingOutput {
     vector: Vec<f32>,
+    token_count: usize,
 }
 
 impl DenseEmbeddingRuntime {
@@ -73,27 +77,11 @@ impl DenseEmbeddingRuntime {
             smoke_norm: 0.0,
         };
         progress("dense_smoke_passage")?;
-        let passage_smoke = runtime.embed_passage(SMOKE_TEXT)?;
+        let passage_smoke =
+            runtime.startup_smoke_embedding("startup_smoke_passage_embedding", "passage")?;
         progress("dense_smoke_query")?;
-        let query_smoke = runtime.embed_query(SMOKE_TEXT)?;
-        if passage_smoke.vector.len() != runtime.dimension {
-            return Err(ApiError::InferenceInit {
-                message: format!(
-                    "dense passage smoke embedding returned dimension {}, expected {}",
-                    passage_smoke.vector.len(),
-                    runtime.dimension
-                ),
-            });
-        }
-        if query_smoke.vector.len() != runtime.dimension {
-            return Err(ApiError::InferenceInit {
-                message: format!(
-                    "dense query smoke embedding returned dimension {}, expected {}",
-                    query_smoke.vector.len(),
-                    runtime.dimension
-                ),
-            });
-        }
+        let _query_smoke =
+            runtime.startup_smoke_embedding("startup_smoke_query_embedding", "query")?;
         runtime.smoke_norm = l2_norm(&passage_smoke.vector);
         progress("dense_smoke_ready")?;
 
@@ -110,12 +98,108 @@ impl DenseEmbeddingRuntime {
 
     /// Embed a retrieval unit as a passage and return its dense vector.
     pub fn embed_passage_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
-        Ok(self.embed_passage(text)?.vector)
+        let started_at = Instant::now();
+        let text_chars = text.chars().count();
+        info!(
+            event = "model_call.started",
+            model_role = "dense",
+            call_purpose = "passage_embedding",
+            input_kind = "passage",
+            text_count = 1usize,
+            text_chars,
+            configured_max_tokens = self.max_tokens,
+            expected_dimension = self.dimension,
+            "dense passage embedding started"
+        );
+        let result = self.embed_passage(text);
+        match &result {
+            Ok(output) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "dense",
+                    call_purpose = "passage_embedding",
+                    input_kind = "passage",
+                    text_count = 1usize,
+                    text_chars,
+                    token_count = output.token_count,
+                    configured_max_tokens = self.max_tokens,
+                    vector_dimension = output.vector.len(),
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "dense passage embedding completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "dense",
+                    call_purpose = "passage_embedding",
+                    input_kind = "passage",
+                    text_count = 1usize,
+                    text_chars,
+                    configured_max_tokens = self.max_tokens,
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "dense passage embedding failed"
+                );
+            }
+        }
+
+        result.map(|output| output.vector)
     }
 
     /// Embed a retrieval query with the configured instruction prefix and return its dense vector.
     pub fn embed_query_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
-        Ok(self.embed_query(text)?.vector)
+        let started_at = Instant::now();
+        let text_chars = text.chars().count();
+        info!(
+            event = "model_call.started",
+            model_role = "dense",
+            call_purpose = "query_embedding",
+            input_kind = "query",
+            text_count = 1usize,
+            text_chars,
+            configured_max_tokens = self.max_tokens,
+            expected_dimension = self.dimension,
+            "dense query embedding started"
+        );
+        let result = self.embed_query(text);
+        match &result {
+            Ok(output) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "dense",
+                    call_purpose = "query_embedding",
+                    input_kind = "query",
+                    text_count = 1usize,
+                    text_chars,
+                    token_count = output.token_count,
+                    configured_max_tokens = self.max_tokens,
+                    vector_dimension = output.vector.len(),
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "dense query embedding completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "dense",
+                    call_purpose = "query_embedding",
+                    input_kind = "query",
+                    text_count = 1usize,
+                    text_chars,
+                    configured_max_tokens = self.max_tokens,
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "dense query embedding failed"
+                );
+            }
+        }
+
+        result.map(|output| output.vector)
     }
 
     /// Embed a retrieval query with the Qwen3 instruction prefix.
@@ -128,12 +212,85 @@ impl DenseEmbeddingRuntime {
         self.embed_text(text)
     }
 
+    /// Run one startup smoke embedding and log the model-call boundary without exposing smoke text.
+    fn startup_smoke_embedding(
+        &self,
+        call_purpose: &'static str,
+        input_kind: &'static str,
+    ) -> Result<DenseEmbeddingOutput, ApiError> {
+        let started_at = Instant::now();
+        info!(
+            event = "model_call.started",
+            model_role = "dense",
+            call_purpose,
+            input_kind,
+            text_count = 1usize,
+            configured_max_tokens = self.max_tokens,
+            expected_dimension = self.dimension,
+            "dense startup smoke embedding started"
+        );
+        let result = match input_kind {
+            "passage" => self.embed_passage(SMOKE_TEXT),
+            "query" => self.embed_query(SMOKE_TEXT),
+            _ => Err(ApiError::InferenceInit {
+                message: format!("unsupported dense startup smoke input kind {input_kind}"),
+            }),
+        }
+        .and_then(|output| {
+            if output.vector.len() != self.dimension {
+                return Err(ApiError::InferenceInit {
+                    message: format!(
+                        "dense {input_kind} smoke embedding returned dimension {}, expected {}",
+                        output.vector.len(),
+                        self.dimension
+                    ),
+                });
+            }
+
+            Ok(output)
+        });
+        match &result {
+            Ok(output) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "dense",
+                    call_purpose,
+                    input_kind,
+                    text_count = 1usize,
+                    token_count = output.token_count,
+                    configured_max_tokens = self.max_tokens,
+                    vector_dimension = output.vector.len(),
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "dense startup smoke embedding completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "dense",
+                    call_purpose,
+                    input_kind,
+                    text_count = 1usize,
+                    configured_max_tokens = self.max_tokens,
+                    expected_dimension = self.dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "dense startup smoke embedding failed"
+                );
+            }
+        }
+
+        result
+    }
+
     /// Tokenize, truncate, run the model, last-token pool, and L2-normalize one text.
     ///
     /// This is the single boundary that applies embedding truncation, pooling, and normalization.
     fn embed_text(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
         let ids = tokenize_truncated(&self.tokenizer, text, self.max_tokens)?;
-        if ids.is_empty() {
+        let token_count = ids.len();
+        if token_count == 0 {
             return Err(ApiError::InferenceInit {
                 message: "dense tokenizer produced no tokens for non-empty input".to_string(),
             });
@@ -161,7 +318,10 @@ impl DenseEmbeddingRuntime {
                 inference_error(format!("failed to pool dense embedding: {source}"))
             })?;
 
-        Ok(DenseEmbeddingOutput { vector: embedding })
+        Ok(DenseEmbeddingOutput {
+            vector: embedding,
+            token_count,
+        })
     }
 }
 

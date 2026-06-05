@@ -1,5 +1,8 @@
 use std::{
-    env, fs,
+    env,
+    error::Error,
+    fmt::{self, Display},
+    fs,
     io::{self, BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -16,6 +19,8 @@ const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
 const SEARCH_EXCERPT_CHARS: usize = 800;
 const OPERATIONS_PATH: &str = "/v1/operations";
+const HEALTH_PATH: &str = "/v1/health";
+const HEALTH_PROBE_TIMEOUT_SECONDS: u64 = 5;
 const SHUTDOWN_STATUS_COMPLETE: &str = "shutdown_complete";
 
 #[derive(Debug, Deserialize)]
@@ -291,9 +296,40 @@ struct ErrorDetail {
     message: String,
 }
 
+#[derive(Debug)]
+struct LastStreamEvent {
+    operation_id: String,
+    sequence: u64,
+    event_type: &'static str,
+    stage: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug)]
+struct AmbiguousStreamLossError {
+    report: String,
+}
+
+#[derive(Debug)]
+enum HealthProbeOutcome {
+    Ready(String),
+    NotReady(String),
+    Unreachable(String),
+    Failed(String),
+}
+
 struct StreamRenderer {
     active_line: bool,
 }
+
+impl Display for AmbiguousStreamLossError {
+    /// Render the complete ambiguous-outcome report as the user-facing error text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.report)
+    }
+}
+
+impl Error for AmbiguousStreamLossError {}
 
 /// Start the interactive client after resolving service config and local history.
 fn main() -> Result<()> {
@@ -705,13 +741,16 @@ where
         return Err(service_error(method, &target_url, status, &text));
     }
 
-    let payload = match read_operation_stream(response, operation, method, &target_url) {
-        Ok(payload) => payload,
-        Err(source) => {
-            println!("Elapsed: {} ms", started.elapsed().as_millis());
-            return Err(source);
-        }
-    };
+    let payload =
+        match read_operation_stream(response, context, operation, method, &target_url, started) {
+            Ok(payload) => payload,
+            Err(source) => {
+                if source.downcast_ref::<AmbiguousStreamLossError>().is_none() {
+                    println!("Elapsed: {} ms", started.elapsed().as_millis());
+                }
+                return Err(source);
+            }
+        };
     println!("Elapsed: {} ms", started.elapsed().as_millis());
     serde_json::from_value(payload)
         .with_context(|| format!("failed to parse {operation} result payload"))
@@ -720,38 +759,88 @@ where
 /// Read streamed operation events until the service emits a terminal result or error.
 fn read_operation_stream(
     response: reqwest::blocking::Response,
+    context: &ClientContext,
     operation: &str,
     method: &str,
     target_url: &str,
+    started: Instant,
 ) -> Result<serde_json::Value> {
     let mut renderer = StreamRenderer::new();
     let mut reader = BufReader::new(response);
+    let mut last_event: Option<LastStreamEvent> = None;
     let mut line = String::new();
     loop {
         line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .with_context(|| format!("{method} {target_url} failed while reading NDJSON stream"))?;
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(source) => {
+                renderer.finish_progress_line()?;
+                let health_probe = probe_health_after_stream_loss(context);
+                return Err(AmbiguousStreamLossError {
+                    report: format_ambiguous_stream_loss_report(
+                        operation,
+                        started.elapsed(),
+                        last_event.as_ref(),
+                        &health_probe,
+                        Some(format!("stream read failed: {source}")),
+                    ),
+                }
+                .into());
+            }
+        };
         if bytes_read == 0 {
             renderer.finish_progress_line()?;
-            bail!(
-                "{method} {target_url} operation `{operation}` stream ended before a terminal event"
-            );
+            let health_probe = probe_health_after_stream_loss(context);
+            return Err(AmbiguousStreamLossError {
+                report: format_ambiguous_stream_loss_report(
+                    operation,
+                    started.elapsed(),
+                    last_event.as_ref(),
+                    &health_probe,
+                    None,
+                ),
+            }
+            .into());
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
         }
-        let event: OperationEvent = serde_json::from_str(trimmed).with_context(|| {
-            format!("{method} {target_url} operation `{operation}` returned invalid NDJSON")
-        })?;
+        let event: OperationEvent = match serde_json::from_str(trimmed) {
+            Ok(event) => event,
+            Err(source) => {
+                renderer.finish_progress_line()?;
+                let health_probe = probe_health_after_stream_loss(context);
+                return Err(AmbiguousStreamLossError {
+                    report: format_ambiguous_stream_loss_report(
+                        operation,
+                        started.elapsed(),
+                        last_event.as_ref(),
+                        &health_probe,
+                        Some(format!(
+                            "{method} {target_url} returned invalid NDJSON before terminal event: {source}"
+                        )),
+                    ),
+                }
+                .into());
+            }
+        };
         match event {
             OperationEvent::Status {
                 operation_id,
                 sequence,
                 stage,
                 message,
-            } => renderer.render_status(&operation_id, sequence, stage, message)?,
+            } => {
+                last_event = Some(LastStreamEvent {
+                    operation_id: operation_id.clone(),
+                    sequence,
+                    event_type: "status",
+                    stage: stage.clone(),
+                    message: message.clone(),
+                });
+                renderer.render_status(&operation_id, sequence, stage, message)?
+            }
             OperationEvent::Progress {
                 operation_id,
                 sequence,
@@ -760,6 +849,13 @@ fn read_operation_stream(
                 current,
                 total,
             } => {
+                last_event = Some(LastStreamEvent {
+                    operation_id: operation_id.clone(),
+                    sequence,
+                    event_type: "progress",
+                    stage: stage.clone(),
+                    message: message.clone(),
+                });
                 renderer.render_progress(&operation_id, sequence, stage, message, current, total)?
             }
             OperationEvent::Result {
@@ -788,6 +884,144 @@ fn read_operation_stream(
             }
         }
     }
+}
+
+/// Build the operator-facing report for a stream that ended before a terminal event.
+fn format_ambiguous_stream_loss_report(
+    operation: &str,
+    elapsed: Duration,
+    last_event: Option<&LastStreamEvent>,
+    health_probe: &HealthProbeOutcome,
+    reason: Option<String>,
+) -> String {
+    let mut lines = vec![
+        format!("operation `{operation}` stream ended before a terminal result/error"),
+        "outcome: unknown".to_string(),
+        format!("operationId: {}", format_last_operation_id(last_event)),
+        format!("last event: {}", format_last_event(last_event)),
+        format!("elapsed: {} ms", elapsed.as_millis()),
+        "server may have crashed, closed the stream, or continued without delivering the terminal event"
+            .to_string(),
+        "success must not be inferred".to_string(),
+        format!("next: {}", recommended_follow_up(operation)),
+        format!("health probe: {}", format_health_probe_outcome(health_probe)),
+        "health probe does not prove operation success".to_string(),
+    ];
+    if let Some(reason) = reason {
+        lines.insert(1, format!("reason: {reason}"));
+    }
+
+    lines.join("\n")
+}
+
+/// Return the operation ID from the latest stream event, or an explicit unknown marker.
+fn format_last_operation_id(last_event: Option<&LastStreamEvent>) -> &str {
+    match last_event {
+        Some(event) => event.operation_id.as_str(),
+        None => "unknown",
+    }
+}
+
+/// Render the latest non-terminal stream event without dropping nullable protocol fields.
+fn format_last_event(last_event: Option<&LastStreamEvent>) -> String {
+    let Some(event) = last_event else {
+        return "none".to_string();
+    };
+    let stage = event.stage.as_deref().unwrap_or("unknown");
+    let message = match &event.message {
+        Some(message) => format!("{message:?}"),
+        None => "none".to_string(),
+    };
+
+    format!(
+        "sequence={} type={} stage={} message={}",
+        event.sequence, event.event_type, stage, message
+    )
+}
+
+/// Choose the next operator action based on the operation whose stream became ambiguous.
+fn recommended_follow_up(operation: &str) -> &'static str {
+    match operation {
+        "ingest" => "run `health`; for ingest, run `versions` if authorized",
+        "rollback" => "run `health`; for rollback, run `versions` if authorized",
+        "shutdown" => "run `health`; if unreachable, confirm the service process exited",
+        _ => "run `health`",
+    }
+}
+
+/// Run a short compatibility health request after ambiguous stream loss.
+fn probe_health_after_stream_loss(context: &ClientContext) -> HealthProbeOutcome {
+    let target_url = url(context, HEALTH_PATH);
+    let probe_http = match Client::builder()
+        .timeout(Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECONDS))
+        .build()
+    {
+        Ok(client) => client,
+        Err(source) => {
+            return HealthProbeOutcome::Failed(format!(
+                "failed to build health probe client: {source}"
+            ));
+        }
+    };
+    let response = match probe_http.get(&target_url).send() {
+        Ok(response) => response,
+        Err(source) if source.is_connect() => {
+            return HealthProbeOutcome::Unreachable(source.to_string());
+        }
+        Err(source) => return HealthProbeOutcome::Failed(source.to_string()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .unwrap_or_else(|source| format!("failed to read health response body: {source}"));
+        return HealthProbeOutcome::Failed(format!(
+            "GET {target_url} HTTP {}: {}",
+            status.as_u16(),
+            text.trim()
+        ));
+    }
+    match response.json::<HealthResponse>() {
+        Ok(health) if health.ready => {
+            HealthProbeOutcome::Ready(format_health_probe_details(&health))
+        }
+        Ok(health) => HealthProbeOutcome::NotReady(format_health_probe_details(&health)),
+        Err(source) => HealthProbeOutcome::Failed(format!(
+            "GET {target_url} returned invalid health JSON: {source}"
+        )),
+    }
+}
+
+/// Render the post-loss health probe without implying the lost operation's outcome.
+fn format_health_probe_outcome(outcome: &HealthProbeOutcome) -> String {
+    match outcome {
+        HealthProbeOutcome::Ready(detail) => format!("service reachable and ready ({detail})"),
+        HealthProbeOutcome::NotReady(detail) => {
+            format!("service reachable but not ready ({detail})")
+        }
+        HealthProbeOutcome::Unreachable(detail) => format!("service unreachable ({detail})"),
+        HealthProbeOutcome::Failed(detail) => {
+            format!("health probe failed with status/error detail ({detail})")
+        }
+    }
+}
+
+/// Keep the ambiguous-outcome health probe compact while preserving admission diagnostics.
+fn format_health_probe_details(health: &HealthResponse) -> String {
+    let mut details = vec![format!("service={}", health.service)];
+    if let Some(admission) = health
+        .components
+        .iter()
+        .find(|component| component.name == "admission")
+    {
+        details.push(format!(
+            "admission_ready={} admission_details={}",
+            admission.ready,
+            admission.details.join("; ")
+        ));
+    }
+
+    details.join("; ")
 }
 
 /// Build a service URL from the configured base URL and a protocol path.

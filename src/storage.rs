@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::{
     config::{ColbertModelConfig, DenseModelConfig, RetrievalConfig, StorageConfig},
@@ -905,15 +905,47 @@ impl StorageRuntime {
 
     /// Return retained source-document versions and active-version diagnostics for admin inspection.
     pub fn list_document_versions(&self) -> Result<DocumentVersionListing, ApiError> {
-        let connection = open_connection(&self.db_path)?;
-        let mut statement = connection
+        let started = Instant::now();
+        info!(
+            event = "storage.document_versions.listing_started",
+            db_path = %self.db_path.display(),
+            "document-version listing started"
+        );
+        let connection = match open_connection(&self.db_path) {
+            Ok(connection) => connection,
+            Err(source) => {
+                error!(
+                    event = "storage.document_versions.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "connection_open",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version listing failed"
+                );
+                return Err(source);
+            }
+        };
+        let mut statement = match connection
             .prepare(LIST_DOCUMENT_VERSIONS_SQL)
             .map_err(|source| {
                 storage_operation_error(format!(
                     "failed to prepare document-version listing: {source}"
                 ))
-            })?;
-        let rows = statement
+            }) {
+            Ok(statement) => statement,
+            Err(source) => {
+                error!(
+                    event = "storage.document_versions.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "statement_prepare",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version listing failed"
+                );
+                return Err(source);
+            }
+        };
+        let rows = match statement
             .query_map([], |row| {
                 Ok(QueriedDocumentVersion {
                     source_path: row.get::<_, String>(0)?,
@@ -937,24 +969,94 @@ impl StorageRuntime {
                 storage_operation_error(format!(
                     "failed to execute document-version listing: {source}"
                 ))
-            })?;
+            }) {
+            Ok(rows) => rows,
+            Err(source) => {
+                error!(
+                    event = "storage.document_versions.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "query_execute",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version listing failed"
+                );
+                return Err(source);
+            }
+        };
         let mut sources = BTreeMap::<String, SourceDocumentVersionListing>::new();
         for row in rows {
-            let version = row.map_err(|source| {
+            let version = match row.map_err(|source| {
                 storage_operation_error(format!("failed to read document-version row: {source}"))
-            })?;
-            let record = version.to_record(
-                load_dense_vector_metadata_for_version(
-                    &connection,
-                    &version.source_path,
-                    &version.version_label,
-                )?,
-                load_colbert_vector_metadata_for_version(
-                    &connection,
-                    &version.source_path,
-                    &version.version_label,
-                )?,
-            )?;
+            }) {
+                Ok(version) => version,
+                Err(source) => {
+                    error!(
+                        event = "storage.document_versions.listing_failed",
+                        db_path = %self.db_path.display(),
+                        phase = "row_read",
+                        error = %source,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "document-version listing failed"
+                    );
+                    return Err(source);
+                }
+            };
+            let dense_metadata = match load_dense_vector_metadata_for_version(
+                &connection,
+                &version.source_path,
+                &version.version_label,
+            ) {
+                Ok(metadata) => metadata,
+                Err(source) => {
+                    error!(
+                        event = "storage.document_versions.listing_failed",
+                        db_path = %self.db_path.display(),
+                        source_path = %version.source_path,
+                        version_label = %version.version_label,
+                        phase = "dense_metadata_load",
+                        error = %source,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "document-version listing failed"
+                    );
+                    return Err(source);
+                }
+            };
+            let colbert_metadata = match load_colbert_vector_metadata_for_version(
+                &connection,
+                &version.source_path,
+                &version.version_label,
+            ) {
+                Ok(metadata) => metadata,
+                Err(source) => {
+                    error!(
+                        event = "storage.document_versions.listing_failed",
+                        db_path = %self.db_path.display(),
+                        source_path = %version.source_path,
+                        version_label = %version.version_label,
+                        phase = "colbert_metadata_load",
+                        error = %source,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "document-version listing failed"
+                    );
+                    return Err(source);
+                }
+            };
+            let record = match version.to_record(dense_metadata, colbert_metadata) {
+                Ok(record) => record,
+                Err(source) => {
+                    error!(
+                        event = "storage.document_versions.listing_failed",
+                        db_path = %self.db_path.display(),
+                        source_path = %version.source_path,
+                        version_label = %version.version_label,
+                        phase = "record_materialization",
+                        error = %source,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "document-version listing failed"
+                    );
+                    return Err(source);
+                }
+            };
             let entry = sources
                 .entry(version.source_path.clone())
                 .or_insert_with(|| SourceDocumentVersionListing {
@@ -967,10 +1069,24 @@ impl StorageRuntime {
             }
             entry.versions.push(record);
         }
-
-        Ok(DocumentVersionListing {
+        let listing = DocumentVersionListing {
             sources: sources.into_values().collect(),
-        })
+        };
+        let version_count = listing
+            .sources
+            .iter()
+            .map(|source| source.versions.len())
+            .sum::<usize>();
+        info!(
+            event = "storage.document_versions.listing_completed",
+            db_path = %self.db_path.display(),
+            sources = listing.sources.len(),
+            versions = version_count,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "document-version listing completed"
+        );
+
+        Ok(listing)
     }
 
     /// Publish an older retained source-document version as active without rebuilding or deleting data.
@@ -979,23 +1095,112 @@ impl StorageRuntime {
         source_path: &str,
         version_label: &str,
     ) -> Result<DocumentVersionRollbackResult, ApiError> {
-        let connection = open_connection(&self.db_path)?;
-        if !document_version_exists(&connection, source_path, version_label)? {
-            return Err(ApiError::BadRequest {
+        let started = Instant::now();
+        info!(
+            event = "storage.document_version_rollback.started",
+            source_path,
+            version_label,
+            db_path = %self.db_path.display(),
+            expected_dense_dimension = self.dense_dimension,
+            "document-version rollback started"
+        );
+        let connection = match open_connection(&self.db_path) {
+            Ok(connection) => connection,
+            Err(source) => {
+                error!(
+                    event = "storage.document_version_rollback.failed",
+                    source_path,
+                    version_label,
+                    db_path = %self.db_path.display(),
+                    phase = "connection_open",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version rollback failed"
+                );
+                return Err(source);
+            }
+        };
+        let version_exists = match document_version_exists(&connection, source_path, version_label)
+        {
+            Ok(version_exists) => version_exists,
+            Err(source) => {
+                error!(
+                    event = "storage.document_version_rollback.failed",
+                    source_path,
+                    version_label,
+                    db_path = %self.db_path.display(),
+                    phase = "version_lookup",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version rollback failed"
+                );
+                return Err(source);
+            }
+        };
+        if !version_exists {
+            let error = ApiError::BadRequest {
                 message: format!(
                     "document version not found for source {source_path} and versionLabel {version_label}"
                 ),
-            });
+            };
+            warn!(
+                event = "storage.document_version_rollback.failed",
+                source_path,
+                version_label,
+                db_path = %self.db_path.display(),
+                phase = "version_lookup",
+                status = error.status_code().as_u16(),
+                error_kind = error.error_kind(),
+                error = %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "document-version rollback failed"
+            );
+            return Err(error);
         }
-        let stored_vectors = load_dense_vectors_for_version(
+        let stored_vectors = match load_dense_vectors_for_version(
             &connection,
             source_path,
             version_label,
             self.dense_dimension,
-        )?;
+        ) {
+            Ok(vectors) => vectors,
+            Err(source) => {
+                error!(
+                    event = "storage.document_version_rollback.failed",
+                    source_path,
+                    version_label,
+                    db_path = %self.db_path.display(),
+                    phase = "dense_vector_load",
+                    expected_dense_dimension = self.dense_dimension,
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version rollback failed"
+                );
+                return Err(source);
+            }
+        };
         let vector_count = stored_vectors.len();
-        let published_at_ms =
-            self.publish_source_version_with_vectors(source_path, version_label, stored_vectors)?;
+        let published_at_ms = match self.publish_source_version_with_vectors(
+            source_path,
+            version_label,
+            stored_vectors,
+        ) {
+            Ok(published_at_ms) => published_at_ms,
+            Err(source) => {
+                error!(
+                    event = "storage.document_version_rollback.failed",
+                    source_path,
+                    version_label,
+                    db_path = %self.db_path.display(),
+                    phase = "active_publish",
+                    vector_count,
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "document-version rollback failed"
+                );
+                return Err(source);
+            }
+        };
 
         // Rollback publishes an already-retained immutable version; it never
         // rewrites embeddings or deletes inactive versions.
@@ -1005,6 +1210,7 @@ impl StorageRuntime {
             version_label,
             vector_count,
             published_at_ms,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "document version rolled back"
         );
 
@@ -1050,17 +1256,62 @@ impl StorageRuntime {
             });
         }
 
-        let stored_vectors = vectors
+        info!(
+            event = "storage.ingest_vectors.validation_started",
+            source_path = %conversion.source.relative_path.display(),
+            version_label,
+            units = units.len(),
+            dense_vectors = vectors.len(),
+            colbert_document_vectors = colbert_vectors.len(),
+            "ingest vector validation started"
+        );
+        let stored_vectors = match vectors
             .into_iter()
             .map(|value| {
                 validate_vector(value.unit_id, value.vector, self.dense_dimension)
                     .map_err(storage_operation_error)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let stored_colbert_vectors = colbert_vectors
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(vectors) => vectors,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_vectors.validation_failed",
+                    source_path = %conversion.source.relative_path.display(),
+                    version_label,
+                    vector_type = "dense",
+                    error = %source,
+                    "ingest dense vector validation failed"
+                );
+                return Err(source);
+            }
+        };
+        let stored_colbert_vectors = match colbert_vectors
             .into_iter()
             .map(|value| validate_colbert_document_vector(value, self.colbert_dimension))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(vectors) => vectors,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_vectors.validation_failed",
+                    source_path = %conversion.source.relative_path.display(),
+                    version_label,
+                    vector_type = "colbert",
+                    error = %source,
+                    "ingest ColBERT vector validation failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.ingest_vectors.validation_completed",
+            source_path = %conversion.source.relative_path.display(),
+            version_label,
+            dense_vectors = stored_vectors.len(),
+            colbert_document_vectors = stored_colbert_vectors.len(),
+            "ingest vector validation completed"
+        );
         let source_bytes =
             fs::read(&conversion.source.absolute_path).map_err(|source| ApiError::InternalIo {
                 message: format!(
@@ -1088,12 +1339,52 @@ impl StorageRuntime {
         }
         let source_path = conversion.source.relative_path.display().to_string();
 
-        let mut connection = open_connection(&self.db_path)?;
-        let tx = connection.transaction().map_err(|source| {
+        info!(
+            event = "storage.ingest_transaction.starting",
+            source_path,
+            version_label,
+            document_id,
+            units = units.len(),
+            "ingest SQLite transaction starting"
+        );
+        let mut connection = match open_connection(&self.db_path) {
+            Ok(connection) => connection,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_transaction.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    phase = "connection_open",
+                    error = %source,
+                    "ingest SQLite transaction failed"
+                );
+                return Err(source);
+            }
+        };
+        let tx = match connection.transaction().map_err(|source| {
             storage_operation_error(format!("failed to begin ingest transaction: {source}"))
-        })?;
+        }) {
+            Ok(tx) => tx,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_transaction.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    phase = "transaction_begin",
+                    error = %source,
+                    "ingest SQLite transaction failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.ingest_transaction.started",
+            source_path, version_label, document_id, "ingest SQLite transaction started"
+        );
 
-        insert_document(
+        if let Err(source) = insert_document(
             &tx,
             conversion,
             version_label,
@@ -1103,7 +1394,25 @@ impl StorageRuntime {
             &markdown_sha256,
             &diagnostics,
             now_ms,
-        )?;
+        ) {
+            error!(
+                event = "storage.ingest_document_metadata.failed",
+                source_path,
+                version_label,
+                document_id,
+                error = %source,
+                "ingest document metadata persistence failed"
+            );
+            return Err(source);
+        }
+        info!(
+            event = "storage.ingest_document_metadata.persisted",
+            source_path,
+            version_label,
+            document_id,
+            units = units.len(),
+            "ingest document metadata persisted"
+        );
         emit_ingest_storage_progress(&mut progress, "persisting document metadata", 1, 1)?;
         for (index, ((unit, vector), colbert_vector)) in units
             .iter()
@@ -1112,14 +1421,82 @@ impl StorageRuntime {
             .enumerate()
         {
             if unit.unit_id != vector.unit_id || unit.unit_id != colbert_vector.unit_id {
-                return Err(storage_operation_error(format!(
+                let error = storage_operation_error(format!(
                     "unit/vector id mismatch during ingest: unit={}, dense={}, colbert={}",
                     unit.unit_id, vector.unit_id, colbert_vector.unit_id
-                )));
+                ));
+                error!(
+                    event = "storage.ingest_units.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    unit_id = %unit.unit_id,
+                    current = index + 1,
+                    total = units.len(),
+                    phase = "id_validation",
+                    error = %error,
+                    "ingest unit persistence failed"
+                );
+                return Err(error);
             }
-            insert_unit(&tx, unit, version_label)?;
-            insert_dense_vector(&tx, vector, dense, now_ms)?;
-            insert_colbert_document_vector(&tx, colbert_vector, colbert, now_ms)?;
+            if let Err(source) = insert_unit(&tx, unit, version_label) {
+                error!(
+                    event = "storage.ingest_units.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    unit_id = %unit.unit_id,
+                    current = index + 1,
+                    total = units.len(),
+                    phase = "unit_row",
+                    error = %source,
+                    "ingest unit persistence failed"
+                );
+                return Err(source);
+            }
+            if let Err(source) = insert_dense_vector(&tx, vector, dense, now_ms) {
+                error!(
+                    event = "storage.ingest_units.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    unit_id = %unit.unit_id,
+                    current = index + 1,
+                    total = units.len(),
+                    phase = "dense_vector_row",
+                    error = %source,
+                    "ingest unit persistence failed"
+                );
+                return Err(source);
+            }
+            if let Err(source) =
+                insert_colbert_document_vector(&tx, colbert_vector, colbert, now_ms)
+            {
+                error!(
+                    event = "storage.ingest_units.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    unit_id = %unit.unit_id,
+                    current = index + 1,
+                    total = units.len(),
+                    phase = "colbert_vector_row",
+                    error = %source,
+                    "ingest unit persistence failed"
+                );
+                return Err(source);
+            }
+            if should_log_storage_checkpoint(index + 1, units.len()) {
+                info!(
+                    event = "storage.ingest_units.persisted_checkpoint",
+                    source_path,
+                    version_label,
+                    document_id,
+                    current = index + 1,
+                    total = units.len(),
+                    "ingest units and vectors persisted checkpoint"
+                );
+            }
             emit_ingest_storage_progress(
                 &mut progress,
                 "persisting units and vectors",
@@ -1128,11 +1505,57 @@ impl StorageRuntime {
             )?;
         }
 
-        tx.commit().map_err(|source| {
+        info!(
+            event = "storage.ingest_transaction.commit_starting",
+            source_path,
+            version_label,
+            document_id,
+            units = units.len(),
+            "ingest SQLite transaction commit starting"
+        );
+        if let Err(source) = tx.commit().map_err(|source| {
             storage_operation_error(format!("failed to commit ingest transaction: {source}"))
-        })?;
+        }) {
+            error!(
+                event = "storage.ingest_transaction.commit_failed",
+                source_path,
+                version_label,
+                document_id,
+                error = %source,
+                "ingest SQLite transaction commit failed"
+            );
+            return Err(source);
+        }
+        info!(
+            event = "storage.ingest_transaction.committed",
+            source_path,
+            version_label,
+            document_id,
+            units = units.len(),
+            "ingest SQLite transaction committed"
+        );
         emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)?;
-        self.publish_document_version(&source_path, version_label, stored_vectors)?;
+        info!(
+            event = "storage.ingest_publish.starting",
+            source_path,
+            version_label,
+            document_id,
+            vectors = stored_vectors.len(),
+            "ingest active-version publish starting"
+        );
+        if let Err(source) =
+            self.publish_document_version(&source_path, version_label, stored_vectors)
+        {
+            error!(
+                event = "storage.ingest_publish.failed",
+                source_path,
+                version_label,
+                document_id,
+                error = %source,
+                "ingest active-version publish failed"
+            );
+            return Err(source);
+        }
         emit_ingest_storage_progress(&mut progress, "publishing active search snapshot", 1, 1)?;
         // Publish is logged after both the durable transaction and active-cache
         // swap complete, so search requests admitted after this event can see
@@ -1154,47 +1577,239 @@ impl StorageRuntime {
     /// ColBERT and later rerankers consume this pool before final public top-K truncation.
     pub fn build_search_candidate_pool(
         &self,
+        operation_id: &str,
         query: &str,
         query_vector: Vec<f32>,
         top_k: u32,
         retrieval: &RetrievalConfig,
     ) -> Result<SearchCandidatePoolOutput, ApiError> {
         let started = Instant::now();
-        let query_vector = validate_vector(
+        let query_chars = query.chars().count();
+        let requested_query_vector_values = query_vector.len();
+        let candidate_limit = first_stage_candidate_limit(top_k, retrieval);
+        info!(
+            event = "storage.search_candidate_pool.started",
+            operation_id,
+            query_chars,
+            top_k,
+            requested_query_vector_values,
+            expected_dense_dimension = self.dense_dimension,
+            candidate_limit,
+            colbert_candidate_pool_size = retrieval.colbert_candidate_pool_size,
+            "search candidate pool construction started"
+        );
+        let query_vector = match validate_vector(
             "search-query".to_string(),
             query_vector,
             self.dense_dimension,
         )
-        .map_err(storage_operation_error)?;
-        let candidate_limit = first_stage_candidate_limit(top_k, retrieval);
+        .map_err(storage_operation_error)
+        {
+            Ok(vector) => vector,
+            Err(source) => {
+                error!(
+                    event = "storage.search_query_vector.validation_failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    requested_query_vector_values,
+                    expected_dense_dimension = self.dense_dimension,
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "search query vector validation failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.search_query_vector.validation_completed",
+            operation_id,
+            query_chars,
+            top_k,
+            vector_dimension = query_vector.vector.len(),
+            vector_norm = query_vector.norm,
+            "search query vector validation completed"
+        );
+        let snapshot_started = Instant::now();
+        info!(
+            event = "storage.search_snapshot.capture_started",
+            operation_id, query_chars, top_k, "search snapshot capture started"
+        );
         let cache_snapshot = {
-            let cache = self.cache.lock().map_err(|source| {
+            let cache = match self.cache.lock().map_err(|source| {
                 storage_operation_error(format!("dense cache lock is poisoned: {source}"))
-            })?;
-            cache.clone()
+            }) {
+                Ok(cache) => cache,
+                Err(source) => {
+                    error!(
+                        event = "storage.search_snapshot.capture_failed",
+                        operation_id,
+                        query_chars,
+                        top_k,
+                        phase = "cache_lock",
+                        error = %source,
+                        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+                        "search snapshot capture failed"
+                    );
+                    return Err(source);
+                }
+            };
+            let snapshot = cache.clone();
+            info!(
+                event = "storage.search_snapshot.capture_completed",
+                operation_id,
+                query_chars,
+                top_k,
+                active_sources = snapshot.active_versions.len(),
+                vectors = snapshot.unit_ids.len(),
+                dimension = snapshot.dimension,
+                memory_bytes = snapshot.memory_bytes,
+                elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+                "search snapshot capture completed"
+            );
+            snapshot
         };
 
         let dense_started = Instant::now();
-        let dense_matches = cache_snapshot.search(&query_vector, candidate_limit)?;
+        info!(
+            event = "storage.search_dense_scan.started",
+            operation_id,
+            query_chars,
+            top_k,
+            candidate_limit,
+            cache_vectors = cache_snapshot.unit_ids.len(),
+            vector_dimension = query_vector.vector.len(),
+            "search dense scan started"
+        );
+        let dense_matches = match cache_snapshot.search(&query_vector, candidate_limit) {
+            Ok(matches) => matches,
+            Err(source) => {
+                error!(
+                    event = "storage.search_dense_scan.failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    candidate_limit,
+                    cache_vectors = cache_snapshot.unit_ids.len(),
+                    error = %source,
+                    elapsed_ms = dense_started.elapsed().as_millis() as u64,
+                    "search dense scan failed"
+                );
+                return Err(source);
+            }
+        };
         let dense_latency_ms = dense_started.elapsed().as_millis() as u64;
+        info!(
+            event = "storage.search_dense_scan.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            candidate_limit,
+            matches = dense_matches.len(),
+            elapsed_ms = dense_latency_ms,
+            "search dense scan completed"
+        );
 
         let bm25_started = Instant::now();
         // Treat user text as plain search terms, not FTS syntax, so operators cannot alter the query language boundary.
         let bm25_query = build_fts_query(query);
-        let bm25_matches = self.search_bm25(
+        info!(
+            event = "storage.search_bm25.started",
+            operation_id,
+            query_chars,
+            top_k,
+            candidate_limit,
+            fts_query_present = bm25_query.is_some(),
+            active_sources = cache_snapshot.active_versions.len(),
+            "search BM25 started"
+        );
+        let bm25_matches = match self.search_bm25(
             bm25_query.as_deref(),
             candidate_limit,
             &cache_snapshot.active_versions,
-        )?;
+        ) {
+            Ok(matches) => matches,
+            Err(source) => {
+                error!(
+                    event = "storage.search_bm25.failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    candidate_limit,
+                    fts_query_present = bm25_query.is_some(),
+                    active_sources = cache_snapshot.active_versions.len(),
+                    error = %source,
+                    elapsed_ms = bm25_started.elapsed().as_millis() as u64,
+                    "search BM25 failed"
+                );
+                return Err(source);
+            }
+        };
         let bm25_latency_ms = bm25_started.elapsed().as_millis() as u64;
+        info!(
+            event = "storage.search_bm25.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            candidate_limit,
+            matches = bm25_matches.len(),
+            elapsed_ms = bm25_latency_ms,
+            "search BM25 completed"
+        );
 
+        let fusion_started = Instant::now();
+        info!(
+            event = "storage.search_rrf_fusion.started",
+            operation_id,
+            query_chars,
+            top_k,
+            dense_matches = dense_matches.len(),
+            bm25_matches = bm25_matches.len(),
+            colbert_candidate_pool_size = retrieval.colbert_candidate_pool_size,
+            rrf_k = retrieval.rrf_k,
+            "search RRF fusion started"
+        );
         let fused_matches = fuse_matches(
             &dense_matches,
             &bm25_matches,
             retrieval.colbert_candidate_pool_size as usize,
             retrieval.rrf_k,
         );
-        let units = self.load_units_for_fused_matches(&fused_matches)?;
+        info!(
+            event = "storage.search_rrf_fusion.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            fused_matches = fused_matches.len(),
+            elapsed_ms = fusion_started.elapsed().as_millis() as u64,
+            "search RRF fusion completed"
+        );
+        let materialization_started = Instant::now();
+        info!(
+            event = "storage.search_candidate_materialization.started",
+            operation_id,
+            query_chars,
+            top_k,
+            fused_matches = fused_matches.len(),
+            "search candidate materialization started"
+        );
+        let units = match self.load_units_for_fused_matches(&fused_matches) {
+            Ok(units) => units,
+            Err(source) => {
+                error!(
+                    event = "storage.search_candidate_materialization.failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    fused_matches = fused_matches.len(),
+                    phase = "unit_load",
+                    error = %source,
+                    elapsed_ms = materialization_started.elapsed().as_millis() as u64,
+                    "search candidate materialization failed"
+                );
+                return Err(source);
+            }
+        };
         let candidates = fused_matches
             .iter()
             .filter_map(|matched| {
@@ -1218,12 +1833,48 @@ impl StorageRuntime {
             })
             .collect::<Vec<_>>();
         if candidates.len() != fused_matches.len() {
-            return Err(storage_operation_error(
+            let source = storage_operation_error(
                 "fused search result materialization missed one or more unit rows".to_string(),
-            ));
+            );
+            error!(
+                event = "storage.search_candidate_materialization.failed",
+                operation_id,
+                query_chars,
+                top_k,
+                fused_matches = fused_matches.len(),
+                loaded_units = units.len(),
+                candidates = candidates.len(),
+                phase = "candidate_join",
+                error = %source,
+                elapsed_ms = materialization_started.elapsed().as_millis() as u64,
+                "search candidate materialization failed"
+            );
+            return Err(source);
         }
+        info!(
+            event = "storage.search_candidate_materialization.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            fused_matches = fused_matches.len(),
+            loaded_units = units.len(),
+            candidates = candidates.len(),
+            elapsed_ms = materialization_started.elapsed().as_millis() as u64,
+            "search candidate materialization completed"
+        );
         let latency_ms = started.elapsed().as_millis() as u64;
-        let raw = self.build_search_raw(SearchRawInput {
+        let raw_started = Instant::now();
+        info!(
+            event = "storage.search_raw_diagnostics.started",
+            operation_id,
+            query_chars,
+            top_k,
+            dense_matches = dense_matches.len(),
+            bm25_matches = bm25_matches.len(),
+            fused_matches = fused_matches.len(),
+            "search raw diagnostics assembly started"
+        );
+        let raw = match self.build_search_raw(SearchRawInput {
             cache: &cache_snapshot,
             query_vector: &query_vector,
             dense_matches: &dense_matches,
@@ -1238,7 +1889,45 @@ impl StorageRuntime {
             dense_latency_ms,
             bm25_latency_ms,
             latency_ms,
-        })?;
+        }) {
+            Ok(raw) => raw,
+            Err(source) => {
+                error!(
+                    event = "storage.search_raw_diagnostics.failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    dense_matches = dense_matches.len(),
+                    bm25_matches = bm25_matches.len(),
+                    fused_matches = fused_matches.len(),
+                    error = %source,
+                    elapsed_ms = raw_started.elapsed().as_millis() as u64,
+                    "search raw diagnostics assembly failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.search_raw_diagnostics.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            elapsed_ms = raw_started.elapsed().as_millis() as u64,
+            "search raw diagnostics assembly completed"
+        );
+        info!(
+            event = "storage.search_candidate_pool.completed",
+            operation_id,
+            query_chars,
+            top_k,
+            candidate_limit,
+            candidates = candidates.len(),
+            dense_matches = dense_matches.len(),
+            bm25_matches = bm25_matches.len(),
+            fused_matches = fused_matches.len(),
+            elapsed_ms = latency_ms,
+            "search candidate pool construction completed"
+        );
 
         Ok(SearchCandidatePoolOutput { candidates, raw })
     }
@@ -1403,33 +2092,247 @@ impl StorageRuntime {
         version_label: &str,
         vectors: Vec<StoredDenseVector>,
     ) -> Result<u64, ApiError> {
+        let started = Instant::now();
         let published_at_ms = current_time_ms()?;
-        let mut cache = self.cache.lock().map_err(|source| {
+        let vector_count = vectors.len();
+        info!(
+            event = "storage.active_version_publish.started",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            "active-version publish started"
+        );
+        let mut cache = match self.cache.lock().map_err(|source| {
             storage_operation_error(format!("dense cache lock is poisoned: {source}"))
-        })?;
-        let published_cache = cache.with_published_source_version(
+        }) {
+            Ok(cache) => cache,
+            Err(source) => {
+                error!(
+                    event = "storage.active_version_publish.failed",
+                    source_path,
+                    version_label,
+                    vectors = vector_count,
+                    published_at_ms,
+                    phase = "cache_lock",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        let published_cache = match cache.with_published_source_version(
             source_path,
             version_label,
             vectors,
             published_at_ms,
-        )?;
-        let mut connection = open_connection(&self.db_path)?;
-        let tx = connection.transaction().map_err(|source| {
+        ) {
+            Ok(cache) => cache,
+            Err(source) => {
+                error!(
+                    event = "storage.active_version_publish.failed",
+                    source_path,
+                    version_label,
+                    vectors = vector_count,
+                    published_at_ms,
+                    phase = "cache_prepare",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.active_version_publish.connection_opening",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            db_path = %self.db_path.display(),
+            phase = "connection_open",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite connection opening"
+        );
+        let mut connection = match open_connection(&self.db_path) {
+            Ok(connection) => connection,
+            Err(source) => {
+                error!(
+                    event = "storage.active_version_publish.failed",
+                    source_path,
+                    version_label,
+                    vectors = vector_count,
+                    published_at_ms,
+                    db_path = %self.db_path.display(),
+                    phase = "connection_open",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.active_version_publish.connection_opened",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            db_path = %self.db_path.display(),
+            phase = "connection_open",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite connection opened"
+        );
+        info!(
+            event = "storage.active_version_publish.transaction_starting",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "transaction_begin",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite transaction starting"
+        );
+        let tx = match connection.transaction().map_err(|source| {
             storage_operation_error(format!("failed to begin active-version publish: {source}"))
-        })?;
-        tx.execute(
-            PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL,
-            params![source_path, version_label, published_at_ms as i64],
-        )
-        .map_err(|source| {
-            storage_operation_error(format!(
-                "failed to publish active document version: {source}"
-            ))
-        })?;
-        tx.commit().map_err(|source| {
+        }) {
+            Ok(tx) => tx,
+            Err(source) => {
+                error!(
+                    event = "storage.active_version_publish.failed",
+                    source_path,
+                    version_label,
+                    vectors = vector_count,
+                    published_at_ms,
+                    phase = "transaction_begin",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.active_version_publish.transaction_started",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "transaction_begin",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite transaction started"
+        );
+        info!(
+            event = "storage.active_version_publish.active_row_writing",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "active_row_write",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version row writing"
+        );
+        if let Err(source) = tx
+            .execute(
+                PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL,
+                params![source_path, version_label, published_at_ms as i64],
+            )
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to publish active document version: {source}"
+                ))
+            })
+        {
+            error!(
+                event = "storage.active_version_publish.failed",
+                source_path,
+                version_label,
+                vectors = vector_count,
+                published_at_ms,
+                phase = "active_row_write",
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "active-version publish failed"
+            );
+            return Err(source);
+        }
+        info!(
+            event = "storage.active_version_publish.active_row_written",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "active_row_write",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version row written"
+        );
+        info!(
+            event = "storage.active_version_publish.commit_starting",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "transaction_commit",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite transaction commit starting"
+        );
+        if let Err(source) = tx.commit().map_err(|source| {
             storage_operation_error(format!("failed to commit active-version publish: {source}"))
-        })?;
+        }) {
+            error!(
+                event = "storage.active_version_publish.failed",
+                source_path,
+                version_label,
+                vectors = vector_count,
+                published_at_ms,
+                phase = "transaction_commit",
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "active-version publish failed"
+            );
+            return Err(source);
+        }
+        info!(
+            event = "storage.active_version_publish.committed",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "transaction_commit",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish SQLite transaction committed"
+        );
+        info!(
+            event = "storage.active_version_publish.cache_swap_starting",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "cache_swap",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version dense cache swap starting"
+        );
         *cache = published_cache;
+        info!(
+            event = "storage.active_version_publish.cache_swap_completed",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "cache_swap",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version dense cache swap completed"
+        );
+        info!(
+            event = "storage.active_version_publish.completed",
+            source_path,
+            version_label,
+            vectors = vector_count,
+            published_at_ms,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "active-version publish completed"
+        );
 
         Ok(published_at_ms)
     }
@@ -2686,6 +3589,11 @@ where
     }
 
     Ok(())
+}
+
+/// Return whether a unit persistence count should be written as a durable service-log checkpoint.
+fn should_log_storage_checkpoint(current: usize, total: usize) -> bool {
+    current == 1 || current == total || current % 10 == 0
 }
 
 /// Insert one retrieval unit and its external-content FTS row.

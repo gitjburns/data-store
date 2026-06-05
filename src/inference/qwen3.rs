@@ -1,8 +1,9 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_no_bias};
 use serde::Deserialize;
+use tracing::{error, info};
 
 use crate::{
     error::ApiError,
@@ -33,7 +34,6 @@ pub struct Qwen3Config {
 #[derive(Debug, Clone)]
 pub struct Qwen3Model {
     embeddings: Embedding,
-    embedding_weight: Tensor,
     layers: Vec<Qwen3Layer>,
     norm: MetalSafeRmsNorm,
     config: Qwen3Config,
@@ -90,71 +90,117 @@ impl Qwen3Model {
         tensor_prefix: Option<&str>,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        validate_qwen3_config(label, config)?;
-        progress(&format!("{label}_model_memory_mapping"))?;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&artifacts.safetensor_paths, DType::BF16, device)
-        }
-        .map_err(|source| {
-            inference_error(format!(
-                "failed to memory-map {label} safetensors from {}: {source}",
-                artifacts.root.display()
-            ))
-        })?;
-        progress(&format!("{label}_model_memory_mapped"))?;
-        let model_vb = tensor_prefix.map_or_else(|| vb.clone(), |prefix| vb.pp(prefix));
-        progress(&format!("{label}_model_embeddings_loading"))?;
-        let embeddings = embedding(
-            config.vocab_size,
-            config.hidden_size,
-            model_vb.pp("embed_tokens"),
-        )
-        .map_err(|source| {
-            inference_error(format!("failed to load {label} token embeddings: {source}"))
-        })?;
-        let embedding_weight = model_vb
-            .get(
-                (config.vocab_size, config.hidden_size),
-                "embed_tokens.weight",
-            )
+        let started_at = Instant::now();
+        info!(
+            event = "model_call.started",
+            model_role = label,
+            call_purpose = "startup_model_load",
+            layer_count = config.num_hidden_layers,
+            hidden_size = config.hidden_size,
+            head_count = config.num_attention_heads,
+            kv_head_count = config.num_key_value_heads,
+            vocab_size = config.vocab_size,
+            safetensor_count = artifacts.safetensor_paths.len(),
+            "Qwen3 startup model load started"
+        );
+        let load_result: Result<Self, ApiError> = (|| {
+            validate_qwen3_config(label, config)?;
+            progress(&format!("{label}_model_memory_mapping"))?;
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    &artifacts.safetensor_paths,
+                    DType::BF16,
+                    device,
+                )
+            }
             .map_err(|source| {
                 inference_error(format!(
-                    "failed to load {label} tied token embedding weight: {source}"
+                    "failed to memory-map {label} safetensors from {}: {source}",
+                    artifacts.root.display()
                 ))
             })?;
-        progress(&format!("{label}_model_embeddings_ready"))?;
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for index in 0..config.num_hidden_layers {
+            progress(&format!("{label}_model_memory_mapped"))?;
+            let model_vb = tensor_prefix.map_or_else(|| vb.clone(), |prefix| vb.pp(prefix));
+            progress(&format!("{label}_model_embeddings_loading"))?;
+            let embeddings = embedding(
+                config.vocab_size,
+                config.hidden_size,
+                model_vb.pp("embed_tokens"),
+            )
+            .map_err(|source| {
+                inference_error(format!("failed to load {label} token embeddings: {source}"))
+            })?;
+            progress(&format!("{label}_model_embeddings_ready"))?;
+            let mut layers = Vec::with_capacity(config.num_hidden_layers);
+            for index in 0..config.num_hidden_layers {
+                progress(&format!(
+                    "{label}_model_layer_loading layer={}/{}",
+                    index + 1,
+                    config.num_hidden_layers
+                ))?;
+                layers.push(Qwen3Layer::load(
+                    label,
+                    config,
+                    model_vb.pp(format!("layers.{index}")),
+                )?);
+            }
             progress(&format!(
-                "{label}_model_layer_loading layer={}/{}",
-                index + 1,
+                "{label}_model_layers_ready count={}",
                 config.num_hidden_layers
             ))?;
-            layers.push(Qwen3Layer::load(
-                label,
-                config,
-                model_vb.pp(format!("layers.{index}")),
-            )?);
-        }
-        progress(&format!(
-            "{label}_model_layers_ready count={}",
-            config.num_hidden_layers
-        ))?;
-        progress(&format!("{label}_model_final_norm_loading"))?;
-        let norm =
-            MetalSafeRmsNorm::load(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))
-                .map_err(|source| {
-                    inference_error(format!("failed to load {label} final norm: {source}"))
-                })?;
-        progress(&format!("{label}_model_final_norm_ready"))?;
+            progress(&format!("{label}_model_final_norm_loading"))?;
+            let norm = MetalSafeRmsNorm::load(
+                config.hidden_size,
+                config.rms_norm_eps,
+                model_vb.pp("norm"),
+            )
+            .map_err(|source| {
+                inference_error(format!("failed to load {label} final norm: {source}"))
+            })?;
+            progress(&format!("{label}_model_final_norm_ready"))?;
 
-        Ok(Self {
-            embeddings,
-            embedding_weight,
-            layers,
-            norm,
-            config: config.clone(),
-        })
+            Ok(Self {
+                embeddings,
+                layers,
+                norm,
+                config: config.clone(),
+            })
+        })();
+        match &load_result {
+            Ok(_) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = label,
+                    call_purpose = "startup_model_load",
+                    layer_count = config.num_hidden_layers,
+                    hidden_size = config.hidden_size,
+                    head_count = config.num_attention_heads,
+                    kv_head_count = config.num_key_value_heads,
+                    vocab_size = config.vocab_size,
+                    safetensor_count = artifacts.safetensor_paths.len(),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "Qwen3 startup model load completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = label,
+                    call_purpose = "startup_model_load",
+                    layer_count = config.num_hidden_layers,
+                    hidden_size = config.hidden_size,
+                    head_count = config.num_attention_heads,
+                    kv_head_count = config.num_key_value_heads,
+                    vocab_size = config.vocab_size,
+                    safetensor_count = artifacts.safetensor_paths.len(),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "Qwen3 startup model load failed"
+                );
+            }
+        }
+
+        load_result
     }
 
     /// Return the configured hidden size for runtime diagnostics and output validation.
@@ -211,30 +257,34 @@ impl Qwen3Model {
                     "failed to extract {label} final hidden state: {source}"
                 ))
             })?;
-        let mut logits = Vec::with_capacity(token_ids.len());
-        for token_id in token_ids {
-            let token_embedding = self
-                .embedding_weight
-                .narrow(0, *token_id as usize, 1)
-                .and_then(|tensor| tensor.reshape((hidden_size,)))
-                .and_then(|tensor| tensor.to_dtype(DType::F32))
-                .and_then(|tensor| tensor.to_device(&Device::Cpu))
-                .and_then(|tensor| tensor.to_vec1::<f32>())
-                .map_err(|source| {
-                    inference_error(format!(
-                        "failed to extract {label} tied embedding for token {token_id}: {source}"
-                    ))
-                })?;
-            let logit = final_hidden
-                .iter()
-                .zip(token_embedding.iter())
-                .map(|(left, right)| left * right)
-                .sum::<f32>();
-            logits.push(TokenLogit {
+        let selected_token_ids = Tensor::new(token_ids, device).map_err(|source| {
+            inference_error(format!(
+                "failed to build {label} selected-token tensor: {source}"
+            ))
+        })?;
+        let selected_embeddings = self
+            .embeddings
+            .forward(&selected_token_ids)
+            .and_then(|tensor| tensor.to_dtype(DType::F32))
+            .and_then(|tensor| tensor.to_device(&Device::Cpu))
+            .and_then(|tensor| tensor.to_vec2::<f32>())
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to extract {label} tied embeddings for selected tokens: {source}"
+                ))
+            })?;
+        let logits = token_ids
+            .iter()
+            .zip(selected_embeddings.iter())
+            .map(|(token_id, token_embedding)| TokenLogit {
                 token_id: *token_id,
-                logit,
-            });
-        }
+                logit: final_hidden
+                    .iter()
+                    .zip(token_embedding.iter())
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>(),
+            })
+            .collect::<Vec<_>>();
 
         Ok(logits)
     }

@@ -19,7 +19,7 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::{
     docling::{DoclingProgressUpdate, convert_source_to_markdown},
@@ -56,6 +56,8 @@ const RERANKER_MODE_QWEN3_YES_NO: &str = "qwen3_yes_no_candidate_rerank";
 const RERANKER_CANDIDATE_SOURCE_COLBERT_POOL: &str = "colbert_ranked_candidate_pool";
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const OPERATION_STREAM_CHANNEL_CAPACITY: usize = 16;
+const OPERATION_STREAM_CLOSED_MESSAGE: &str =
+    "operation response stream closed before event delivery";
 static NEXT_SERVER_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Build the Axum router for the versioned HTTP API and protected admin controls.
@@ -84,12 +86,41 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// Return service readiness and startup diagnostics.
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    Json(state.health())
+    let started = log_route_started("/v1/health", "health_reading");
+    let response = state.health();
+    info!(
+        event = "http.route.result_ready",
+        route = "/v1/health",
+        stage = "health_reading",
+        status = 200_u16,
+        ready = response.ready,
+        components = response.components.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
+
+    Json(response)
 }
 
 /// Return public request and retrieval limits for caller-side request construction.
 async fn get_limits(State(state): State<Arc<AppState>>) -> Json<LimitsResponse> {
-    Json(build_limits_response(&state))
+    let started = log_route_started("/v1/limits", "limits_reading");
+    let response = build_limits_response(&state);
+    info!(
+        event = "http.route.result_ready",
+        route = "/v1/limits",
+        stage = "limits_reading",
+        status = 200_u16,
+        max_request_body_bytes = response.request.max_request_body_bytes,
+        max_ingest_source_chars = response.request.max_ingest_source_chars,
+        max_search_query_chars = response.request.max_search_query_chars,
+        default_top_k = response.retrieval.default_top_k,
+        max_top_k = response.retrieval.max_top_k,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
+
+    Json(response)
 }
 
 /// Build the public limits response from validated runtime config.
@@ -107,14 +138,94 @@ fn build_limits_response(state: &AppState) -> LimitsResponse {
     }
 }
 
+/// Log the accepted boundary for one route-specific HTTP request.
+fn log_route_started(route: &'static str, stage: &'static str) -> Instant {
+    let started = Instant::now();
+    info!(
+        event = "http.route.started",
+        route,
+        stage,
+        elapsed_ms = 0_u64,
+        "HTTP route started"
+    );
+
+    started
+}
+
+/// Log a route-local failure before the shared API error renderer loses route context.
+fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, started: &Instant) {
+    let status = error.status_code();
+    let error_kind = error.error_kind();
+    let error_message = error.to_string();
+    if status.is_server_error() {
+        error!(
+            event = "http.route.failed",
+            route,
+            stage,
+            status = status.as_u16(),
+            error_kind,
+            error = %error_message,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "HTTP route failed"
+        );
+    } else {
+        warn!(
+            event = "http.route.failed",
+            route,
+            stage,
+            status = status.as_u16(),
+            error_kind,
+            error = %error_message,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "HTTP route failed"
+        );
+    }
+}
+
 /// Run one synchronous ingest request while keeping file bytes inside the service-owned corpus.
 async fn post_ingest(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<Json<IngestResponse>, ApiError> {
-    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    let started = log_route_started("/v1/ingest", "request_decoding");
+    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
+        Ok(request) => request,
+        Err(error) => {
+            log_route_failed("/v1/ingest", "request_decoding", &error, &started);
+            return Err(error);
+        }
+    };
+    let requested_source = request.source.clone();
+    info!(
+        event = "http.route.request_decoded",
+        route = "/v1/ingest",
+        stage = "request_decoded",
+        requested_source = %requested_source,
+        source_chars = requested_source.chars().count(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route request decoded"
+    );
+    let response = match execute_ingest(&state, request, None).await {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed("/v1/ingest", "ingest_executing", &error, &started);
+            return Err(error);
+        }
+    };
+    info!(
+        event = "http.route.result_ready",
+        route = "/v1/ingest",
+        stage = "result_ready",
+        status = 200_u16,
+        requested_source = %requested_source,
+        document_id = %response.document_id,
+        version_label = %response.version_label,
+        units_ingested = response.units_ingested,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
 
-    Ok(Json(execute_ingest(&state, request, None).await?))
+    Ok(Json(response))
 }
 
 /// Execute the ingest pipeline shared by the route-specific and operation-stream APIs.
@@ -124,13 +235,32 @@ async fn execute_ingest(
     mut emitter: Option<&mut OperationEmitter>,
 ) -> Result<IngestResponse, ApiError> {
     let started = Instant::now();
-    request.validate(state.config.server.max_ingest_source_chars)?;
+    let requested_source = request.source.clone();
+    let operation_id = operation_id_for_log(&emitter);
+    if let Err(source) = request.validate(state.config.server.max_ingest_source_chars) {
+        info!(
+            event = "ingest.validation_failed",
+            operation_id = %operation_id,
+            requested_source = %requested_source,
+            rejected_field = "source",
+            max_ingest_source_chars = state.config.server.max_ingest_source_chars,
+            source_chars = requested_source.chars().count(),
+            status = source.status_code().as_u16(),
+            error_kind = source.error_kind(),
+            error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ingest request validation failed"
+        );
+        return Err(source);
+    }
     let _admission_permit = match state.try_acquire_ingest_admission() {
         Ok(permit) => permit,
         Err(error) => {
             let admission = state.ingest_admission_snapshot();
             info!(
                 event = "ingest.admission_rejected",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
                 in_flight = admission.in_flight,
                 max_in_flight = admission.max_in_flight,
                 error = %error,
@@ -142,6 +272,8 @@ async fn execute_ingest(
     let admission = state.ingest_admission_snapshot();
     info!(
         event = "ingest.admitted",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
         in_flight = admission.in_flight,
         max_in_flight = admission.max_in_flight,
         "ingest request admitted"
@@ -158,8 +290,36 @@ async fn execute_ingest(
         "resolving source reference",
     )
     .await?;
-    let source = resolve_source_reference(&state.config.storage, &request.source)?;
+    info!(
+        event = "ingest.source_resolution.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        "ingest source resolution started"
+    );
+    let source = match resolve_source_reference(&state.config.storage, &request.source) {
+        Ok(source) => source,
+        Err(source) => {
+            error!(
+                event = "ingest.source_resolution.failed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                error = %source,
+                elapsed_ms = source_started.elapsed().as_millis() as u64,
+                "ingest source resolution failed"
+            );
+            return Err(source);
+        }
+    };
     let source_resolution_latency_ms = source_started.elapsed().as_millis() as u64;
+    info!(
+        event = "ingest.source_resolution.completed",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        relative_source = %source.relative_path.display(),
+        absolute_source = %source.absolute_path.display(),
+        elapsed_ms = source_resolution_latency_ms,
+        "ingest source resolution completed"
+    );
     let conversion_started = Instant::now();
     emit_operation_status(
         &mut emitter,
@@ -167,6 +327,13 @@ async fn execute_ingest(
         "converting source document",
     )
     .await?;
+    info!(
+        event = "ingest.docling_conversion.started",
+        operation = "ingest",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        "ingest Docling conversion started"
+    );
     let (docling_progress_sender, mut docling_progress_receiver) =
         mpsc::channel(OPERATION_STREAM_CHANNEL_CAPACITY);
     let progress_sender = if emitter.is_some() {
@@ -181,25 +348,66 @@ async fn execute_ingest(
         progress_sender,
     );
     tokio::pin!(conversion_future);
-    let mut docling_progress_open = emitter.is_some();
+    let mut docling_progress_channel_open = emitter.is_some();
+    let mut docling_progress_delivery_open = emitter.is_some();
     let conversion = loop {
         tokio::select! {
             result = &mut conversion_future => {
-                let conversion = result?;
-                drain_docling_progress(&mut emitter, &mut docling_progress_receiver).await?;
+                let conversion = match result {
+                    Ok(conversion) => conversion,
+                    Err(source) => {
+                        error!(
+                            event = "ingest.docling_conversion.failed",
+                            operation = "ingest",
+                            operation_id = %operation_id,
+                            requested_source = %requested_source,
+                            error = %source,
+                            elapsed_ms = conversion_started.elapsed().as_millis() as u64,
+                            "ingest Docling conversion failed"
+                        );
+                        return Err(source);
+                    }
+                };
+                drain_docling_progress(
+                    &mut emitter,
+                    &mut docling_progress_receiver,
+                    &mut docling_progress_delivery_open,
+                    &operation_id,
+                    &requested_source,
+                    &conversion_started,
+                ).await;
                 break conversion;
             }
-            progress = docling_progress_receiver.recv(), if docling_progress_open => {
+            progress = docling_progress_receiver.recv(), if docling_progress_channel_open => {
                 match progress {
-                    Some(progress) => emit_docling_progress(&mut emitter, progress).await?,
+                    Some(progress) => {
+                        forward_docling_progress(
+                            &mut emitter,
+                            progress,
+                            &mut docling_progress_delivery_open,
+                            &operation_id,
+                            &requested_source,
+                            &conversion_started,
+                        ).await;
+                    }
                     None => {
-                        docling_progress_open = false;
+                        docling_progress_channel_open = false;
                     }
                 }
             }
         }
     };
     let conversion_latency_ms = conversion_started.elapsed().as_millis() as u64;
+    info!(
+        event = "ingest.docling_conversion.completed",
+        operation = "ingest",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        markdown_path = %conversion.markdown_path.display(),
+        markdown_chars = conversion.markdown.chars().count(),
+        elapsed_ms = conversion_latency_ms,
+        "ingest Docling conversion completed"
+    );
     let splitting_started = Instant::now();
     emit_operation_status(
         &mut emitter,
@@ -207,11 +415,30 @@ async fn execute_ingest(
         "splitting document into retrieval units",
     )
     .await?;
-    let base_units = split_conversion_into_units(
+    info!(
+        event = "ingest.unit_splitting.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        "ingest unit splitting started"
+    );
+    let base_units = match split_conversion_into_units(
         &conversion,
         &state.config.retrieval,
         &state.config.models.colbert.path.join("tokenizer.json"),
-    )?;
+    ) {
+        Ok(units) => units,
+        Err(source) => {
+            error!(
+                event = "ingest.unit_splitting.failed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                error = %source,
+                elapsed_ms = splitting_started.elapsed().as_millis() as u64,
+                "ingest unit splitting failed"
+            );
+            return Err(source);
+        }
+    };
     emit_operation_progress(
         &mut emitter,
         "unit_splitting",
@@ -225,13 +452,48 @@ async fn execute_ingest(
     let versioned_document_id =
         build_versioned_document_id(&conversion.source.relative_path, &version_label);
     let units = assign_units_to_document_version(&base_units, &versioned_document_id);
+    info!(
+        event = "ingest.unit_splitting.completed",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        document_id = %versioned_document_id,
+        units = units.len(),
+        elapsed_ms = splitting_latency_ms,
+        "ingest unit splitting completed"
+    );
     let inference = state.inference()?;
     let dense_embedding_started = Instant::now();
     emit_operation_status(&mut emitter, "dense_embedding", "embedding document units").await?;
+    info!(
+        event = "ingest.dense_embedding.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        units = units.len(),
+        "ingest dense embedding started"
+    );
     let total_units = units.len() as u64;
     let mut vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
-        let vector = inference.dense.embed_passage_vector(&unit.content)?;
+        let vector = match inference.dense.embed_passage_vector(&unit.content) {
+            Ok(vector) => vector,
+            Err(source) => {
+                error!(
+                    event = "ingest.dense_embedding.failed",
+                    operation_id = %operation_id,
+                    requested_source = %requested_source,
+                    version_label = %version_label,
+                    unit_id = %unit.unit_id,
+                    completed_units = index,
+                    total_units = units.len(),
+                    error = %source,
+                    elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
+                    "ingest dense embedding failed"
+                );
+                return Err(source);
+            }
+        };
         vectors.push(UnitDenseVector {
             unit_id: unit.unit_id.clone(),
             vector,
@@ -246,6 +508,15 @@ async fn execute_ingest(
         .await?;
     }
     let dense_embedding_latency_ms = dense_embedding_started.elapsed().as_millis() as u64;
+    info!(
+        event = "ingest.dense_embedding.completed",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        dense_vectors = vectors.len(),
+        elapsed_ms = dense_embedding_latency_ms,
+        "ingest dense embedding completed"
+    );
     let colbert_embedding_started = Instant::now();
     emit_operation_status(
         &mut emitter,
@@ -253,11 +524,37 @@ async fn execute_ingest(
         "embedding ColBERT document vectors",
     )
     .await?;
+    info!(
+        event = "ingest.colbert_embedding.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        units = units.len(),
+        "ingest ColBERT embedding started"
+    );
     let mut colbert_vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
-        let embedding = inference
+        let embedding = match inference
             .colbert
-            .embed_document(&unit.unit_id, &unit.content)?;
+            .embed_document(&unit.unit_id, &unit.content)
+        {
+            Ok(embedding) => embedding,
+            Err(source) => {
+                error!(
+                    event = "ingest.colbert_embedding.failed",
+                    operation_id = %operation_id,
+                    requested_source = %requested_source,
+                    version_label = %version_label,
+                    unit_id = %unit.unit_id,
+                    completed_units = index,
+                    total_units = units.len(),
+                    error = %source,
+                    elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
+                    "ingest ColBERT embedding failed"
+                );
+                return Err(source);
+            }
+        };
         colbert_vectors.push(UnitColbertDocumentVector {
             unit_id: embedding.unit_id,
             token_count: embedding.token_count,
@@ -280,6 +577,16 @@ async fn execute_ingest(
         .sum::<usize>();
     let storage = state.storage()?;
     let colbert_embedding_latency_ms = colbert_embedding_started.elapsed().as_millis() as u64;
+    info!(
+        event = "ingest.colbert_embedding.completed",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        colbert_document_vectors = colbert_vector_count,
+        colbert_document_vector_values = colbert_vector_values,
+        elapsed_ms = colbert_embedding_latency_ms,
+        "ingest ColBERT embedding completed"
+    );
     let storage_started = Instant::now();
     emit_operation_status(
         &mut emitter,
@@ -287,7 +594,18 @@ async fn execute_ingest(
         "publishing document version",
     )
     .await?;
-    storage.ingest_document(
+    info!(
+        event = "ingest.storage_publishing.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        document_id = %versioned_document_id,
+        units = units.len(),
+        dense_vectors = vectors.len(),
+        colbert_document_vectors = colbert_vector_count,
+        "ingest storage publishing started"
+    );
+    match storage.ingest_document(
         &conversion,
         &version_label,
         &units,
@@ -300,8 +618,32 @@ async fn execute_ingest(
                 emitter.progress_blocking("storage_publishing", message, current, total)
             }
         }),
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(source) => {
+            error!(
+                event = "ingest.storage_publishing.failed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                version_label = %version_label,
+                document_id = %versioned_document_id,
+                error = %source,
+                elapsed_ms = storage_started.elapsed().as_millis() as u64,
+                "ingest storage publishing failed"
+            );
+            return Err(source);
+        }
+    }
     let storage_latency_ms = storage_started.elapsed().as_millis() as u64;
+    info!(
+        event = "ingest.storage_publishing.completed",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        version_label = %version_label,
+        document_id = %versioned_document_id,
+        elapsed_ms = storage_latency_ms,
+        "ingest storage publishing completed"
+    );
     let latency_ms = started.elapsed().as_millis() as u64;
     let first_unit = units.first();
 
@@ -346,9 +688,46 @@ async fn post_search(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    let started = log_route_started("/v1/search", "request_decoding");
+    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
+        Ok(request) => request,
+        Err(error) => {
+            log_route_failed("/v1/search", "request_decoding", &error, &started);
+            return Err(error);
+        }
+    };
+    let query_chars = request.query.chars().count();
+    let requested_top_k = request.top_k;
+    info!(
+        event = "http.route.request_decoded",
+        route = "/v1/search",
+        stage = "request_decoded",
+        query_chars,
+        top_k = ?requested_top_k,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route request decoded"
+    );
+    let response = match execute_search(&state, request, None).await {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed("/v1/search", "search_executing", &error, &started);
+            return Err(error);
+        }
+    };
+    info!(
+        event = "http.route.result_ready",
+        route = "/v1/search",
+        stage = "result_ready",
+        status = 200_u16,
+        query_chars,
+        requested_top_k = ?requested_top_k,
+        results = response.results.len(),
+        search_latency_ms = response.latency_ms,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
 
-    Ok(Json(execute_search(&state, request, None).await?))
+    Ok(Json(response))
 }
 
 /// Execute the retrieval pipeline shared by the route-specific and operation-stream APIs.
@@ -358,16 +737,45 @@ async fn execute_search(
     mut emitter: Option<&mut OperationEmitter>,
 ) -> Result<SearchResponse, ApiError> {
     let started = Instant::now();
-    request.validate(
-        state.config.server.max_search_query_chars,
-        state.config.retrieval.max_top_k,
-    )?;
+    let operation_id = operation_id_for_log(&emitter);
+    let max_query_chars = state.config.server.max_search_query_chars;
+    let max_top_k = state.config.retrieval.max_top_k;
+    if let Err(source) = request.validate(max_query_chars, max_top_k) {
+        let rejected_field = if request
+            .top_k
+            .is_some_and(|top_k| top_k == 0 || top_k > max_top_k)
+        {
+            "topK"
+        } else {
+            "query"
+        };
+        info!(
+            event = "search.validation_failed",
+            operation_id = %operation_id,
+            rejected_field,
+            max_query_chars,
+            max_top_k,
+            top_k = ?request.top_k,
+            status = source.status_code().as_u16(),
+            error_kind = source.error_kind(),
+            error = %source,
+            "search request validation failed"
+        );
+        return Err(source);
+    }
+    let query_chars = request.query.chars().count();
+    let top_k = request
+        .top_k
+        .unwrap_or(state.config.retrieval.default_top_k);
     let _admission_permit = match state.try_acquire_search_admission() {
         Ok(permit) => permit,
         Err(error) => {
             let admission = state.search_admission_snapshot();
             info!(
                 event = "search.admission_rejected",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
                 in_flight = admission.in_flight,
                 max_in_flight = admission.max_in_flight,
                 error = %error,
@@ -379,33 +787,105 @@ async fn execute_search(
     let admission = state.search_admission_snapshot();
     info!(
         event = "search.admitted",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
         in_flight = admission.in_flight,
         max_in_flight = admission.max_in_flight,
         "search request admitted"
     );
-    let top_k = request
-        .top_k
-        .unwrap_or(state.config.retrieval.default_top_k);
     let inference = state.inference()?;
     let storage = state.storage()?;
     let embedding_started = Instant::now();
     emit_operation_status(&mut emitter, "embedding_query", "embedding search query").await?;
-    let query_vector = inference.dense.embed_query_vector(&request.query)?;
+    info!(
+        event = "search.query_embedding.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        max_tokens = state.config.models.dense.max_tokens,
+        model_dimension = state.config.models.dense.dimension,
+        "search query embedding started"
+    );
+    let query_vector = match inference.dense.embed_query_vector(&request.query) {
+        Ok(vector) => vector,
+        Err(source) => {
+            error!(
+                event = "search.query_embedding.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                max_tokens = state.config.models.dense.max_tokens,
+                model_dimension = state.config.models.dense.dimension,
+                error = %source,
+                elapsed_ms = embedding_started.elapsed().as_millis() as u64,
+                "search query embedding failed"
+            );
+            return Err(source);
+        }
+    };
     let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
+    let query_vector_dimension = query_vector.len();
+    info!(
+        event = "search.query_embedding.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        vector_dimension = query_vector_dimension,
+        elapsed_ms = embedding_latency_ms,
+        "search query embedding completed"
+    );
     // Storage builds the dense/BM25/RRF pool and returns raw retrieval
     // diagnostics for the API response; the log keeps only summary counts.
+    let retrieval_started = Instant::now();
     emit_operation_status(
         &mut emitter,
         "retrieving_candidates",
         "retrieving candidate units",
     )
     .await?;
-    let storage_output = storage.build_search_candidate_pool(
+    info!(
+        event = "search.retrieval.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        query_vector_dimension,
+        candidate_overfetch_multiplier = state.config.retrieval.candidate_overfetch_multiplier,
+        colbert_candidate_pool_size = state.config.retrieval.colbert_candidate_pool_size,
+        "search retrieval candidate pool started"
+    );
+    let storage_output = match storage.build_search_candidate_pool(
+        &operation_id,
         &request.query,
         query_vector,
         top_k,
         &state.config.retrieval,
-    )?;
+    ) {
+        Ok(output) => output,
+        Err(source) => {
+            error!(
+                event = "search.retrieval.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                query_vector_dimension,
+                error = %source,
+                elapsed_ms = retrieval_started.elapsed().as_millis() as u64,
+                "search retrieval candidate pool failed"
+            );
+            return Err(source);
+        }
+    };
+    let retrieval_latency_ms = retrieval_started.elapsed().as_millis() as u64;
+    info!(
+        event = "search.retrieval.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = storage_output.candidates.len(),
+        elapsed_ms = retrieval_latency_ms,
+        "search retrieval candidate pool completed"
+    );
     let colbert_candidates = storage_output
         .candidates
         .iter()
@@ -417,13 +897,30 @@ async fn execute_search(
         })
         .collect::<Vec<_>>();
     let colbert_started = Instant::now();
+    let colbert_candidate_count = colbert_candidates.len();
+    let colbert_document_tokens = colbert_candidates
+        .iter()
+        .map(|candidate| candidate.token_count)
+        .sum::<usize>();
     emit_operation_status(
         &mut emitter,
         "colbert_scoring",
         "scoring ColBERT candidates",
     )
     .await?;
-    let colbert_scores = if let Some(operation_emitter) = emitter.as_deref_mut() {
+    info!(
+        event = "search.colbert_scoring.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = colbert_candidate_count,
+        document_tokens = colbert_document_tokens,
+        query_max_tokens = state.config.models.colbert.query_max_tokens,
+        document_max_tokens = state.config.models.colbert.document_max_tokens,
+        model_dimension = state.config.models.colbert.dimension,
+        "search ColBERT scoring started"
+    );
+    let colbert_score_result = if let Some(operation_emitter) = emitter.as_deref_mut() {
         tokio::task::block_in_place(|| {
             inference.colbert.score_persisted_candidates_with_progress(
                 &request.query,
@@ -437,18 +934,89 @@ async fn execute_search(
                     )
                 },
             )
-        })?
+        })
     } else {
         inference
             .colbert
-            .score_persisted_candidates(&request.query, &colbert_candidates)?
+            .score_persisted_candidates(&request.query, &colbert_candidates)
+    };
+    let colbert_scores = match colbert_score_result {
+        Ok(scores) => scores,
+        Err(source) => {
+            error!(
+                event = "search.colbert_scoring.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                candidates = colbert_candidate_count,
+                document_tokens = colbert_document_tokens,
+                error = %source,
+                elapsed_ms = colbert_started.elapsed().as_millis() as u64,
+                "search ColBERT scoring failed"
+            );
+            return Err(source);
+        }
     };
     let colbert_latency_ms = colbert_started.elapsed().as_millis() as u64;
+    info!(
+        event = "search.colbert_scoring.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = colbert_candidate_count,
+        scores = colbert_scores.len(),
+        elapsed_ms = colbert_latency_ms,
+        "search ColBERT scoring completed"
+    );
+    let reranker_candidate_started = Instant::now();
+    info!(
+        event = "search.reranker_candidates.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        storage_candidates = storage_output.candidates.len(),
+        colbert_scores = colbert_scores.len(),
+        "search reranker candidate assembly started"
+    );
     let reranker_candidates =
-        build_reranker_candidates(&storage_output.candidates, &colbert_scores)?;
+        match build_reranker_candidates(&storage_output.candidates, &colbert_scores) {
+            Ok(candidates) => candidates,
+            Err(source) => {
+                error!(
+                    event = "search.reranker_candidates.failed",
+                    operation_id = %operation_id,
+                    query_chars,
+                    top_k,
+                    storage_candidates = storage_output.candidates.len(),
+                    colbert_scores = colbert_scores.len(),
+                    error = %source,
+                    elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
+                    "search reranker candidate assembly failed"
+                );
+                return Err(source);
+            }
+        };
+    info!(
+        event = "search.reranker_candidates.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = reranker_candidates.len(),
+        elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
+        "search reranker candidate assembly completed"
+    );
     let reranker_started = Instant::now();
     emit_operation_status(&mut emitter, "reranking", "reranking candidates").await?;
-    let reranker_scores = if let Some(operation_emitter) = emitter.as_deref_mut() {
+    info!(
+        event = "search.reranking.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = reranker_candidates.len(),
+        max_tokens = state.config.models.reranker.max_tokens,
+        "search reranking started"
+    );
+    let reranker_score_result = if let Some(operation_emitter) = emitter.as_deref_mut() {
         tokio::task::block_in_place(|| {
             inference.reranker.score_candidates_with_progress(
                 &request.query,
@@ -462,25 +1030,88 @@ async fn execute_search(
                     )
                 },
             )
-        })?
+        })
     } else {
         inference
             .reranker
-            .score_candidates(&request.query, &reranker_candidates)?
+            .score_candidates(&request.query, &reranker_candidates)
+    };
+    let reranker_scores = match reranker_score_result {
+        Ok(scores) => scores,
+        Err(source) => {
+            error!(
+                event = "search.reranking.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                candidates = reranker_candidates.len(),
+                error = %source,
+                elapsed_ms = reranker_started.elapsed().as_millis() as u64,
+                "search reranking failed"
+            );
+            return Err(source);
+        }
     };
     let reranker_latency_ms = reranker_started.elapsed().as_millis() as u64;
+    info!(
+        event = "search.reranking.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        candidates = reranker_candidates.len(),
+        scores = reranker_scores.len(),
+        elapsed_ms = reranker_latency_ms,
+        "search reranking completed"
+    );
+    let result_assembly_started = Instant::now();
     emit_operation_status(
         &mut emitter,
         "result_assembling",
         "assembling search results",
     )
     .await?;
-    let (results, final_result_raw) = build_reranker_results(
+    info!(
+        event = "search.result_assembly.started",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        storage_candidates = storage_output.candidates.len(),
+        colbert_scores = colbert_scores.len(),
+        reranker_scores = reranker_scores.len(),
+        "search result assembly started"
+    );
+    let (results, final_result_raw) = match build_reranker_results(
         &storage_output.candidates,
         &colbert_scores,
         &reranker_scores,
         top_k,
-    )?;
+    ) {
+        Ok(results) => results,
+        Err(source) => {
+            error!(
+                event = "search.result_assembly.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                storage_candidates = storage_output.candidates.len(),
+                colbert_scores = colbert_scores.len(),
+                reranker_scores = reranker_scores.len(),
+                error = %source,
+                elapsed_ms = result_assembly_started.elapsed().as_millis() as u64,
+                "search result assembly failed"
+            );
+            return Err(source);
+        }
+    };
+    info!(
+        event = "search.result_assembly.completed",
+        operation_id = %operation_id,
+        query_chars,
+        top_k,
+        results = results.len(),
+        elapsed_ms = result_assembly_started.elapsed().as_millis() as u64,
+        "search result assembly completed"
+    );
     let latency_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::json!({
         "search": {
@@ -532,9 +1163,10 @@ async fn execute_search(
     // lossless retrieval diagnostics remain in SearchResponse.raw.
     info!(
         event = "search.completed",
+        operation_id = %operation_id,
         status = 200,
         top_k,
-        query_chars = request.query.chars().count(),
+        query_chars,
         first_stage_candidates = storage_output.candidates.len(),
         colbert_candidates = colbert_scores.len(),
         reranker_candidates = reranker_scores.len(),
@@ -614,29 +1246,52 @@ impl OperationFailure {
 
 struct OperationEmitter {
     operation_id: String,
+    operation: &'static str,
     sequence: u64,
+    started: Instant,
     sender: mpsc::Sender<Result<Bytes, Infallible>>,
+    reporting_delivery_open: bool,
 }
 
 impl OperationEmitter {
     /// Create a sequence-owning emitter for one accepted operation stream.
-    fn new(operation_id: String, sender: mpsc::Sender<Result<Bytes, Infallible>>) -> Self {
+    fn new(
+        operation_id: String,
+        operation: &'static str,
+        sender: mpsc::Sender<Result<Bytes, Infallible>>,
+    ) -> Self {
         Self {
             operation_id,
+            operation,
             sequence: 0,
+            started: Instant::now(),
             sender,
+            reporting_delivery_open: true,
         }
     }
 
     /// Emit one newline-worthy status event for a real operation boundary.
     async fn status(&mut self, stage: &'static str, message: &'static str) -> Result<(), ApiError> {
+        let sequence = self.next_sequence();
         let event = OperationEvent::Status {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             stage: Some(stage.to_string()),
             message: Some(message.to_string()),
         };
-        self.send(event).await
+        info!(
+            event = "operation.event_ready",
+            operation = self.operation,
+            operation_id = %self.operation_id,
+            sequence,
+            event_type = "status",
+            stage,
+            message,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "operation status event ready"
+        );
+        self.send_reporting("status", sequence, Some(stage), Some(message), event)
+            .await
     }
 
     /// Emit one counted progress event through the async operation stream.
@@ -647,15 +1302,31 @@ impl OperationEmitter {
         current: u64,
         total: u64,
     ) -> Result<(), ApiError> {
+        let sequence = self.next_sequence();
         let event = OperationEvent::Progress {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             stage: Some(stage.to_string()),
             message: Some(message.to_string()),
             current: Some(current),
             total: Some(total),
         };
-        self.send(event).await
+        if should_log_progress_checkpoint(current, total) {
+            info!(
+                event = "operation.progress_checkpoint",
+                operation = self.operation,
+                operation_id = %self.operation_id,
+                sequence,
+                stage,
+                message,
+                current,
+                total,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "operation progress checkpoint"
+            );
+        }
+        self.send_reporting("progress", sequence, Some(stage), Some(message), event)
+            .await
     }
 
     /// Emit one uncounted progress event through the async operation stream.
@@ -664,18 +1335,20 @@ impl OperationEmitter {
         stage: &'static str,
         message: String,
     ) -> Result<(), ApiError> {
+        let sequence = self.next_sequence();
         let event = OperationEvent::Progress {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             stage: Some(stage.to_string()),
             message: Some(message),
             current: None,
             total: None,
         };
-        self.send(event).await
+        self.send_reporting("progress", sequence, Some(stage), None, event)
+            .await
     }
 
-    /// Emit one counted progress event from synchronous model-scoring loops.
+    /// Emit one counted progress event from synchronous pipeline stages without blocking the runtime.
     fn progress_blocking(
         &mut self,
         stage: &'static str,
@@ -683,67 +1356,317 @@ impl OperationEmitter {
         current: u64,
         total: u64,
     ) -> Result<(), ApiError> {
+        let sequence = self.next_sequence();
         let event = OperationEvent::Progress {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             stage: Some(stage.to_string()),
             message: Some(message.to_string()),
             current: Some(current),
             total: Some(total),
         };
-        let mut line = serde_json::to_vec(&event).map_err(|source| ApiError::InternalIo {
-            message: format!("failed to serialize operation event: {source}"),
-        })?;
+        if should_log_progress_checkpoint(current, total) {
+            info!(
+                event = "operation.progress_checkpoint",
+                operation = self.operation,
+                operation_id = %self.operation_id,
+                sequence,
+                stage,
+                message,
+                current,
+                total,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "operation progress checkpoint"
+            );
+        }
+        if !self.reporting_delivery_open {
+            return Ok(());
+        }
+
+        let mut line = match serde_json::to_vec(&event) {
+            Ok(line) => line,
+            Err(source) => {
+                error!(
+                    event = "operation.event_prepare_failed",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type = "progress",
+                    stage,
+                    message,
+                    error = %source,
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation event preparation failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to serialize operation event: {source}"),
+                });
+            }
+        };
         line.push(b'\n');
-        self.sender
-            .blocking_send(Ok(Bytes::from(line)))
-            .map_err(|_| ApiError::InternalIo {
-                message: "operation response stream closed before event delivery".to_string(),
-            })
+        match self.sender.try_send(Ok(Bytes::from(line))) {
+            Ok(()) => {
+                let delivery = Ok(());
+                self.log_delivery_result(
+                    "progress",
+                    sequence,
+                    Some(stage),
+                    Some(message),
+                    &delivery,
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                info!(
+                    event = "operation.reporting_event_not_delivered",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type = "progress",
+                    stage,
+                    message,
+                    reason = "stream_channel_full",
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation reporting event not delivered"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let delivery = Err(operation_stream_closed_api_error());
+                self.log_delivery_result(
+                    "progress",
+                    sequence,
+                    Some(stage),
+                    Some(message),
+                    &delivery,
+                );
+                self.finish_reporting_delivery(
+                    "progress",
+                    sequence,
+                    Some(stage),
+                    Some(message),
+                    delivery,
+                )
+            }
+        }
     }
 
     /// Emit one terminal success event and let the response stream finish.
     async fn result<T: Serialize>(&mut self, payload: T) -> Result<(), ApiError> {
-        let payload = serde_json::to_value(payload).map_err(|source| ApiError::InternalIo {
-            message: format!("failed to serialize operation result payload: {source}"),
-        })?;
+        let next_sequence = self.sequence + 1;
+        let payload = match serde_json::to_value(payload) {
+            Ok(payload) => payload,
+            Err(source) => {
+                error!(
+                    event = "operation.result_prepare_failed",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence = next_sequence,
+                    stage = "result_preparing",
+                    error = %source,
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation terminal result preparation failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to serialize operation result payload: {source}"),
+                });
+            }
+        };
+        let terminal_status = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("result")
+            .to_string();
+        let sequence = self.next_sequence();
         let event = OperationEvent::Result {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             payload,
         };
-        self.send(event).await
+        info!(
+            event = "operation.result_ready",
+            operation = self.operation,
+            operation_id = %self.operation_id,
+            sequence,
+            stage = "terminal_result_ready",
+            terminal_status,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "operation terminal result ready"
+        );
+        self.send(
+            "result",
+            sequence,
+            Some("terminal_result"),
+            Some(&terminal_status),
+            event,
+        )
+        .await
     }
 
     /// Emit one terminal error event and let the response stream finish.
     async fn error(&mut self, stage: &'static str, error: ApiError) -> Result<(), ApiError> {
+        let error_message = error.to_string();
+        let detail = error.operation_error_detail();
+        let error_status = detail.status;
+        let error_kind = detail.kind.clone();
+        let sequence = self.next_sequence();
         let event = OperationEvent::Error {
             operation_id: self.operation_id.clone(),
-            sequence: self.next_sequence(),
+            sequence,
             stage: Some(stage.to_string()),
-            error: error.operation_error_detail(),
+            error: detail,
         };
-        self.send(event).await
+        info!(
+            event = "operation.error_ready",
+            operation = self.operation,
+            operation_id = %self.operation_id,
+            sequence,
+            stage,
+            status = error_status,
+            error_kind = %error_kind,
+            error = %error_message,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "operation terminal error ready"
+        );
+        self.send("error", sequence, Some(stage), Some(&error_message), event)
+            .await
+    }
+
+    /// Send one nonterminal reporting event without letting client disconnects abort backend work.
+    async fn send_reporting(
+        &mut self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        event: OperationEvent,
+    ) -> Result<(), ApiError> {
+        if !self.reporting_delivery_open {
+            return Ok(());
+        }
+
+        let delivery = self.send(event_type, sequence, stage, message, event).await;
+        self.finish_reporting_delivery(event_type, sequence, stage, message, delivery)
     }
 
     /// Serialize and send one complete NDJSON line.
-    async fn send(&mut self, event: OperationEvent) -> Result<(), ApiError> {
-        let mut line = serde_json::to_vec(&event).map_err(|source| ApiError::InternalIo {
-            message: format!("failed to serialize operation event: {source}"),
-        })?;
+    async fn send(
+        &mut self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        event: OperationEvent,
+    ) -> Result<(), ApiError> {
+        let mut line = match serde_json::to_vec(&event) {
+            Ok(line) => line,
+            Err(source) => {
+                error!(
+                    event = "operation.event_prepare_failed",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type,
+                    stage = stage.unwrap_or("none"),
+                    message = message.unwrap_or("none"),
+                    error = %source,
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation event preparation failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to serialize operation event: {source}"),
+                });
+            }
+        };
         line.push(b'\n');
-        self.sender
+        let delivery = self
+            .sender
             .send(Ok(Bytes::from(line)))
             .await
-            .map_err(|_| ApiError::InternalIo {
-                message: "operation response stream closed before event delivery".to_string(),
-            })
+            .map_err(operation_stream_closed_error);
+        self.log_delivery_result(event_type, sequence, stage, message, &delivery);
+        delivery
+    }
+
+    /// Convert nonterminal stream-close failures into durable reporting-only diagnostics.
+    fn finish_reporting_delivery(
+        &mut self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        delivery: Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        match delivery {
+            Ok(()) => Ok(()),
+            Err(error) if is_operation_stream_closed_error(&error) => {
+                warn!(
+                    event = "operation.reporting_delivery_closed",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type,
+                    stage = stage.unwrap_or("none"),
+                    message = message.unwrap_or("none"),
+                    status = error.status_code().as_u16(),
+                    error_kind = error.error_kind(),
+                    error = %error,
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation reporting delivery closed; backend execution continues"
+                );
+                self.reporting_delivery_open = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Allocate the next monotonic sequence number for this operation.
     fn next_sequence(&mut self) -> u64 {
         self.sequence += 1;
         self.sequence
+    }
+
+    /// Log whether a prepared operation event reached the response stream.
+    fn log_delivery_result(
+        &self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        delivery: &Result<(), ApiError>,
+    ) {
+        match delivery {
+            Ok(()) => {
+                if event_type == "result" || event_type == "error" || event_type == "status" {
+                    info!(
+                        event = "operation.event_delivered",
+                        operation = self.operation,
+                        operation_id = %self.operation_id,
+                        sequence,
+                        event_type,
+                        stage = stage.unwrap_or("none"),
+                        message = message.unwrap_or("none"),
+                        elapsed_ms = self.started.elapsed().as_millis() as u64,
+                        "operation event delivered"
+                    );
+                }
+            }
+            Err(source) => {
+                error!(
+                    event = "operation.event_delivery_failed",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type,
+                    stage = stage.unwrap_or("none"),
+                    message = message.unwrap_or("none"),
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    error = %source,
+                    "operation event delivery failed"
+                );
+            }
+        }
     }
 }
 
@@ -773,6 +1696,47 @@ async fn emit_operation_progress(
     }
 
     Ok(())
+}
+
+/// Return whether a counted progress update is useful enough to write to the durable service log.
+fn should_log_progress_checkpoint(current: u64, total: u64) -> bool {
+    current == 1 || current == total || current % 10 == 0
+}
+
+/// Return a stable log correlation value for route-specific and operation-stream calls.
+fn operation_id_for_log(emitter: &Option<&mut OperationEmitter>) -> String {
+    emitter
+        .as_ref()
+        .map(|emitter| emitter.operation_id.clone())
+        .unwrap_or_else(|| "route".to_string())
+}
+
+/// Return whether operation-stream reporting events should still attempt client delivery.
+fn operation_reporting_delivery_open(emitter: &Option<&mut OperationEmitter>) -> bool {
+    emitter
+        .as_ref()
+        .map(|emitter| emitter.reporting_delivery_open)
+        .unwrap_or(false)
+}
+
+/// Build the canonical internal error value for response-stream delivery loss.
+fn operation_stream_closed_api_error() -> ApiError {
+    ApiError::InternalIo {
+        message: OPERATION_STREAM_CLOSED_MESSAGE.to_string(),
+    }
+}
+
+/// Build the canonical internal error for a response stream that closed before delivery.
+fn operation_stream_closed_error(_: mpsc::error::SendError<Result<Bytes, Infallible>>) -> ApiError {
+    operation_stream_closed_api_error()
+}
+
+/// Return whether an operation-stream error represents client delivery loss only.
+fn is_operation_stream_closed_error(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::InternalIo { message } if message == OPERATION_STREAM_CLOSED_MESSAGE
+    )
 }
 
 /// Emit one uncounted progress event only when the pipeline serves an operation stream.
@@ -810,16 +1774,75 @@ async fn emit_docling_progress(
     }
 }
 
-/// Flush any parsed Docling progress that arrived immediately before process completion.
+/// Forward one Docling progress update without letting client delivery control backend conversion.
+async fn forward_docling_progress(
+    emitter: &mut Option<&mut OperationEmitter>,
+    progress: DoclingProgressUpdate,
+    delivery_open: &mut bool,
+    operation_id: &str,
+    requested_source: &str,
+    conversion_started: &Instant,
+) {
+    if !*delivery_open {
+        return;
+    }
+
+    let was_delivery_open = operation_reporting_delivery_open(emitter);
+    if let Err(error) = emit_docling_progress(emitter, progress).await {
+        error!(
+            event = "ingest.docling_progress_delivery.failed",
+            operation = "ingest",
+            operation_id = %operation_id,
+            requested_source = %requested_source,
+            stage = "docling_converting",
+            status = error.status_code().as_u16(),
+            error_kind = error.error_kind(),
+            error = %error,
+            elapsed_ms = conversion_started.elapsed().as_millis() as u64,
+            "ingest Docling progress delivery failed; conversion continues"
+        );
+        *delivery_open = false;
+        return;
+    }
+
+    if was_delivery_open && !operation_reporting_delivery_open(emitter) {
+        let error = operation_stream_closed_api_error();
+        error!(
+            event = "ingest.docling_progress_delivery.failed",
+            operation = "ingest",
+            operation_id = %operation_id,
+            requested_source = %requested_source,
+            stage = "docling_converting",
+            status = error.status_code().as_u16(),
+            error_kind = error.error_kind(),
+            error = %error,
+            elapsed_ms = conversion_started.elapsed().as_millis() as u64,
+            "ingest Docling progress delivery failed; conversion continues"
+        );
+        *delivery_open = false;
+    }
+}
+
+/// Flush parsed Docling progress without allowing stream delivery to abort completed conversion.
 async fn drain_docling_progress(
     emitter: &mut Option<&mut OperationEmitter>,
     receiver: &mut mpsc::Receiver<DoclingProgressUpdate>,
-) -> Result<(), ApiError> {
+    delivery_open: &mut bool,
+    operation_id: &str,
+    requested_source: &str,
+    conversion_started: &Instant,
+) {
     while let Ok(progress) = receiver.try_recv() {
-        emit_docling_progress(emitter, progress).await?;
+        forward_docling_progress(
+            emitter,
+            progress,
+            delivery_open,
+            operation_id,
+            requested_source,
+            conversion_started,
+        )
+        .await;
     }
-
-    Ok(())
 }
 
 /// Accept one operation request and return an operation-scoped NDJSON stream.
@@ -828,16 +1851,132 @@ async fn post_operation(
     headers: HeaderMap,
     payload: Result<Json<OperationRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
-    let operation = OperationName::parse(&request.operation)?;
+    let setup_started = Instant::now();
+    info!(
+        event = "operation.stream_setup_started",
+        route = "/v1/operations",
+        stage = "request_decoding",
+        elapsed_ms = 0_u64,
+        "operation stream setup started"
+    );
+    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
+        Ok(request) => request,
+        Err(error) => {
+            log_operation_stream_setup_failed(
+                "request_decoding",
+                None,
+                None,
+                &error,
+                &setup_started,
+            );
+            return Err(error);
+        }
+    };
+    let requested_operation = request.operation.clone();
+    let requested_operation_id = request.operation_id.clone();
+    info!(
+        event = "operation.stream_setup_checkpoint",
+        route = "/v1/operations",
+        operation = %requested_operation,
+        operation_id = requested_operation_id.as_deref().unwrap_or("none"),
+        stage = "request_decoded",
+        has_client_operation_id = requested_operation_id.is_some(),
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "operation stream request decoded"
+    );
+    let operation = match OperationName::parse(&request.operation) {
+        Ok(operation) => operation,
+        Err(error) => {
+            log_operation_stream_setup_failed(
+                "operation_parsing",
+                Some(&requested_operation),
+                requested_operation_id.as_deref(),
+                &error,
+                &setup_started,
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        event = "operation.stream_setup_checkpoint",
+        route = "/v1/operations",
+        operation = operation.as_str(),
+        operation_id = requested_operation_id.as_deref().unwrap_or("none"),
+        stage = "operation_parsed",
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "operation stream operation parsed"
+    );
     if operation.is_protected() {
-        let token = bearer_token_from_headers(&headers)?;
-        state.authorize_admin_token(token)?;
+        info!(
+            event = "operation.stream_setup_checkpoint",
+            route = "/v1/operations",
+            operation = operation.as_str(),
+            operation_id = requested_operation_id.as_deref().unwrap_or("none"),
+            stage = "authorization_checking",
+            elapsed_ms = setup_started.elapsed().as_millis() as u64,
+            "operation stream authorization checking"
+        );
+        let token = match bearer_token_from_headers(&headers) {
+            Ok(token) => token,
+            Err(error) => {
+                log_operation_stream_setup_failed(
+                    "authorization_checking",
+                    Some(operation.as_str()),
+                    requested_operation_id.as_deref(),
+                    &error,
+                    &setup_started,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = state.authorize_admin_token(token) {
+            log_operation_stream_setup_failed(
+                "authorization_checking",
+                Some(operation.as_str()),
+                requested_operation_id.as_deref(),
+                &error,
+                &setup_started,
+            );
+            return Err(error);
+        }
+        info!(
+            event = "operation.stream_setup_checkpoint",
+            route = "/v1/operations",
+            operation = operation.as_str(),
+            operation_id = requested_operation_id.as_deref().unwrap_or("none"),
+            stage = "authorization_completed",
+            elapsed_ms = setup_started.elapsed().as_millis() as u64,
+            "operation stream authorization completed"
+        );
     }
-    let operation_id = operation_id_for_request(request.operation_id)?;
+    let operation_id = match operation_id_for_request(request.operation_id) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            log_operation_stream_setup_failed(
+                "operation_id_validating",
+                Some(operation.as_str()),
+                requested_operation_id.as_deref(),
+                &error,
+                &setup_started,
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        event = "operation.stream_setup_checkpoint",
+        route = "/v1/operations",
+        operation = operation.as_str(),
+        operation_id = %operation_id,
+        stage = "operation_id_ready",
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "operation stream operation ID ready"
+    );
     let (sender, receiver) = mpsc::channel(OPERATION_STREAM_CHANNEL_CAPACITY);
     let stream_state = state.clone();
-    tokio::spawn(async move {
+    let task_operation = operation;
+    let task_operation_id = operation_id.clone();
+    let response_operation_id = operation_id.clone();
+    let handle = tokio::spawn(async move {
         run_operation_stream(
             stream_state,
             operation,
@@ -847,16 +1986,146 @@ async fn post_operation(
         )
         .await;
     });
+    info!(
+        event = "operation.task_spawned",
+        operation = task_operation.as_str(),
+        operation_id = %task_operation_id,
+        stage = "task_spawned",
+        task = "operation_stream",
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "operation stream task spawned"
+    );
+    tokio::spawn(async move {
+        let join_started = Instant::now();
+        let mut observed_child_outcome = "completed";
+        let mut observed_child_panicked = false;
+        let mut observed_child_cancelled = false;
+        info!(
+            event = "operation.task_join_watcher_started",
+            operation = task_operation.as_str(),
+            operation_id = %task_operation_id,
+            stage = "task_joining",
+            task = "operation_stream_join_watcher",
+            "operation task join watcher started"
+        );
+        match handle.await {
+            Ok(()) => {
+                info!(
+                    event = "operation.task_join_completed",
+                    operation = task_operation.as_str(),
+                    operation_id = %task_operation_id,
+                    stage = "task_joined",
+                    task = "operation_stream",
+                    elapsed_ms = join_started.elapsed().as_millis() as u64,
+                    "operation task join completed"
+                );
+            }
+            Err(source) => {
+                observed_child_outcome = "join_failed";
+                observed_child_panicked = source.is_panic();
+                observed_child_cancelled = source.is_cancelled();
+                error!(
+                    event = "operation.task_join_failed",
+                    operation = task_operation.as_str(),
+                    operation_id = %task_operation_id,
+                    stage = "task_join_failed",
+                    task = "operation_stream",
+                    is_panic = observed_child_panicked,
+                    is_cancelled = observed_child_cancelled,
+                    elapsed_ms = join_started.elapsed().as_millis() as u64,
+                    error = %source,
+                    "operation task join failed"
+                );
+            }
+        }
+        info!(
+            event = "operation.task_join_watcher_completed",
+            operation = task_operation.as_str(),
+            operation_id = %task_operation_id,
+            stage = "task_join_watcher_completed",
+            task = "operation_stream_join_watcher",
+            observed_task = "operation_stream",
+            observed_child_outcome,
+            observed_child_panicked,
+            observed_child_cancelled,
+            elapsed_ms = join_started.elapsed().as_millis() as u64,
+            "operation task join watcher completed"
+        );
+    });
     let body = Body::from_stream(ReceiverStream::new(receiver));
 
-    Response::builder()
+    let response = match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, NDJSON_CONTENT_TYPE)
         .body(body)
         .map(IntoResponse::into_response)
-        .map_err(|source| ApiError::InternalIo {
-            message: format!("failed to build operation stream response: {source}"),
-        })
+    {
+        Ok(response) => response,
+        Err(source) => {
+            let error = ApiError::InternalIo {
+                message: format!("failed to build operation stream response: {source}"),
+            };
+            log_operation_stream_setup_failed(
+                "response_building",
+                Some(operation.as_str()),
+                Some(&response_operation_id),
+                &error,
+                &setup_started,
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        event = "operation.stream_setup_completed",
+        route = "/v1/operations",
+        operation = operation.as_str(),
+        operation_id = %response_operation_id,
+        stage = "response_built",
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "operation stream setup completed"
+    );
+
+    Ok(response)
+}
+
+/// Log a local setup failure before the operation stream has been returned to the client.
+fn log_operation_stream_setup_failed(
+    stage: &'static str,
+    operation: Option<&str>,
+    operation_id: Option<&str>,
+    error: &ApiError,
+    started: &Instant,
+) {
+    let status = error.status_code();
+    let error_kind = error.error_kind();
+    let error_message = error.to_string();
+    if status.is_server_error() {
+        error!(
+            event = "operation.stream_setup_failed",
+            route = "/v1/operations",
+            operation = operation.unwrap_or("unknown"),
+            operation_id = operation_id.unwrap_or("unknown"),
+            stage,
+            status = status.as_u16(),
+            error_kind,
+            error = %error_message,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "operation stream setup failed"
+        );
+    } else {
+        warn!(
+            event = "operation.stream_setup_failed",
+            route = "/v1/operations",
+            operation = operation.unwrap_or("unknown"),
+            operation_id = operation_id.unwrap_or("unknown"),
+            stage,
+            status = status.as_u16(),
+            error_kind,
+            error = %error_message,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "operation stream setup failed"
+        );
+    }
 }
 
 /// Reject reserved control messages explicitly until operation cancellation is implemented.
@@ -864,19 +2133,61 @@ async fn post_operation_control(
     Path(operation_id): Path<String>,
     payload: Result<Json<OperationControlRequest>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    let started = log_route_started("/v1/operations/{operation_id}/control", "request_decoding");
+    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
+        Ok(request) => request,
+        Err(error) => {
+            log_route_failed(
+                "/v1/operations/{operation_id}/control",
+                "request_decoding",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        event = "operation.control.request_decoded",
+        route = "/v1/operations/{operation_id}/control",
+        operation_id = %operation_id,
+        stage = "request_decoded",
+        control_type = %request.control_type,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "operation control request decoded"
+    );
     if request.control_type.trim().is_empty() {
-        return Err(ApiError::BadRequest {
+        let error = ApiError::BadRequest {
             message: "operation control type must be non-empty".to_string(),
-        });
+        };
+        log_route_failed(
+            "/v1/operations/{operation_id}/control",
+            "control_validating",
+            &error,
+            &started,
+        );
+        return Err(error);
     }
 
-    Err(ApiError::BadRequest {
+    let error = ApiError::BadRequest {
         message: format!(
             "operation control '{}' is reserved but not implemented for operationId {}",
             request.control_type, operation_id
         ),
-    })
+    };
+    warn!(
+        event = "operation.control.rejected",
+        route = "/v1/operations/{operation_id}/control",
+        operation_id = %operation_id,
+        stage = "control_reserved",
+        control_type = %request.control_type,
+        status = error.status_code().as_u16(),
+        error_kind = error.error_kind(),
+        error = %error,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "operation control request rejected"
+    );
+
+    Err(error)
 }
 
 /// Run accepted operation work and convert post-acceptance failures into terminal stream errors.
@@ -887,10 +2198,13 @@ async fn run_operation_stream(
     payload: serde_json::Value,
     sender: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
-    let mut emitter = OperationEmitter::new(operation_id, sender);
+    let mut emitter = OperationEmitter::new(operation_id, operation.as_str(), sender);
     info!(
         event = "operation.accepted",
         operation = operation.as_str(),
+        operation_id = %emitter.operation_id,
+        stage = "accepted",
+        elapsed_ms = emitter.started.elapsed().as_millis() as u64,
         "operation stream accepted"
     );
     if let Err(failure) = execute_operation(state, operation, payload, &mut emitter).await {
@@ -900,14 +2214,35 @@ async fn run_operation_stream(
         info!(
             event = "operation.failed",
             operation = operation.as_str(),
+            operation_id = %emitter.operation_id,
             stage = failure.stage,
             status,
             error_kind,
             error = %error_message,
+            elapsed_ms = emitter.started.elapsed().as_millis() as u64,
             "operation stream failed"
         );
         let _ = emitter.error(failure.stage, failure.error).await;
+        info!(
+            event = "operation.task_finished",
+            operation = operation.as_str(),
+            operation_id = %emitter.operation_id,
+            stage = "task_finished",
+            terminal = "error",
+            elapsed_ms = emitter.started.elapsed().as_millis() as u64,
+            "operation task finished"
+        );
+        return;
     }
+    info!(
+        event = "operation.task_finished",
+        operation = operation.as_str(),
+        operation_id = %emitter.operation_id,
+        stage = "task_finished",
+        terminal = "result",
+        elapsed_ms = emitter.started.elapsed().as_millis() as u64,
+        "operation task finished"
+    );
 }
 
 /// Dispatch one accepted operation to the route-compatible service implementation.
@@ -923,20 +2258,14 @@ async fn execute_operation(
                 .status("health_checking", "reading service health")
                 .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
-            emitter
-                .result(state.health())
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), state.health()).await
         }
         OperationName::Limits => {
             emitter
                 .status("limits_reading", "reading request and retrieval limits")
                 .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
-            emitter
-                .result(build_limits_response(&state))
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), build_limits_response(&state)).await
         }
         OperationName::Ingest => {
             let request = decode_operation_payload(payload, operation.as_str())
@@ -948,10 +2277,7 @@ async fn execute_operation(
             let response = execute_ingest(&state, request, Some(emitter))
                 .await
                 .map_err(|error| OperationFailure::new("ingest_running", error))?;
-            emitter
-                .result(response)
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), response).await
         }
         OperationName::Search => {
             let request = decode_operation_payload(payload, operation.as_str())
@@ -963,10 +2289,7 @@ async fn execute_operation(
             let response = execute_search(&state, request, Some(emitter))
                 .await
                 .map_err(|error| OperationFailure::new("search_running", error))?;
-            emitter
-                .result(response)
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), response).await
         }
         OperationName::Versions => {
             emitter
@@ -975,10 +2298,7 @@ async fn execute_operation(
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_document_versions(&state)
                 .map_err(|error| OperationFailure::new("versions_listing", error))?;
-            emitter
-                .result(response)
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), response).await
         }
         OperationName::Rollback => {
             let request = decode_operation_payload(payload, operation.as_str())
@@ -992,10 +2312,7 @@ async fn execute_operation(
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_document_version_rollback(&state, request)
                 .map_err(|error| OperationFailure::new("rollback_publishing", error))?;
-            emitter
-                .result(response)
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), response).await
         }
         OperationName::Shutdown => {
             emitter
@@ -1004,12 +2321,32 @@ async fn execute_operation(
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_shutdown(&state)
                 .map_err(|error| OperationFailure::new("shutdown_requesting", error))?;
-            emitter
-                .result(response)
-                .await
-                .map_err(|error| OperationFailure::new("operation_streaming", error))
+            emit_terminal_result(emitter, operation.as_str(), response).await
         }
     }
+}
+
+/// Emit a terminal result without treating client delivery failure as execution failure.
+async fn emit_terminal_result<T: Serialize>(
+    emitter: &mut OperationEmitter,
+    operation: &'static str,
+    response: T,
+) -> Result<(), OperationFailure> {
+    if let Err(error) = emitter.result(response).await {
+        error!(
+            event = "operation.terminal_result_emit_failed",
+            operation,
+            operation_id = %emitter.operation_id,
+            stage = "terminal_result_emitting",
+            status = error.status_code().as_u16(),
+            error_kind = error.error_kind(),
+            error = %error,
+            elapsed_ms = emitter.started.elapsed().as_millis() as u64,
+            "operation terminal result emission failed after execution completed"
+        );
+    }
+
+    Ok(())
 }
 
 /// Decode an operation payload into the existing request DTO while preserving validation errors.
@@ -1147,10 +2484,53 @@ async fn post_admin_shutdown(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ShutdownResponse>, ApiError> {
-    let token = bearer_token_from_headers(&headers)?;
-    state.authorize_admin_token(token)?;
+    let started = log_route_started("/admin/shutdown", "authorization_checking");
+    let token = match bearer_token_from_headers(&headers) {
+        Ok(token) => token,
+        Err(error) => {
+            log_route_failed(
+                "/admin/shutdown",
+                "authorization_checking",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = state.authorize_admin_token(token) {
+        log_route_failed(
+            "/admin/shutdown",
+            "authorization_checking",
+            &error,
+            &started,
+        );
+        return Err(error);
+    }
+    info!(
+        event = "http.route.authorization_completed",
+        route = "/admin/shutdown",
+        stage = "authorization_completed",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route authorization completed"
+    );
+    let response = match execute_shutdown(&state) {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed("/admin/shutdown", "shutdown_requesting", &error, &started);
+            return Err(error);
+        }
+    };
+    info!(
+        event = "http.route.result_ready",
+        route = "/admin/shutdown",
+        stage = "result_ready",
+        status = 200_u16,
+        shutdown_status = %response.status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
 
-    Ok(Json(execute_shutdown(&state)?))
+    Ok(Json(response))
 }
 
 /// Request graceful shutdown after the caller has passed admin authorization.
@@ -1172,23 +2552,115 @@ async fn get_admin_document_versions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<crate::storage::DocumentVersionListing>, ApiError> {
-    let token = bearer_token_from_headers(&headers)?;
-    state.authorize_admin_token(token)?;
+    let started = log_route_started("/admin/document-versions", "authorization_checking");
+    let token = match bearer_token_from_headers(&headers) {
+        Ok(token) => token,
+        Err(error) => {
+            log_route_failed(
+                "/admin/document-versions",
+                "authorization_checking",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = state.authorize_admin_token(token) {
+        log_route_failed(
+            "/admin/document-versions",
+            "authorization_checking",
+            &error,
+            &started,
+        );
+        return Err(error);
+    }
+    info!(
+        event = "http.route.authorization_completed",
+        route = "/admin/document-versions",
+        stage = "authorization_completed",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route authorization completed"
+    );
+    let response = match execute_document_versions(&state) {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed(
+                "/admin/document-versions",
+                "versions_listing",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    let version_count = response
+        .sources
+        .iter()
+        .map(|source| source.versions.len())
+        .sum::<usize>();
+    info!(
+        event = "http.route.result_ready",
+        route = "/admin/document-versions",
+        stage = "result_ready",
+        status = 200_u16,
+        sources = response.sources.len(),
+        versions = version_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
 
-    Ok(Json(execute_document_versions(&state)?))
+    Ok(Json(response))
 }
 
 /// Return retained source-document versions after the caller has passed admin authorization.
 fn execute_document_versions(
     state: &AppState,
 ) -> Result<crate::storage::DocumentVersionListing, ApiError> {
-    let storage = state.storage()?;
+    let started = Instant::now();
+    let storage = match state.storage() {
+        Ok(storage) => storage,
+        Err(source) => {
+            error!(
+                event = "admin.document_versions.failed",
+                stage = "storage_runtime",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "admin document versions listing failed"
+            );
+            return Err(source);
+        }
+    };
+    let listing = match storage.list_document_versions() {
+        Ok(listing) => listing,
+        Err(source) => {
+            error!(
+                event = "admin.document_versions.failed",
+                stage = "storage_listing",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "admin document versions listing failed"
+            );
+            return Err(source);
+        }
+    };
+    let version_count = listing
+        .sources
+        .iter()
+        .map(|source| source.versions.len())
+        .sum::<usize>();
     info!(
         event = "admin.document_versions.listed",
+        sources = listing.sources.len(),
+        versions = version_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "admin document versions listed"
     );
 
-    storage.list_document_versions()
+    Ok(listing)
 }
 
 /// Authorize and repoint one source document to an already-retained version.
@@ -1197,11 +2669,90 @@ async fn post_admin_document_version_rollback(
     headers: HeaderMap,
     payload: Result<Json<DocumentVersionRollbackRequest>, JsonRejection>,
 ) -> Result<Json<DocumentVersionRollbackResponse>, ApiError> {
-    let token = bearer_token_from_headers(&headers)?;
-    state.authorize_admin_token(token)?;
-    let Json(request) = payload.map_err(json_rejection_to_api_error)?;
+    let started = log_route_started(
+        "/admin/document-versions/rollback",
+        "authorization_checking",
+    );
+    let token = match bearer_token_from_headers(&headers) {
+        Ok(token) => token,
+        Err(error) => {
+            log_route_failed(
+                "/admin/document-versions/rollback",
+                "authorization_checking",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = state.authorize_admin_token(token) {
+        log_route_failed(
+            "/admin/document-versions/rollback",
+            "authorization_checking",
+            &error,
+            &started,
+        );
+        return Err(error);
+    }
+    info!(
+        event = "http.route.authorization_completed",
+        route = "/admin/document-versions/rollback",
+        stage = "authorization_completed",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route authorization completed"
+    );
+    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
+        Ok(request) => request,
+        Err(error) => {
+            log_route_failed(
+                "/admin/document-versions/rollback",
+                "request_decoding",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    let requested_source = request.source.clone();
+    let requested_version_label = request.version_label.clone();
+    info!(
+        event = "http.route.request_decoded",
+        route = "/admin/document-versions/rollback",
+        stage = "request_decoded",
+        requested_source = %requested_source,
+        version_label = %requested_version_label,
+        source_chars = requested_source.chars().count(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route request decoded"
+    );
+    let response = match execute_document_version_rollback(&state, request) {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed(
+                "/admin/document-versions/rollback",
+                "rollback_publishing",
+                &error,
+                &started,
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        event = "http.route.result_ready",
+        route = "/admin/document-versions/rollback",
+        stage = "result_ready",
+        status = 200_u16,
+        requested_source = %requested_source,
+        requested_version_label = %requested_version_label,
+        source_path = %response.source_path,
+        active_version_label = %response.active_version_label,
+        published_at_ms = response.published_at_ms,
+        vector_count = response.vector_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
 
-    Ok(Json(execute_document_version_rollback(&state, request)?))
+    Ok(Json(response))
 }
 
 /// Publish an already-retained document version after the caller has passed admin authorization.
@@ -1209,15 +2760,66 @@ fn execute_document_version_rollback(
     state: &AppState,
     request: DocumentVersionRollbackRequest,
 ) -> Result<DocumentVersionRollbackResponse, ApiError> {
-    request.validate(state.config.server.max_ingest_source_chars)?;
-    let storage = state.storage()?;
-    let rollback = storage.rollback_document_version(&request.source, &request.version_label)?;
+    let started = Instant::now();
+    let requested_source = request.source.clone();
+    let requested_version_label = request.version_label.clone();
+    if let Err(source) = request.validate(state.config.server.max_ingest_source_chars) {
+        warn!(
+            event = "admin.document_version_rollback.validation_failed",
+            source_path = %requested_source,
+            version_label = %requested_version_label,
+            max_ingest_source_chars = state.config.server.max_ingest_source_chars,
+            source_chars = requested_source.chars().count(),
+            status = source.status_code().as_u16(),
+            error_kind = source.error_kind(),
+            error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "admin document version rollback validation failed"
+        );
+        return Err(source);
+    }
+    let storage = match state.storage() {
+        Ok(storage) => storage,
+        Err(source) => {
+            error!(
+                event = "admin.document_version_rollback.failed",
+                source_path = %requested_source,
+                version_label = %requested_version_label,
+                stage = "storage_runtime",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "admin document version rollback failed"
+            );
+            return Err(source);
+        }
+    };
+    let rollback = match storage.rollback_document_version(&request.source, &request.version_label)
+    {
+        Ok(rollback) => rollback,
+        Err(source) => {
+            error!(
+                event = "admin.document_version_rollback.failed",
+                source_path = %requested_source,
+                version_label = %requested_version_label,
+                stage = "storage_rollback",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "admin document version rollback failed"
+            );
+            return Err(source);
+        }
+    };
     info!(
         event = "admin.document_version_rollback.completed",
         source_path = %rollback.source_path,
         active_version_label = %rollback.active_version_label,
         published_at_ms = rollback.published_at_ms,
         vector_count = rollback.vector_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "admin document version rollback completed"
     );
 

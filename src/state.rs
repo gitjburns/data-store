@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tracing::{error, info};
 
 use crate::{
     config::ServiceConfig,
@@ -112,19 +113,50 @@ impl AppState {
 
     /// Signal the HTTP server to drain active work and exit.
     pub fn request_shutdown(&self) -> Result<(), ApiError> {
-        let mut sender = self
-            .shutdown_sender
-            .lock()
-            .map_err(|source| ApiError::InternalIo {
-                message: format!("shutdown signal lock is poisoned: {source}"),
-            })?;
+        info!(
+            event = "shutdown.signal.requested",
+            stage = "signal_requesting",
+            "shutdown signal requested"
+        );
+        let mut sender = match self.shutdown_sender.lock() {
+            Ok(sender) => sender,
+            Err(source) => {
+                error!(
+                    event = "shutdown.signal.failed",
+                    stage = "signal_locking",
+                    error = %source,
+                    "shutdown signal lock failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("shutdown signal lock is poisoned: {source}"),
+                });
+            }
+        };
         let Some(sender) = sender.take() else {
+            info!(
+                event = "shutdown.signal.already_requested",
+                stage = "signal_sender_absent",
+                "shutdown signal was already requested"
+            );
             return Ok(());
         };
 
-        sender.send(()).map_err(|_| ApiError::InternalIo {
-            message: "failed to signal service shutdown".to_string(),
-        })
+        if sender.send(()).is_err() {
+            error!(
+                event = "shutdown.signal.failed",
+                stage = "signal_sending",
+                "shutdown signal receiver was unavailable"
+            );
+            return Err(ApiError::InternalIo {
+                message: "failed to signal service shutdown".to_string(),
+            });
+        }
+        info!(
+            event = "shutdown.signal.sent",
+            stage = "signal_sent",
+            "shutdown signal sent"
+        );
+        Ok(())
     }
 
     /// Return current service health and readiness diagnostics.

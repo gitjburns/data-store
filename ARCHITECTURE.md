@@ -246,6 +246,19 @@ the configured log file. Logs summarize operation status, counts, and timings;
 they must not store the admin token, document contents, vector values, or
 oversized retrieval internals.
 
+Operation-stream events are live client feedback, not the only diagnostic
+record. Long-running operation stages must also write durable service-log
+boundaries so a client disconnect, timeout, or terminal delivery failure does
+not leave operators blind. Ingest logs include source resolution, Docling
+conversion, unit splitting, dense embedding, ColBERT document embedding,
+storage publishing, terminal result/error readiness, event delivery outcome,
+and operation task finish. Persistence-affecting workflows log durable
+transaction boundaries separately from active-version/cache publish boundaries.
+These logs preserve compact operational facts such as operation ID, source
+reference, version label, unit/vector counts, stage elapsed milliseconds, status,
+and error kind/message without logging contents, vectors, tokens, or large raw
+payloads.
+
 ## Admin Token
 
 Each service start generates one cryptographically random admin token. The
@@ -294,6 +307,8 @@ itself.
 - No silent fallbacks across accelerators, models, vector sources, Docling
   backends, OCR modes, or search-time ColBERT document-vector recomputation.
 - Durable state and in-memory active cache updates must publish together.
+- Long-running operation stages and persistence publish boundaries must be
+  visible in durable service logs; stream events alone are not sufficient.
 - Source files are addressed by corpus-relative references; ingest request
   bodies never carry source file bytes.
 - Admin tokens are startup-scoped secrets exposed only through bootstrap stdout
@@ -302,3 +317,14 @@ itself.
   service validation, storage, or authentication.
 - Public API strings and persisted metadata values are contracts; change them
   deliberately.
+- Every operation writes meaningful lifecycle facts to the service log at
+  `service/data-store/logs/data-store.log`.
+- Storage transactions log begin, each persistence phase, commit attempt,
+  commit success or failure, rollback or abort when visible, and publish
+  success or failure.
+- External process calls and model calls log start, completion, elapsed time,
+  and failure with source context.
+- Operation streams are reporting channels only; they must not control
+  authoritative execution or outcome logging.
+- Health and CLI diagnostics must surface active operation counts and last known
+  operation facts when available.

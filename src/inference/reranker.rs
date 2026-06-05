@@ -1,8 +1,9 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 use candle_core::Device;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tracing::{error, info};
 
 use crate::{
     config::RerankerModelConfig,
@@ -134,7 +135,62 @@ impl RerankerRuntime {
                 content: SMOKE_DISTRACTOR_DOCUMENT.to_string(),
             },
         ];
-        let smoke_scores = runtime.score_candidates(SMOKE_QUERY, &smoke_candidates)?;
+        let smoke_started_at = Instant::now();
+        info!(
+            event = "model_call.started",
+            model_role = "reranker",
+            call_purpose = "startup_smoke_scoring",
+            candidate_count = smoke_candidates.len(),
+            configured_max_tokens = runtime.max_tokens,
+            selected_token_count = 2usize,
+            true_token_id = runtime.true_token_id,
+            false_token_id = runtime.false_token_id,
+            "reranker startup smoke scoring started"
+        );
+        let smoke_scores_result = runtime.score_candidates(SMOKE_QUERY, &smoke_candidates);
+        match &smoke_scores_result {
+            Ok(scores) => {
+                let max_token_count = scores
+                    .iter()
+                    .map(|score| score.token_count)
+                    .max()
+                    .unwrap_or(0);
+                let first_score = scores.first();
+                info!(
+                    event = "model_call.completed",
+                    model_role = "reranker",
+                    call_purpose = "startup_smoke_scoring",
+                    candidate_count = scores.len(),
+                    configured_max_tokens = runtime.max_tokens,
+                    selected_token_count = 2usize,
+                    true_token_id = runtime.true_token_id,
+                    false_token_id = runtime.false_token_id,
+                    max_token_count,
+                    smoke_score = ?first_score.map(|score| score.score),
+                    smoke_true_logit = ?first_score.map(|score| score.true_logit),
+                    smoke_false_logit = ?first_score.map(|score| score.false_logit),
+                    smoke_token_count = ?first_score.map(|score| score.token_count),
+                    elapsed_ms = smoke_started_at.elapsed().as_millis() as u64,
+                    "reranker startup smoke scoring completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "reranker",
+                    call_purpose = "startup_smoke_scoring",
+                    candidate_count = smoke_candidates.len(),
+                    configured_max_tokens = runtime.max_tokens,
+                    selected_token_count = 2usize,
+                    true_token_id = runtime.true_token_id,
+                    false_token_id = runtime.false_token_id,
+                    elapsed_ms = smoke_started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "reranker startup smoke scoring failed"
+                );
+            }
+        }
+        let smoke_scores = smoke_scores_result?;
         let smoke = smoke_scores.first().ok_or_else(|| {
             inference_error("reranker smoke candidate set produced no scores".to_string())
         })?;
@@ -183,66 +239,199 @@ impl RerankerRuntime {
     where
         F: FnMut(u64, u64) -> Result<(), ApiError>,
     {
-        let total = candidates.len() as u64;
-        let mut scores = Vec::with_capacity(candidates.len());
-        for (index, candidate) in candidates.iter().enumerate() {
-            let pair_score = self.score_pair(query, &candidate.content)?;
-            scores.push(RerankerCandidateScore {
-                unit_id: candidate.unit_id.clone(),
-                score: pair_score.score,
-                rank: 0,
-                true_logit: pair_score.true_logit,
-                false_logit: pair_score.false_logit,
-                token_count: pair_score.token_count,
+        let started_at = Instant::now();
+        let query_chars = query.chars().count();
+        let document_chars = candidates
+            .iter()
+            .map(|candidate| candidate.content.chars().count())
+            .sum::<usize>();
+        info!(
+            event = "model_call.started",
+            model_role = "reranker",
+            call_purpose = "candidate_batch_scoring",
+            input_kind = "query_candidates",
+            query_chars,
+            candidates = candidates.len(),
+            document_chars,
+            configured_max_tokens = self.max_tokens,
+            "reranker candidate batch scoring started"
+        );
+        let result = (|| -> Result<Vec<RerankerCandidateScore>, ApiError> {
+            let total = candidates.len() as u64;
+            let mut scores = Vec::with_capacity(candidates.len());
+            for (index, candidate) in candidates.iter().enumerate() {
+                let pair_score = self.score_pair(&candidate.unit_id, query, &candidate.content)?;
+                scores.push(RerankerCandidateScore {
+                    unit_id: candidate.unit_id.clone(),
+                    score: pair_score.score,
+                    rank: 0,
+                    true_logit: pair_score.true_logit,
+                    false_logit: pair_score.false_logit,
+                    token_count: pair_score.token_count,
+                });
+                progress((index + 1) as u64, total)?;
+            }
+            scores.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.unit_id.cmp(&right.unit_id))
             });
-            progress((index + 1) as u64, total)?;
-        }
-        scores.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.unit_id.cmp(&right.unit_id))
-        });
-        for (index, score) in scores.iter_mut().enumerate() {
-            score.rank = index + 1;
+            for (index, score) in scores.iter_mut().enumerate() {
+                score.rank = index + 1;
+            }
+
+            Ok(scores)
+        })();
+        match &result {
+            Ok(scores) => {
+                let max_token_count = scores
+                    .iter()
+                    .map(|score| score.token_count)
+                    .max()
+                    .unwrap_or(0);
+                info!(
+                    event = "model_call.completed",
+                    model_role = "reranker",
+                    call_purpose = "candidate_batch_scoring",
+                    input_kind = "query_candidates",
+                    query_chars,
+                    candidates = candidates.len(),
+                    scores = scores.len(),
+                    document_chars,
+                    configured_max_tokens = self.max_tokens,
+                    max_token_count,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "reranker candidate batch scoring completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "reranker",
+                    call_purpose = "candidate_batch_scoring",
+                    input_kind = "query_candidates",
+                    query_chars,
+                    candidates = candidates.len(),
+                    document_chars,
+                    configured_max_tokens = self.max_tokens,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "reranker candidate batch scoring failed"
+                );
+            }
         }
 
-        Ok(scores)
+        result
     }
 
-    /// Render, tokenize, and score one query/document pair by yes/no next-token probability.
-    fn score_pair(&self, query: &str, document: &str) -> Result<PairScore, ApiError> {
-        let input_ids = build_reranker_input_ids(
-            &self.tokenizer,
-            DEFAULT_INSTRUCTION,
-            query,
-            document,
-            self.max_tokens,
-        )?;
-        let logits = self.model.selected_token_logits(
-            &input_ids,
-            &[self.false_token_id, self.true_token_id],
-            &self.device,
-            "reranker",
-        )?;
-        let false_logit = logits
-            .iter()
-            .find(|logit| logit.token_id == self.false_token_id)
-            .map(|logit| logit.logit)
-            .ok_or_else(|| inference_error("reranker false-token logit is missing".to_string()))?;
-        let true_logit = logits
-            .iter()
-            .find(|logit| logit.token_id == self.true_token_id)
-            .map(|logit| logit.logit)
-            .ok_or_else(|| inference_error("reranker true-token logit is missing".to_string()))?;
-        let score = yes_probability(false_logit, true_logit)?;
+    /// Render, tokenize, and score one identified query/document pair by yes/no next-token probability.
+    fn score_pair(
+        &self,
+        unit_id: &str,
+        query: &str,
+        document: &str,
+    ) -> Result<PairScore, ApiError> {
+        let started_at = Instant::now();
+        let query_chars = query.chars().count();
+        let document_chars = document.chars().count();
+        info!(
+            event = "model_call.started",
+            model_role = "reranker",
+            call_purpose = "candidate_pair_scoring",
+            input_kind = "query_document",
+            unit_id,
+            query_chars,
+            document_chars,
+            configured_max_tokens = self.max_tokens,
+            "reranker candidate pair scoring started"
+        );
+        let mut token_count_for_log = 0usize;
+        let result = (|| -> Result<PairScore, ApiError> {
+            let input_ids = build_reranker_input_ids(
+                &self.tokenizer,
+                DEFAULT_INSTRUCTION,
+                query,
+                document,
+                self.max_tokens,
+            )?;
+            token_count_for_log = input_ids.len();
+            info!(
+                event = "model_call.input_ready",
+                model_role = "reranker",
+                call_purpose = "candidate_pair_scoring",
+                input_kind = "query_document",
+                unit_id,
+                query_chars,
+                document_chars,
+                configured_max_tokens = self.max_tokens,
+                token_count = token_count_for_log,
+                "reranker candidate pair input tokenized"
+            );
+            let logits = self.model.selected_token_logits(
+                &input_ids,
+                &[self.false_token_id, self.true_token_id],
+                &self.device,
+                "reranker",
+            )?;
+            let false_logit = logits
+                .iter()
+                .find(|logit| logit.token_id == self.false_token_id)
+                .map(|logit| logit.logit)
+                .ok_or_else(|| {
+                    inference_error("reranker false-token logit is missing".to_string())
+                })?;
+            let true_logit = logits
+                .iter()
+                .find(|logit| logit.token_id == self.true_token_id)
+                .map(|logit| logit.logit)
+                .ok_or_else(|| {
+                    inference_error("reranker true-token logit is missing".to_string())
+                })?;
+            let score = yes_probability(false_logit, true_logit)?;
 
-        Ok(PairScore {
-            score,
-            true_logit,
-            false_logit,
-            token_count: input_ids.len(),
-        })
+            Ok(PairScore {
+                score,
+                true_logit,
+                false_logit,
+                token_count: input_ids.len(),
+            })
+        })();
+        match &result {
+            Ok(score) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "reranker",
+                    call_purpose = "candidate_pair_scoring",
+                    input_kind = "query_document",
+                    unit_id,
+                    query_chars,
+                    document_chars,
+                    configured_max_tokens = self.max_tokens,
+                    token_count = score.token_count,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "reranker candidate pair scoring completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "reranker",
+                    call_purpose = "candidate_pair_scoring",
+                    input_kind = "query_document",
+                    unit_id,
+                    query_chars,
+                    document_chars,
+                    configured_max_tokens = self.max_tokens,
+                    token_count = token_count_for_log,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "reranker candidate pair scoring failed"
+                );
+            }
+        }
+
+        result
     }
 }
 

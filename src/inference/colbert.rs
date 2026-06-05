@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use candle_core::{D, DType, Device, Tensor};
@@ -9,6 +10,7 @@ use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_no_bias
 use safetensors::{Dtype as SafeTensorDType, SafeTensors};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tracing::{error, info};
 
 use crate::{
     config::ColbertModelConfig,
@@ -218,6 +220,20 @@ struct TensorMetadata {
     shape: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ColbertStartupCallDiagnostics {
+    call_purpose: &'static str,
+    query_tokens: Option<usize>,
+    document_tokens: Option<usize>,
+    document_capacity_tokens: Option<usize>,
+    configured_query_max_tokens: usize,
+    configured_document_max_tokens: usize,
+    hidden_size: usize,
+    projection_dimension: usize,
+    layer_count: usize,
+    attention_kind: Option<&'static str>,
+}
+
 impl ColbertRuntime {
     /// Load ColBERT while reporting tokenizer, encoder, projection, and smoke-check progress.
     pub fn load_with_progress(
@@ -257,43 +273,143 @@ impl ColbertRuntime {
             ColbertEncoderRuntime::load_with_progress(artifacts, &model_config, device, progress)?;
         progress("colbert_encoder_ready")?;
 
+        let smoke_base = ColbertStartupCallDiagnostics {
+            call_purpose: "startup_smoke",
+            query_tokens: None,
+            document_tokens: None,
+            document_capacity_tokens: None,
+            configured_query_max_tokens: config.query_max_tokens as usize,
+            configured_document_max_tokens: config.document_max_tokens as usize,
+            hidden_size: model_config.hidden_size,
+            projection_dimension: config.dimension as usize,
+            layer_count: model_config.num_hidden_layers,
+            attention_kind: None,
+        };
         progress("colbert_smoke_tokenizing")?;
-        let query_token_ids = tokenize_formatted(
-            &tokenizer,
-            &format_query(SMOKE_QUERY),
-            config.query_max_tokens as usize,
-            "query",
-        )?;
-        let document_token_ids = tokenize_formatted(
-            &tokenizer,
-            &format_document(SMOKE_DOCUMENT),
-            config.document_max_tokens as usize,
-            "document",
-        )?;
+        let tokenizing_started_at = Instant::now();
+        log_colbert_startup_call_started(ColbertStartupCallDiagnostics {
+            call_purpose: "startup_smoke_tokenizing",
+            ..smoke_base
+        });
+        let tokenizing_result: Result<(Vec<u32>, Vec<u32>), ApiError> = (|| {
+            let query_token_ids = tokenize_formatted(
+                &tokenizer,
+                &format_query(SMOKE_QUERY),
+                config.query_max_tokens as usize,
+                "query",
+            )?;
+            let document_token_ids = tokenize_formatted(
+                &tokenizer,
+                &format_document(SMOKE_DOCUMENT),
+                config.document_max_tokens as usize,
+                "document",
+            )?;
+
+            Ok((query_token_ids, document_token_ids))
+        })();
+        match &tokenizing_result {
+            Ok((query_token_ids, document_token_ids)) => {
+                log_colbert_startup_call_completed(
+                    ColbertStartupCallDiagnostics {
+                        call_purpose: "startup_smoke_tokenizing",
+                        query_tokens: Some(query_token_ids.len()),
+                        document_tokens: Some(document_token_ids.len()),
+                        ..smoke_base
+                    },
+                    tokenizing_started_at,
+                );
+            }
+            Err(source) => {
+                log_colbert_startup_call_failed(
+                    ColbertStartupCallDiagnostics {
+                        call_purpose: "startup_smoke_tokenizing",
+                        ..smoke_base
+                    },
+                    tokenizing_started_at,
+                    source,
+                );
+            }
+        }
+        let (query_token_ids, document_token_ids) = tokenizing_result?;
+        let smoke_tokens = ColbertStartupCallDiagnostics {
+            query_tokens: Some(query_token_ids.len()),
+            document_tokens: Some(document_token_ids.len()),
+            ..smoke_base
+        };
         progress("colbert_smoke_input_path")?;
-        let query_hidden = input_path.forward(&query_token_ids, device, "query")?;
-        let document_hidden = input_path.forward(&document_token_ids, device, "document")?;
+        let (query_hidden, document_hidden) = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_input_path",
+                ..smoke_tokens
+            },
+            || {
+                let query_hidden = input_path.forward(&query_token_ids, device, "query")?;
+                let document_hidden =
+                    input_path.forward(&document_token_ids, device, "document")?;
+
+                Ok((query_hidden, document_hidden))
+            },
+        )?;
         progress("colbert_smoke_projection")?;
-        let query_projection = projection.project(&query_hidden)?;
-        let document_projection = projection.project(&document_hidden)?;
-        let maxsim_score = maxsim_score(&query_projection, &document_projection)?;
+        let maxsim_score = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_projection_maxsim",
+                ..smoke_tokens
+            },
+            || {
+                let query_projection = projection.project(&query_hidden)?;
+                let document_projection = projection.project(&document_hidden)?;
+                maxsim_score(&query_projection, &document_projection)
+            },
+        )?;
         let first_layer = encoder.first_layer()?;
         progress("colbert_smoke_attention")?;
-        let attention_smoke = first_layer.attention.smoke(&query_hidden, "query")?;
+        let attention_smoke = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_attention",
+                attention_kind: Some(first_layer.attention.attention_kind.label()),
+                ..smoke_tokens
+            },
+            || first_layer.attention.smoke(&query_hidden, "query"),
+        )?;
         progress("colbert_smoke_single_layer")?;
-        let single_layer_smoke = first_layer.smoke(&query_hidden, "query")?;
+        let single_layer_smoke = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_single_layer",
+                attention_kind: Some(first_layer.attention.attention_kind.label()),
+                ..smoke_tokens
+            },
+            || first_layer.smoke(&query_hidden, "query"),
+        )?;
         progress("colbert_smoke_full_encoder")?;
-        let full_encoder_smoke = encoder.smoke(&query_hidden, &document_hidden, &projection)?;
+        let full_encoder_smoke = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_full_encoder",
+                ..smoke_tokens
+            },
+            || encoder.smoke(&query_hidden, &document_hidden, &projection),
+        )?;
         progress("colbert_smoke_document_capacity")?;
         let capacity_document_token_ids = repeat_token_ids_to_capacity(
             &document_token_ids,
             config.document_max_tokens as usize,
             "document capacity",
         )?;
-        let capacity_document_hidden =
-            input_path.forward(&capacity_document_token_ids, device, "document capacity")?;
-        let document_capacity_smoke =
-            encoder.document_capacity_smoke(&capacity_document_hidden, &projection)?;
+        let document_capacity_smoke = run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_document_capacity",
+                document_capacity_tokens: Some(capacity_document_token_ids.len()),
+                ..smoke_tokens
+            },
+            || {
+                let capacity_document_hidden = input_path.forward(
+                    &capacity_document_token_ids,
+                    device,
+                    "document capacity",
+                )?;
+                encoder.document_capacity_smoke(&capacity_document_hidden, &projection)
+            },
+        )?;
         progress("colbert_smoke_ready")?;
 
         Ok(Self {
@@ -382,8 +498,63 @@ impl ColbertRuntime {
         unit_id: &str,
         document: &str,
     ) -> Result<ColbertDocumentEmbedding, ApiError> {
-        let document_projection = self.encode_projected_document(document)?;
-        tensor_to_document_embedding(unit_id, document_projection)
+        let started_at = Instant::now();
+        let document_chars = document.chars().count();
+        info!(
+            event = "model_call.started",
+            model_role = "colbert",
+            call_purpose = "document_embedding",
+            input_kind = "document",
+            unit_id,
+            text_count = 1usize,
+            document_chars,
+            configured_max_tokens = self.document_max_tokens,
+            expected_dimension = self.projection_dimension,
+            "ColBERT document embedding started"
+        );
+        let result = self
+            .encode_projected_document(document)
+            .and_then(|document_projection| {
+                tensor_to_document_embedding(unit_id, document_projection)
+            });
+        match &result {
+            Ok(embedding) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "colbert",
+                    call_purpose = "document_embedding",
+                    input_kind = "document",
+                    unit_id,
+                    text_count = 1usize,
+                    document_chars,
+                    token_count = embedding.token_count,
+                    configured_max_tokens = self.document_max_tokens,
+                    vector_dimension = embedding.dimension,
+                    vector_values = embedding.vector.len(),
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "ColBERT document embedding completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "colbert",
+                    call_purpose = "document_embedding",
+                    input_kind = "document",
+                    unit_id,
+                    text_count = 1usize,
+                    document_chars,
+                    configured_max_tokens = self.document_max_tokens,
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "ColBERT document embedding failed"
+                );
+            }
+        }
+
+        result
     }
 
     /// Score persisted ColBERT document token vectors without per-candidate progress reporting.
@@ -405,47 +576,117 @@ impl ColbertRuntime {
     where
         F: FnMut(u64, u64) -> Result<(), ApiError>,
     {
-        let query_projection = self.encode_projected_query(query)?;
-        let (query_tokens, _) = query_projection.dims2().map_err(|source| {
-            inference_error(format!(
-                "ColBERT search query projection shape error: {source}"
-            ))
-        })?;
-        let total = candidates.len() as u64;
-        let mut scores = Vec::with_capacity(candidates.len());
-        for (index, candidate) in candidates.iter().enumerate() {
-            let document_projection = Tensor::from_vec(
-                candidate.vector.clone(),
-                (candidate.token_count, candidate.dimension),
-                &self.device,
-            )
-            .map_err(|source| {
+        let started_at = Instant::now();
+        let query_chars = query.chars().count();
+        let document_tokens = candidates
+            .iter()
+            .map(|candidate| candidate.token_count)
+            .sum::<usize>();
+        let document_vector_values = candidates
+            .iter()
+            .map(|candidate| candidate.vector.len())
+            .sum::<usize>();
+        info!(
+            event = "model_call.started",
+            model_role = "colbert",
+            call_purpose = "persisted_candidate_scoring",
+            input_kind = "query_candidates",
+            query_chars,
+            candidates = candidates.len(),
+            document_tokens,
+            document_vector_values,
+            query_max_tokens = self.query_max_tokens,
+            document_max_tokens = self.document_max_tokens,
+            expected_dimension = self.projection_dimension,
+            "ColBERT persisted candidate scoring started"
+        );
+        let mut query_tokens_for_log = 0usize;
+        let result = (|| -> Result<Vec<ColbertCandidateScore>, ApiError> {
+            let query_projection = self.encode_projected_query(query)?;
+            let (query_tokens, _) = query_projection.dims2().map_err(|source| {
                 inference_error(format!(
-                    "failed to load persisted ColBERT document vector {} onto device: {source}",
-                    candidate.unit_id
+                    "ColBERT search query projection shape error: {source}"
                 ))
             })?;
-            let score = maxsim_score(&query_projection, &document_projection)?;
-            scores.push(ColbertCandidateScore {
-                unit_id: candidate.unit_id.clone(),
-                score,
-                rank: 0,
-                query_tokens,
-                document_tokens: candidate.token_count,
+            query_tokens_for_log = query_tokens;
+            let total = candidates.len() as u64;
+            let mut scores = Vec::with_capacity(candidates.len());
+            for (index, candidate) in candidates.iter().enumerate() {
+                let document_projection = Tensor::from_vec(
+                    candidate.vector.clone(),
+                    (candidate.token_count, candidate.dimension),
+                    &self.device,
+                )
+                .map_err(|source| {
+                    inference_error(format!(
+                        "failed to load persisted ColBERT document vector {} onto device: {source}",
+                        candidate.unit_id
+                    ))
+                })?;
+                let score = maxsim_score(&query_projection, &document_projection)?;
+                scores.push(ColbertCandidateScore {
+                    unit_id: candidate.unit_id.clone(),
+                    score,
+                    rank: 0,
+                    query_tokens,
+                    document_tokens: candidate.token_count,
+                });
+                progress((index + 1) as u64, total)?;
+            }
+            scores.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.unit_id.cmp(&right.unit_id))
             });
-            progress((index + 1) as u64, total)?;
-        }
-        scores.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.unit_id.cmp(&right.unit_id))
-        });
-        for (index, score) in scores.iter_mut().enumerate() {
-            score.rank = index + 1;
+            for (index, score) in scores.iter_mut().enumerate() {
+                score.rank = index + 1;
+            }
+
+            Ok(scores)
+        })();
+        match &result {
+            Ok(scores) => {
+                info!(
+                    event = "model_call.completed",
+                    model_role = "colbert",
+                    call_purpose = "persisted_candidate_scoring",
+                    input_kind = "query_candidates",
+                    query_chars,
+                    candidates = candidates.len(),
+                    scores = scores.len(),
+                    query_tokens = query_tokens_for_log,
+                    document_tokens,
+                    document_vector_values,
+                    query_max_tokens = self.query_max_tokens,
+                    document_max_tokens = self.document_max_tokens,
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "ColBERT persisted candidate scoring completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "colbert",
+                    call_purpose = "persisted_candidate_scoring",
+                    input_kind = "query_candidates",
+                    query_chars,
+                    candidates = candidates.len(),
+                    query_tokens = query_tokens_for_log,
+                    document_tokens,
+                    document_vector_values,
+                    query_max_tokens = self.query_max_tokens,
+                    document_max_tokens = self.document_max_tokens,
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "ColBERT persisted candidate scoring failed"
+                );
+            }
         }
 
-        Ok(scores)
+        result
     }
 
     /// Encode and project one search query using the ColBERT prompt contract.
@@ -1942,6 +2183,92 @@ fn maxsim_score(query_vectors: &Tensor, document_vectors: &Tensor) -> Result<f32
     }
 
     Ok(total)
+}
+
+/// Run one ColBERT startup smoke boundary with durable R5-shaped lifecycle logs.
+fn run_colbert_startup_call<T, F>(
+    diagnostics: ColbertStartupCallDiagnostics,
+    call: F,
+) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError>,
+{
+    let started_at = Instant::now();
+    log_colbert_startup_call_started(diagnostics);
+    let result = call();
+    match &result {
+        Ok(_) => log_colbert_startup_call_completed(diagnostics, started_at),
+        Err(source) => log_colbert_startup_call_failed(diagnostics, started_at, source),
+    }
+
+    result
+}
+
+/// Log the start of a ColBERT startup smoke boundary without document or token payloads.
+fn log_colbert_startup_call_started(diagnostics: ColbertStartupCallDiagnostics) {
+    info!(
+        event = "model_call.started",
+        model_role = "colbert",
+        call_purpose = diagnostics.call_purpose,
+        query_tokens = ?diagnostics.query_tokens,
+        document_tokens = ?diagnostics.document_tokens,
+        document_capacity_tokens = ?diagnostics.document_capacity_tokens,
+        configured_query_max_tokens = diagnostics.configured_query_max_tokens,
+        configured_document_max_tokens = diagnostics.configured_document_max_tokens,
+        hidden_size = diagnostics.hidden_size,
+        projection_dimension = diagnostics.projection_dimension,
+        layer_count = diagnostics.layer_count,
+        attention_kind = ?diagnostics.attention_kind,
+        "ColBERT startup smoke boundary started"
+    );
+}
+
+/// Log successful completion of a ColBERT startup smoke boundary with compact shape facts.
+fn log_colbert_startup_call_completed(
+    diagnostics: ColbertStartupCallDiagnostics,
+    started_at: Instant,
+) {
+    info!(
+        event = "model_call.completed",
+        model_role = "colbert",
+        call_purpose = diagnostics.call_purpose,
+        query_tokens = ?diagnostics.query_tokens,
+        document_tokens = ?diagnostics.document_tokens,
+        document_capacity_tokens = ?diagnostics.document_capacity_tokens,
+        configured_query_max_tokens = diagnostics.configured_query_max_tokens,
+        configured_document_max_tokens = diagnostics.configured_document_max_tokens,
+        hidden_size = diagnostics.hidden_size,
+        projection_dimension = diagnostics.projection_dimension,
+        layer_count = diagnostics.layer_count,
+        attention_kind = ?diagnostics.attention_kind,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "ColBERT startup smoke boundary completed"
+    );
+}
+
+/// Log failure of a ColBERT startup smoke boundary with local model shape context.
+fn log_colbert_startup_call_failed(
+    diagnostics: ColbertStartupCallDiagnostics,
+    started_at: Instant,
+    source: &ApiError,
+) {
+    error!(
+        event = "model_call.failed",
+        model_role = "colbert",
+        call_purpose = diagnostics.call_purpose,
+        query_tokens = ?diagnostics.query_tokens,
+        document_tokens = ?diagnostics.document_tokens,
+        document_capacity_tokens = ?diagnostics.document_capacity_tokens,
+        configured_query_max_tokens = diagnostics.configured_query_max_tokens,
+        configured_document_max_tokens = diagnostics.configured_document_max_tokens,
+        hidden_size = diagnostics.hidden_size,
+        projection_dimension = diagnostics.projection_dimension,
+        layer_count = diagnostics.layer_count,
+        attention_kind = ?diagnostics.attention_kind,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        error = %source,
+        "ColBERT startup smoke boundary failed"
+    );
 }
 
 /// Convert ColBERT runtime failures into the service inference error shape.

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -14,6 +14,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tracing::{error, info};
 
 use crate::{config::DoclingConfig, error::ApiError, source::ResolvedSource};
 
@@ -66,7 +67,15 @@ pub async fn convert_source_to_markdown(
     let options = resolve_docling_options(config)?;
     let output_dir = create_conversion_output_dir(index_root)?;
     let args = build_docling_args(&output_dir, &source.absolute_path, &options);
-    let output = run_docling(config, &args, index_root, progress_sender).await?;
+    let output = run_docling(
+        config,
+        &args,
+        index_root,
+        &output_dir,
+        &source,
+        progress_sender,
+    )
+    .await?;
     let stdout = truncate_diagnostic_text(&output.stdout);
     let stderr = truncate_diagnostic_text(&output.stderr);
 
@@ -195,57 +204,291 @@ async fn run_docling(
     config: &DoclingConfig,
     args: &[String],
     index_root: &Path,
+    output_dir: &Path,
+    source: &ResolvedSource,
     progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
 ) -> Result<DoclingRunOutput, ApiError> {
-    let mut child = Command::new(&config.docling_path)
+    let started = Instant::now();
+    info!(
+        event = "docling.process.starting",
+        executable_path = %config.docling_path.display(),
+        python_path = %config.python_path.display(),
+        source_requested = %source.requested,
+        relative_source = %source.relative_path.display(),
+        absolute_source = %source.absolute_path.display(),
+        output_dir = %output_dir.display(),
+        working_dir = %index_root.display(),
+        timeout_seconds = config.document_timeout_seconds,
+        args_count = args.len(),
+        elapsed_ms = 0_u64,
+        "Docling process starting"
+    );
+    let mut child = match Command::new(&config.docling_path)
         .args(args)
         .current_dir(index_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|source| ApiError::DoclingUnavailable {
-            message: format!(
-                "Docling CLI failed to start at {}; configured python_path is {}: {source}",
-                config.docling_path.display(),
-                config.python_path.display()
-            ),
-        })?;
-    let stdout = child.stdout.take().ok_or_else(|| ApiError::InternalIo {
-        message: "Docling child stdout pipe was not available".to_string(),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| ApiError::InternalIo {
-        message: "Docling child stderr pipe was not available".to_string(),
-    })?;
-    let stdout_reader = tokio::spawn(read_child_output(stdout, None));
-    let stderr_reader = tokio::spawn(read_child_output(stderr, progress_sender));
+    {
+        Ok(child) => child,
+        Err(io_error) => {
+            error!(
+                event = "docling.process.spawn_failed",
+                executable_path = %config.docling_path.display(),
+                python_path = %config.python_path.display(),
+                source_requested = %source.requested,
+                relative_source = %source.relative_path.display(),
+                absolute_source = %source.absolute_path.display(),
+                output_dir = %output_dir.display(),
+                working_dir = %index_root.display(),
+                timeout_seconds = config.document_timeout_seconds,
+                args_count = args.len(),
+                error = %io_error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling process spawn failed"
+            );
+            return Err(ApiError::DoclingUnavailable {
+                message: format!(
+                    "Docling CLI failed to start at {}; configured python_path is {}: {io_error}",
+                    config.docling_path.display(),
+                    config.python_path.display()
+                ),
+            });
+        }
+    };
+    let process_id = child.id();
+    info!(
+        event = "docling.process.spawned",
+        executable_path = %config.docling_path.display(),
+        source_requested = %source.requested,
+        relative_source = %source.relative_path.display(),
+        output_dir = %output_dir.display(),
+        process_id = ?process_id,
+        timeout_seconds = config.document_timeout_seconds,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Docling process spawned"
+    );
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            error!(
+                event = "docling.process.pipe_unavailable",
+                executable_path = %config.docling_path.display(),
+                source_requested = %source.requested,
+                relative_source = %source.relative_path.display(),
+                output_dir = %output_dir.display(),
+                process_id = ?process_id,
+                pipe = "stdout",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling child stdout pipe unavailable"
+            );
+            return Err(ApiError::InternalIo {
+                message: "Docling child stdout pipe was not available".to_string(),
+            });
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            error!(
+                event = "docling.process.pipe_unavailable",
+                executable_path = %config.docling_path.display(),
+                source_requested = %source.requested,
+                relative_source = %source.relative_path.display(),
+                output_dir = %output_dir.display(),
+                process_id = ?process_id,
+                pipe = "stderr",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling child stderr pipe unavailable"
+            );
+            return Err(ApiError::InternalIo {
+                message: "Docling child stderr pipe was not available".to_string(),
+            });
+        }
+    };
+    let source_requested = source.requested.clone();
+    let relative_source = source.relative_path.display().to_string();
+    let output_dir_for_log = output_dir.display().to_string();
+    info!(
+        event = "docling.child_output_reader.spawned",
+        task_purpose = "read_docling_child_output",
+        pipe = "stdout",
+        process_id = ?process_id,
+        source_requested = %source_requested,
+        relative_source = %relative_source,
+        output_dir = %output_dir_for_log,
+        "Docling child output reader task spawned"
+    );
+    let stdout_reader = tokio::spawn(read_child_output(
+        stdout,
+        "stdout",
+        process_id,
+        source_requested.clone(),
+        relative_source.clone(),
+        output_dir_for_log.clone(),
+        None,
+    ));
+    info!(
+        event = "docling.child_output_reader.spawned",
+        task_purpose = "read_docling_child_output",
+        pipe = "stderr",
+        process_id = ?process_id,
+        source_requested = %source_requested,
+        relative_source = %relative_source,
+        output_dir = %output_dir_for_log,
+        "Docling child output reader task spawned"
+    );
+    let stderr_reader = tokio::spawn(read_child_output(
+        stderr,
+        "stderr",
+        process_id,
+        source_requested,
+        relative_source,
+        output_dir_for_log,
+        progress_sender,
+    ));
     let wait_result = timeout(
         Duration::from_secs(config.document_timeout_seconds),
         child.wait(),
     )
     .await;
     let (status, timed_out) = match wait_result {
-        Ok(result) => (
-            result.map_err(|source| ApiError::InternalIo {
-                message: format!("failed while waiting for Docling CLI: {source}"),
-            })?,
-            false,
-        ),
-        Err(_) => {
-            let kill_result = child.start_kill();
-            let status = child.wait().await.map_err(|source| ApiError::InternalIo {
-                message: format!("failed while waiting for timed-out Docling CLI: {source}"),
-            })?;
-            if let Err(source) = kill_result {
+        Ok(result) => match result {
+            Ok(status) => (status, false),
+            Err(wait_error) => {
+                error!(
+                    event = "docling.process.wait_failed",
+                    executable_path = %config.docling_path.display(),
+                    source_requested = %source.requested,
+                    relative_source = %source.relative_path.display(),
+                    output_dir = %output_dir.display(),
+                    process_id = ?process_id,
+                    timeout_seconds = config.document_timeout_seconds,
+                    error = %wait_error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling process wait failed"
+                );
                 return Err(ApiError::InternalIo {
-                    message: format!("failed to kill timed-out Docling CLI: {source}"),
+                    message: format!("failed while waiting for Docling CLI: {wait_error}"),
+                });
+            }
+        },
+        Err(_) => {
+            error!(
+                event = "docling.process.timeout_reached",
+                executable_path = %config.docling_path.display(),
+                source_requested = %source.requested,
+                relative_source = %source.relative_path.display(),
+                output_dir = %output_dir.display(),
+                process_id = ?process_id,
+                timeout_seconds = config.document_timeout_seconds,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling process timeout reached"
+            );
+            let kill_result = child.start_kill();
+            let status = match child.wait().await {
+                Ok(status) => status,
+                Err(io_error) => {
+                    error!(
+                        event = "docling.process.timeout_wait_failed",
+                        executable_path = %config.docling_path.display(),
+                        source_requested = %source.requested,
+                        relative_source = %source.relative_path.display(),
+                        output_dir = %output_dir.display(),
+                        process_id = ?process_id,
+                        timeout_seconds = config.document_timeout_seconds,
+                        kill_requested = kill_result.is_ok(),
+                        error = %io_error,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Docling process wait after timeout failed"
+                    );
+                    return Err(ApiError::InternalIo {
+                        message: format!(
+                            "failed while waiting for timed-out Docling CLI: {io_error}"
+                        ),
+                    });
+                }
+            };
+            if let Err(kill_error) = kill_result {
+                error!(
+                    event = "docling.process.kill_failed",
+                    executable_path = %config.docling_path.display(),
+                    source_requested = %source.requested,
+                    relative_source = %source.relative_path.display(),
+                    output_dir = %output_dir.display(),
+                    process_id = ?process_id,
+                    exit_code = ?status.code(),
+                    signal = ?status.signal(),
+                    timeout_seconds = config.document_timeout_seconds,
+                    error = %kill_error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling process kill after timeout failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to kill timed-out Docling CLI: {kill_error}"),
                 });
             }
             (status, true)
         }
     };
-    let stdout = join_child_output(stdout_reader, "stdout").await?;
-    let stderr = join_child_output(stderr_reader, "stderr").await?;
+    info!(
+        event = "docling.process.wait_completed",
+        executable_path = %config.docling_path.display(),
+        source_requested = %source.requested,
+        relative_source = %source.relative_path.display(),
+        output_dir = %output_dir.display(),
+        process_id = ?process_id,
+        timed_out,
+        exit_code = ?status.code(),
+        signal = ?status.signal(),
+        timeout_seconds = config.document_timeout_seconds,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Docling process wait completed"
+    );
+    let stdout = join_child_output(stdout_reader, "stdout", process_id, started).await;
+    let stderr = join_child_output(stderr_reader, "stderr", process_id, started).await;
+    let stdout = stdout?;
+    let stderr = stderr?;
+    let stdout_diagnostic = truncate_diagnostic_text(&stdout);
+    let stderr_diagnostic = truncate_diagnostic_text(&stderr);
+    if timed_out || !status.success() {
+        error!(
+            event = "docling.process.failed",
+            executable_path = %config.docling_path.display(),
+            source_requested = %source.requested,
+            relative_source = %source.relative_path.display(),
+            output_dir = %output_dir.display(),
+            process_id = ?process_id,
+            timed_out,
+            exit_code = ?status.code(),
+            signal = ?status.signal(),
+            timeout_seconds = config.document_timeout_seconds,
+            stdout_chars = stdout.chars().count(),
+            stderr_chars = stderr.chars().count(),
+            stdout = %stdout_diagnostic,
+            stderr = %stderr_diagnostic,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Docling process failed"
+        );
+    } else {
+        info!(
+            event = "docling.process.completed",
+            executable_path = %config.docling_path.display(),
+            source_requested = %source.requested,
+            relative_source = %source.relative_path.display(),
+            output_dir = %output_dir.display(),
+            process_id = ?process_id,
+            timed_out,
+            exit_code = ?status.code(),
+            signal = ?status.signal(),
+            timeout_seconds = config.document_timeout_seconds,
+            stdout_chars = stdout.chars().count(),
+            stderr_chars = stderr.chars().count(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Docling process completed"
+        );
+    }
 
     Ok(DoclingRunOutput {
         status,
@@ -258,28 +501,90 @@ async fn run_docling(
 /// Read one child-process pipe while preserving bounded diagnostics and optional progress.
 async fn read_child_output<R>(
     mut reader: R,
+    label: &'static str,
+    process_id: Option<u32>,
+    source_requested: String,
+    relative_source: String,
+    output_dir: String,
     progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
 ) -> Result<String, ApiError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
 {
+    let started = Instant::now();
+    info!(
+        event = "docling.child_output_reader.started",
+        task_purpose = "read_docling_child_output",
+        pipe = label,
+        process_id = ?process_id,
+        source_requested = %source_requested,
+        relative_source = %relative_source,
+        output_dir = %output_dir,
+        elapsed_ms = 0_u64,
+        "Docling child output reader started"
+    );
     let mut output = String::new();
     let mut buffer = [0_u8; CHILD_OUTPUT_READ_CHUNK_BYTES];
     loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|source| ApiError::InternalIo {
-                message: format!("failed to read Docling child output: {source}"),
-            })?;
+        let bytes_read = match reader.read(&mut buffer).await {
+            Ok(bytes_read) => bytes_read,
+            Err(source) => {
+                error!(
+                    event = "docling.child_output_reader.failed",
+                    task_purpose = "read_docling_child_output",
+                    pipe = label,
+                    process_id = ?process_id,
+                    source_requested = %source_requested,
+                    relative_source = %relative_source,
+                    output_dir = %output_dir,
+                    stage = "pipe_reading",
+                    output_chars = output.chars().count(),
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling child output reader failed"
+                );
+                return Err(ApiError::InternalIo {
+                    message: format!("failed to read Docling child output: {source}"),
+                });
+            }
+        };
         if bytes_read == 0 {
+            info!(
+                event = "docling.child_output_reader.completed",
+                task_purpose = "read_docling_child_output",
+                pipe = label,
+                process_id = ?process_id,
+                source_requested = %source_requested,
+                relative_source = %relative_source,
+                output_dir = %output_dir,
+                output_chars = output.chars().count(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling child output reader completed"
+            );
             return Ok(output);
         }
 
         let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
         output = append_bounded_diagnostic_text(&output, &chunk);
         if let Some(sender) = progress_sender.as_ref() {
-            emit_docling_progress_from_chunk(sender, &chunk).await?;
+            if let Err(error) = emit_docling_progress_from_chunk(sender, &chunk).await {
+                error!(
+                    event = "docling.child_output_reader.failed",
+                    task_purpose = "read_docling_child_output",
+                    pipe = label,
+                    process_id = ?process_id,
+                    source_requested = %source_requested,
+                    relative_source = %relative_source,
+                    output_dir = %output_dir,
+                    stage = "progress_delivery",
+                    output_chars = output.chars().count(),
+                    error_kind = error.error_kind(),
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling child output reader failed"
+                );
+                return Err(error);
+            }
         }
     }
 }
@@ -288,10 +593,41 @@ where
 async fn join_child_output(
     handle: JoinHandle<Result<String, ApiError>>,
     label: &'static str,
+    process_id: Option<u32>,
+    process_started: Instant,
 ) -> Result<String, ApiError> {
-    handle.await.map_err(|source| ApiError::InternalIo {
-        message: format!("Docling {label} reader task failed: {source}"),
-    })?
+    match handle.await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            error!(
+                event = "docling.child_output_reader.task_failed",
+                task_purpose = "read_docling_child_output",
+                pipe = label,
+                process_id = ?process_id,
+                error_kind = error.error_kind(),
+                error = %error,
+                elapsed_ms = process_started.elapsed().as_millis() as u64,
+                "Docling child output reader task returned an error"
+            );
+            Err(error)
+        }
+        Err(source) => {
+            error!(
+                event = "docling.child_output_reader.join_failed",
+                task_purpose = "read_docling_child_output",
+                pipe = label,
+                process_id = ?process_id,
+                is_panic = source.is_panic(),
+                is_cancelled = source.is_cancelled(),
+                error = %source,
+                elapsed_ms = process_started.elapsed().as_millis() as u64,
+                "Docling child output reader task join failed"
+            );
+            Err(ApiError::InternalIo {
+                message: format!("Docling {label} reader task failed: {source}"),
+            })
+        }
+    }
 }
 
 /// Emit parsed Docling progress from one stderr chunk.
