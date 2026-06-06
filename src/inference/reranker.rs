@@ -11,7 +11,7 @@ use crate::{
     inference::{
         InferenceProgress,
         artifacts::{CONFIG_FILE_NAME, ModelArtifacts},
-        qwen3::{Qwen3Model, load_qwen3_config},
+        qwen3::{Qwen3Model, TokenLogit, load_qwen3_config},
     },
 };
 
@@ -23,6 +23,9 @@ const SMOKE_QUERY: &str = "clear writing style rules";
 const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 const SMOKE_DISTRACTOR_DOCUMENT: &str = "A recipe lists ingredients and oven temperatures.";
 const LOGIT_SCORE_DIR_NAME: &str = "1_LogitScore";
+// Multi-row Qwen reranker passes produced non-finite logits on Metal during
+// startup smoke scoring; keep scoring single-row until that path is proven.
+const RERANKER_MICROBATCH_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct RerankerRuntime {
@@ -66,11 +69,17 @@ struct LogitScoreConfig {
 }
 
 #[derive(Debug, Clone)]
-struct PairScore {
+struct TokenizedRerankerCandidate {
+    unit_id: String,
+    input_ids: Vec<u32>,
+    document_chars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ScoredLogits {
     score: f32,
     true_logit: f32,
     false_logit: f32,
-    token_count: usize,
 }
 
 impl RerankerRuntime {
@@ -257,19 +266,55 @@ impl RerankerRuntime {
             "reranker candidate batch scoring started"
         );
         let result = (|| -> Result<Vec<RerankerCandidateScore>, ApiError> {
+            let tokenized_candidates = self.tokenize_candidates(query, candidates)?;
+            let total_token_count = tokenized_candidates
+                .iter()
+                .map(|candidate| candidate.input_ids.len())
+                .sum::<usize>();
+            let max_token_count = tokenized_candidates
+                .iter()
+                .map(|candidate| candidate.input_ids.len())
+                .max()
+                .unwrap_or(0);
+            info!(
+                event = "model_call.input_ready",
+                model_role = "reranker",
+                call_purpose = "candidate_batch_scoring",
+                input_kind = "query_candidates",
+                query_chars,
+                candidates = candidates.len(),
+                document_chars,
+                configured_max_tokens = self.max_tokens,
+                total_token_count,
+                max_token_count,
+                microbatch_size = RERANKER_MICROBATCH_SIZE,
+                "reranker candidate batch input tokenized"
+            );
             let total = candidates.len() as u64;
+            let microbatch_count = if tokenized_candidates.is_empty() {
+                0
+            } else {
+                (tokenized_candidates.len() + RERANKER_MICROBATCH_SIZE - 1)
+                    / RERANKER_MICROBATCH_SIZE
+            };
+            let mut completed = 0u64;
             let mut scores = Vec::with_capacity(candidates.len());
-            for (index, candidate) in candidates.iter().enumerate() {
-                let pair_score = self.score_pair(&candidate.unit_id, query, &candidate.content)?;
-                scores.push(RerankerCandidateScore {
-                    unit_id: candidate.unit_id.clone(),
-                    score: pair_score.score,
-                    rank: 0,
-                    true_logit: pair_score.true_logit,
-                    false_logit: pair_score.false_logit,
-                    token_count: pair_score.token_count,
-                });
-                progress((index + 1) as u64, total)?;
+            for (microbatch_index, microbatch) in tokenized_candidates
+                .chunks(RERANKER_MICROBATCH_SIZE)
+                .enumerate()
+            {
+                let mut microbatch_scores = self.score_candidate_microbatch(
+                    microbatch_index + 1,
+                    microbatch_count,
+                    query_chars,
+                    microbatch,
+                )?;
+                let completed_target = completed + microbatch_scores.len() as u64;
+                scores.append(&mut microbatch_scores);
+                while completed < completed_target {
+                    completed += 1;
+                    progress(completed, total)?;
+                }
             }
             scores.sort_by(|left, right| {
                 right
@@ -325,114 +370,187 @@ impl RerankerRuntime {
         result
     }
 
-    /// Render, tokenize, and score one identified query/document pair by yes/no next-token probability.
-    fn score_pair(
+    /// Render and tokenize reranker prompts while preserving candidate identity for later scores.
+    fn tokenize_candidates(
         &self,
-        unit_id: &str,
         query: &str,
-        document: &str,
-    ) -> Result<PairScore, ApiError> {
+        candidates: &[RerankerCandidateInput],
+    ) -> Result<Vec<TokenizedRerankerCandidate>, ApiError> {
+        candidates
+            .iter()
+            .map(|candidate| {
+                let input_ids = build_reranker_input_ids(
+                    &self.tokenizer,
+                    DEFAULT_INSTRUCTION,
+                    query,
+                    &candidate.content,
+                    self.max_tokens,
+                )
+                .map_err(|source| {
+                    inference_error(format!(
+                        "reranker candidate {} tokenization failed: {source}",
+                        candidate.unit_id
+                    ))
+                })?;
+
+                Ok(TokenizedRerankerCandidate {
+                    unit_id: candidate.unit_id.clone(),
+                    input_ids,
+                    document_chars: candidate.content.chars().count(),
+                })
+            })
+            .collect()
+    }
+
+    /// Score one tokenized candidate microbatch with a single Qwen forward pass.
+    fn score_candidate_microbatch(
+        &self,
+        microbatch_index: usize,
+        microbatch_count: usize,
+        query_chars: usize,
+        candidates: &[TokenizedRerankerCandidate],
+    ) -> Result<Vec<RerankerCandidateScore>, ApiError> {
         let started_at = Instant::now();
-        let query_chars = query.chars().count();
-        let document_chars = document.chars().count();
+        let document_chars = candidates
+            .iter()
+            .map(|candidate| candidate.document_chars)
+            .sum::<usize>();
+        let total_token_count = candidates
+            .iter()
+            .map(|candidate| candidate.input_ids.len())
+            .sum::<usize>();
+        let max_token_count = candidates
+            .iter()
+            .map(|candidate| candidate.input_ids.len())
+            .max()
+            .unwrap_or(0);
         info!(
             event = "model_call.started",
             model_role = "reranker",
-            call_purpose = "candidate_pair_scoring",
-            input_kind = "query_document",
-            unit_id,
+            call_purpose = "candidate_microbatch_scoring",
+            input_kind = "query_documents",
+            microbatch_index,
+            microbatch_count,
             query_chars,
+            candidates = candidates.len(),
             document_chars,
             configured_max_tokens = self.max_tokens,
-            "reranker candidate pair scoring started"
+            total_token_count,
+            max_token_count,
+            selected_token_count = 2usize,
+            "reranker candidate microbatch scoring started"
         );
-        let mut token_count_for_log = 0usize;
-        let result = (|| -> Result<PairScore, ApiError> {
-            let input_ids = build_reranker_input_ids(
-                &self.tokenizer,
-                DEFAULT_INSTRUCTION,
-                query,
-                document,
-                self.max_tokens,
-            )?;
-            token_count_for_log = input_ids.len();
-            info!(
-                event = "model_call.input_ready",
-                model_role = "reranker",
-                call_purpose = "candidate_pair_scoring",
-                input_kind = "query_document",
-                unit_id,
-                query_chars,
-                document_chars,
-                configured_max_tokens = self.max_tokens,
-                token_count = token_count_for_log,
-                "reranker candidate pair input tokenized"
-            );
-            let logits = self.model.selected_token_logits(
-                &input_ids,
+        let result = (|| -> Result<Vec<RerankerCandidateScore>, ApiError> {
+            let input_refs = candidates
+                .iter()
+                .map(|candidate| candidate.input_ids.as_slice())
+                .collect::<Vec<_>>();
+            let batch_logits = self.model.selected_token_logits_batch(
+                &input_refs,
                 &[self.false_token_id, self.true_token_id],
                 &self.device,
                 "reranker",
             )?;
-            let false_logit = logits
-                .iter()
-                .find(|logit| logit.token_id == self.false_token_id)
-                .map(|logit| logit.logit)
-                .ok_or_else(|| {
-                    inference_error("reranker false-token logit is missing".to_string())
-                })?;
-            let true_logit = logits
-                .iter()
-                .find(|logit| logit.token_id == self.true_token_id)
-                .map(|logit| logit.logit)
-                .ok_or_else(|| {
-                    inference_error("reranker true-token logit is missing".to_string())
-                })?;
-            let score = yes_probability(false_logit, true_logit)?;
+            if batch_logits.len() != candidates.len() {
+                return Err(inference_error(format!(
+                    "reranker microbatch returned {} score rows for {} candidates",
+                    batch_logits.len(),
+                    candidates.len()
+                )));
+            }
 
-            Ok(PairScore {
-                score,
-                true_logit,
-                false_logit,
-                token_count: input_ids.len(),
-            })
+            let mut scores = Vec::with_capacity(candidates.len());
+            for (candidate, logits) in candidates.iter().zip(batch_logits.iter()) {
+                let scored_logits =
+                    score_selected_logits(logits, self.false_token_id, self.true_token_id)
+                        .map_err(|source| {
+                            inference_error(format!(
+                                "reranker candidate {} logit scoring failed: {source}",
+                                candidate.unit_id
+                            ))
+                        })?;
+                scores.push(RerankerCandidateScore {
+                    unit_id: candidate.unit_id.clone(),
+                    score: scored_logits.score,
+                    rank: 0,
+                    true_logit: scored_logits.true_logit,
+                    false_logit: scored_logits.false_logit,
+                    token_count: candidate.input_ids.len(),
+                });
+            }
+
+            Ok(scores)
         })();
         match &result {
-            Ok(score) => {
+            Ok(scores) => {
                 info!(
                     event = "model_call.completed",
                     model_role = "reranker",
-                    call_purpose = "candidate_pair_scoring",
-                    input_kind = "query_document",
-                    unit_id,
+                    call_purpose = "candidate_microbatch_scoring",
+                    input_kind = "query_documents",
+                    microbatch_index,
+                    microbatch_count,
                     query_chars,
+                    candidates = candidates.len(),
+                    scores = scores.len(),
                     document_chars,
                     configured_max_tokens = self.max_tokens,
-                    token_count = score.token_count,
+                    total_token_count,
+                    max_token_count,
+                    selected_token_count = 2usize,
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "reranker candidate pair scoring completed"
+                    "reranker candidate microbatch scoring completed"
                 );
             }
             Err(source) => {
                 error!(
                     event = "model_call.failed",
                     model_role = "reranker",
-                    call_purpose = "candidate_pair_scoring",
-                    input_kind = "query_document",
-                    unit_id,
+                    call_purpose = "candidate_microbatch_scoring",
+                    input_kind = "query_documents",
+                    microbatch_index,
+                    microbatch_count,
                     query_chars,
+                    candidates = candidates.len(),
                     document_chars,
                     configured_max_tokens = self.max_tokens,
-                    token_count = token_count_for_log,
+                    total_token_count,
+                    max_token_count,
+                    selected_token_count = 2usize,
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     error = %source,
-                    "reranker candidate pair scoring failed"
+                    "reranker candidate microbatch scoring failed"
                 );
             }
         }
 
         result
     }
+}
+
+/// Extract yes/no logits and convert them into the public reranker score.
+fn score_selected_logits(
+    logits: &[TokenLogit],
+    false_token_id: u32,
+    true_token_id: u32,
+) -> Result<ScoredLogits, ApiError> {
+    let false_logit = logits
+        .iter()
+        .find(|logit| logit.token_id == false_token_id)
+        .map(|logit| logit.logit)
+        .ok_or_else(|| inference_error("reranker false-token logit is missing".to_string()))?;
+    let true_logit = logits
+        .iter()
+        .find(|logit| logit.token_id == true_token_id)
+        .map(|logit| logit.logit)
+        .ok_or_else(|| inference_error("reranker true-token logit is missing".to_string()))?;
+    let score = yes_probability(false_logit, true_logit)?;
+
+    Ok(ScoredLogits {
+        score,
+        true_logit,
+        false_logit,
+    })
 }
 
 /// Validate reranker config values that affect runtime prompt construction and memory use.

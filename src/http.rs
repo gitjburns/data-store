@@ -976,10 +976,11 @@ async fn execute_search(
         top_k,
         storage_candidates = storage_output.candidates.len(),
         colbert_scores = colbert_scores.len(),
+        reranker_candidate_limit = top_k,
         "search reranker candidate assembly started"
     );
     let reranker_candidates =
-        match build_reranker_candidates(&storage_output.candidates, &colbert_scores) {
+        match build_reranker_candidates(&storage_output.candidates, &colbert_scores, top_k) {
             Ok(candidates) => candidates,
             Err(source) => {
                 error!(
@@ -989,6 +990,7 @@ async fn execute_search(
                     top_k,
                     storage_candidates = storage_output.candidates.len(),
                     colbert_scores = colbert_scores.len(),
+                    reranker_candidate_limit = top_k,
                     error = %source,
                     elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
                     "search reranker candidate assembly failed"
@@ -1002,6 +1004,8 @@ async fn execute_search(
         query_chars,
         top_k,
         candidates = reranker_candidates.len(),
+        colbert_scores = colbert_scores.len(),
+        reranker_candidate_limit = top_k,
         elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
         "search reranker candidate assembly completed"
     );
@@ -1145,6 +1149,8 @@ async fn execute_search(
         "reranker": {
             "mode": RERANKER_MODE_QWEN3_YES_NO,
             "candidateSource": RERANKER_CANDIDATE_SOURCE_COLBERT_POOL,
+            "colbertCandidateCount": colbert_scores.len(),
+            "candidateLimit": top_k,
             "candidateCount": reranker_scores.len(),
             "scores": reranker_scores.iter().map(|score| {
                 serde_json::json!({
@@ -2389,13 +2395,15 @@ fn generate_operation_id() -> String {
 fn build_reranker_candidates(
     candidates: &[SearchCandidate],
     colbert_scores: &[ColbertCandidateScore],
+    top_k: u32,
 ) -> Result<Vec<RerankerCandidateInput>, ApiError> {
     let candidate_by_id = candidates
         .iter()
         .map(|candidate| (candidate.unit_id.as_str(), candidate))
         .collect::<HashMap<_, _>>();
-    let mut reranker_candidates = Vec::with_capacity(colbert_scores.len());
-    for score in colbert_scores {
+    let reranker_limit = top_k as usize;
+    let mut reranker_candidates = Vec::with_capacity(colbert_scores.len().min(reranker_limit));
+    for score in colbert_scores.iter().take(reranker_limit) {
         let Some(candidate) = candidate_by_id.get(score.unit_id.as_str()) else {
             return Err(ApiError::StorageOperation {
                 message: format!(

@@ -80,6 +80,8 @@ pub struct TokenLogit {
     pub logit: f32,
 }
 
+const RIGHT_PAD_TOKEN_ID: u32 = 0;
+
 impl Qwen3Model {
     /// Load a Qwen3 graph while reporting long model-load substeps to startup.
     pub fn load_with_progress(
@@ -221,42 +223,57 @@ impl Qwen3Model {
             .map_err(|source| inference_error(format!("{label} final norm failed: {source}")))
     }
 
-    /// Score selected next-token logits from the final prompt position using tied output embeddings.
-    pub fn selected_token_logits(
+    /// Score selected next-token logits for each right-padded prompt row at its real final token.
+    pub fn selected_token_logits_batch(
         &self,
-        input_ids: &[u32],
+        input_batches: &[&[u32]],
         token_ids: &[u32],
         device: &Device,
         label: &str,
-    ) -> Result<Vec<TokenLogit>, ApiError> {
+    ) -> Result<Vec<Vec<TokenLogit>>, ApiError> {
         if !self.config.tie_word_embeddings {
             return Err(inference_error(format!(
                 "{label} selected-token scoring requires tied word embeddings"
             )));
         }
-        let input = Tensor::new(input_ids, device)
-            .map_err(|source| {
-                inference_error(format!("failed to build {label} input tensor: {source}"))
-            })?
-            .unsqueeze(0)
-            .map_err(|source| {
-                inference_error(format!("failed to batch {label} input tensor: {source}"))
-            })?;
-        let hidden = self.forward_hidden(&input, label)?;
-        let (_, seq_len, hidden_size) = hidden.dims3().map_err(|source| {
-            inference_error(format!("{label} hidden state shape error: {source}"))
-        })?;
-        let final_hidden = hidden
-            .narrow(1, seq_len - 1, 1)
-            .and_then(|tensor| tensor.reshape((hidden_size,)))
-            .and_then(|tensor| tensor.to_dtype(DType::F32))
-            .and_then(|tensor| tensor.to_device(&Device::Cpu))
-            .and_then(|tensor| tensor.to_vec1::<f32>())
+        if input_batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max_seq_len = input_batches
+            .iter()
+            .map(|input_ids| input_ids.len())
+            .max()
+            .unwrap_or(0);
+        if max_seq_len == 0 || input_batches.iter().any(|input_ids| input_ids.is_empty()) {
+            return Err(inference_error(format!(
+                "{label} selected-token scoring requires non-empty input rows"
+            )));
+        }
+
+        let mut padded_input_ids = Vec::with_capacity(input_batches.len() * max_seq_len);
+        for input_ids in input_batches {
+            padded_input_ids.extend_from_slice(input_ids);
+            padded_input_ids
+                .extend(std::iter::repeat(RIGHT_PAD_TOKEN_ID).take(max_seq_len - input_ids.len()));
+        }
+        // The score is read from each row's real final token. The causal mask
+        // prevents that position from attending to any right-padding tokens.
+        let input = Tensor::from_vec(padded_input_ids, (input_batches.len(), max_seq_len), device)
             .map_err(|source| {
                 inference_error(format!(
-                    "failed to extract {label} final hidden state: {source}"
+                    "failed to build {label} batched input tensor: {source}"
                 ))
             })?;
+        let hidden = self.forward_hidden(&input, label)?;
+        let (batch_size, seq_len, hidden_size) = hidden.dims3().map_err(|source| {
+            inference_error(format!("{label} hidden state shape error: {source}"))
+        })?;
+        if batch_size != input_batches.len() || seq_len != max_seq_len {
+            return Err(inference_error(format!(
+                "{label} batched hidden state shape mismatch: batch {batch_size}/{}, seq {seq_len}/{max_seq_len}",
+                input_batches.len()
+            )));
+        }
         let selected_token_ids = Tensor::new(token_ids, device).map_err(|source| {
             inference_error(format!(
                 "failed to build {label} selected-token tensor: {source}"
@@ -273,20 +290,37 @@ impl Qwen3Model {
                     "failed to extract {label} tied embeddings for selected tokens: {source}"
                 ))
             })?;
-        let logits = token_ids
-            .iter()
-            .zip(selected_embeddings.iter())
-            .map(|(token_id, token_embedding)| TokenLogit {
-                token_id: *token_id,
-                logit: final_hidden
-                    .iter()
-                    .zip(token_embedding.iter())
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>(),
-            })
-            .collect::<Vec<_>>();
+        let mut batch_logits = Vec::with_capacity(input_batches.len());
+        for (row_index, input_ids) in input_batches.iter().enumerate() {
+            let final_hidden = hidden
+                .narrow(0, row_index, 1)
+                .and_then(|tensor| tensor.narrow(1, input_ids.len() - 1, 1))
+                .and_then(|tensor| tensor.reshape((hidden_size,)))
+                .and_then(|tensor| tensor.to_dtype(DType::F32))
+                .and_then(|tensor| tensor.to_device(&Device::Cpu))
+                .and_then(|tensor| tensor.to_vec1::<f32>())
+                .map_err(|source| {
+                    inference_error(format!(
+                        "failed to extract {label} final hidden state row {}: {source}",
+                        row_index + 1
+                    ))
+                })?;
+            let logits = token_ids
+                .iter()
+                .zip(selected_embeddings.iter())
+                .map(|(token_id, token_embedding)| TokenLogit {
+                    token_id: *token_id,
+                    logit: final_hidden
+                        .iter()
+                        .zip(token_embedding.iter())
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>(),
+                })
+                .collect::<Vec<_>>();
+            batch_logits.push(logits);
+        }
 
-        Ok(logits)
+        Ok(batch_logits)
     }
 }
 
