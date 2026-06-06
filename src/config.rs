@@ -129,7 +129,7 @@ pub struct ModelConfig {
     pub dense: DenseModelConfig,
     /// ColBERT late-interaction model configuration.
     pub colbert: ColbertModelConfig,
-    /// Qwen3 yes/no reranker model configuration.
+    /// ModernBERT sequence-classification reranker model configuration.
     pub reranker: RerankerModelConfig,
 }
 
@@ -159,7 +159,7 @@ pub struct ColbertModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RerankerModelConfig {
-    /// Local model artifact directory for Qwen3 reranking.
+    /// Local model artifact directory for ModernBERT sequence-classification reranking.
     pub path: PathBuf,
     /// Runtime token cap for reranker query/document pairs.
     pub max_tokens: u32,

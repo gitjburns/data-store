@@ -52,7 +52,7 @@ const ROLLBACK_STATUS_ROLLED_BACK: &str = "rolled_back";
 const SEARCH_MODE_FULL_RETRIEVAL: &str = "dense_bm25_rrf_colbert_reranker";
 const COLBERT_MODE_PERSISTED_MAXSIM: &str = "persisted_candidate_pool_maxsim";
 const COLBERT_DOCUMENT_VECTOR_SOURCE_SQLITE: &str = "sqlite";
-const RERANKER_MODE_QWEN3_YES_NO: &str = "qwen3_yes_no_candidate_rerank";
+const RERANKER_MODE_MODERNBERT_SEQUENCE_CLASSIFIER: &str = "modernbert_sequence_classifier";
 const RERANKER_CANDIDATE_SOURCE_COLBERT_POOL: &str = "colbert_ranked_candidate_pool";
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const OPERATION_STREAM_CHANNEL_CAPACITY: usize = 16;
@@ -683,7 +683,7 @@ async fn execute_ingest(
     })
 }
 
-/// Run dense, BM25, RRF, bounded ColBERT reranking, and final Qwen3 reranking for one search request.
+/// Run dense, BM25, RRF, bounded ColBERT reranking, and final ModernBERT reranking for one search request.
 async fn post_search(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<SearchRequest>, JsonRejection>,
@@ -1147,7 +1147,7 @@ async fn execute_search(
             "rankedCandidateCount": colbert_scores.len()
         },
         "reranker": {
-            "mode": RERANKER_MODE_QWEN3_YES_NO,
+            "mode": RERANKER_MODE_MODERNBERT_SEQUENCE_CLASSIFIER,
             "candidateSource": RERANKER_CANDIDATE_SOURCE_COLBERT_POOL,
             "colbertCandidateCount": colbert_scores.len(),
             "candidateLimit": top_k,
@@ -1157,8 +1157,7 @@ async fn execute_search(
                     "unitId": score.unit_id,
                     "score": score.score,
                     "rank": score.rank,
-                    "trueLogit": score.true_logit,
-                    "falseLogit": score.false_logit,
+                    "logit": score.logit,
                     "tokenCount": score.token_count
                 })
             }).collect::<Vec<_>>(),
@@ -2457,7 +2456,7 @@ fn build_reranker_results(
         };
         results.push(SearchResult {
             unit_id: candidate.unit_id.clone(),
-            // The public score is the final Qwen3 yes/no probability after ColBERT candidate reranking.
+            // The public score is the final ModernBERT sigmoid score after ColBERT candidate reranking.
             score: score.score,
             content: candidate.content.clone(),
             heading_path: candidate.heading_path.clone(),
@@ -2468,8 +2467,7 @@ fn build_reranker_results(
             "unitId": candidate.unit_id,
             "rerankerScore": score.score,
             "rerankerRank": score.rank,
-            "rerankerTrueLogit": score.true_logit,
-            "rerankerFalseLogit": score.false_logit,
+            "rerankerLogit": score.logit,
             "rerankerTokenCount": score.token_count,
             "colbertScore": colbert_score.score,
             "colbertRank": colbert_score.rank,
