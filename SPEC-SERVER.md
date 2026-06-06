@@ -16,7 +16,7 @@ references and search queries.
 - Document ingestion from service-owned corpus files.
 - Docling conversion, unit splitting, dense embeddings, persisted ColBERT
   document vectors, SQLite storage, FTS, active-version cache, ColBERT scoring,
-  and Qwen3 reranking.
+  and ModernBERT sequence-classification reranking.
 - Immutable source-document versioning, active-version publish, retained-version
   listing, rollback, health, limits, and graceful shutdown.
 - Runtime admin token-file handoff for local operators.
@@ -41,7 +41,8 @@ references and search queries.
   cache with exact cosine similarity over active document versions.
 - **Late interaction:** ColBERT scoring runs over a bounded candidate pool and
   loads persisted document token vectors from SQLite.
-- **Final ranking:** Qwen3 reranker scoring produces the public result order.
+- **Final ranking:** ModernBERT sequence-classification reranker scoring
+  produces the public result order.
 - **Ownership:** the service owns corpus resolution, conversion, chunking,
   embeddings, durable storage, retrieval cache, indexes, config, and lifecycle
   controls.
@@ -57,7 +58,7 @@ is unavailable.
 |---|---|---|---|---|
 | Dense | Qwen/Qwen3-Embedding-8B | 4096-d Matryoshka, 32k ctx | Query: instruct prefix; passage: raw | 1-D vector with last-token pooling |
 | Late-interaction | lightonai/ColBERT-Zero | 128-d/token, about 512 ctx | `search_query:` / `search_document:` | 2-D `[num_tokens,128]` tensor, no pooling |
-| Reranker | Qwen/Qwen3-Reranker-4B | 32k ctx | Chat template | yes/no token logit to score |
+| Reranker | Alibaba-NLP/gte-reranker-modernbert-base | 8192 ctx, single-label classifier | `[CLS]` query `[SEP]` document `[SEP]` | raw logit and sigmoid score |
 
 ## 4. Storage Schema
 
@@ -143,7 +144,8 @@ searchable.
 7. ColBERT embeds the query, loads persisted candidate document token vectors
    for the captured versions from SQLite, and MaxSim reranks only the fused
    candidate pool.
-8. Qwen3 reranker rescores the ColBERT-ranked candidate pool.
+8. ModernBERT sequence-classification reranker rescores the ColBERT-ranked
+   candidate pool.
 9. Return top-K in final reranker order.
 
 ## 6. Operation Protocol
@@ -290,7 +292,29 @@ Result payload:
     }
   ],
   "latencyMs": 103500,
-  "raw": {}
+  "raw": {
+    "reranker": {
+      "mode": "modernbert_sequence_classifier",
+      "scores": [
+        {
+          "unitId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z:unit:000000",
+          "score": 0.725617,
+          "rank": 1,
+          "logit": 0.961434,
+          "tokenCount": 512
+        }
+      ],
+      "finalResults": [
+        {
+          "unitId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z:unit:000000",
+          "rerankerScore": 0.725617,
+          "rerankerRank": 1,
+          "rerankerLogit": 0.961434,
+          "rerankerTokenCount": 512
+        }
+      ]
+    }
+  }
 }
 ```
 
@@ -351,7 +375,8 @@ Result payload:
 
 ```json
 {
-  "status": "shutting_down"
+  "status": "shutdown_complete",
+  "message": "shutdown complete; service process is terminating"
 }
 ```
 
@@ -433,6 +458,8 @@ Service-owned config includes:
 - Admin token file:
   - `admin.token_file_path`
 - Model paths.
+- Reranker token cap:
+  - `models.reranker.max_tokens`, `8192` for the local ModernBERT reranker.
 - Inference device and device index.
 - Docling paths and PDF defaults.
 - Corpus path.

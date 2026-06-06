@@ -309,7 +309,8 @@ confirmation before sending the request. Confirmation should require:
 shutdown
 ```
 
-Output: streamed operation status and shutdown status.
+Output: streamed operation status followed by the server-authored
+`shutdown_complete` terminal result.
 
 ### `help`
 

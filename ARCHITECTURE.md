@@ -64,7 +64,7 @@ readiness data during migration compatibility.
 |---|---|---|
 | Dense | Qwen3 embedding | One normalized dense vector per query or passage |
 | ColBERT | Late interaction | One 128-dimensional vector per token |
-| Reranker | Qwen3 yes/no reranker | Final yes-probability score per candidate |
+| Reranker | ModernBERT sequence classifier | Raw relevance logit and sigmoid score per candidate |
 
 Dense embeddings use query instruction formatting for queries, raw passage text
 for documents, last-token pooling, and L2 normalization.
@@ -76,9 +76,9 @@ Startup smoke checks include max-capacity ColBERT document encoding so
 long-sequence accelerator failures are reported through readiness rather than
 after ingest work has already completed conversion and dense embedding.
 
-The reranker renders the service-local Qwen3 chat prompt shape and scores final
-next-token logits for the configured yes/no token IDs. Public search scores are
-the reranker yes probabilities.
+The reranker tokenizes query/document pairs as ModernBERT sequence pairs,
+scores one raw single-label relevance logit per candidate, and converts that
+logit to the public search score with a sigmoid.
 
 ## Operation Protocol
 
@@ -201,7 +201,7 @@ The `search` operation is synchronous and streamed. The high-level stages are:
 8. Fuse dense and BM25 candidate lists with Reciprocal Rank Fusion.
 9. Load persisted ColBERT document vectors for the bounded RRF pool.
 10. Embed the query with ColBERT and MaxSim-rerank the candidate pool.
-11. Rerank the ColBERT-ranked candidates with the Qwen3 yes/no reranker.
+11. Rerank the ColBERT-ranked candidates with the ModernBERT sequence-classification reranker.
 12. Emit public top-K results and raw diagnostics for every stage.
 
 Dense tie-breaking is deterministic by `unitId` ascending. Public result scores

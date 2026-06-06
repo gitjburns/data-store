@@ -18,13 +18,13 @@ otherwise.
   protected admin version controls, and protected shutdown.
 - Interactive `data-store` CLI client for operating the documented HTTP API.
 - Explicit Metal/CUDA accelerator selection with no CPU fallback.
-- Local Qwen3 dense embedding, ColBERT, and Qwen3 reranker runtimes through
-  Candle.
+- Local Qwen3 dense embedding, ColBERT, and ModernBERT sequence-classification
+  reranker runtimes through Candle.
 - PDF ingest through Docling, deterministic unit splitting, dense and ColBERT
   embedding, SQLite persistence, and FTS5 population.
 - Startup-loaded in-memory dense vector cache with exact cosine retrieval.
 - SQLite FTS5 BM25, dense/BM25 over-fetch, RRF fusion, persisted ColBERT
-  MaxSim reranking, and Qwen3 yes/no reranking.
+  MaxSim reranking, and ModernBERT sequence-classification reranking.
 - Immutable source-document versions with active-version publish and protected
   rollback.
 - Explicit `--setup-storage` schema setup; normal runtime validates existing
@@ -36,7 +36,8 @@ otherwise.
 Create a local `config.toml` from `config.example.toml`. The local config is
 machine-specific and should point at:
 
-- local model directories for Qwen3 embedding, ColBERT-Zero, and Qwen3 reranker
+- local model directories for Qwen3 embedding, ColBERT-Zero, and ModernBERT
+  reranker
 - a service-owned corpus root for source files
 - a service-owned index root for SQLite and Docling conversion artifacts
 - the Python executable for environment diagnostics and the directly launched Docling executable
@@ -269,8 +270,10 @@ curl -N -X POST \
 
 Search is synchronous. It captures the active document-version snapshot at
 request admission and uses that same snapshot through dense retrieval, BM25,
-RRF, ColBERT MaxSim, Qwen3 reranking, and result materialization. The terminal
-`result` event contains public results plus raw stage diagnostics.
+RRF, ColBERT MaxSim, ModernBERT reranking, and result materialization. The
+terminal `result` event contains public results plus raw stage diagnostics.
+Reranker raw diagnostics expose `mode: "modernbert_sequence_classifier"`, one
+raw `logit`, and the public sigmoid `score` per reranked candidate.
 
 If the configured ingest/search admission gate is saturated, the endpoint
 emits a terminal `error` event with status `503 Service Unavailable`. The
