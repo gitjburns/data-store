@@ -193,10 +193,16 @@ data-store> exit
 ```
 
 `search` prints excerpts. `search-full` prints the full matched unit content.
-Quote multi-word queries and any argument containing spaces. Long operations
-stream status and counted progress while they run. The CLI updates the current
-stage line in place and prints a newline when each stage completes. The
-`shutdown` command sends the protected operation directly and prints the
+Both search commands print a client-side `Benchmarks:` summary after the
+rendered search results, including `http_to_first_status`,
+`search_preparation`, streamed search stages, and the measured HTTP operation
+total. `ingest` prints a client-side `Benchmarks:` summary after the ingest
+result for `docling_converting`, `unit_splitting`, `dense_embedding`,
+`colbert_embedding`, and `storage_publishing`; its total is the sum of those
+rows. Quote multi-word queries and any argument containing spaces. Long
+operations stream status and counted progress while they run. The CLI updates
+the current stage line in place and prints a newline when each stage completes.
+The `shutdown` command sends the protected operation directly and prints the
 server-authored `shutdown_complete` confirmation from the terminal result
 event. Any shutdown stream error or non-completion status is reported as an
 operator-visible error.
