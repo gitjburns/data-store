@@ -96,6 +96,10 @@ Version rules:
 - First-time ingests remain invisible to search until publish completes.
 - Force re-ingests keep the previously active version searchable until the new
   version publishes.
+- Failed ingest attempts must not create an active version, must not become
+  search-visible, and must not require `force: true` on retry. `force: true` is
+  required only when the source already has an active searchable version from a
+  prior successful ingest.
 
 Dense search cache:
 
@@ -106,15 +110,19 @@ Dense search cache:
   footprint.
 - Cache publish happens only after the new document version is fully durable and
   ready.
-- Search captures the active cache/snapshot at request start and uses that same
-  snapshot for the lifetime of the request.
+- Search captures the active cache/snapshot at request admission, before query
+  embedding or later inference work, and uses that same snapshot for the
+  lifetime of the request. A version published after that capture must not enter
+  the already-admitted search scope.
 
 ## 5. Pipelines
 
 ### Ingestion
 
 Ingestion blocks until the new document version is durable and, after publish,
-searchable.
+searchable. Ingestion is atomic at the service contract boundary: it either
+fully succeeds and publishes the new active version, or it fails without leaving
+new successful ingested state.
 
 1. Resolve the referenced source file internally.
 2. Allocate a source-document-scoped timestamp `versionLabel`.
@@ -129,14 +137,21 @@ searchable.
 7. Build the search cache state for the new active-version map offline.
 8. Publish by atomically updating the active version for the source document and
    swapping the active search snapshot.
-9. Surface conversion failures with diagnostics. No silent fallback across
+9. If any step fails before the terminal ingest result is ready, roll back or
+   remove staged durable rows and active-cache changes for that attempted
+   version. A failed attempt must not leave a success-labeled retained
+   `document_versions` row, units, vector rows, FTS rows, or active-version row
+   that affects future duplicate checks, rollback choices, or search scope.
+   Temporary conversion artifacts may be retained only as diagnostics when they
+   are not treated as ingested state.
+10. Surface conversion failures with diagnostics. No silent fallback across
    backends or OCR modes is allowed.
 
 ### Retrieval
 
 1. Capture the current active source-document version map and active search
-   cache snapshot. This captured snapshot is authoritative for the lifetime of
-   the request.
+   cache snapshot at request admission, before query embedding. This captured
+   snapshot is authoritative for the lifetime of the request.
 2. Embed the query with Qwen3 dense.
 3. Validate query vector values are finite and compute query norm. Invalid or
    zero-norm vectors fail explicitly.
@@ -509,6 +524,27 @@ oversized retrieval internals.
 Ingest and search each have a separate configured maximum in-flight count. When
 the limit is saturated, the service emits a terminal operation `error` event
 with status `503`.
+
+Separate ingest/search admission is a functional requirement, not only a
+counter layout. A search admitted while an ingest is in progress must search the
+already-active corpus snapshot captured at its own admission. In-progress ingest
+output remains out of search scope until that ingest commits durable storage and
+publishes the new active snapshot. An admitted search must not fail with `503`
+solely because an ingest operation is running.
+
+Shared accelerator and model runtimes must be made safe for overlapping
+admitted operations. The implementation may serialize individual model calls or
+small model-call batches when required by the accelerator/runtime, but it must
+not serialize whole ingest and search operations as the concurrency mechanism.
+For example, an ingest may yield between per-unit dense or ColBERT document
+embedding calls so a search can run query embedding, ColBERT scoring, and
+reranking against the captured active corpus.
+
+Model outputs are validated at the inference boundary before storage or ranking
+code consumes them. Dense vectors, ColBERT token vectors, reranker logits, and
+derived scores must be finite and dimensionally valid. Non-finite model output
+is an inference failure with model-call diagnostics, not a downstream storage
+failure.
 
 The first operation-stream implementation does not need to guarantee
 cancellation support, queue position, or resumable streams.
