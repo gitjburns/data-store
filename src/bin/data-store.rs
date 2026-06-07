@@ -606,6 +606,7 @@ enum HealthProbeOutcome {
 
 struct StreamRenderer {
     active_line_chars: usize,
+    docling_wait_line_active: bool,
 }
 
 impl Display for AmbiguousStreamLossError {
@@ -1867,6 +1868,7 @@ impl StreamRenderer {
     fn new() -> Self {
         Self {
             active_line_chars: 0,
+            docling_wait_line_active: false,
         }
     }
 
@@ -1888,6 +1890,7 @@ impl StreamRenderer {
                 format!("[{operation_id} #{sequence}] {stage}")
             }
         };
+        self.docling_wait_line_active = false;
         self.render_active_line(&line)?;
         Ok(())
     }
@@ -1905,11 +1908,11 @@ impl StreamRenderer {
         let stage = stage.unwrap_or_else(|| "progress".to_string());
         let message = message.unwrap_or_else(|| "working".to_string());
         if stage == "docling_converting" && message.starts_with("Waiting for Docling process: ") {
-            self.finish_progress_line()?;
-            println!("{message}");
-            io::stdout()
-                .flush()
-                .context("failed to flush Docling wait message")?;
+            if !self.docling_wait_line_active {
+                self.finish_progress_line()?;
+                self.docling_wait_line_active = true;
+            }
+            self.render_active_line(&message)?;
             return Ok(());
         }
         let line = match (current, total) {
@@ -1925,6 +1928,7 @@ impl StreamRenderer {
             }
             _ => format!("[{operation_id} #{sequence}] {stage}: {message}"),
         };
+        self.docling_wait_line_active = false;
         self.render_active_line(&line)?;
         Ok(())
     }
