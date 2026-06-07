@@ -22,9 +22,44 @@ The target service behavior is now explicit in `SPEC-SERVER.md`:
   searchable version from a prior successful ingest.
 - Model outputs must be validated at the inference boundary.
 
+## Current Status
+
+Phase 1 is complete as of 2026-06-06.
+
+Implemented work:
+
+- `AppState` now owns a shared model-call gate that logs wait, acquire, release,
+  and acquisition failure boundaries.
+- Ingest dense passage embedding and ColBERT document embedding are gated per
+  unit, so ingest can yield between model calls.
+- Search captures the active storage snapshot immediately after search
+  admission and before dense query embedding.
+- Search dense query embedding, ColBERT persisted-candidate scoring, and
+  ModernBERT reranker scoring are gated as individual model-backed stages.
+- `inference/dense.rs` now validates dense output dimension, finite values, and
+  finite nonzero norm before logging model-call completion or returning vectors
+  to callers.
+- Storage candidate-pool construction now consumes the captured search snapshot
+  instead of locking and cloning the active cache internally.
+
+Verification completed for Phase 1:
+
+```bash
+cargo fmt
+cargo check
+cargo check --features metal
+```
+
+Manual runtime checks have not been run yet because starting/stopping service
+processes requires separate approval.
+
+Remaining work for the next session is Phase 2: make ingest storage publish
+atomic at the service contract boundary. The delicate storage/publish
+restructuring was intentionally not changed in Phase 1.
+
 ## Current Findings
 
-The observed search failure was:
+The original observed search failure was:
 
 ```text
 dense vector search-query contains non-finite values
@@ -36,14 +71,12 @@ same time. This points to unsafe overlapping model execution, not a search-scope
 or SQLite issue.
 
 There was also an ingest failure where storage rejected a dense passage vector
-as non-finite. Dense inference currently logs the model call as completed before
-finite-value validation happens downstream.
+as non-finite. Phase 1 moved dense finite-value validation into the inference
+boundary before dense model-call completion is logged.
 
-Search visibility is mostly implemented correctly: storage captures an active
-dense-cache snapshot and BM25 filters to active versions. However, the current
-search pipeline embeds the query before storage captures the active snapshot,
-which violates the updated spec requirement that capture happens at request
-admission.
+Search visibility was mostly implemented correctly before Phase 1: storage
+captured an active dense-cache snapshot and BM25 filtered to active versions.
+Phase 1 moved snapshot capture to request admission, before query embedding.
 
 Ingest durability is not fully atomic. The implementation writes document
 version, unit, vector, and FTS rows in one SQLite transaction, commits that
@@ -73,7 +106,7 @@ state for a failed attempt.
 
 ## Implementation Plan
 
-### 1. Capture Search Snapshot At Admission
+### 1. Capture Search Snapshot At Admission - Completed In Phase 1
 
 Move active search snapshot capture to immediately after search validation and
 search admission, before dense query embedding.
@@ -91,7 +124,7 @@ Likely work:
 - Preserve existing service-log lifecycle boundaries and add missing logs for
   request-admission snapshot capture.
 
-### 2. Add Shared Model Execution Safety
+### 2. Add Shared Model Execution Safety - Completed In Phase 1
 
 Add an explicit model-execution boundary that protects shared accelerator/model
 runtimes without serializing whole operations.
@@ -115,11 +148,11 @@ Likely work:
   model execution internally, but ingest/search operation admission remains
   separate.
 
-Design question to resolve during implementation: whether model-call wait should
-be bounded. The updated spec allows brief waits for model calls and forbids
-waiting for an entire ingest, but it does not currently define a timeout.
+Phase 1 uses an unbounded model-call wait because the spec allows model-call
+waiting but does not currently define a timeout. Revisit only if runtime checks
+show operator-visible wait behavior needs an explicit bound.
 
-### 3. Validate Dense Output At The Inference Boundary
+### 3. Validate Dense Output At The Inference Boundary - Completed In Phase 1
 
 Make dense embedding validation part of `inference/dense.rs`, before the model
 call is logged as completed and before vectors are returned to callers.
@@ -136,7 +169,7 @@ Likely work:
 - Audit ColBERT and reranker paths so non-finite token vectors, logits, and
   scores are also reported at inference/ranking boundaries rather than storage.
 
-### 4. Make Ingest Storage Publish Atomic
+### 4. Make Ingest Storage Publish Atomic - Phase 2 Resume Point
 
 Restructure ingest persistence so an ingest does not leave success-labeled
 durable rows unless the active publish also succeeds.
@@ -163,7 +196,7 @@ Target approach:
 Important constraint: do not add runtime schema migrations. If schema changes
 are needed, stop and propose an explicit setup/migration script instead.
 
-### 5. Preserve Retry And Force Semantics
+### 5. Preserve Retry And Force Semantics - Phase 2
 
 Make duplicate checks depend only on active searchable versions from prior
 successful ingests.
@@ -209,6 +242,9 @@ cargo check --features metal
 
 Manual runtime checks, with user approval before starting/stopping service
 processes:
+
+Checks 1-3 validate Phase 1 behavior. Checks 4-6 validate Phase 2 behavior
+after ingest publish atomicity is implemented.
 
 1. Start a long ingest and run search while ingest is in progress.
    - Search should complete against the previously active corpus.

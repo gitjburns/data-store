@@ -559,22 +559,47 @@ async fn execute_ingest(
     let total_units = units.len() as u64;
     let mut vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
-        let vector = match inference.dense.embed_passage_vector(&unit.content) {
-            Ok(vector) => vector,
-            Err(source) => {
-                error!(
-                    event = "ingest.dense_embedding.failed",
-                    operation_id = %operation_id,
-                    requested_source = %requested_source,
-                    version_label = %version_label,
-                    unit_id = %unit.unit_id,
-                    completed_units = index,
-                    total_units = units.len(),
-                    error = %source,
-                    elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
-                    "ingest dense embedding failed"
-                );
-                return Err(source);
+        let vector = {
+            let _model_permit = match state
+                .acquire_model_call_gate(&operation_id, "dense", "passage_embedding")
+                .await
+            {
+                Ok(permit) => permit,
+                Err(source) => {
+                    error!(
+                        event = "ingest.dense_embedding.failed",
+                        operation_id = %operation_id,
+                        requested_source = %requested_source,
+                        version_label = %version_label,
+                        unit_id = %unit.unit_id,
+                        completed_units = index,
+                        total_units = units.len(),
+                        phase = "model_gate_acquire",
+                        error = %source,
+                        elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
+                        "ingest dense embedding failed"
+                    );
+                    return Err(source);
+                }
+            };
+            match inference.dense.embed_passage_vector(&unit.content) {
+                Ok(vector) => vector,
+                Err(source) => {
+                    error!(
+                        event = "ingest.dense_embedding.failed",
+                        operation_id = %operation_id,
+                        requested_source = %requested_source,
+                        version_label = %version_label,
+                        unit_id = %unit.unit_id,
+                        completed_units = index,
+                        total_units = units.len(),
+                        phase = "model_call",
+                        error = %source,
+                        elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
+                        "ingest dense embedding failed"
+                    );
+                    return Err(source);
+                }
             }
         };
         vectors.push(UnitDenseVector {
@@ -617,25 +642,50 @@ async fn execute_ingest(
     );
     let mut colbert_vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
-        let embedding = match inference
-            .colbert
-            .embed_document(&unit.unit_id, &unit.content)
-        {
-            Ok(embedding) => embedding,
-            Err(source) => {
-                error!(
-                    event = "ingest.colbert_embedding.failed",
-                    operation_id = %operation_id,
-                    requested_source = %requested_source,
-                    version_label = %version_label,
-                    unit_id = %unit.unit_id,
-                    completed_units = index,
-                    total_units = units.len(),
-                    error = %source,
-                    elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
-                    "ingest ColBERT embedding failed"
-                );
-                return Err(source);
+        let embedding = {
+            let _model_permit = match state
+                .acquire_model_call_gate(&operation_id, "colbert", "document_embedding")
+                .await
+            {
+                Ok(permit) => permit,
+                Err(source) => {
+                    error!(
+                        event = "ingest.colbert_embedding.failed",
+                        operation_id = %operation_id,
+                        requested_source = %requested_source,
+                        version_label = %version_label,
+                        unit_id = %unit.unit_id,
+                        completed_units = index,
+                        total_units = units.len(),
+                        phase = "model_gate_acquire",
+                        error = %source,
+                        elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
+                        "ingest ColBERT embedding failed"
+                    );
+                    return Err(source);
+                }
+            };
+            match inference
+                .colbert
+                .embed_document(&unit.unit_id, &unit.content)
+            {
+                Ok(embedding) => embedding,
+                Err(source) => {
+                    error!(
+                        event = "ingest.colbert_embedding.failed",
+                        operation_id = %operation_id,
+                        requested_source = %requested_source,
+                        version_label = %version_label,
+                        unit_id = %unit.unit_id,
+                        completed_units = index,
+                        total_units = units.len(),
+                        phase = "model_call",
+                        error = %source,
+                        elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
+                        "ingest ColBERT embedding failed"
+                    );
+                    return Err(source);
+                }
             }
         };
         colbert_vectors.push(UnitColbertDocumentVector {
@@ -877,8 +927,23 @@ async fn execute_search(
         max_in_flight = admission.max_in_flight,
         "search request admitted"
     );
-    let inference = state.inference()?;
     let storage = state.storage()?;
+    let search_snapshot = match storage.capture_search_snapshot(&operation_id, query_chars, top_k) {
+        Ok(snapshot) => snapshot,
+        Err(source) => {
+            error!(
+                event = "search.snapshot_capture.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "search snapshot capture failed"
+            );
+            return Err(source);
+        }
+    };
+    let inference = state.inference()?;
     let embedding_started = Instant::now();
     emit_operation_status(&mut emitter, "embedding_query", "embedding search query").await?;
     info!(
@@ -890,21 +955,45 @@ async fn execute_search(
         model_dimension = state.config.models.dense.dimension,
         "search query embedding started"
     );
-    let query_vector = match inference.dense.embed_query_vector(&request.query) {
-        Ok(vector) => vector,
-        Err(source) => {
-            error!(
-                event = "search.query_embedding.failed",
-                operation_id = %operation_id,
-                query_chars,
-                top_k,
-                max_tokens = state.config.models.dense.max_tokens,
-                model_dimension = state.config.models.dense.dimension,
-                error = %source,
-                elapsed_ms = embedding_started.elapsed().as_millis() as u64,
-                "search query embedding failed"
-            );
-            return Err(source);
+    let query_vector = {
+        let _model_permit = match state
+            .acquire_model_call_gate(&operation_id, "dense", "query_embedding")
+            .await
+        {
+            Ok(permit) => permit,
+            Err(source) => {
+                error!(
+                    event = "search.query_embedding.failed",
+                    operation_id = %operation_id,
+                    query_chars,
+                    top_k,
+                    max_tokens = state.config.models.dense.max_tokens,
+                    model_dimension = state.config.models.dense.dimension,
+                    phase = "model_gate_acquire",
+                    error = %source,
+                    elapsed_ms = embedding_started.elapsed().as_millis() as u64,
+                    "search query embedding failed"
+                );
+                return Err(source);
+            }
+        };
+        match inference.dense.embed_query_vector(&request.query) {
+            Ok(vector) => vector,
+            Err(source) => {
+                error!(
+                    event = "search.query_embedding.failed",
+                    operation_id = %operation_id,
+                    query_chars,
+                    top_k,
+                    max_tokens = state.config.models.dense.max_tokens,
+                    model_dimension = state.config.models.dense.dimension,
+                    phase = "model_call",
+                    error = %source,
+                    elapsed_ms = embedding_started.elapsed().as_millis() as u64,
+                    "search query embedding failed"
+                );
+                return Err(source);
+            }
         }
     };
     let embedding_latency_ms = embedding_started.elapsed().as_millis() as u64;
@@ -941,6 +1030,7 @@ async fn execute_search(
         &operation_id,
         &request.query,
         query_vector,
+        search_snapshot,
         top_k,
         &state.config.retrieval,
     ) {
@@ -1003,25 +1093,48 @@ async fn execute_search(
         model_dimension = state.config.models.colbert.dimension,
         "search ColBERT scoring started"
     );
-    let colbert_score_result = if let Some(operation_emitter) = emitter.as_deref_mut() {
-        tokio::task::block_in_place(|| {
-            inference.colbert.score_persisted_candidates_with_progress(
-                &request.query,
-                &colbert_candidates,
-                |current, total| {
-                    operation_emitter.progress_blocking(
-                        "colbert_scoring",
-                        "scoring ColBERT candidates",
-                        current,
-                        total,
-                    )
-                },
-            )
-        })
-    } else {
-        inference
-            .colbert
-            .score_persisted_candidates(&request.query, &colbert_candidates)
+    let colbert_score_result = {
+        let _model_permit = match state
+            .acquire_model_call_gate(&operation_id, "colbert", "persisted_candidate_scoring")
+            .await
+        {
+            Ok(permit) => permit,
+            Err(source) => {
+                error!(
+                    event = "search.colbert_scoring.failed",
+                    operation_id = %operation_id,
+                    query_chars,
+                    top_k,
+                    candidates = colbert_candidate_count,
+                    document_tokens = colbert_document_tokens,
+                    phase = "model_gate_acquire",
+                    error = %source,
+                    elapsed_ms = colbert_started.elapsed().as_millis() as u64,
+                    "search ColBERT scoring failed"
+                );
+                return Err(source);
+            }
+        };
+        if let Some(operation_emitter) = emitter.as_deref_mut() {
+            tokio::task::block_in_place(|| {
+                inference.colbert.score_persisted_candidates_with_progress(
+                    &request.query,
+                    &colbert_candidates,
+                    |current, total| {
+                        operation_emitter.progress_blocking(
+                            "colbert_scoring",
+                            "scoring ColBERT candidates",
+                            current,
+                            total,
+                        )
+                    },
+                )
+            })
+        } else {
+            inference
+                .colbert
+                .score_persisted_candidates(&request.query, &colbert_candidates)
+        }
     };
     let colbert_scores = match colbert_score_result {
         Ok(scores) => scores,
@@ -1033,6 +1146,7 @@ async fn execute_search(
                 top_k,
                 candidates = colbert_candidate_count,
                 document_tokens = colbert_document_tokens,
+                phase = "model_call",
                 error = %source,
                 elapsed_ms = colbert_started.elapsed().as_millis() as u64,
                 "search ColBERT scoring failed"
@@ -1103,25 +1217,47 @@ async fn execute_search(
         max_tokens = state.config.models.reranker.max_tokens,
         "search reranking started"
     );
-    let reranker_score_result = if let Some(operation_emitter) = emitter.as_deref_mut() {
-        tokio::task::block_in_place(|| {
-            inference.reranker.score_candidates_with_progress(
-                &request.query,
-                &reranker_candidates,
-                |current, total| {
-                    operation_emitter.progress_blocking(
-                        "reranking",
-                        "reranking candidates",
-                        current,
-                        total,
-                    )
-                },
-            )
-        })
-    } else {
-        inference
-            .reranker
-            .score_candidates(&request.query, &reranker_candidates)
+    let reranker_score_result = {
+        let _model_permit = match state
+            .acquire_model_call_gate(&operation_id, "reranker", "candidate_batch_scoring")
+            .await
+        {
+            Ok(permit) => permit,
+            Err(source) => {
+                error!(
+                    event = "search.reranking.failed",
+                    operation_id = %operation_id,
+                    query_chars,
+                    top_k,
+                    candidates = reranker_candidates.len(),
+                    phase = "model_gate_acquire",
+                    error = %source,
+                    elapsed_ms = reranker_started.elapsed().as_millis() as u64,
+                    "search reranking failed"
+                );
+                return Err(source);
+            }
+        };
+        if let Some(operation_emitter) = emitter.as_deref_mut() {
+            tokio::task::block_in_place(|| {
+                inference.reranker.score_candidates_with_progress(
+                    &request.query,
+                    &reranker_candidates,
+                    |current, total| {
+                        operation_emitter.progress_blocking(
+                            "reranking",
+                            "reranking candidates",
+                            current,
+                            total,
+                        )
+                    },
+                )
+            })
+        } else {
+            inference
+                .reranker
+                .score_candidates(&request.query, &reranker_candidates)
+        }
     };
     let reranker_scores = match reranker_score_result {
         Ok(scores) => scores,
@@ -1132,6 +1268,7 @@ async fn execute_search(
                 query_chars,
                 top_k,
                 candidates = reranker_candidates.len(),
+                phase = "model_call",
                 error = %source,
                 elapsed_ms = reranker_started.elapsed().as_millis() as u64,
                 "search reranking failed"

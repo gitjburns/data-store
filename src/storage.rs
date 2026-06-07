@@ -47,6 +47,11 @@ pub struct SearchCandidatePoolOutput {
 }
 
 #[derive(Debug, Clone)]
+pub struct SearchSnapshot {
+    cache: DenseVectorCache,
+}
+
+#[derive(Debug, Clone)]
 pub struct SearchCandidate {
     pub unit_id: String,
     pub rrf_score: f64,
@@ -919,6 +924,53 @@ impl StorageRuntime {
             .map(|active| active.version_label.clone()))
     }
 
+    /// Capture the active search-visible cache immediately after request admission.
+    pub fn capture_search_snapshot(
+        &self,
+        operation_id: &str,
+        query_chars: usize,
+        top_k: u32,
+    ) -> Result<SearchSnapshot, ApiError> {
+        let snapshot_started = Instant::now();
+        info!(
+            event = "storage.search_snapshot.capture_started",
+            operation_id, query_chars, top_k, "search snapshot capture started"
+        );
+        let cache = match self.cache.lock().map_err(|source| {
+            storage_operation_error(format!("dense cache lock is poisoned: {source}"))
+        }) {
+            Ok(cache) => cache,
+            Err(source) => {
+                error!(
+                    event = "storage.search_snapshot.capture_failed",
+                    operation_id,
+                    query_chars,
+                    top_k,
+                    phase = "cache_lock",
+                    error = %source,
+                    elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+                    "search snapshot capture failed"
+                );
+                return Err(source);
+            }
+        };
+        let snapshot = cache.clone();
+        info!(
+            event = "storage.search_snapshot.capture_completed",
+            operation_id,
+            query_chars,
+            top_k,
+            active_sources = snapshot.active_versions.len(),
+            vectors = snapshot.unit_ids.len(),
+            dimension = snapshot.dimension,
+            memory_bytes = snapshot.memory_bytes,
+            elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+            "search snapshot capture completed"
+        );
+
+        Ok(SearchSnapshot { cache: snapshot })
+    }
+
     /// Return retained source-document versions and active-version diagnostics for admin inspection.
     pub fn list_document_versions(&self) -> Result<DocumentVersionListing, ApiError> {
         let started = Instant::now();
@@ -1596,6 +1648,7 @@ impl StorageRuntime {
         operation_id: &str,
         query: &str,
         query_vector: Vec<f32>,
+        snapshot: SearchSnapshot,
         top_k: u32,
         retrieval: &RetrievalConfig,
     ) -> Result<SearchCandidatePoolOutput, ApiError> {
@@ -1646,45 +1699,7 @@ impl StorageRuntime {
             vector_norm = query_vector.norm,
             "search query vector validation completed"
         );
-        let snapshot_started = Instant::now();
-        info!(
-            event = "storage.search_snapshot.capture_started",
-            operation_id, query_chars, top_k, "search snapshot capture started"
-        );
-        let cache_snapshot = {
-            let cache = match self.cache.lock().map_err(|source| {
-                storage_operation_error(format!("dense cache lock is poisoned: {source}"))
-            }) {
-                Ok(cache) => cache,
-                Err(source) => {
-                    error!(
-                        event = "storage.search_snapshot.capture_failed",
-                        operation_id,
-                        query_chars,
-                        top_k,
-                        phase = "cache_lock",
-                        error = %source,
-                        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
-                        "search snapshot capture failed"
-                    );
-                    return Err(source);
-                }
-            };
-            let snapshot = cache.clone();
-            info!(
-                event = "storage.search_snapshot.capture_completed",
-                operation_id,
-                query_chars,
-                top_k,
-                active_sources = snapshot.active_versions.len(),
-                vectors = snapshot.unit_ids.len(),
-                dimension = snapshot.dimension,
-                memory_bytes = snapshot.memory_bytes,
-                elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
-                "search snapshot capture completed"
-            );
-            snapshot
-        };
+        let cache_snapshot = snapshot.cache;
 
         let dense_started = Instant::now();
         info!(

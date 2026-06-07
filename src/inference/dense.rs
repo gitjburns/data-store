@@ -111,7 +111,15 @@ impl DenseEmbeddingRuntime {
             expected_dimension = self.dimension,
             "dense passage embedding started"
         );
-        let result = self.embed_passage(text);
+        let result = self.embed_passage(text).and_then(|output| {
+            validate_dense_embedding_output(
+                output,
+                "passage_embedding",
+                "passage",
+                self.dimension,
+                started_at.elapsed().as_millis() as u64,
+            )
+        });
         match &result {
             Ok(output) => {
                 info!(
@@ -164,7 +172,15 @@ impl DenseEmbeddingRuntime {
             expected_dimension = self.dimension,
             "dense query embedding started"
         );
-        let result = self.embed_query(text);
+        let result = self.embed_query(text).and_then(|output| {
+            validate_dense_embedding_output(
+                output,
+                "query_embedding",
+                "query",
+                self.dimension,
+                started_at.elapsed().as_millis() as u64,
+            )
+        });
         match &result {
             Ok(output) => {
                 info!(
@@ -237,17 +253,13 @@ impl DenseEmbeddingRuntime {
             }),
         }
         .and_then(|output| {
-            if output.vector.len() != self.dimension {
-                return Err(ApiError::InferenceInit {
-                    message: format!(
-                        "dense {input_kind} smoke embedding returned dimension {}, expected {}",
-                        output.vector.len(),
-                        self.dimension
-                    ),
-                });
-            }
-
-            Ok(output)
+            validate_dense_embedding_output(
+                output,
+                call_purpose,
+                input_kind,
+                self.dimension,
+                started_at.elapsed().as_millis() as u64,
+            )
         });
         match &result {
             Ok(output) => {
@@ -337,6 +349,68 @@ fn validate_dense_config(config: &DenseModelConfig) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+/// Validate dense model output before callers can persist or rank with it.
+fn validate_dense_embedding_output(
+    output: DenseEmbeddingOutput,
+    call_purpose: &'static str,
+    input_kind: &'static str,
+    expected_dimension: usize,
+    elapsed_ms: u64,
+) -> Result<DenseEmbeddingOutput, ApiError> {
+    let actual_dimension = output.vector.len();
+    if actual_dimension != expected_dimension {
+        return Err(dense_output_validation_error(
+            call_purpose,
+            input_kind,
+            output.token_count,
+            expected_dimension,
+            actual_dimension,
+            elapsed_ms,
+            format!("dimension mismatch: got {actual_dimension}, expected {expected_dimension}"),
+        ));
+    }
+    if output.vector.iter().any(|value| !value.is_finite()) {
+        return Err(dense_output_validation_error(
+            call_purpose,
+            input_kind,
+            output.token_count,
+            expected_dimension,
+            actual_dimension,
+            elapsed_ms,
+            "non-finite vector value".to_string(),
+        ));
+    }
+    let norm = l2_norm(&output.vector);
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(dense_output_validation_error(
+            call_purpose,
+            input_kind,
+            output.token_count,
+            expected_dimension,
+            actual_dimension,
+            elapsed_ms,
+            format!("invalid norm {norm}; expected finite nonzero norm"),
+        ));
+    }
+
+    Ok(output)
+}
+
+/// Build an inference error with the local dense output facts needed to diagnose invalid model output.
+fn dense_output_validation_error(
+    call_purpose: &'static str,
+    input_kind: &'static str,
+    token_count: usize,
+    expected_dimension: usize,
+    actual_dimension: usize,
+    elapsed_ms: u64,
+    reason: String,
+) -> ApiError {
+    inference_error(format!(
+        "dense model output validation failed: model_role=dense call_purpose={call_purpose} input_kind={input_kind} token_count={token_count} expected_dimension={expected_dimension} actual_dimension={actual_dimension} elapsed_ms={elapsed_ms} reason={reason}"
+    ))
 }
 
 /// Tokenize one string and apply explicit service-owned truncation.

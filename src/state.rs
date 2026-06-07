@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{error, info};
@@ -18,6 +21,7 @@ pub struct AppState {
     storage: Result<StorageRuntime, ApiError>,
     ingest_admission: AdmissionGate,
     search_admission: AdmissionGate,
+    model_call_gate: Arc<Semaphore>,
     admin_shutdown_token: String,
     shutdown_sender: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -25,6 +29,15 @@ pub struct AppState {
 #[derive(Debug)]
 pub struct AdmissionPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+pub struct ModelCallPermit {
+    _permit: OwnedSemaphorePermit,
+    operation_id: String,
+    model_role: &'static str,
+    call_purpose: &'static str,
+    acquired_at: Instant,
 }
 
 #[derive(Debug)]
@@ -50,6 +63,7 @@ impl AppState {
     ) -> Self {
         let ingest_admission = AdmissionGate::new(config.server.max_in_flight_ingest);
         let search_admission = AdmissionGate::new(config.server.max_in_flight_search);
+        let model_call_gate = Arc::new(Semaphore::new(1));
 
         Self {
             config,
@@ -57,6 +71,7 @@ impl AppState {
             storage,
             ingest_admission,
             search_admission,
+            model_call_gate,
             admin_shutdown_token,
             shutdown_sender: Mutex::new(Some(shutdown_sender)),
         }
@@ -88,6 +103,56 @@ impl AppState {
     /// Admit one search request without queuing when the configured concurrency budget is saturated.
     pub fn try_acquire_search_admission(&self) -> Result<AdmissionPermit, ApiError> {
         self.search_admission.try_acquire("search")
+    }
+
+    /// Wait for exclusive access to the shared accelerator-backed model runtimes.
+    pub async fn acquire_model_call_gate(
+        &self,
+        operation_id: &str,
+        model_role: &'static str,
+        call_purpose: &'static str,
+    ) -> Result<ModelCallPermit, ApiError> {
+        let wait_started = Instant::now();
+        info!(
+            event = "model_gate.waiting",
+            operation_id, model_role, call_purpose, "model execution gate wait started"
+        );
+        let permit = match self.model_call_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(source) => {
+                let error = ApiError::InferenceInit {
+                    message: format!(
+                        "model execution gate closed before {model_role} {call_purpose}: {source}"
+                    ),
+                };
+                error!(
+                    event = "model_gate.failed",
+                    operation_id,
+                    model_role,
+                    call_purpose,
+                    error = %error,
+                    wait_ms = wait_started.elapsed().as_millis() as u64,
+                    "model execution gate acquisition failed"
+                );
+                return Err(error);
+            }
+        };
+        info!(
+            event = "model_gate.acquired",
+            operation_id,
+            model_role,
+            call_purpose,
+            wait_ms = wait_started.elapsed().as_millis() as u64,
+            "model execution gate acquired"
+        );
+
+        Ok(ModelCallPermit {
+            _permit: permit,
+            operation_id: operation_id.to_string(),
+            model_role,
+            call_purpose,
+            acquired_at: Instant::now(),
+        })
     }
 
     /// Return current ingest admission counters for health and request diagnostics.
@@ -232,6 +297,20 @@ impl AppState {
             ready,
             components,
         }
+    }
+}
+
+impl Drop for ModelCallPermit {
+    /// Log the release side of the model-call boundary when the exclusive permit leaves scope.
+    fn drop(&mut self) {
+        info!(
+            event = "model_gate.released",
+            operation_id = %self.operation_id,
+            model_role = self.model_role,
+            call_purpose = self.call_purpose,
+            held_ms = self.acquired_at.elapsed().as_millis() as u64,
+            "model execution gate released"
+        );
     }
 }
 
