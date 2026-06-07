@@ -1564,7 +1564,13 @@ impl StreamRenderer {
                 )
             }
             _ => {
-                format!("[{operation_id} #{sequence}] {stage}: {message}")
+                if stage == "docling_converting"
+                    && message.starts_with("Waiting for Docling process: ")
+                {
+                    message
+                } else {
+                    format!("[{operation_id} #{sequence}] {stage}: {message}")
+                }
             }
         };
         self.render_active_line(&line)?;

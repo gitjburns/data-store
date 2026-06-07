@@ -32,9 +32,9 @@ static CONVERSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_DIAGNOSTIC_CHARS: usize = 16_000;
 const CHILD_OUTPUT_READ_CHUNK_BYTES: usize = 8_192;
 const DOCLING_WAIT_POLL_MILLIS: u64 = 250;
-const POST_100_FIRST_FEEDBACK_SECONDS: u64 = 5;
-const POST_100_FEEDBACK_CADENCE_SECONDS: u64 = 15;
-const POST_100_SAMPLE_SECONDS: u64 = 2;
+const POST_100_FIRST_FEEDBACK_SECONDS: u64 = 1;
+const POST_100_FEEDBACK_CADENCE_SECONDS: u64 = 1;
+const POST_100_SAMPLE_SECONDS: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDoclingOptions {
@@ -505,9 +505,7 @@ async fn wait_for_docling_process(
 
         let now = Instant::now();
         let snapshot = snapshot_docling_progress(&progress_state, now);
-        if should_emit_post_100_feedback(&snapshot, last_feedback_at, now)
-            && has_time_for_post_100_sample(started, timeout_duration)
-        {
+        if should_emit_post_100_feedback(&snapshot, last_feedback_at, now) {
             last_feedback_at = Some(now);
             emit_post_100_docling_feedback(
                 process_id,
@@ -783,12 +781,6 @@ fn should_emit_post_100_feedback(
         .and_then(|last_feedback_at| now.checked_duration_since(last_feedback_at))
         .map(|age| age >= Duration::from_secs(POST_100_FEEDBACK_CADENCE_SECONDS))
         .unwrap_or(true)
-}
-
-/// Avoid starting a sample when the configured document timeout is already imminent.
-fn has_time_for_post_100_sample(started: Instant, timeout_duration: Duration) -> bool {
-    timeout_duration.saturating_sub(started.elapsed())
-        > Duration::from_secs(POST_100_SAMPLE_SECONDS + 1)
 }
 
 /// Bound the latest Docling progress line before writing it to the service log.

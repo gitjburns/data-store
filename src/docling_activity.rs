@@ -75,20 +75,11 @@ pub fn format_docling_activity_message(
     _timeout_remaining: Duration,
 ) -> String {
     format!(
-        "Docling:100% cpu:{} mem:{} rss:{} thr:{} st:{} t={} omp={} pdf={} ocr={} io={} blk={} out={} files={} {}",
+        "Waiting for Docling process: cpu:{} mem:{} rss:{} thr:{} elapsed:{}",
         format_percent(report.process.cpu_percent),
         format_percent(report.process.memory_percent),
         format_bytes_option(report.process.rss_bytes),
         format_optional_u64(report.process.thread_count),
-        report.process.state.as_deref().unwrap_or("?"),
-        report.sample.tensor_frames,
-        report.sample.openmp_wait_frames,
-        report.sample.pdf_frames,
-        report.sample.ocr_image_frames,
-        report.sample.file_io_frames,
-        report.sample.blocked_wait_frames,
-        format_bytes(report.artifacts.total_bytes),
-        report.artifacts.file_count,
         format_duration(elapsed),
     )
 }
@@ -190,6 +181,10 @@ fn inspect_process_thread_count(process_id: u32) -> Option<u64> {
 
 /// Run a bounded macOS sample command and count diagnostic frame categories.
 fn sample_process_activity(process_id: u32, sample_duration: Duration) -> SampleCounters {
+    if sample_duration.is_zero() {
+        return SampleCounters::default();
+    }
+
     let report = match run_bounded_sample(process_id, sample_duration) {
         Ok(report) => report,
         Err(error) => {
@@ -455,13 +450,7 @@ fn format_bytes(bytes: u64) -> String {
 /// Format a duration for a progress line without excessive precision.
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    if seconds >= 3600 {
-        format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
-    } else if seconds >= 60 {
-        format!("{}m{}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
-    }
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// Bound diagnostic command errors included in metrics.
