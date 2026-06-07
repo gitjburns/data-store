@@ -16,7 +16,7 @@ pub struct ServiceConfig {
     pub inference: InferenceConfig,
     /// Corpus and durable index/artifact paths owned by the service.
     pub storage: StorageConfig,
-    /// Docling executable and PDF conversion defaults.
+    /// Explicit Docling executable and PDF conversion controls.
     pub docling: DoclingConfig,
     /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,

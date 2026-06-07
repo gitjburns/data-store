@@ -34,6 +34,10 @@ available and compiled into the binary through the matching Cargo feature:
 There is no automatic device fallback. If the requested accelerator cannot be
 initialized, inference readiness fails explicitly.
 
+Docling conversion runs in a separate Python CLI process. Its configured
+`[docling].device` is passed to Docling as `--device` and is independent from
+the Rust `[inference].device` used by Candle model inference.
+
 ## Configuration Ownership
 
 All operational service behavior is config-backed in the service TOML config:
@@ -44,7 +48,8 @@ All operational service behavior is config-backed in the service TOML config:
 - CLI operation-stream timeout.
 - Accelerator device kind and device index.
 - Corpus root and index root.
-- Docling executable, document timeout, and PDF conversion defaults.
+- Docling executable, document timeout, PDF backend, OCR mode, Docling device,
+  thread count, and page batch size.
 - Local model artifact paths and model shape limits.
 - Retrieval defaults, candidate-pool sizes, and unit sizing.
 
