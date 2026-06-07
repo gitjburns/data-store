@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SAMPLE_TIMEOUT_GRACE_SECONDS: u64 = 3;
+const SAMPLE_TIMEOUT_GRACE_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct DoclingActivityReport {
@@ -72,11 +72,10 @@ pub fn inspect_docling_activity(
 pub fn format_docling_activity_message(
     report: &DoclingActivityReport,
     elapsed: Duration,
-    timeout_remaining: Duration,
+    _timeout_remaining: Duration,
 ) -> String {
-    let mut message = format!(
-        "Docling still running after 100%: {}; CPU {}; mem {}; RSS {}; threads {}; state {}; sample tensor={} openmp_wait={} pdf={} ocr={} io={} blocked={}; output {} files/{}; md {}; elapsed {}; timeout {}",
-        report.activity_label,
+    format!(
+        "Docling:100% cpu:{} mem:{} rss:{} thr:{} st:{} t={} omp={} pdf={} ocr={} io={} blk={} out={} files={} {}",
         format_percent(report.process.cpu_percent),
         format_percent(report.process.memory_percent),
         format_bytes_option(report.process.rss_bytes),
@@ -88,30 +87,10 @@ pub fn format_docling_activity_message(
         report.sample.ocr_image_frames,
         report.sample.file_io_frames,
         report.sample.blocked_wait_frames,
-        report.artifacts.file_count,
         format_bytes(report.artifacts.total_bytes),
-        yes_no(report.artifacts.expected_markdown_exists),
+        report.artifacts.file_count,
         format_duration(elapsed),
-        format_duration(timeout_remaining),
-    );
-
-    if let (Some(name), Some(bytes)) = (
-        report.artifacts.largest_file_name.as_ref(),
-        report.artifacts.largest_file_bytes,
-    ) {
-        message.push_str(&format!("; largest {} {}", name, format_bytes(bytes)));
-    }
-    if report.sample.unavailable_reason.is_some() {
-        message.push_str("; sample unavailable");
-    }
-    if report.process.error.is_some() {
-        message.push_str("; ps unavailable");
-    }
-    if report.artifacts.error.is_some() {
-        message.push_str("; artifact scan incomplete");
-    }
-
-    message
+    )
 }
 
 /// Read cheap process metrics from the platform process table.
@@ -121,61 +100,45 @@ fn inspect_process_metrics(process_id: u32) -> ProcessMetrics {
             "-p",
             &process_id.to_string(),
             "-o",
-            "stat=,%cpu=,%mem=,rss=,thcount=",
+            "stat=,%cpu=,%mem=,rss=",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
     let output = match output {
         Ok(output) if output.status.success() => output,
-        Ok(primary_output) => {
-            let fallback = Command::new("ps")
-                .args([
-                    "-p",
-                    &process_id.to_string(),
-                    "-o",
-                    "stat=,%cpu=,%mem=,rss=",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            match fallback {
-                Ok(output) if output.status.success() => output,
-                Ok(output) => {
-                    return ProcessMetrics {
-                        error: Some(format!(
-                            "ps failed: primary_status={}; fallback_status={}; stderr={}",
-                            primary_output.status,
-                            output.status,
-                            truncate_for_metric(&String::from_utf8_lossy(&output.stderr))
-                        )),
-                        ..ProcessMetrics::default()
-                    };
-                }
-                Err(error) => {
-                    return ProcessMetrics {
-                        error: Some(format!("ps failed: {error}")),
-                        ..ProcessMetrics::default()
-                    };
-                }
-            }
+        Ok(output) => {
+            return ProcessMetrics {
+                error: Some(format!(
+                    "ps failed: status={}; stderr={}",
+                    output.status,
+                    truncate_for_metric(&String::from_utf8_lossy(&output.stderr))
+                )),
+                thread_count: inspect_process_thread_count(process_id),
+                ..ProcessMetrics::default()
+            };
         }
         Err(error) => {
             return ProcessMetrics {
                 error: Some(format!("ps failed: {error}")),
+                thread_count: inspect_process_thread_count(process_id),
                 ..ProcessMetrics::default()
             };
         }
     };
-    parse_process_metrics(&String::from_utf8_lossy(&output.stdout))
+    parse_process_metrics(
+        &String::from_utf8_lossy(&output.stdout),
+        inspect_process_thread_count(process_id),
+    )
 }
 
 /// Parse the whitespace-delimited ps output emitted by inspect_process_metrics.
-fn parse_process_metrics(output: &str) -> ProcessMetrics {
+fn parse_process_metrics(output: &str, thread_count: Option<u64>) -> ProcessMetrics {
     let fields = output.split_whitespace().collect::<Vec<_>>();
     if fields.len() < 4 {
         return ProcessMetrics {
             error: Some("ps output did not include expected fields".to_string()),
+            thread_count,
             ..ProcessMetrics::default()
         };
     }
@@ -188,9 +151,41 @@ fn parse_process_metrics(output: &str) -> ProcessMetrics {
             .get(3)
             .and_then(|value| value.parse::<u64>().ok())
             .map(|kilobytes| kilobytes.saturating_mul(1024)),
-        thread_count: fields.get(4).and_then(|value| value.parse::<u64>().ok()),
+        thread_count,
         error: None,
     }
+}
+
+/// Count macOS process threads from ps -M output when direct ps fields are unavailable.
+fn inspect_process_thread_count(process_id: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-M", "-p", &process_id.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let process_id_text = process_id.to_string();
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .map(|field| field == process_id_text)
+                .unwrap_or(false)
+                || fields
+                    .next()
+                    .map(|field| field == process_id_text)
+                    .unwrap_or(false)
+        })
+        .count();
+
+    u64::try_from(count).ok().filter(|count| *count > 0)
 }
 
 /// Run a bounded macOS sample command and count diagnostic frame categories.
@@ -467,11 +462,6 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-/// Render a boolean as a short operator-facing value.
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
 }
 
 /// Bound diagnostic command errors included in metrics.

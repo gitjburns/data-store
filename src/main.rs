@@ -49,7 +49,7 @@ enum ServiceProcessRole {
 
 enum StartupReporter {
     Stdout {
-        progress_active: bool,
+        active_progress_chars: usize,
         started_at: Instant,
     },
     Pipe {
@@ -146,11 +146,12 @@ impl StartupReporter {
     fn write_status_line(&mut self, message: &str) -> Result<(), ApiError> {
         match self {
             Self::Stdout {
-                progress_active, ..
+                active_progress_chars,
+                ..
             } => {
-                if *progress_active {
+                if *active_progress_chars > 0 {
                     println!();
-                    *progress_active = false;
+                    *active_progress_chars = 0;
                 }
                 println!("{message}");
                 std::io::stdout()
@@ -177,15 +178,11 @@ impl StartupReporter {
         let message = message.as_ref();
         match self {
             Self::Stdout {
-                progress_active, ..
+                active_progress_chars,
+                ..
             } => {
-                print!("\r\u{1b}[2K{message}");
-                *progress_active = true;
-                std::io::stdout()
-                    .flush()
-                    .map_err(|source| ApiError::InternalIo {
-                        message: format!("failed to flush startup progress stdout: {source}"),
-                    })?;
+                *active_progress_chars =
+                    write_active_terminal_line(message, *active_progress_chars)?;
             }
             Self::Pipe { stream, .. } => {
                 writeln!(stream, "{STARTUP_PROGRESS_PREFIX}{message}").map_err(|source| {
@@ -213,9 +210,10 @@ impl StartupReporter {
     /// Close the startup handoff channel so the background parent can exit.
     fn close(self) {
         if let Self::Stdout {
-            progress_active: true,
+            active_progress_chars,
             ..
         } = self
+            && active_progress_chars > 0
         {
             println!();
         }
@@ -747,7 +745,7 @@ fn enter_service_process(foreground: bool) -> Result<ServiceProcessRole, ApiErro
     if foreground {
         println!("data-store bootstrap mode=foreground");
         return Ok(ServiceProcessRole::Service(StartupReporter::Stdout {
-            progress_active: false,
+            active_progress_chars: 0,
             started_at: Instant::now(),
         }));
     }
@@ -975,7 +973,7 @@ fn relay_startup_status(stream: UnixStream) -> Result<StartupRelayOutcome, ApiEr
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut startup_failed = false;
-    let mut progress_active = false;
+    let mut active_progress_chars = 0_usize;
     let mut last_status_line = None;
     let mut last_progress_line = None;
     loop {
@@ -1007,18 +1005,12 @@ fn relay_startup_status(stream: UnixStream) -> Result<StartupRelayOutcome, ApiEr
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "startup progress relayed from background child"
             );
-            print!("\r\u{1b}[2K{progress}");
-            std::io::stdout()
-                .flush()
-                .map_err(|source| ApiError::InternalIo {
-                    message: format!("failed to flush startup progress stdout: {source}"),
-                })?;
-            progress_active = true;
+            active_progress_chars = write_active_terminal_line(progress, active_progress_chars)?;
             continue;
         }
-        if progress_active {
+        if active_progress_chars > 0 {
             println!();
-            progress_active = false;
+            active_progress_chars = 0;
         }
         let status = line.trim_end_matches(['\r', '\n']);
         last_status_line = Some(sanitize_startup_line(status));
@@ -1056,7 +1048,7 @@ fn relay_startup_status(stream: UnixStream) -> Result<StartupRelayOutcome, ApiEr
                 message: format!("failed to flush startup status stdout: {source}"),
             })?;
     }
-    if progress_active {
+    if active_progress_chars > 0 {
         println!();
     }
     info!(
@@ -1112,6 +1104,20 @@ fn uses_count_progress(message: &str) -> bool {
             && current.chars().all(|value| value.is_ascii_digit())
             && total.chars().all(|value| value.is_ascii_digit())
     })
+}
+
+/// Write one terminal active line and pad over remnants from the previous active line.
+fn write_active_terminal_line(message: &str, previous_chars: usize) -> Result<usize, ApiError> {
+    let message_chars = message.chars().count();
+    let padding = " ".repeat(previous_chars.saturating_sub(message_chars));
+    print!("\r{message}{padding}");
+    std::io::stdout()
+        .flush()
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("failed to flush active terminal line stdout: {source}"),
+        })?;
+
+    Ok(message_chars)
 }
 
 /// Extract a compact startup stage label from the existing operator-facing startup text.

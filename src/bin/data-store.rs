@@ -493,7 +493,7 @@ enum HealthProbeOutcome {
 }
 
 struct StreamRenderer {
-    active_line: bool,
+    active_line_chars: usize,
 }
 
 impl Display for AmbiguousStreamLossError {
@@ -1513,7 +1513,9 @@ fn source_already_ingested_message(error: &ErrorDetail) -> Option<&str> {
 impl StreamRenderer {
     /// Create a renderer that tracks whether the terminal cursor is on an overwritten progress line.
     fn new() -> Self {
-        Self { active_line: false }
+        Self {
+            active_line_chars: 0,
+        }
     }
 
     /// Render one status event as the active in-place stage line.
@@ -1571,22 +1573,24 @@ impl StreamRenderer {
 
     /// Write one complete terminal line in place without advancing to the next line.
     fn render_active_line(&mut self, line: &str) -> Result<()> {
-        print!("\r\x1b[2K{line}");
+        let line_chars = line.chars().count();
+        let padding = " ".repeat(self.active_line_chars.saturating_sub(line_chars));
+        print!("\r{line}{padding}");
         io::stdout()
             .flush()
             .context("failed to flush progress line")?;
-        self.active_line = true;
+        self.active_line_chars = line_chars;
         Ok(())
     }
 
     /// Finish an overwritten progress line before printing normal output.
     fn finish_progress_line(&mut self) -> Result<()> {
-        if self.active_line {
+        if self.active_line_chars > 0 {
             println!();
             io::stdout()
                 .flush()
                 .context("failed to flush completed progress line")?;
-            self.active_line = false;
+            self.active_line_chars = 0;
         }
         Ok(())
     }
