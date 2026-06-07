@@ -1,5 +1,6 @@
 mod config;
 mod docling;
+mod docling_activity;
 mod error;
 mod http;
 mod inference;
