@@ -22,6 +22,7 @@ const OPERATIONS_PATH: &str = "/v1/operations";
 const HEALTH_PATH: &str = "/v1/health";
 const HEALTH_PROBE_TIMEOUT_SECONDS: u64 = 5;
 const SHUTDOWN_STATUS_COMPLETE: &str = "shutdown_complete";
+const SOURCE_ALREADY_INGESTED_ERROR_KIND: &str = "source_already_ingested";
 
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
@@ -60,6 +61,7 @@ enum Command {
     Limits,
     Ingest {
         source: String,
+        force: bool,
     },
     Search {
         query: String,
@@ -81,8 +83,8 @@ enum Command {
 
 /// Construct a typed command when the registry says the command accepts no arguments.
 type NoArgCommandBuilder = fn() -> Command;
-/// Construct a typed command when the registry says the command accepts one value.
-type OneValueCommandBuilder = fn(String) -> Command;
+/// Construct a typed ingest command after parsing the source and optional force flag.
+type IngestCommandBuilder = fn(String, bool) -> Command;
 /// Construct a typed command when the registry says the command accepts two values.
 type TwoValueCommandBuilder = fn(String, String) -> Command;
 /// Construct a typed search command after parsing the optional topK value.
@@ -92,11 +94,8 @@ type SearchCommandBuilder = fn(String, Option<u32>) -> Command;
 enum CommandArguments {
     /// The command accepts no positional values in either REPL or CLI form.
     NoArgs { build: NoArgCommandBuilder },
-    /// The command accepts one required value, such as an ingest source path.
-    OneValue {
-        value_name: &'static str,
-        build: OneValueCommandBuilder,
-    },
+    /// Ingest accepts one required source plus an optional `--force` flag.
+    Ingest { build: IngestCommandBuilder },
     /// The command accepts two required values, such as rollback source and version label.
     TwoValues {
         first_value_name: &'static str,
@@ -156,10 +155,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_aliases: &[],
         cli_flag: Some("--ingest"),
         cli_aliases: &[],
-        repl_usage: "ingest <source>",
-        cli_usage: Some("data-store [--config <path>] --ingest <source>"),
-        arguments: CommandArguments::OneValue {
-            value_name: "source",
+        repl_usage: "ingest <source> [--force]",
+        cli_usage: Some("data-store [--config <path>] --ingest <source> [--force]"),
+        arguments: CommandArguments::Ingest {
             build: build_ingest_command,
         },
     },
@@ -294,6 +292,8 @@ struct RetrievalLimitsResponse {
 #[derive(Debug, Serialize)]
 struct IngestRequest {
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,9 +629,12 @@ fn parse_repl_command(spec: &CommandSpec, args: &[String]) -> Result<Command> {
             require_repl_arg_count(spec, args, 0)?;
             Ok(build())
         }
-        CommandArguments::OneValue { build, .. } => {
-            require_repl_arg_count(spec, args, 1)?;
-            Ok(build(args[0].clone()))
+        CommandArguments::Ingest { build } => {
+            if args.len() != 1 && args.len() != 2 {
+                bail!("usage: {}", spec.repl_usage);
+            }
+            let force = parse_optional_ingest_force(args.get(1), spec.repl_usage)?;
+            Ok(build(args[0].clone(), force))
         }
         CommandArguments::TwoValues { build, .. } => {
             require_repl_arg_count(spec, args, 2)?;
@@ -655,11 +658,10 @@ fn parse_cli_command(spec: &CommandSpec, args: &[String], index: &mut usize) -> 
     *index += 1;
     match spec.arguments {
         CommandArguments::NoArgs { build } => Ok(build()),
-        CommandArguments::OneValue {
-            value_name, build, ..
-        } => {
-            let value = take_cli_command_value(spec, args, index, value_name)?;
-            Ok(build(value))
+        CommandArguments::Ingest { build } => {
+            let source = take_cli_ingest_source_value(spec, args, index)?;
+            let force = take_optional_cli_ingest_force(spec, args, index)?;
+            Ok(build(source, force))
         }
         CommandArguments::TwoValues {
             first_value_name,
@@ -710,6 +712,28 @@ fn take_cli_command_value(
     Ok(value.clone())
 }
 
+/// Take ingest's required source while reserving `--force` for the optional flag position.
+fn take_cli_ingest_source_value(
+    spec: &CommandSpec,
+    args: &[String],
+    index: &mut usize,
+) -> Result<String> {
+    let Some(value) = args.get(*index) else {
+        bail!(
+            "{} requires a source",
+            spec.cli_flag.unwrap_or(spec.repl_name)
+        );
+    };
+    if is_startup_flag(value) || value == "--force" {
+        bail!(
+            "{} requires a source",
+            spec.cli_flag.unwrap_or(spec.repl_name)
+        );
+    }
+    *index += 1;
+    Ok(value.clone())
+}
+
 /// Parse search's optional command-line `topK` while leaving the next flag untouched.
 fn take_optional_cli_top_k(args: &[String], index: &mut usize) -> Result<Option<u32>> {
     let Some(value) = args.get(*index) else {
@@ -721,6 +745,38 @@ fn take_optional_cli_top_k(args: &[String], index: &mut usize) -> Result<Option<
     let top_k = parse_top_k(value)?;
     *index += 1;
     Ok(Some(top_k))
+}
+
+/// Parse ingest's optional REPL force flag without accepting unrelated trailing values.
+fn parse_optional_ingest_force(value: Option<&String>, usage: &str) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value == "--force" {
+        return Ok(true);
+    }
+
+    bail!("usage: {usage}");
+}
+
+/// Parse ingest's optional command-line force flag while leaving later startup flags untouched.
+fn take_optional_cli_ingest_force(
+    spec: &CommandSpec,
+    args: &[String],
+    index: &mut usize,
+) -> Result<bool> {
+    let Some(value) = args.get(*index) else {
+        return Ok(false);
+    };
+    if is_startup_flag(value) {
+        return Ok(false);
+    }
+    if value == "--force" {
+        *index += 1;
+        return Ok(true);
+    }
+
+    bail!("usage: {}", spec.cli_usage.unwrap_or(spec.repl_usage));
 }
 
 /// Parse a user-provided `topK` value without imposing server-owned range validation.
@@ -740,9 +796,9 @@ fn build_limits_command() -> Command {
     Command::Limits
 }
 
-/// Build the typed ingest command after shared parsing has captured the source path.
-fn build_ingest_command(source: String) -> Command {
-    Command::Ingest { source }
+/// Build the typed ingest command after shared parsing has captured the source and force flag.
+fn build_ingest_command(source: String, force: bool) -> Command {
+    Command::Ingest { source, force }
 }
 
 /// Build the excerpted search command after shared parsing has captured query and topK.
@@ -963,8 +1019,11 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
         Command::Limits => {
             render_limits(send_operation(context, "limits", empty_payload(), false)?)
         }
-        Command::Ingest { source } => {
-            let request = IngestRequest { source };
+        Command::Ingest { source, force } => {
+            let request = IngestRequest {
+                source,
+                force: force.then_some(true),
+            };
             render_ingest(send_operation(
                 context,
                 "ingest",
@@ -1383,6 +1442,9 @@ fn url(context: &ClientContext, path: &str) -> String {
 /// Convert a non-success HTTP response into an operator-facing error.
 fn service_error(method: &str, target_url: &str, status: StatusCode, text: &str) -> anyhow::Error {
     if let Ok(body) = serde_json::from_str::<ErrorBody>(text) {
+        if let Some(message) = source_already_ingested_message(&body.error) {
+            return anyhow!("{message}");
+        }
         return anyhow!(
             "{} {} HTTP {}: {}",
             method,
@@ -1417,6 +1479,9 @@ fn operation_error(
     stage: Option<&str>,
     error: &ErrorDetail,
 ) -> anyhow::Error {
+    if let Some(message) = source_already_ingested_message(error) {
+        return anyhow!("{message}");
+    }
     let stage = stage.unwrap_or("unknown");
     anyhow!(
         "operation `{operation}` failed: operationId={operation_id} sequence={sequence} stage={stage} {}",
@@ -1434,6 +1499,15 @@ fn format_error_detail(error: &ErrorDetail) -> String {
         (None, Some(kind)) => format!("kind={kind} message={}", error.message),
         (None, None) => error.message.clone(),
     }
+}
+
+/// Return the duplicate-ingest message when the service marks the error with the stable kind.
+fn source_already_ingested_message(error: &ErrorDetail) -> Option<&str> {
+    if error.kind.as_deref() == Some(SOURCE_ALREADY_INGESTED_ERROR_KIND) {
+        return Some(error.message.as_str());
+    }
+
+    None
 }
 
 impl StreamRenderer {

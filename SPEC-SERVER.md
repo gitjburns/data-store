@@ -89,10 +89,13 @@ Version rules:
 - Every successful ingest creates a new immutable source-document version.
 - `versionLabel` is a self-documenting timestamp scoped to the source document,
   such as `2026-06-01T21:37:22.184Z`.
-- Re-ingesting a source document never overwrites or deletes older versions.
+- Ingesting an already-active source without `force: true` fails with
+  `409 Conflict`.
+- Force re-ingesting a source document never overwrites or deletes older
+  versions.
 - First-time ingests remain invisible to search until publish completes.
-- Re-ingests keep the previously active version searchable until the new version
-  publishes.
+- Force re-ingests keep the previously active version searchable until the new
+  version publishes.
 
 Dense search cache:
 
@@ -242,13 +245,19 @@ Payload:
 
 ```json
 {
-  "source": "The_Elements_of_Style.pdf"
+  "source": "The_Elements_of_Style.pdf",
+  "force": true
 }
 ```
 
+If `force` is absent or `false` and the resolved source already has an active
+version, the operation must abort before conversion with terminal error
+`status: 409`, `kind: "source_already_ingested"`, and message
+`Source <source> is already ingested. Use --force to override.`
+
 The operation must emit real server-side status/progress events for source
-resolution, conversion, unit splitting, dense embedding, ColBERT embedding, and
-storage publish.
+resolution, existing-source checking, conversion, unit splitting, dense
+embedding, ColBERT embedding, and storage publish.
 
 Result payload:
 
@@ -410,6 +419,7 @@ Required behavior:
 - Unknown request fields and invalid request fields fail with `400 Bad Request`.
 - Missing or invalid bearer auth for protected operations fails with `401
   Unauthorized`.
+- Duplicate ingest without `force: true` fails with `409 Conflict`.
 - Conversion failures fail with useful diagnostics and no silent fallback.
 - Inference, storage, and internal failures include enough context for an
   operator to identify the failing subsystem.

@@ -47,6 +47,9 @@ pub struct RetrievalLimitsResponse {
 #[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     pub source: String,
+
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +215,11 @@ impl IngestRequest {
         }
 
         Ok(())
+    }
+
+    /// Return whether the caller explicitly requested a replacement ingest.
+    pub fn force_enabled(&self) -> bool {
+        self.force
     }
 }
 

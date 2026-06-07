@@ -145,6 +145,7 @@ For non-interactive use, pass exactly one operation flag:
 ./target/release/data-store --config config.toml --health
 ./target/release/data-store --config config.toml --limits
 ./target/release/data-store --config config.toml --ingest The_Elements_of_Style.pdf
+./target/release/data-store --config config.toml --ingest The_Elements_of_Style.pdf --force
 ./target/release/data-store --config config.toml --search "clear writing style rules" 3
 ./target/release/data-store --config config.toml --search-full "clear writing style rules" 3
 ./target/release/data-store --config config.toml --versions
@@ -176,6 +177,7 @@ Common commands:
 data-store> health
 data-store> limits
 data-store> ingest The_Elements_of_Style.pdf
+data-store> ingest The_Elements_of_Style.pdf --force
 data-store> search "clear writing style rules" 3
 data-store> search-full "clear writing style rules" 3
 data-store> versions
@@ -273,6 +275,17 @@ curl -N -X POST \
 A successful ingest creates a new immutable source-document version, persists
 units and vectors, updates the active-version map, and publishes a new active
 search snapshot only after the new version is durable and cache-ready.
+If the resolved source already has an active version, ingest aborts before
+conversion unless the request includes `force: true`. The CLI and REPL expose
+that override as `--force`.
+
+```bash
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -d '{"operation":"ingest","payload":{"source":"The_Elements_of_Style.pdf","force":true}}' \
+  http://127.0.0.1:8091/v1/operations
+```
 
 PDF conversion progress comes from Docling stderr progress lines when Docling
 emits them. The service passes `[docling].document_timeout_seconds` to Docling

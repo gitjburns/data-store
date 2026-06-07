@@ -903,6 +903,22 @@ impl StorageRuntime {
         }
     }
 
+    /// Return the active version label for a source path when the source is currently searchable.
+    pub fn active_version_for_source(&self, source_path: &str) -> Result<Option<String>, ApiError> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|source| ApiError::StorageOperation {
+                message: format!("dense cache lock is poisoned: {source}"),
+            })?;
+
+        Ok(cache
+            .active_versions
+            .iter()
+            .find(|active| active.source_path == source_path)
+            .map(|active| active.version_label.clone()))
+    }
+
     /// Return retained source-document versions and active-version diagnostics for admin inspection.
     pub fn list_document_versions(&self) -> Result<DocumentVersionListing, ApiError> {
         let started = Instant::now();

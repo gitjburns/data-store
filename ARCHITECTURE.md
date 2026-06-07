@@ -129,10 +129,12 @@ and domain-specific invariants.
 Every successful ingest creates a new immutable version for one corpus-relative
 source document. `versionLabel` is a source-document-scoped timestamp string.
 
-Older versions are retained. Re-ingest never overwrites or deletes a previous
-version. First-time ingest remains invisible to search until the new version is
-fully durable and cache-ready. Re-ingest keeps the previously active version
-searchable until publish completes.
+Older versions are retained. By default, ingest aborts when the resolved source
+already has an active version; callers must set `force: true` to create and
+publish a replacement version. Force re-ingest never overwrites or deletes a
+previous version. First-time ingest remains invisible to search until the new
+version is fully durable and cache-ready. Force re-ingest keeps the previously
+active version searchable until publish completes.
 
 Publishing a version updates `active_document_versions` and swaps the active
 in-memory dense cache snapshot after durable writes and cache preparation have

@@ -196,11 +196,13 @@ async fn post_ingest(
         }
     };
     let requested_source = request.source.clone();
+    let force_requested = request.force_enabled();
     info!(
         event = "http.route.request_decoded",
         route = "/v1/ingest",
         stage = "request_decoded",
         requested_source = %requested_source,
+        force = force_requested,
         source_chars = requested_source.chars().count(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "HTTP route request decoded"
@@ -236,12 +238,14 @@ async fn execute_ingest(
 ) -> Result<IngestResponse, ApiError> {
     let started = Instant::now();
     let requested_source = request.source.clone();
+    let force_requested = request.force_enabled();
     let operation_id = operation_id_for_log(&emitter);
     if let Err(source) = request.validate(state.config.server.max_ingest_source_chars) {
         info!(
             event = "ingest.validation_failed",
             operation_id = %operation_id,
             requested_source = %requested_source,
+            force = force_requested,
             rejected_field = "source",
             max_ingest_source_chars = state.config.server.max_ingest_source_chars,
             source_chars = requested_source.chars().count(),
@@ -274,6 +278,7 @@ async fn execute_ingest(
         event = "ingest.admitted",
         operation_id = %operation_id,
         requested_source = %requested_source,
+        force = force_requested,
         in_flight = admission.in_flight,
         max_in_flight = admission.max_in_flight,
         "ingest request admitted"
@@ -320,6 +325,84 @@ async fn execute_ingest(
         elapsed_ms = source_resolution_latency_ms,
         "ingest source resolution completed"
     );
+    let source_path = source.relative_path.display().to_string();
+    let duplicate_check_started = Instant::now();
+    emit_operation_status(
+        &mut emitter,
+        "existing_source_checking",
+        "checking existing source version",
+    )
+    .await?;
+    info!(
+        event = "ingest.existing_source_check.started",
+        operation_id = %operation_id,
+        requested_source = %requested_source,
+        source_path,
+        force = force_requested,
+        "ingest existing-source check started"
+    );
+    let active_version = match state.storage()?.active_version_for_source(&source_path) {
+        Ok(version) => version,
+        Err(source) => {
+            error!(
+                event = "ingest.existing_source_check.failed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                source_path,
+                force = force_requested,
+                error = %source,
+                elapsed_ms = duplicate_check_started.elapsed().as_millis() as u64,
+                "ingest existing-source check failed"
+            );
+            return Err(source);
+        }
+    };
+    match active_version {
+        Some(active_version_label) if !force_requested => {
+            let error = ApiError::SourceAlreadyIngested {
+                message: format!(
+                    "Source {source_path} is already ingested. Use --force to override."
+                ),
+            };
+            warn!(
+                event = "ingest.existing_source_check.rejected",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                source_path,
+                active_version_label,
+                force = force_requested,
+                status = error.status_code().as_u16(),
+                error_kind = error.error_kind(),
+                error = %error,
+                elapsed_ms = duplicate_check_started.elapsed().as_millis() as u64,
+                "ingest existing source rejected"
+            );
+            return Err(error);
+        }
+        Some(active_version_label) => {
+            info!(
+                event = "ingest.existing_source_check.override_allowed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                source_path,
+                active_version_label,
+                force = force_requested,
+                elapsed_ms = duplicate_check_started.elapsed().as_millis() as u64,
+                "ingest existing source force override allowed"
+            );
+        }
+        None => {
+            info!(
+                event = "ingest.existing_source_check.completed",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                source_path,
+                force = force_requested,
+                elapsed_ms = duplicate_check_started.elapsed().as_millis() as u64,
+                "ingest existing-source check completed"
+            );
+        }
+    }
     let conversion_started = Instant::now();
     emit_operation_status(
         &mut emitter,

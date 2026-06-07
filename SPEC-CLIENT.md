@@ -180,7 +180,7 @@ Supported operation flags:
 ```bash
 data-store [--config <path>] --health
 data-store [--config <path>] --limits
-data-store [--config <path>] --ingest <source>
+data-store [--config <path>] --ingest <source> [--force]
 data-store [--config <path>] --search <query> [topK]
 data-store [--config <path>] --search-full <query> [topK]
 data-store [--config <path>] --versions
@@ -215,6 +215,7 @@ Examples:
 ```text
 search "clear writing style rules" 3
 ingest The_Elements_of_Style.pdf
+ingest The_Elements_of_Style.pdf --force
 rollback The_Elements_of_Style.pdf 2026-06-01T21:37:22.184Z
 ```
 
@@ -254,7 +255,7 @@ Payload:
 
 Output: labeled request and retrieval limits.
 
-### `ingest <source>` / `--ingest <source>`
+### `ingest <source> [--force]` / `--ingest <source> [--force]`
 
 Operation: `ingest`
 
@@ -264,12 +265,18 @@ Payload:
 
 ```json
 {
-  "source": "<source>"
+  "source": "<source>",
+  "force": true
 }
 ```
 
 Output: streamed operation status and progress, followed by document ID,
 version label, units ingested, and status.
+
+The client sends `force: true` only when `--force` is provided.
+When `--force` is omitted and the service returns
+`kind: "source_already_ingested"`, output the service message:
+`Source <source> is already ingested. Use --force to override.`
 
 ### `search <query> [topK]` / `--search <query> [topK]`
 

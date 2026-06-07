@@ -183,6 +183,7 @@ Common operation error statuses:
 | Status | Meaning |
 |---:|---|
 | 400 | Invalid payload shape, unknown field, oversized field, invalid field value, or invalid rollback target. |
+| 409 | Ingest source already has an active version and the request did not set `force: true`. |
 | 413 | Request body exceeds `request.maxRequestBodyBytes`. |
 | 422 | Source conversion failed. |
 | 500 | Configuration, inference, storage, or internal operation failure. |
@@ -289,7 +290,8 @@ Payload:
 
 ```json
 {
-  "source": "The_Elements_of_Style.pdf"
+  "source": "The_Elements_of_Style.pdf",
+  "force": true
 }
 ```
 
@@ -298,22 +300,24 @@ Payload fields:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `source` | string | yes | Non-empty corpus-relative source reference. Must not exceed `maxIngestSourceChars`. |
+| `force` | boolean | no | Defaults to `false`. When `true`, ingest creates and publishes a new immutable version even if the source already has an active version. |
 
 Representative event sequence:
 
 ```json
 {"type":"status","operationId":"op-1","sequence":1,"stage":"source_resolving","message":"resolving source reference"}
-{"type":"status","operationId":"op-1","sequence":2,"stage":"docling_converting","message":"converting source document"}
-{"type":"progress","operationId":"op-1","sequence":3,"stage":"docling_converting","message":"converting source document","current":42,"total":100}
-{"type":"status","operationId":"op-1","sequence":4,"stage":"unit_splitting","message":"splitting document into retrieval units"}
-{"type":"progress","operationId":"op-1","sequence":5,"stage":"unit_splitting","message":"retrieval units ready","current":43,"total":43}
-{"type":"status","operationId":"op-1","sequence":6,"stage":"dense_embedding","message":"embedding document units"}
-{"type":"progress","operationId":"op-1","sequence":7,"stage":"dense_embedding","message":"embedding document units","current":12,"total":43}
-{"type":"status","operationId":"op-1","sequence":8,"stage":"colbert_embedding","message":"embedding ColBERT document vectors"}
-{"type":"progress","operationId":"op-1","sequence":9,"stage":"colbert_embedding","message":"embedding ColBERT document vectors","current":12,"total":43}
-{"type":"status","operationId":"op-1","sequence":10,"stage":"storage_publishing","message":"publishing document version"}
-{"type":"progress","operationId":"op-1","sequence":11,"stage":"storage_publishing","message":"persisting units and vectors","current":12,"total":43}
-{"type":"progress","operationId":"op-1","sequence":12,"stage":"storage_publishing","message":"publishing active search snapshot","current":1,"total":1}
+{"type":"status","operationId":"op-1","sequence":2,"stage":"existing_source_checking","message":"checking existing source version"}
+{"type":"status","operationId":"op-1","sequence":3,"stage":"docling_converting","message":"converting source document"}
+{"type":"progress","operationId":"op-1","sequence":4,"stage":"docling_converting","message":"converting source document","current":42,"total":100}
+{"type":"status","operationId":"op-1","sequence":5,"stage":"unit_splitting","message":"splitting document into retrieval units"}
+{"type":"progress","operationId":"op-1","sequence":6,"stage":"unit_splitting","message":"retrieval units ready","current":43,"total":43}
+{"type":"status","operationId":"op-1","sequence":7,"stage":"dense_embedding","message":"embedding document units"}
+{"type":"progress","operationId":"op-1","sequence":8,"stage":"dense_embedding","message":"embedding document units","current":12,"total":43}
+{"type":"status","operationId":"op-1","sequence":9,"stage":"colbert_embedding","message":"embedding ColBERT document vectors"}
+{"type":"progress","operationId":"op-1","sequence":10,"stage":"colbert_embedding","message":"embedding ColBERT document vectors","current":12,"total":43}
+{"type":"status","operationId":"op-1","sequence":11,"stage":"storage_publishing","message":"publishing document version"}
+{"type":"progress","operationId":"op-1","sequence":12,"stage":"storage_publishing","message":"persisting units and vectors","current":12,"total":43}
+{"type":"progress","operationId":"op-1","sequence":13,"stage":"storage_publishing","message":"publishing active search snapshot","current":1,"total":1}
 ```
 
 Result payload:
@@ -330,9 +334,15 @@ Result payload:
 Ingest semantics:
 
 - Every successful ingest creates a new immutable source-document version.
+- If the resolved source already has an active version and `force` is absent or
+  `false`, the service aborts before conversion with a terminal error:
+  `status: 409`, `kind: "source_already_ingested"`, and stable message
+  `Source <source> is already ingested. Use --force to override.`
+- If `force` is `true`, the service permits re-ingest and publishes the new
+  immutable version after the normal storage/cache publish boundary.
 - The new version becomes search-visible only after storage and cache publish
   complete.
-- Re-ingesting a source does not delete older versions.
+- Force re-ingesting a source does not delete older versions.
 - Existing active versions remain searchable until the new version publishes.
 - Conversion options are service-configured; callers cannot override Docling
   backend, OCR mode, page batch size, or document timeout per request.

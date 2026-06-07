@@ -54,6 +54,9 @@ pub enum ApiError {
     BadRequest { message: String },
 
     #[error("{message}")]
+    SourceAlreadyIngested { message: String },
+
+    #[error("{message}")]
     PayloadTooLarge { message: String },
 
     #[error("{message}")]
@@ -82,6 +85,7 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
+            Self::SourceAlreadyIngested { .. } => StatusCode::CONFLICT,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -115,6 +119,7 @@ impl ApiError {
             Self::StorageInit { .. } => "storage_init",
             Self::StorageOperation { .. } => "storage_operation",
             Self::BadRequest { .. } => "bad_request",
+            Self::SourceAlreadyIngested { .. } => "source_already_ingested",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::Unauthorized { .. } => "unauthorized",
             Self::ServiceUnavailable { .. } => "service_unavailable",
