@@ -40,7 +40,9 @@ const POST_100_SAMPLE_SECONDS: u64 = 0;
 pub struct ResolvedDoclingOptions {
     pub pdf_backend: String,
     pub ocr_mode: String,
-    pub page_batch_size: Option<u32>,
+    pub device: String,
+    pub num_threads: u32,
+    pub page_batch_size: u32,
     pub document_timeout_seconds: u64,
 }
 
@@ -145,20 +147,24 @@ pub async fn convert_source_to_markdown(
 
 /// Resolve service-configured Docling options for one conversion attempt.
 fn resolve_docling_options(config: &DoclingConfig) -> Result<ResolvedDoclingOptions, ApiError> {
-    let pdf_backend = config.default_pdf_backend.trim().to_string();
-    let ocr_mode = config.default_ocr_mode.trim().to_string();
+    let pdf_backend = config.pdf_backend.trim().to_string();
+    let ocr_mode = config.ocr_mode.trim().to_string();
+    let device = config.device.trim().to_string();
+    let num_threads = config.num_threads;
     let page_batch_size = config.page_batch_size;
     let document_timeout_seconds = config.document_timeout_seconds;
 
     if !matches!(ocr_mode.as_str(), "auto" | "on" | "off") {
         return Err(ApiError::DoclingConversion {
-            message: "docling.default_ocr_mode must be one of auto, on, or off".to_string(),
+            message: "docling.ocr_mode must be one of auto, on, or off".to_string(),
         });
     }
 
     Ok(ResolvedDoclingOptions {
         pdf_backend,
         ocr_mode,
+        device,
+        num_threads,
         page_batch_size,
         document_timeout_seconds,
     })
@@ -210,6 +216,10 @@ fn build_docling_args(
         options.pdf_backend.clone(),
         "--document-timeout".to_string(),
         options.document_timeout_seconds.to_string(),
+        "--device".to_string(),
+        options.device.clone(),
+        "--num-threads".to_string(),
+        options.num_threads.to_string(),
     ];
 
     if options.ocr_mode == "on" {
@@ -218,10 +228,8 @@ fn build_docling_args(
     if options.ocr_mode == "off" {
         args.push("--no-ocr".to_string());
     }
-    if let Some(page_batch_size) = options.page_batch_size {
-        args.push("--page-batch-size".to_string());
-        args.push(page_batch_size.to_string());
-    }
+    args.push("--page-batch-size".to_string());
+    args.push(options.page_batch_size.to_string());
 
     args.push(source_path.display().to_string());
     args

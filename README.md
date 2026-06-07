@@ -41,13 +41,18 @@ machine-specific and should point at:
 - a service-owned corpus root for source files
 - a service-owned index root for SQLite and Docling conversion artifacts
 - the Python executable for environment diagnostics and the directly launched Docling executable
-- the CLI operation timeout and Docling document timeout
-- the selected accelerator backend and device index
+- the CLI operation timeout and explicit Docling document timeout, PDF backend,
+  OCR mode, Docling device, thread count, and page batch size
+- the selected Rust inference accelerator backend and device index
 - required request, retrieval, admission, logging, and admin token-file settings
 
 The service has no CPU inference fallback. If `inference.device = "metal"`, run
 with `--features metal`. CUDA support is separate operational verification
 work; this runbook documents the locally used Metal path.
+
+Docling's `[docling].device` setting is passed to the Python Docling CLI as
+`--device` and is separate from `[inference].device`, which controls the
+Rust/Candle dense embedding, ColBERT, and reranker runtimes.
 
 ## First-Time Storage Setup
 
@@ -289,9 +294,13 @@ curl -N -X POST \
 
 PDF conversion progress comes from Docling stderr progress lines when Docling
 emits them. The service passes `[docling].document_timeout_seconds` to Docling
-as `--document-timeout`; the example config sets it to `3600`. The interactive
-CLI uses `[client].operation_timeout_seconds`, also `3600` in the example
-config, as the HTTP stream timeout for one operation.
+as `--document-timeout`, `[docling].pdf_backend` as `--pdf-backend`,
+`[docling].device` as `--device`, `[docling].num_threads` as `--num-threads`,
+and `[docling].page_batch_size` as `--page-batch-size`. OCR behavior is
+explicitly config-backed: `ocr_mode = "on"` passes `--ocr`, `ocr_mode = "off"`
+passes `--no-ocr`, and `ocr_mode = "auto"` leaves Docling's CLI default in
+control. The interactive CLI uses `[client].operation_timeout_seconds` as the
+HTTP stream timeout for one operation.
 
 ## Search
 

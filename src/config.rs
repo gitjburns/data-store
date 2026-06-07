@@ -113,14 +113,17 @@ pub struct DoclingConfig {
     /// Docling executable launched directly for PDF conversion.
     pub docling_path: PathBuf,
     /// Per-document Docling conversion timeout in seconds.
-    #[serde(default = "default_docling_document_timeout_seconds")]
     pub document_timeout_seconds: u64,
     /// PDF backend selected by service config rather than callers.
-    pub default_pdf_backend: String,
+    pub pdf_backend: String,
     /// OCR behavior selected by service config: auto, on, or off.
-    pub default_ocr_mode: String,
-    /// Optional Docling page batch size for conversion resource control.
-    pub page_batch_size: Option<u32>,
+    pub ocr_mode: String,
+    /// Accelerator device selected for Docling's Python-side processing.
+    pub device: String,
+    /// Worker thread count passed to Docling.
+    pub num_threads: u32,
+    /// Docling page batch size for conversion resource control.
+    pub page_batch_size: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,21 +244,34 @@ impl ServiceConfig {
         require_absolute_path("models.colbert.path", &self.models.colbert.path)?;
         require_absolute_path("models.reranker.path", &self.models.reranker.path)?;
 
-        require_non_empty(
-            "docling.default_pdf_backend",
-            &self.docling.default_pdf_backend,
-        )?;
-        require_non_empty("docling.default_ocr_mode", &self.docling.default_ocr_mode)?;
-        if !matches!(self.docling.default_ocr_mode.trim(), "auto" | "on" | "off") {
+        require_non_empty("docling.pdf_backend", &self.docling.pdf_backend)?;
+        if !matches!(
+            self.docling.pdf_backend.trim(),
+            "pypdfium2" | "docling_parse" | "dlparse_v1" | "dlparse_v2" | "dlparse_v4"
+        ) {
             return Err(ApiError::InvalidConfig {
-                message: "docling.default_ocr_mode must be one of auto, on, or off".to_string(),
+                message:
+                    "docling.pdf_backend must be one of pypdfium2, docling_parse, dlparse_v1, dlparse_v2, or dlparse_v4"
+                        .to_string(),
             });
         }
-        if self.docling.page_batch_size == Some(0) {
+        require_non_empty("docling.ocr_mode", &self.docling.ocr_mode)?;
+        if !matches!(self.docling.ocr_mode.trim(), "auto" | "on" | "off") {
             return Err(ApiError::InvalidConfig {
-                message: "docling.page_batch_size must be greater than zero when set".to_string(),
+                message: "docling.ocr_mode must be one of auto, on, or off".to_string(),
             });
         }
+        require_non_empty("docling.device", &self.docling.device)?;
+        if !matches!(
+            self.docling.device.trim(),
+            "auto" | "cpu" | "cuda" | "mps" | "xpu"
+        ) {
+            return Err(ApiError::InvalidConfig {
+                message: "docling.device must be one of auto, cpu, cuda, mps, or xpu".to_string(),
+            });
+        }
+        require_positive("docling.num_threads", self.docling.num_threads)?;
+        require_positive("docling.page_batch_size", self.docling.page_batch_size)?;
         require_non_empty("models.dense.pooling", &self.models.dense.pooling)?;
         require_positive("models.dense.dimension", self.models.dense.dimension)?;
         require_positive("models.dense.max_tokens", self.models.dense.max_tokens)?;
@@ -351,11 +367,6 @@ fn service_root() -> PathBuf {
 /// Return the Phase 11F default bounded ColBERT reranking pool size.
 fn default_colbert_candidate_pool_size() -> u32 {
     100
-}
-
-/// Return the default one-hour Docling document timeout used by existing operators.
-fn default_docling_document_timeout_seconds() -> u64 {
-    3_600
 }
 
 /// Resolve supported CLI options, falling back to `config.toml`.

@@ -3721,7 +3721,7 @@ fn insert_document(
             markdown_sha256,
             &conversion.options.pdf_backend,
             &conversion.options.ocr_mode,
-            conversion.options.page_batch_size.map(i64::from),
+            Some(i64::from(conversion.options.page_batch_size)),
             units_ingested as i64,
             DOCUMENT_STATUS_INGESTED,
             diagnostics_json,

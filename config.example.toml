@@ -39,17 +39,76 @@ corpus_root = "/absolute/path/to/corpus"
 index_root = "/absolute/path/to/indexes"
 
 [docling]
-# Python executable recorded for the configured Docling environment.
+# Python executable for the environment where Docling is installed. The service
+# launches docling_path directly, but keeps this path in config so startup and
+# failure diagnostics identify the expected Python environment.
 python_path = "/absolute/path/to/python"
+
 # Docling executable launched directly for PDF-to-markdown conversion.
 docling_path = "/absolute/path/to/docling"
-# Per-document Docling conversion timeout passed to the Docling CLI.
-document_timeout_seconds = 3600
-# Service-selected PDF backend; callers cannot override this per request.
-default_pdf_backend = "docling_parse"
-# Service-selected OCR mode: auto lets Docling choose, on forces OCR, off disables it.
-default_ocr_mode = "auto"
-# Optional Docling page batch size for PDF conversion throughput/resource control.
+
+# Per-document Docling processing timeout in seconds. This is passed as
+# --document-timeout. Very large books, OCR-heavy PDFs, or table-heavy PDFs may
+# need a higher value. If the timeout is reached, Docling aborts and the ingest
+# fails without publishing a partial version.
+document_timeout_seconds = 7200
+
+# PDF parser backend passed as --pdf-backend.
+#
+# Valid values:
+# - pypdfium2: Uses the PDFium-based parser. This matched the legacy Data Store
+#   UI default. Good first choice for text-layer PDFs when you want predictable
+#   extraction without Docling's newer parser stack.
+# - docling_parse: Docling's default parser backend in the installed CLI. Uses
+#   Docling's current parser stack and may provide richer layout recovery, but
+#   can be slower or heavier on difficult books.
+# - dlparse_v1: Older Docling Parse backend. Keep available for compatibility
+#   testing when newer parser versions regress on a specific PDF.
+# - dlparse_v2: Newer Docling Parse backend than v1. Use when comparing parser
+#   quality or performance against v1/v4/docling_parse.
+# - dlparse_v4: Newer Docling Parse backend than v2. Use when testing Docling's
+#   more recent parser behavior on layout-heavy PDFs.
+pdf_backend = "pypdfium2"
+
+# OCR behavior for bitmap/scanned page content.
+#
+# Valid values:
+# - auto: The service passes no OCR flag and lets Docling's CLI default decide.
+#   In the installed Docling CLI, the default is OCR enabled. This may invoke
+#   RapidOCR and can be very slow on CPU.
+# - on: Passes --ocr and explicitly enables OCR.
+# - off: Passes --no-ocr and disables OCR. Best default for text-layer PDFs
+#   such as most ebooks, papers, and generated PDFs. Scanned PDFs may produce
+#   little or no text with OCR disabled.
+ocr_mode = "off"
+
+# Accelerator device passed to Docling as --device. This controls Docling's
+# Python/PyTorch-side processing only. It is separate from [inference].device,
+# which controls the Rust/Candle embedding and reranking models.
+#
+# Valid values:
+# - auto: Let Docling choose a device. Convenient, but less predictable because
+#   device selection depends on the installed Python packages and hardware.
+# - cpu: Force CPU execution. Most compatible, but slowest for OCR/model-heavy
+#   conversion.
+# - cuda: Use NVIDIA CUDA. Relevant on machines with NVIDIA GPUs, CUDA drivers,
+#   and a CUDA-enabled PyTorch/Docling environment. Not useful on Apple Silicon.
+# - mps: Use Apple's Metal Performance Shaders through PyTorch. Relevant on
+#   Apple Silicon when the installed Docling/OCR/model stack supports MPS.
+# - xpu: Use Intel's accelerator path for Intel GPUs/XPUs through PyTorch.
+#   Relevant only on systems with Intel accelerator support and a compatible
+#   Python/PyTorch environment.
+device = "mps"
+
+# Number of worker threads passed as --num-threads. This bounds Docling's CPU
+# parallelism. Higher values may improve throughput but can increase contention,
+# memory pressure, and interference with the Rust service.
+num_threads = 10
+
+# Number of pages Docling processes per batch, passed as --page-batch-size.
+# Lower values can reduce peak memory usage and isolate problematic pages.
+# Higher values can improve throughput when the selected backend/device has
+# enough memory.
 page_batch_size = 10
 
 [models.dense]
