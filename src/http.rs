@@ -1987,7 +1987,7 @@ async fn emit_docling_progress(
             emit_operation_progress(
                 emitter,
                 "docling_converting",
-                "converting source document",
+                "loading model weights",
                 percentage,
                 100,
             )

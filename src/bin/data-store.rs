@@ -1907,7 +1907,9 @@ impl StreamRenderer {
     ) -> Result<()> {
         let stage = stage.unwrap_or_else(|| "progress".to_string());
         let message = message.unwrap_or_else(|| "working".to_string());
-        if stage == "docling_converting" && message.starts_with("Waiting for Docling process: ") {
+        if stage == "docling_converting"
+            && message.starts_with("docling_converting: processing and generating markdown: ")
+        {
             if !self.docling_wait_line_active {
                 self.finish_progress_line()?;
                 self.docling_wait_line_active = true;

@@ -75,7 +75,7 @@ pub fn format_docling_activity_message(
     _timeout_remaining: Duration,
 ) -> String {
     format!(
-        "Waiting for Docling process: cpu:{} mem:{} rss:{} thr:{} elapsed:{}",
+        "docling_converting: processing and generating markdown: cpu:{} mem:{} rss:{} thr:{} elapsed:{}",
         format_percent(report.process.cpu_percent),
         format_percent(report.process.memory_percent),
         format_bytes_option(report.process.rss_bytes),
