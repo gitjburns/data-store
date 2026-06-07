@@ -1290,7 +1290,7 @@ impl StorageRuntime {
         })
     }
 
-    /// Persist one immutable document version, then publish it as the active search snapshot after commit.
+    /// Persist one immutable document version, active map, and cache publish as one ingest boundary.
     pub fn ingest_document<F>(
         &self,
         conversion: &DoclingConversionResult,
@@ -1573,12 +1573,150 @@ impl StorageRuntime {
             )?;
         }
 
+        let vector_count = stored_vectors.len();
+        let published_at_ms = match current_time_ms() {
+            Ok(value) => value,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_publish.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    vectors = vector_count,
+                    phase = "publish_timestamp",
+                    error = %source,
+                    "ingest active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.ingest_publish.starting",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            "ingest active-version publish starting"
+        );
+        let mut cache = match self.cache.lock().map_err(|source| {
+            storage_operation_error(format!("dense cache lock is poisoned: {source}"))
+        }) {
+            Ok(cache) => cache,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_publish.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    vectors = vector_count,
+                    published_at_ms,
+                    phase = "cache_lock",
+                    error = %source,
+                    "ingest active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        info!(
+            event = "storage.ingest_publish.cache_prepare_starting",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            current_active_sources = cache.active_versions.len(),
+            current_cache_vectors = cache.unit_ids.len(),
+            "ingest active-version cache preparation starting"
+        );
+        let published_cache = match cache.with_published_source_version(
+            &source_path,
+            version_label,
+            stored_vectors,
+            published_at_ms,
+        ) {
+            Ok(cache) => cache,
+            Err(source) => {
+                error!(
+                    event = "storage.ingest_publish.failed",
+                    source_path,
+                    version_label,
+                    document_id,
+                    vectors = vector_count,
+                    published_at_ms,
+                    phase = "cache_prepare",
+                    error = %source,
+                    "ingest active-version publish failed"
+                );
+                return Err(source);
+            }
+        };
+        let published_cache_vectors = published_cache.unit_ids.len();
+        let published_cache_active_sources = published_cache.active_versions.len();
+        info!(
+            event = "storage.ingest_publish.cache_prepared",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            cache_vectors = published_cache_vectors,
+            active_sources = published_cache_active_sources,
+            "ingest active-version cache prepared"
+        );
+        info!(
+            event = "storage.ingest_publish.active_row_writing",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "active_row_write",
+            "ingest active-version row writing"
+        );
+        if let Err(source) = tx
+            .execute(
+                PUBLISH_ACTIVE_DOCUMENT_VERSION_SQL,
+                params![&source_path, version_label, published_at_ms as i64],
+            )
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to publish active document version during ingest: {source}"
+                ))
+            })
+        {
+            error!(
+                event = "storage.ingest_publish.failed",
+                source_path,
+                version_label,
+                document_id,
+                vectors = vector_count,
+                published_at_ms,
+                phase = "active_row_write",
+                error = %source,
+                "ingest active-version publish failed"
+            );
+            return Err(source);
+        }
+        info!(
+            event = "storage.ingest_publish.active_row_written",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            phase = "active_row_write",
+            "ingest active-version row written"
+        );
+        emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)?;
         info!(
             event = "storage.ingest_transaction.commit_starting",
             source_path,
             version_label,
             document_id,
             units = units.len(),
+            vectors = vector_count,
+            published_at_ms,
             "ingest SQLite transaction commit starting"
         );
         if let Err(source) = tx.commit().map_err(|source| {
@@ -1589,6 +1727,8 @@ impl StorageRuntime {
                 source_path,
                 version_label,
                 document_id,
+                vectors = vector_count,
+                published_at_ms,
                 error = %source,
                 "ingest SQLite transaction commit failed"
             );
@@ -1600,40 +1740,41 @@ impl StorageRuntime {
             version_label,
             document_id,
             units = units.len(),
+            vectors = vector_count,
+            published_at_ms,
             "ingest SQLite transaction committed"
         );
-        emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)?;
         info!(
-            event = "storage.ingest_publish.starting",
+            event = "storage.ingest_publish.cache_swap_starting",
             source_path,
             version_label,
             document_id,
-            vectors = stored_vectors.len(),
-            "ingest active-version publish starting"
+            vectors = vector_count,
+            published_at_ms,
+            phase = "cache_swap",
+            "ingest active-version dense cache swap starting"
         );
-        if let Err(source) =
-            self.publish_document_version(&source_path, version_label, stored_vectors)
-        {
-            error!(
-                event = "storage.ingest_publish.failed",
-                source_path,
-                version_label,
-                document_id,
-                error = %source,
-                "ingest active-version publish failed"
-            );
-            return Err(source);
-        }
-        emit_ingest_storage_progress(&mut progress, "publishing active search snapshot", 1, 1)?;
-        // Publish is logged after both the durable transaction and active-cache
-        // swap complete, so search requests admitted after this event can see
-        // the new version.
+        *cache = published_cache;
+        info!(
+            event = "storage.ingest_publish.cache_swap_completed",
+            source_path,
+            version_label,
+            document_id,
+            vectors = vector_count,
+            published_at_ms,
+            cache_vectors = published_cache_vectors,
+            active_sources = published_cache_active_sources,
+            phase = "cache_swap",
+            "ingest active-version dense cache swap completed"
+        );
         info!(
             event = "storage.ingest_version.published",
             source_path,
             version_label,
             document_id,
             units = units.len(),
+            vectors = vector_count,
+            published_at_ms,
             "ingested document version published"
         );
 
@@ -2102,18 +2243,6 @@ impl StorageRuntime {
                 }).collect::<Vec<_>>()
             }
         }))
-    }
-
-    /// Publish one source version by committing the active map and swapping the in-memory search snapshot together.
-    fn publish_document_version(
-        &self,
-        source_path: &str,
-        version_label: &str,
-        vectors: Vec<StoredDenseVector>,
-    ) -> Result<(), ApiError> {
-        self.publish_source_version_with_vectors(source_path, version_label, vectors)?;
-
-        Ok(())
     }
 
     /// Publish one source version by committing the active map and swapping the cache under one lock.

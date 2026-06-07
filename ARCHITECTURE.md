@@ -136,9 +136,12 @@ previous version. First-time ingest remains invisible to search until the new
 version is fully durable and cache-ready. Force re-ingest keeps the previously
 active version searchable until publish completes.
 
-Publishing a version updates `active_document_versions` and swaps the active
-in-memory dense cache snapshot after durable writes and cache preparation have
-succeeded.
+Publishing an ingest version writes `active_document_versions` in the same
+SQLite transaction as the immutable document version, units, dense vectors,
+ColBERT vectors, and FTS rows. The replacement dense-cache snapshot is prepared
+before commit, and the in-memory active cache is swapped immediately after
+commit while the cache lock is still held. Rollback publishes an already
+retained version through its own active-version transaction and cache swap.
 
 Rollback is an admin operation that repoints one source document to an already
 retained version. It does not delete versions, rebuild embeddings, or mutate
@@ -174,10 +177,14 @@ The `ingest` operation is synchronous and streamed. The high-level stages are:
 6. Allocate a version label and versioned document/unit IDs.
 7. Generate dense passage vectors for every unit.
 8. Generate ColBERT document-token vectors for every unit.
-9. Persist the immutable document version, units, dense vectors, ColBERT
-   vectors, and FTS rows in SQLite.
-10. Publish the active version and swap the active dense cache.
-11. Emit the terminal ingest result.
+9. Prepare the replacement active dense-cache snapshot from validated dense
+   vectors and the current active cache.
+10. Persist the immutable document version, units, dense vectors, ColBERT
+   vectors, FTS rows, and `active_document_versions` row in one SQLite
+   transaction.
+11. Commit the transaction and immediately swap the active dense cache before
+   any terminal ingest result is considered ready.
+12. Emit the terminal ingest result.
 
 Ingest progress is part of the operation stream contract. The service emits
 Docling conversion progress parsed from Docling stderr when available, unit
@@ -311,7 +318,9 @@ API itself.
   replacing it with summaries.
 - No silent fallbacks across accelerators, models, vector sources, Docling
   backends, OCR modes, or search-time ColBERT document-vector recomputation.
-- Durable state and in-memory active cache updates must publish together.
+- Ingest durable state, active-version publication, and in-memory active cache
+  update must publish together; failed pre-commit cache preparation or
+  active-version row writes must roll back the attempted ingest version.
 - Long-running operation stages and persistence publish boundaries must be
   visible in durable service logs; stream events alone are not sufficient.
 - Source files are addressed by corpus-relative references; ingest request

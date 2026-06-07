@@ -24,9 +24,11 @@ The target service behavior is now explicit in `SPEC-SERVER.md`:
 
 ## Current Status
 
-Phase 1 is complete as of 2026-06-06.
+Phase 1 and Phase 2 are complete as of 2026-06-06.
 
 Implemented work:
+
+Phase 1:
 
 - `AppState` now owns a shared model-call gate that logs wait, acquire, release,
   and acquisition failure boundaries.
@@ -42,20 +44,39 @@ Implemented work:
 - Storage candidate-pool construction now consumes the captured search snapshot
   instead of locking and cloning the active cache internally.
 
-Verification completed for Phase 1:
+Phase 2:
+
+- `storage.rs` now publishes ingest storage atomically at the service contract
+  boundary.
+- Ingest validates dense and ColBERT vectors before opening the SQLite
+  transaction.
+- Ingest writes `document_versions`, `units`, `dense_vectors`,
+  `colbert_document_vectors`, `units_fts`, and `active_document_versions` in
+  one SQLite transaction.
+- Ingest prepares the replacement dense-cache snapshot before commit, holds the
+  cache lock through commit, and swaps the in-memory cache immediately after
+  commit.
+- The commit-to-cache-swap window has no fallible stream/progress callback.
+- The previous ingest-only publish wrapper was removed; rollback still uses the
+  retained-version publish helper.
+- Storage logs now cover ingest publish timestamp allocation, cache lock,
+  cache preparation, active-row write, commit, cache swap, and publish
+  completion/failure boundaries.
+
+Verification completed for Phase 1 and Phase 2:
 
 ```bash
-cargo fmt
-cargo check
-cargo check --features metal
+cargo fmt --manifest-path service/data-store/Cargo.toml
+cargo check --manifest-path service/data-store/Cargo.toml
+cargo check --manifest-path service/data-store/Cargo.toml --features metal
 ```
 
 Manual runtime checks have not been run yet because starting/stopping service
 processes requires separate approval.
 
-Remaining work for the next session is Phase 2: make ingest storage publish
-atomic at the service contract boundary. The delicate storage/publish
-restructuring was intentionally not changed in Phase 1.
+Remaining work is manual runtime validation of the concurrent search and atomic
+ingest behaviors, with user approval before starting or stopping service
+processes.
 
 ## Current Findings
 
@@ -78,11 +99,13 @@ Search visibility was mostly implemented correctly before Phase 1: storage
 captured an active dense-cache snapshot and BM25 filtered to active versions.
 Phase 1 moved snapshot capture to request admission, before query embedding.
 
-Ingest durability is not fully atomic. The implementation writes document
-version, unit, vector, and FTS rows in one SQLite transaction, commits that
-transaction, then publishes the active version/cache in a separate step. A
-failure after the first commit but before publish can leave inactive retained
-state for a failed attempt.
+Before Phase 2, ingest durability was not fully atomic. The implementation
+wrote document version, unit, vector, and FTS rows in one SQLite transaction,
+committed that transaction, then published the active version/cache in a
+separate step. A failure after the first commit but before publish could leave
+inactive retained state for a failed attempt. Phase 2 corrected this by moving
+the active-version row into the ingest transaction and preparing the cache swap
+before commit.
 
 ## Target Invariants
 
@@ -169,7 +192,7 @@ Likely work:
 - Audit ColBERT and reranker paths so non-finite token vectors, logits, and
   scores are also reported at inference/ranking boundaries rather than storage.
 
-### 4. Make Ingest Storage Publish Atomic - Phase 2 Resume Point
+### 4. Make Ingest Storage Publish Atomic - Completed In Phase 2
 
 Restructure ingest persistence so an ingest does not leave success-labeled
 durable rows unless the active publish also succeeds.
@@ -196,7 +219,18 @@ Target approach:
 Important constraint: do not add runtime schema migrations. If schema changes
 are needed, stop and propose an explicit setup/migration script instead.
 
-### 5. Preserve Retry And Force Semantics - Phase 2
+Phase 2 implementation notes:
+
+- No schema changes or runtime migrations were added.
+- The ingest path now writes active-version publication in the same SQLite
+  transaction as the successful document/version rows.
+- All fallible dense-cache preparation is done before commit.
+- The in-memory active dense cache is swapped immediately after commit while
+  the cache lock is still held.
+- A failed pre-commit publish/cache preparation path rolls back the whole
+  ingest transaction.
+
+### 5. Preserve Retry And Force Semantics - Completed In Phase 2
 
 Make duplicate checks depend only on active searchable versions from prior
 successful ingests.
