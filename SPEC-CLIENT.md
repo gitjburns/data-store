@@ -2,9 +2,10 @@
 
 ## Purpose
 
-Build a simple interactive command-line client for operating the standalone Data
-Store service. The client is an operator/developer interface over the same
-documented operation protocol used by all consumers.
+Build a simple command-line client for operating the standalone Data Store
+service. The client supports both interactive REPL use and non-interactive
+one-shot operation invocation. Both modes are operator/developer interfaces over
+the same documented operation protocol used by all consumers.
 
 The client must not introduce a second authentication path, service-side
 backdoor, hidden client state, or alternate domain behavior. The service remains
@@ -34,6 +35,12 @@ Expected development run command:
 cargo run --bin data-store -- --config config.toml
 ```
 
+Expected non-interactive development command:
+
+```bash
+cargo run --bin data-store -- --config config.toml --health
+```
+
 ## Startup Configuration
 
 The client starts from the same service config file used by the service:
@@ -50,9 +57,16 @@ The client reads:
 - `server.bind_address` to construct the base HTTP URL.
 - `admin.token_file_path` to locate the current startup-scoped admin bearer
   token for protected operations.
+- `client.operation_timeout_seconds` to bound one operation-stream request.
 
 The client must not require operators to manually provide the admin token during
 normal use.
+
+The local usage command does not require config or a running service:
+
+```bash
+data-store --help
+```
 
 ## Admin Token File
 
@@ -126,7 +140,13 @@ service implementation supports cancellation.
 
 ## Interaction Model
 
-The client is a REPL-style interactive CLI, not a menu-driven TUI.
+The client supports two interaction modes:
+
+- With no operation flag, it starts a REPL-style interactive CLI.
+- With exactly one operation flag, it sends that operation once and exits after
+  the terminal result or error.
+
+It is not a menu-driven TUI.
 
 The prompt should be concise and stable:
 
@@ -148,6 +168,36 @@ service/data-store/.data-store.history
 
 - The history file is not configured in the service config.
 - The history file must be gitignored.
+
+## Non-Interactive Invocation
+
+Non-interactive invocation uses the same command semantics and renderers as the
+REPL commands, but receives arguments from process argv instead of the REPL
+line parser.
+
+Supported operation flags:
+
+```bash
+data-store [--config <path>] --health
+data-store [--config <path>] --limits
+data-store [--config <path>] --ingest <source>
+data-store [--config <path>] --search <query> [topK]
+data-store [--config <path>] --search-full <query> [topK]
+data-store [--config <path>] --versions
+data-store [--config <path>] --rollback <source> <versionLabel>
+data-store [--config <path>] --shutdown
+```
+
+Only one operation flag may be provided per process invocation. Public flags
+send unauthenticated operations. Protected flags read the configured token file
+immediately before the request, exactly like their REPL equivalents.
+
+Shells perform argument splitting before the client receives argv, so
+multi-word queries and paths containing spaces must be quoted by the operator:
+
+```bash
+data-store --config config.toml --search "clear writing style rules" 3
+```
 
 ## Input Parsing
 
@@ -173,10 +223,10 @@ request.
 
 ## Commands
 
-The first client version exposes the service operations plus basic REPL
-controls.
+The client exposes the service operations plus basic REPL controls. Each service
+operation has both a REPL command and a matching non-interactive flag.
 
-### `health`
+### `health` / `--health`
 
 Operation: `health`
 
@@ -190,7 +240,7 @@ Payload:
 
 Output: human-readable readiness summary and component details.
 
-### `limits`
+### `limits` / `--limits`
 
 Operation: `limits`
 
@@ -204,7 +254,7 @@ Payload:
 
 Output: labeled request and retrieval limits.
 
-### `ingest <source>`
+### `ingest <source>` / `--ingest <source>`
 
 Operation: `ingest`
 
@@ -221,7 +271,7 @@ Payload:
 Output: streamed operation status and progress, followed by document ID,
 version label, units ingested, and status.
 
-### `search <query> [topK]`
+### `search <query> [topK]` / `--search <query> [topK]`
 
 Operation: `search`
 
@@ -242,7 +292,7 @@ bounded excerpt of matched content.
 
 The client rendering is excerpted only; service search behavior is unchanged.
 
-### `search-full <query> [topK]`
+### `search-full <query> [topK]` / `--search-full <query> [topK]`
 
 Operation: `search`
 
@@ -256,7 +306,7 @@ each result.
 The client rendering is full-content only; service search behavior is
 unchanged.
 
-### `versions`
+### `versions` / `--versions`
 
 Operation: `versions`
 
@@ -272,7 +322,7 @@ Output: grouped source-document version listing. Active versions must be clearly
 marked. Include version label, document ID, status, units ingested, timestamps,
 and vector metadata counts/dimensions.
 
-### `rollback <source> <versionLabel>`
+### `rollback <source> <versionLabel>` / `--rollback <source> <versionLabel>`
 
 Operation: `rollback`
 
@@ -290,7 +340,7 @@ Payload:
 Output: streamed operation status, followed by source path, active version
 label, publish timestamp, vector count, and status.
 
-### `shutdown`
+### `shutdown` / `--shutdown`
 
 Operation: `shutdown`
 
@@ -302,19 +352,16 @@ Payload:
 {}
 ```
 
-Because this command stops the running service, the REPL must ask for typed
-confirmation before sending the request. Confirmation should require:
-
-```text
-shutdown
-```
-
 Output: streamed operation status followed by the server-authored
 `shutdown_complete` terminal result.
 
 ### `help`
 
-Prints the available commands, syntax, and a short description of each command.
+Prints the available REPL commands and syntax.
+
+### `--help`
+
+Prints executable-level usage without reading config or contacting the service.
 
 ### `exit`
 
@@ -330,9 +377,8 @@ the first version.
 Client output should be concise but complete enough for operation:
 
 - Show operation start, status, progress, terminal result, and elapsed time.
-- Render status events as newline-terminated lines.
-- Render counted progress events with `current` and `total` by overwriting the
-  current line.
+- Render status and counted progress events compactly, including `current` and
+  `total` when the service provides them.
 - Finalize any overwritten progress line before printing the next status,
   result, or error.
 - Show HTTP method and URL for transport failures.
@@ -378,7 +424,7 @@ Examples:
 - Missing required config fields.
 - Token file missing for a protected operation.
 - Token file unreadable.
-- Invalid REPL command syntax.
+- Invalid command syntax.
 - HTTP connection failure.
 - Operation stream line is not valid JSON.
 - Operation stream ends before a terminal event.
@@ -405,6 +451,8 @@ Implementation should update the operator documentation to describe:
 
 - The `data-store` client binary.
 - How to run it with `--config config.toml`.
+- How to invoke one-shot commands such as `--health`, `--ingest`, `--search`,
+  and `--shutdown`.
 - The required `[admin] token_file_path` config.
 - Token-file lifecycle and security behavior.
 - The operation-stream protocol at a user-facing level.

@@ -122,9 +122,10 @@ this directory.
 
 ## Use The CLI Client
 
-The `data-store` client is an interactive REPL over the same
-`POST /v1/operations` stream API shown in this runbook. Start the service
-first, then start the client from this directory:
+The `data-store` client supports both an interactive REPL and one-shot command
+invocation over the same `POST /v1/operations` stream API shown in this
+runbook. Start the service first, then start the interactive client from this
+directory:
 
 ```bash
 cargo run --bin data-store -- --config config.toml
@@ -134,6 +135,27 @@ For a release build, run:
 
 ```bash
 ./target/release/data-store --config config.toml
+```
+
+When no operation flag is supplied, the client opens the interactive REPL.
+For non-interactive use, pass exactly one operation flag:
+
+```bash
+./target/release/data-store --config config.toml --help
+./target/release/data-store --config config.toml --health
+./target/release/data-store --config config.toml --limits
+./target/release/data-store --config config.toml --ingest The_Elements_of_Style.pdf
+./target/release/data-store --config config.toml --search "clear writing style rules" 3
+./target/release/data-store --config config.toml --search-full "clear writing style rules" 3
+./target/release/data-store --config config.toml --versions
+./target/release/data-store --config config.toml --rollback The_Elements_of_Style.pdf 2026-06-01T21:37:22.184Z
+./target/release/data-store --config config.toml --shutdown
+```
+
+The same one-shot command surface is available during development:
+
+```bash
+cargo run --bin data-store -- --config config.toml --health
 ```
 
 The client reads `server.bind_address`, `admin.token_file_path`, and

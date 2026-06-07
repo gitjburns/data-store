@@ -79,6 +79,180 @@ enum Command {
     Exit,
 }
 
+/// Construct a typed command when the registry says the command accepts no arguments.
+type NoArgCommandBuilder = fn() -> Command;
+/// Construct a typed command when the registry says the command accepts one value.
+type OneValueCommandBuilder = fn(String) -> Command;
+/// Construct a typed command when the registry says the command accepts two values.
+type TwoValueCommandBuilder = fn(String, String) -> Command;
+/// Construct a typed search command after parsing the optional topK value.
+type SearchCommandBuilder = fn(String, Option<u32>) -> Command;
+
+#[derive(Clone, Copy)]
+enum CommandArguments {
+    /// The command accepts no positional values in either REPL or CLI form.
+    NoArgs { build: NoArgCommandBuilder },
+    /// The command accepts one required value, such as an ingest source path.
+    OneValue {
+        value_name: &'static str,
+        build: OneValueCommandBuilder,
+    },
+    /// The command accepts two required values, such as rollback source and version label.
+    TwoValues {
+        first_value_name: &'static str,
+        second_value_name: &'static str,
+        build: TwoValueCommandBuilder,
+    },
+    /// Search has one required query plus an optional topK value in both command surfaces.
+    Search { build: SearchCommandBuilder },
+}
+
+struct CommandSpec {
+    /// Canonical token used at the interactive prompt.
+    repl_name: &'static str,
+    /// Additional REPL spellings that parse as this command but do not appear in help.
+    repl_aliases: &'static [&'static str],
+    /// Canonical process flag for one-shot invocation; absent for REPL-only commands.
+    cli_flag: Option<&'static str>,
+    /// Additional process flags that parse as this command but do not appear in help.
+    cli_aliases: &'static [&'static str],
+    /// Help line displayed by the interactive `help` command.
+    repl_usage: &'static str,
+    /// Help line displayed by executable-level `--help`; absent for REPL-only commands.
+    cli_usage: Option<&'static str>,
+    /// Argument parser shape plus constructor used to build the typed command.
+    arguments: CommandArguments,
+}
+
+// Keep command metadata in one table so REPL parsing, CLI parsing, and help
+// rendering cannot drift apart. This is the Rust equivalent of a C dispatch
+// table: the command names and help text sit beside the constructor function
+// pointer and the argument shape used by both front doors.
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        repl_name: "health",
+        repl_aliases: &[],
+        cli_flag: Some("--health"),
+        cli_aliases: &[],
+        repl_usage: "health",
+        cli_usage: Some("data-store [--config <path>] --health"),
+        arguments: CommandArguments::NoArgs {
+            build: build_health_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "limits",
+        repl_aliases: &[],
+        cli_flag: Some("--limits"),
+        cli_aliases: &[],
+        repl_usage: "limits",
+        cli_usage: Some("data-store [--config <path>] --limits"),
+        arguments: CommandArguments::NoArgs {
+            build: build_limits_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "ingest",
+        repl_aliases: &[],
+        cli_flag: Some("--ingest"),
+        cli_aliases: &[],
+        repl_usage: "ingest <source>",
+        cli_usage: Some("data-store [--config <path>] --ingest <source>"),
+        arguments: CommandArguments::OneValue {
+            value_name: "source",
+            build: build_ingest_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "search",
+        repl_aliases: &[],
+        cli_flag: Some("--search"),
+        cli_aliases: &[],
+        repl_usage: "search <query> [topK]",
+        cli_usage: Some("data-store [--config <path>] --search <query> [topK]"),
+        arguments: CommandArguments::Search {
+            build: build_search_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "search-full",
+        repl_aliases: &[],
+        cli_flag: Some("--search-full"),
+        cli_aliases: &[],
+        repl_usage: "search-full <query> [topK]",
+        cli_usage: Some("data-store [--config <path>] --search-full <query> [topK]"),
+        arguments: CommandArguments::Search {
+            build: build_search_full_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "versions",
+        repl_aliases: &[],
+        cli_flag: Some("--versions"),
+        cli_aliases: &[],
+        repl_usage: "versions",
+        cli_usage: Some("data-store [--config <path>] --versions"),
+        arguments: CommandArguments::NoArgs {
+            build: build_versions_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "rollback",
+        repl_aliases: &[],
+        cli_flag: Some("--rollback"),
+        cli_aliases: &[],
+        repl_usage: "rollback <source> <versionLabel>",
+        cli_usage: Some("data-store [--config <path>] --rollback <source> <versionLabel>"),
+        arguments: CommandArguments::TwoValues {
+            first_value_name: "source",
+            second_value_name: "versionLabel",
+            build: build_rollback_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "shutdown",
+        repl_aliases: &[],
+        cli_flag: Some("--shutdown"),
+        cli_aliases: &[],
+        repl_usage: "shutdown",
+        cli_usage: Some("data-store [--config <path>] --shutdown"),
+        arguments: CommandArguments::NoArgs {
+            build: build_shutdown_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "help",
+        repl_aliases: &[],
+        cli_flag: Some("--help"),
+        cli_aliases: &["-h"],
+        repl_usage: "help",
+        cli_usage: Some("data-store --help"),
+        arguments: CommandArguments::NoArgs {
+            build: build_help_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "exit",
+        repl_aliases: &["quit"],
+        cli_flag: None,
+        cli_aliases: &[],
+        repl_usage: "exit",
+        cli_usage: None,
+        arguments: CommandArguments::NoArgs {
+            build: build_exit_command,
+        },
+    },
+];
+
+#[derive(Debug)]
+enum StartupSelection {
+    Help,
+    Client {
+        config_path: PathBuf,
+        command: Option<Command>,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct HealthResponse {
     service: String,
@@ -331,36 +505,285 @@ impl Display for AmbiguousStreamLossError {
 
 impl Error for AmbiguousStreamLossError {}
 
-/// Start the interactive client after resolving service config and local history.
+/// Start either one command-line operation or the interactive client after resolving config.
 fn main() -> Result<()> {
-    let config_path = resolve_config_path()?;
+    let StartupSelection::Client {
+        config_path,
+        command,
+    } = parse_startup_args()?
+    else {
+        render_cli_help();
+        return Ok(());
+    };
     let config = load_config(&config_path)?;
     let context = ClientContext {
         base_url: base_url_for_bind_address(config.server.bind_address),
         token_file_path: resolve_service_root_path(&config.admin.token_file_path),
         http: build_http_client(&config.client)?,
     };
-    run_repl(context)
+    match command {
+        Some(command) => {
+            execute_command(&context, command)?;
+            Ok(())
+        }
+        None => run_repl(context),
+    }
 }
 
-/// Resolve the optional `--config` argument without accepting unrelated startup flags.
-fn resolve_config_path() -> Result<PathBuf> {
-    let mut args = env::args().skip(1);
+/// Parse process arguments into local help, one-shot command, or interactive mode.
+fn parse_startup_args() -> Result<StartupSelection> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    parse_startup_arguments(&args)
+}
+
+/// Parse the supported non-interactive command surface without adding a new dependency.
+fn parse_startup_arguments(args: &[String]) -> Result<StartupSelection> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    while let Some(arg) = args.next() {
-        if arg != "--config" {
-            bail!("unknown argument: {arg}");
+    let mut command = None;
+    let mut help_requested = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--config" {
+            let value = take_startup_value(args, &mut index, "--config", "path")?;
+            config_path = PathBuf::from(value);
+            continue;
         }
-        let Some(value) = args.next() else {
-            bail!("--config requires a path");
+        let Some(spec) = find_cli_command_spec(arg) else {
+            bail!("unknown argument `{arg}`; run `data-store --help` for usage");
         };
-        config_path = PathBuf::from(value);
+        let next_command = parse_cli_command(spec, args, &mut index)?;
+        if matches!(next_command, Command::Help) {
+            help_requested = true;
+        } else {
+            set_startup_command(&mut command, next_command, arg)?;
+        }
+    }
+    if help_requested {
+        if command.is_some() {
+            bail!("--help cannot be combined with operation flags");
+        }
+        return Ok(StartupSelection::Help);
     }
 
-    Ok(config_path)
+    Ok(StartupSelection::Client {
+        config_path,
+        command,
+    })
 }
 
-/// Load the subset of service config needed by the interactive client.
+/// Store the selected one-shot command while rejecting ambiguous multi-command invocations.
+fn set_startup_command(
+    command: &mut Option<Command>,
+    next_command: Command,
+    flag: &str,
+) -> Result<()> {
+    if command.is_some() {
+        bail!("only one operation flag may be provided; got `{flag}` after another operation");
+    }
+    *command = Some(next_command);
+    Ok(())
+}
+
+/// Take the value for a startup option that is not part of the command registry.
+fn take_startup_value(
+    args: &[String],
+    index: &mut usize,
+    flag: &str,
+    value_name: &str,
+) -> Result<String> {
+    let value_index = *index + 1;
+    let Some(value) = args.get(value_index) else {
+        bail!("{flag} requires a {value_name}");
+    };
+    if is_startup_flag(value) {
+        bail!("{flag} requires a {value_name}");
+    }
+    *index += 2;
+    Ok(value.clone())
+}
+
+/// Locate a REPL command by its primary name or a documented alias such as `quit`.
+fn find_repl_command_spec(value: &str) -> Option<&'static CommandSpec> {
+    COMMAND_SPECS
+        .iter()
+        .find(|spec| spec.repl_name == value || spec.repl_aliases.contains(&value))
+}
+
+/// Locate a command-line operation flag by its primary flag or alias such as `-h`.
+fn find_cli_command_spec(value: &str) -> Option<&'static CommandSpec> {
+    COMMAND_SPECS
+        .iter()
+        .find(|spec| spec.cli_flag == Some(value) || spec.cli_aliases.contains(&value))
+}
+
+/// Identify startup flags so positional command parsing can stop before the next option.
+fn is_startup_flag(value: &str) -> bool {
+    value == "--config" || find_cli_command_spec(value).is_some()
+}
+
+/// Parse REPL arguments using the command's registry-owned argument shape.
+fn parse_repl_command(spec: &CommandSpec, args: &[String]) -> Result<Command> {
+    match spec.arguments {
+        CommandArguments::NoArgs { build } => {
+            require_repl_arg_count(spec, args, 0)?;
+            Ok(build())
+        }
+        CommandArguments::OneValue { build, .. } => {
+            require_repl_arg_count(spec, args, 1)?;
+            Ok(build(args[0].clone()))
+        }
+        CommandArguments::TwoValues { build, .. } => {
+            require_repl_arg_count(spec, args, 2)?;
+            Ok(build(args[0].clone(), args[1].clone()))
+        }
+        CommandArguments::Search { build } => {
+            if args.len() != 1 && args.len() != 2 {
+                bail!("usage: {}", spec.repl_usage);
+            }
+            let top_k = match args.get(1) {
+                Some(value) => Some(parse_top_k(value)?),
+                None => None,
+            };
+            Ok(build(args[0].clone(), top_k))
+        }
+    }
+}
+
+/// Parse one CLI operation flag and advance the argv cursor past its arguments.
+fn parse_cli_command(spec: &CommandSpec, args: &[String], index: &mut usize) -> Result<Command> {
+    *index += 1;
+    match spec.arguments {
+        CommandArguments::NoArgs { build } => Ok(build()),
+        CommandArguments::OneValue {
+            value_name, build, ..
+        } => {
+            let value = take_cli_command_value(spec, args, index, value_name)?;
+            Ok(build(value))
+        }
+        CommandArguments::TwoValues {
+            first_value_name,
+            second_value_name,
+            build,
+        } => {
+            let first = take_cli_command_value(spec, args, index, first_value_name)?;
+            let second = take_cli_command_value(spec, args, index, second_value_name)?;
+            Ok(build(first, second))
+        }
+        CommandArguments::Search { build } => {
+            let query = take_cli_command_value(spec, args, index, "query")?;
+            let top_k = take_optional_cli_top_k(args, index)?;
+            Ok(build(query, top_k))
+        }
+    }
+}
+
+/// Enforce exact REPL arity while reporting the usage line owned by the registry.
+fn require_repl_arg_count(spec: &CommandSpec, args: &[String], expected: usize) -> Result<()> {
+    if args.len() == expected {
+        return Ok(());
+    }
+
+    bail!("usage: {}", spec.repl_usage);
+}
+
+/// Take one required command-line positional value for the current command.
+fn take_cli_command_value(
+    spec: &CommandSpec,
+    args: &[String],
+    index: &mut usize,
+    value_name: &str,
+) -> Result<String> {
+    let Some(value) = args.get(*index) else {
+        bail!(
+            "{} requires a {value_name}",
+            spec.cli_flag.unwrap_or(spec.repl_name)
+        );
+    };
+    if is_startup_flag(value) {
+        bail!(
+            "{} requires a {value_name}",
+            spec.cli_flag.unwrap_or(spec.repl_name)
+        );
+    }
+    *index += 1;
+    Ok(value.clone())
+}
+
+/// Parse search's optional command-line `topK` while leaving the next flag untouched.
+fn take_optional_cli_top_k(args: &[String], index: &mut usize) -> Result<Option<u32>> {
+    let Some(value) = args.get(*index) else {
+        return Ok(None);
+    };
+    if is_startup_flag(value) {
+        return Ok(None);
+    }
+    let top_k = parse_top_k(value)?;
+    *index += 1;
+    Ok(Some(top_k))
+}
+
+/// Parse a user-provided `topK` value without imposing server-owned range validation.
+fn parse_top_k(value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("topK must be an integer, got `{value}`"))
+}
+
+/// Build the typed health command from a no-argument registry entry.
+fn build_health_command() -> Command {
+    Command::Health
+}
+
+/// Build the typed limits command from a no-argument registry entry.
+fn build_limits_command() -> Command {
+    Command::Limits
+}
+
+/// Build the typed ingest command after shared parsing has captured the source path.
+fn build_ingest_command(source: String) -> Command {
+    Command::Ingest { source }
+}
+
+/// Build the excerpted search command after shared parsing has captured query and topK.
+fn build_search_command(query: String, top_k: Option<u32>) -> Command {
+    Command::Search { query, top_k }
+}
+
+/// Build the full-content search command after shared parsing has captured query and topK.
+fn build_search_full_command(query: String, top_k: Option<u32>) -> Command {
+    Command::SearchFull { query, top_k }
+}
+
+/// Build the typed versions command from a no-argument registry entry.
+fn build_versions_command() -> Command {
+    Command::Versions
+}
+
+/// Build the typed rollback command after shared parsing has captured both identifiers.
+fn build_rollback_command(source: String, version_label: String) -> Command {
+    Command::Rollback {
+        source,
+        version_label,
+    }
+}
+
+/// Build the typed shutdown command from a no-argument registry entry.
+fn build_shutdown_command() -> Command {
+    Command::Shutdown
+}
+
+/// Build the local help command; CLI startup intercepts this before config loading.
+fn build_help_command() -> Command {
+    Command::Help
+}
+
+/// Build the local exit command, which is intentionally REPL-only.
+fn build_exit_command() -> Command {
+    Command::Exit
+}
+
+/// Load the subset of service config needed by the CLI client.
 fn load_config(path: &Path) -> Result<ClientConfig> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
@@ -471,83 +894,11 @@ fn parse_command_line(line: &str) -> Result<Command> {
     if args.is_empty() {
         bail!("empty command");
     }
-    match args[0].as_str() {
-        "health" => {
-            require_arg_count(&args, 1, "health")?;
-            Ok(Command::Health)
-        }
-        "limits" => {
-            require_arg_count(&args, 1, "limits")?;
-            Ok(Command::Limits)
-        }
-        "ingest" => {
-            require_arg_count(&args, 2, "ingest <source>")?;
-            Ok(Command::Ingest {
-                source: args[1].clone(),
-            })
-        }
-        "search" => parse_search_command(&args, false),
-        "search-full" => parse_search_command(&args, true),
-        "versions" => {
-            require_arg_count(&args, 1, "versions")?;
-            Ok(Command::Versions)
-        }
-        "rollback" => {
-            require_arg_count(&args, 3, "rollback <source> <versionLabel>")?;
-            Ok(Command::Rollback {
-                source: args[1].clone(),
-                version_label: args[2].clone(),
-            })
-        }
-        "shutdown" => {
-            require_arg_count(&args, 1, "shutdown")?;
-            Ok(Command::Shutdown)
-        }
-        "help" => {
-            require_arg_count(&args, 1, "help")?;
-            Ok(Command::Help)
-        }
-        "exit" | "quit" => {
-            require_arg_count(&args, 1, "exit")?;
-            Ok(Command::Exit)
-        }
-        command => bail!("unknown command `{command}`; type `help` for commands"),
-    }
-}
-
-/// Parse search commands that share HTTP behavior but differ in rendering.
-fn parse_search_command(args: &[String], full_content: bool) -> Result<Command> {
-    if args.len() != 2 && args.len() != 3 {
-        bail!("usage: {} <query> [topK]", args[0]);
-    }
-    let top_k = match args.get(2) {
-        Some(value) => Some(
-            value
-                .parse::<u32>()
-                .with_context(|| format!("topK must be an integer, got `{value}`"))?,
-        ),
-        None => None,
+    let command_name = &args[0];
+    let Some(spec) = find_repl_command_spec(command_name) else {
+        bail!("unknown command `{command_name}`; type `help` for commands");
     };
-    if full_content {
-        return Ok(Command::SearchFull {
-            query: args[1].clone(),
-            top_k,
-        });
-    }
-
-    Ok(Command::Search {
-        query: args[1].clone(),
-        top_k,
-    })
-}
-
-/// Enforce exact command arity with a usage-oriented error.
-fn require_arg_count(args: &[String], expected: usize, usage: &str) -> Result<()> {
-    if args.len() == expected {
-        return Ok(());
-    }
-
-    bail!("usage: {usage}");
+    parse_repl_command(spec, &args[1..])
 }
 
 /// Split one REPL line with minimal shell-like quotes but no shell behavior.
@@ -1303,16 +1654,24 @@ fn render_shutdown(response: ShutdownResponse) -> Result<()> {
 /// Print command syntax without describing hidden or unsupported shell behavior.
 fn render_help() {
     println!("Commands:");
-    println!("  health");
-    println!("  limits");
-    println!("  ingest <source>");
-    println!("  search <query> [topK]");
-    println!("  search-full <query> [topK]");
-    println!("  versions");
-    println!("  rollback <source> <versionLabel>");
-    println!("  shutdown");
-    println!("  help");
-    println!("  exit");
+    for spec in COMMAND_SPECS {
+        println!("  {}", spec.repl_usage);
+    }
+}
+
+/// Print executable-level usage for interactive and one-shot command modes.
+fn render_cli_help() {
+    println!("Usage:");
+    println!("  data-store [--config <path>]");
+    for spec in COMMAND_SPECS {
+        if let Some(usage) = spec.cli_usage {
+            println!("  {usage}");
+        }
+    }
+    println!();
+    println!("Options:");
+    println!("  --config <path>  Service config path; defaults to config.toml");
+    println!("  --help, -h       Print this help without reading config");
 }
 
 /// Render boolean readiness flags without adding presentation-only state to DTOs.

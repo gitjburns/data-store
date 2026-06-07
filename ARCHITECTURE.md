@@ -281,22 +281,25 @@ client to infer completion.
 
 ## CLI Client
 
-The `data-store` binary is an interactive REPL client over the documented HTTP
-API. It reads `server.bind_address`, `admin.token_file_path`, and
-`client.operation_timeout_seconds` from the service config, constructs
-`http://<bind_address>`, and sends operation requests to the service. It does
-not share process memory, bypass authorization, access SQLite directly, or
+The `data-store` binary is a CLI client over the documented HTTP API. With no
+operation flag, it starts the interactive REPL. With one operation flag such as
+`--health`, `--ingest`, `--search`, or `--shutdown`, it executes that operation
+non-interactively and exits after the terminal result or error. Both modes read
+`server.bind_address`, `admin.token_file_path`, and
+`client.operation_timeout_seconds` from the service config, construct
+`http://<bind_address>`, and send operation requests to the service. The client
+does not share process memory, bypass authorization, access SQLite directly, or
 reimplement domain behavior.
 
 Public commands send unauthenticated operations. Protected commands read the
-current token file immediately before sending the request and use the same
-bearer-token header required by curl clients. Client output is human-readable:
-it renders streamed status/progress events in place for the active stage,
-prints a newline when each stage completes, and then prints terminal
-results/errors. The `shutdown` command sends the protected operation directly
-and displays only the server-authored `shutdown_complete` terminal result as
-confirmation. Raw protocol payloads remain available through the HTTP API
-itself.
+current token file immediately before sending the request in either mode and use
+the same bearer-token header required by curl clients. Client output is
+human-readable: it renders streamed status/progress events in place for the
+active stage, prints a newline when each stage completes, and then prints
+terminal results/errors. The `shutdown` command sends the protected operation
+directly and displays only the server-authored `shutdown_complete` terminal
+result as confirmation. Raw protocol payloads remain available through the HTTP
+API itself.
 
 ## Hard Invariants
 
