@@ -252,6 +252,38 @@ Payload:
 
 Result payload reports service readiness and component diagnostics.
 
+### `sources`
+
+Authentication: none.
+
+Payload:
+
+```json
+{}
+```
+
+Result payload lists active ingested source documents:
+
+```json
+{
+  "sources": [
+    {
+      "sourcePath": "The_Elements_of_Style.pdf",
+      "activeVersionLabel": "2026-06-01T21:37:22.184Z",
+      "documentId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z",
+      "unitsIngested": 43,
+      "status": "ingested",
+      "createdAtMs": 1780135249223,
+      "updatedAtMs": 1780135249223
+    }
+  ]
+}
+```
+
+The operation must not expose retained inactive versions, absolute markdown
+paths, checksums, vector metadata, or conversion diagnostics. Those remain in
+the protected `versions` operation.
+
 ### `ingest`
 
 Authentication: none.

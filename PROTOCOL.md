@@ -282,6 +282,40 @@ startup smoke diagnostics. ColBERT readiness includes a max-capacity document
 encoding smoke check so long-sequence document-vector failures are reported
 before ingest is accepted as ready.
 
+### `sources`
+
+Authentication: none.
+
+Payload:
+
+```json
+{}
+```
+
+Result payload:
+
+```json
+{
+  "sources": [
+    {
+      "sourcePath": "The_Elements_of_Style.pdf",
+      "activeVersionLabel": "2026-06-01T21:37:22.184Z",
+      "documentId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z",
+      "unitsIngested": 43,
+      "status": "ingested",
+      "createdAtMs": 1780135249223,
+      "updatedAtMs": 1780135249223
+    }
+  ]
+}
+```
+
+Source listing returns active ingested source documents only. It is the public
+inventory view for callers that need to inspect which files are currently
+ingested. Retained inactive versions, checksums, absolute markdown paths, vector
+metadata, and conversion diagnostics remain part of the protected `versions`
+operation.
+
 ### `ingest`
 
 Authentication: none.

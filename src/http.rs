@@ -67,6 +67,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/health", get(get_health))
         .route("/v1/limits", get(get_limits))
+        .route("/v1/sources", get(get_sources))
         .route("/v1/ingest", post(post_ingest))
         .route("/v1/search", post(post_search))
         .route("/v1/operations", post(post_operation))
@@ -136,6 +137,31 @@ fn build_limits_response(state: &AppState) -> LimitsResponse {
             max_top_k: state.config.retrieval.max_top_k,
         },
     }
+}
+
+/// Return active ingested source documents without admin-only retained-version diagnostics.
+async fn get_sources(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::storage::IngestedSourceListing>, ApiError> {
+    let started = log_route_started("/v1/sources", "sources_listing");
+    let response = match execute_ingested_sources(&state) {
+        Ok(response) => response,
+        Err(error) => {
+            log_route_failed("/v1/sources", "sources_listing", &error, &started);
+            return Err(error);
+        }
+    };
+    info!(
+        event = "http.route.result_ready",
+        route = "/v1/sources",
+        stage = "result_ready",
+        status = 200_u16,
+        sources = response.sources.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
+
+    Ok(Json(response))
 }
 
 /// Log the accepted boundary for one route-specific HTTP request.
@@ -1414,6 +1440,7 @@ async fn execute_search(
 enum OperationName {
     Health,
     Limits,
+    Sources,
     Ingest,
     Search,
     Versions,
@@ -1427,6 +1454,7 @@ impl OperationName {
         match value {
             "health" => Ok(Self::Health),
             "limits" => Ok(Self::Limits),
+            "sources" => Ok(Self::Sources),
             "ingest" => Ok(Self::Ingest),
             "search" => Ok(Self::Search),
             "versions" => Ok(Self::Versions),
@@ -1443,6 +1471,7 @@ impl OperationName {
         match self {
             Self::Health => "health",
             Self::Limits => "limits",
+            Self::Sources => "sources",
             Self::Ingest => "ingest",
             Self::Search => "search",
             Self::Versions => "versions",
@@ -2492,6 +2521,15 @@ async fn execute_operation(
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             emit_terminal_result(emitter, operation.as_str(), build_limits_response(&state)).await
         }
+        OperationName::Sources => {
+            emitter
+                .status("sources_listing", "listing ingested source documents")
+                .await
+                .map_err(|error| OperationFailure::new("operation_streaming", error))?;
+            let response = execute_ingested_sources(&state)
+                .map_err(|error| OperationFailure::new("sources_listing", error))?;
+            emit_terminal_result(emitter, operation.as_str(), response).await
+        }
         OperationName::Ingest => {
             let request = decode_operation_payload(payload, operation.as_str())
                 .map_err(|error| OperationFailure::new("request_validating", error))?;
@@ -2771,6 +2809,51 @@ fn execute_shutdown(state: &AppState) -> Result<ShutdownResponse, ApiError> {
         status: SHUTDOWN_STATUS_COMPLETE.to_string(),
         message: SHUTDOWN_COMPLETE_MESSAGE.to_string(),
     })
+}
+
+/// Return active ingested sources after the public caller has opened the route or stream.
+fn execute_ingested_sources(
+    state: &AppState,
+) -> Result<crate::storage::IngestedSourceListing, ApiError> {
+    let started = Instant::now();
+    let storage = match state.storage() {
+        Ok(storage) => storage,
+        Err(source) => {
+            error!(
+                event = "sources.listing_failed",
+                stage = "storage_runtime",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ingested sources listing failed"
+            );
+            return Err(source);
+        }
+    };
+    let listing = match storage.list_ingested_sources() {
+        Ok(listing) => listing,
+        Err(source) => {
+            error!(
+                event = "sources.listing_failed",
+                stage = "storage_listing",
+                status = source.status_code().as_u16(),
+                error_kind = source.error_kind(),
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ingested sources listing failed"
+            );
+            return Err(source);
+        }
+    };
+    info!(
+        event = "sources.listed",
+        sources = listing.sources.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ingested sources listed"
+    );
+
+    Ok(listing)
 }
 
 /// Authorize and return retained source-document version diagnostics.

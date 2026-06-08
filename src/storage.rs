@@ -70,6 +70,34 @@ pub struct SearchCandidate {
 }
 
 #[derive(Debug, Serialize)]
+pub struct IngestedSourceListing {
+    pub sources: Vec<IngestedSourceRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestedSourceRecord {
+    #[serde(rename = "sourcePath")]
+    pub source_path: String,
+
+    #[serde(rename = "activeVersionLabel")]
+    pub active_version_label: String,
+
+    #[serde(rename = "documentId")]
+    pub document_id: String,
+
+    #[serde(rename = "unitsIngested")]
+    pub units_ingested: u32,
+
+    pub status: String,
+
+    #[serde(rename = "createdAtMs")]
+    pub created_at_ms: u64,
+
+    #[serde(rename = "updatedAtMs")]
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DocumentVersionListing {
     pub sources: Vec<SourceDocumentVersionListing>,
 }
@@ -210,6 +238,17 @@ struct StoredColbertDocumentVector {
     token_count: usize,
     dimension: usize,
     vector: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct QueriedIngestedSource {
+    source_path: String,
+    active_version_label: String,
+    document_id: String,
+    units_ingested: i64,
+    status: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug)]
@@ -356,6 +395,20 @@ const LOAD_ACTIVE_DOCUMENT_VERSIONS_SQL: &str = "
 SELECT source_path, version_label
 FROM active_document_versions
 ORDER BY source_path ASC";
+const LIST_INGESTED_SOURCES_SQL: &str = "
+SELECT
+  document_versions.source_path,
+  active_document_versions.version_label,
+  document_versions.document_id,
+  document_versions.units_ingested,
+  document_versions.status,
+  document_versions.created_at_ms,
+  document_versions.updated_at_ms
+FROM active_document_versions
+JOIN document_versions
+  ON document_versions.source_path = active_document_versions.source_path
+ AND document_versions.version_label = active_document_versions.version_label
+ORDER BY document_versions.source_path ASC";
 const LIST_DOCUMENT_VERSIONS_SQL: &str = "
 SELECT
   document_versions.source_path,
@@ -969,6 +1022,167 @@ impl StorageRuntime {
         );
 
         Ok(SearchSnapshot { cache: snapshot })
+    }
+
+    /// Return active ingested source documents without admin-only version diagnostics.
+    pub fn list_ingested_sources(&self) -> Result<IngestedSourceListing, ApiError> {
+        let started = Instant::now();
+        info!(
+            event = "storage.ingested_sources.listing_started",
+            db_path = %self.db_path.display(),
+            "ingested-source listing started"
+        );
+        let connection = match open_connection(&self.db_path) {
+            Ok(connection) => connection,
+            Err(source) => {
+                error!(
+                    event = "storage.ingested_sources.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "connection_open",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ingested-source listing failed"
+                );
+                return Err(source);
+            }
+        };
+        let mut statement = match connection
+            .prepare(LIST_INGESTED_SOURCES_SQL)
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to prepare ingested-source listing: {source}"
+                ))
+            }) {
+            Ok(statement) => statement,
+            Err(source) => {
+                error!(
+                    event = "storage.ingested_sources.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "statement_prepare",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ingested-source listing failed"
+                );
+                return Err(source);
+            }
+        };
+        let rows = match statement
+            .query_map([], |row| {
+                Ok(QueriedIngestedSource {
+                    source_path: row.get::<_, String>(0)?,
+                    active_version_label: row.get::<_, String>(1)?,
+                    document_id: row.get::<_, String>(2)?,
+                    units_ingested: row.get::<_, i64>(3)?,
+                    status: row.get::<_, String>(4)?,
+                    created_at_ms: row.get::<_, i64>(5)?,
+                    updated_at_ms: row.get::<_, i64>(6)?,
+                })
+            })
+            .map_err(|source| {
+                storage_operation_error(format!(
+                    "failed to execute ingested-source listing: {source}"
+                ))
+            }) {
+            Ok(rows) => rows,
+            Err(source) => {
+                error!(
+                    event = "storage.ingested_sources.listing_failed",
+                    db_path = %self.db_path.display(),
+                    phase = "query_execute",
+                    error = %source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ingested-source listing failed"
+                );
+                return Err(source);
+            }
+        };
+        let mut sources = Vec::new();
+        for row in rows {
+            let source = match row.map_err(|source| {
+                storage_operation_error(format!("failed to read ingested-source row: {source}"))
+            }) {
+                Ok(source) => source,
+                Err(source) => {
+                    error!(
+                        event = "storage.ingested_sources.listing_failed",
+                        db_path = %self.db_path.display(),
+                        phase = "row_read",
+                        error = %source,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "ingested-source listing failed"
+                    );
+                    return Err(source);
+                }
+            };
+            let record = IngestedSourceRecord {
+                source_path: source.source_path,
+                active_version_label: source.active_version_label,
+                document_id: source.document_id,
+                units_ingested: match i64_to_u32(
+                    "document_versions.units_ingested",
+                    source.units_ingested,
+                ) {
+                    Ok(units_ingested) => units_ingested,
+                    Err(source) => {
+                        error!(
+                            event = "storage.ingested_sources.listing_failed",
+                            db_path = %self.db_path.display(),
+                            phase = "record_materialization",
+                            error = %source,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "ingested-source listing failed"
+                        );
+                        return Err(source);
+                    }
+                },
+                status: source.status,
+                created_at_ms: match i64_to_u64(
+                    "document_versions.created_at_ms",
+                    source.created_at_ms,
+                ) {
+                    Ok(created_at_ms) => created_at_ms,
+                    Err(source) => {
+                        error!(
+                            event = "storage.ingested_sources.listing_failed",
+                            db_path = %self.db_path.display(),
+                            phase = "record_materialization",
+                            error = %source,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "ingested-source listing failed"
+                        );
+                        return Err(source);
+                    }
+                },
+                updated_at_ms: match i64_to_u64(
+                    "document_versions.updated_at_ms",
+                    source.updated_at_ms,
+                ) {
+                    Ok(updated_at_ms) => updated_at_ms,
+                    Err(source) => {
+                        error!(
+                            event = "storage.ingested_sources.listing_failed",
+                            db_path = %self.db_path.display(),
+                            phase = "record_materialization",
+                            error = %source,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "ingested-source listing failed"
+                        );
+                        return Err(source);
+                    }
+                },
+            };
+            sources.push(record);
+        }
+        let listing = IngestedSourceListing { sources };
+        info!(
+            event = "storage.ingested_sources.listing_completed",
+            db_path = %self.db_path.display(),
+            sources = listing.sources.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ingested-source listing completed"
+        );
+
+        Ok(listing)
     }
 
     /// Return retained source-document versions and active-version diagnostics for admin inspection.

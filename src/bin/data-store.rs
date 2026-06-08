@@ -63,6 +63,7 @@ struct ClientContext {
 enum Command {
     Health,
     Limits,
+    Sources,
     Ingest {
         source: String,
         force: bool,
@@ -209,6 +210,17 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         cli_usage: Some("data-store [--config <path>] --limits"),
         arguments: CommandArguments::NoArgs {
             build: build_limits_command,
+        },
+    },
+    CommandSpec {
+        repl_name: "sources",
+        repl_aliases: &[],
+        cli_flag: Some("--sources"),
+        cli_aliases: &[],
+        repl_usage: "sources",
+        cli_usage: Some("data-store [--config <path>] --sources"),
+        arguments: CommandArguments::NoArgs {
+            build: build_sources_command,
         },
     },
     CommandSpec {
@@ -392,6 +404,28 @@ struct SearchResult {
     source_path: String,
     #[serde(rename = "pageNumbers")]
     page_numbers: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestedSourceListing {
+    sources: Vec<IngestedSourceRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestedSourceRecord {
+    #[serde(rename = "sourcePath")]
+    source_path: String,
+    #[serde(rename = "activeVersionLabel")]
+    active_version_label: String,
+    #[serde(rename = "documentId")]
+    document_id: String,
+    #[serde(rename = "unitsIngested")]
+    units_ingested: u32,
+    status: String,
+    #[serde(rename = "createdAtMs")]
+    created_at_ms: u64,
+    #[serde(rename = "updatedAtMs")]
+    updated_at_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -909,6 +943,11 @@ fn build_limits_command() -> Command {
     Command::Limits
 }
 
+/// Build the typed sources command from a no-argument registry entry.
+fn build_sources_command() -> Command {
+    Command::Sources
+}
+
 /// Build the typed ingest command after shared parsing has captured the source and force flag.
 fn build_ingest_command(source: String, force: bool) -> Command {
     Command::Ingest { source, force }
@@ -1131,6 +1170,9 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
         }
         Command::Limits => {
             render_limits(send_operation(context, "limits", empty_payload(), false)?)
+        }
+        Command::Sources => {
+            render_sources(send_operation(context, "sources", empty_payload(), false)?);
         }
         Command::Ingest { source, force } => {
             let request = IngestRequest {
@@ -2050,6 +2092,24 @@ fn render_operation_benchmarks(benchmarks: Option<BenchmarkReport>) {
     }
     println!();
     println!("Total: {}", format_benchmark_duration(benchmarks.total));
+}
+
+/// Print active ingested source documents without retained-version diagnostics.
+fn render_sources(response: IngestedSourceListing) {
+    if response.sources.is_empty() {
+        println!("No ingested sources");
+        return;
+    }
+    for source in response.sources {
+        println!("Source: {}", source.source_path);
+        println!("  active version: {}", source.active_version_label);
+        println!("  document ID: {}", source.document_id);
+        println!("  status: {}", source.status);
+        println!("  units ingested: {}", source.units_ingested);
+        println!("  createdAtMs: {}", source.created_at_ms);
+        println!("  updatedAtMs: {}", source.updated_at_ms);
+        println!();
+    }
 }
 
 /// Print retained document versions grouped by source path.

@@ -149,6 +149,7 @@ For non-interactive use, pass exactly one operation flag:
 ./target/release/data-store --config config.toml --help
 ./target/release/data-store --config config.toml --health
 ./target/release/data-store --config config.toml --limits
+./target/release/data-store --config config.toml --sources
 ./target/release/data-store --config config.toml --ingest The_Elements_of_Style.pdf
 ./target/release/data-store --config config.toml --ingest The_Elements_of_Style.pdf --force
 ./target/release/data-store --config config.toml --search "clear writing style rules" 3
@@ -181,6 +182,7 @@ Common commands:
 ```text
 data-store> health
 data-store> limits
+data-store> sources
 data-store> ingest The_Elements_of_Style.pdf
 data-store> ingest The_Elements_of_Style.pdf --force
 data-store> search "clear writing style rules" 3
@@ -229,8 +231,8 @@ Public operations do not require authentication. Protected operations require
 the startup-scoped bearer token printed as `admin_shutdown_token=<token>` or
 written to the configured admin token file.
 
-Route-specific endpoints such as `/v1/health`, `/v1/limits`, `/v1/ingest`,
-`/v1/search`, and `/admin/...` remain available during migration as
+Route-specific endpoints such as `/v1/health`, `/v1/limits`, `/v1/sources`,
+`/v1/ingest`, `/v1/search`, and `/admin/...` remain available during migration as
 compatibility routes. New consumers should use `/v1/operations`.
 
 ## Health And Limits

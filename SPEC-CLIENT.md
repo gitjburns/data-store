@@ -180,6 +180,7 @@ Supported operation flags:
 ```bash
 data-store [--config <path>] --health
 data-store [--config <path>] --limits
+data-store [--config <path>] --sources
 data-store [--config <path>] --ingest <source> [--force]
 data-store [--config <path>] --search <query> [topK]
 data-store [--config <path>] --search-full <query> [topK]
@@ -254,6 +255,21 @@ Payload:
 ```
 
 Output: labeled request and retrieval limits.
+
+### `sources` / `--sources`
+
+Operation: `sources`
+
+Authentication: none.
+
+Payload:
+
+```json
+{}
+```
+
+Output: active ingested source listing. Include source path, active version
+label, document ID, status, units ingested, and timestamps.
 
 ### `ingest <source> [--force]` / `--ingest <source> [--force]`
 
