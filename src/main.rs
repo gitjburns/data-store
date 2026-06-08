@@ -293,7 +293,7 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(run_http_service(config, admin_shutdown_token, reporter))
 }
 
-/// Initialize service dependencies, bind HTTP, report readiness, and serve until shutdown.
+/// Bind HTTP before lengthy dependency initialization, then report readiness and serve until shutdown.
 async fn run_http_service(
     config: ServiceConfig,
     admin_shutdown_token: String,
@@ -305,6 +305,49 @@ async fn run_http_service(
         "data-store startup mode={} bind_address={bind_address}",
         reporter.mode_label()
     ))?;
+    reporter.report(format!(
+        "data-store startup http=binding bind_address={bind_address}"
+    ))?;
+    let http_bind_started_at = Instant::now();
+    info!(
+        event = "startup.http_bind_started",
+        %bind_address,
+        elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+        "startup HTTP bind started"
+    );
+    let listener = match TcpListener::bind(bind_address).await {
+        Ok(listener) => {
+            info!(
+                event = "startup.http_bound",
+                %bind_address,
+                elapsed_ms = http_bind_started_at.elapsed().as_millis() as u64,
+                "startup HTTP bind completed"
+            );
+            listener
+        }
+        Err(source) => {
+            reporter.report(format!(
+                "data-store startup http=bind_failed bind_address={bind_address} error=\"{source}\""
+            ))?;
+            error!(
+                event = "startup.http_bind_failed",
+                %bind_address,
+                error = %source,
+                elapsed_ms = http_bind_started_at.elapsed().as_millis() as u64,
+                "startup HTTP bind failed"
+            );
+            error!(
+                event = "startup.fatal",
+                stage = "http_bind",
+                %bind_address,
+                error = %source,
+                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+                "startup failed during HTTP bind"
+            );
+            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+            return Err(source.into());
+        }
+    };
     reporter.report_admin_shutdown_token(&admin_shutdown_token)?;
     let admin_token_file = match AdminTokenFile::write_current(&config, &admin_shutdown_token) {
         Ok(token_file) => token_file,
@@ -431,50 +474,6 @@ async fn run_http_service(
         shutdown_sender,
     ));
     let app = build_router(state).layer(TraceLayer::new_for_http());
-    reporter.report(format!(
-        "data-store startup http=binding bind_address={bind_address}"
-    ))?;
-    let http_bind_started_at = Instant::now();
-    info!(
-        event = "startup.http_bind_started",
-        %bind_address,
-        elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-        "startup HTTP bind started"
-    );
-    let listener = match TcpListener::bind(bind_address).await {
-        Ok(listener) => {
-            info!(
-                event = "startup.http_bound",
-                %bind_address,
-                elapsed_ms = http_bind_started_at.elapsed().as_millis() as u64,
-                "startup HTTP bind completed"
-            );
-            listener
-        }
-        Err(source) => {
-            reporter.report(format!(
-                "data-store startup http=bind_failed bind_address={bind_address} error=\"{source}\""
-            ))?;
-            error!(
-                event = "startup.http_bind_failed",
-                %bind_address,
-                error = %source,
-                elapsed_ms = http_bind_started_at.elapsed().as_millis() as u64,
-                "startup HTTP bind failed"
-            );
-            error!(
-                event = "startup.fatal",
-                stage = "http_bind",
-                %bind_address,
-                error = %source,
-                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-                "startup failed during HTTP bind"
-            );
-            admin_token_file.cleanup_if_current();
-            return Err(source.into());
-        }
-    };
-
     reporter.report(format!(
         "data-store startup http=listening bind_address={bind_address}"
     ))?;
