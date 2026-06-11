@@ -11,7 +11,8 @@ references and search queries.
 
 **In scope**
 
-- Rust service process using `axum` and `tokio`.
+- Rust service process with `axum` and `tokio` confined to the HTTP transport
+  shell.
 - Operation-scoped streamed HTTP protocol.
 - Document ingestion from service-owned corpus files.
 - Docling conversion, unit splitting, dense embeddings, persisted ColBERT
@@ -32,7 +33,11 @@ references and search queries.
 ## 2. Architecture
 
 - **Process:** independent service binary, `data-store-service`.
-- **HTTP runtime:** `axum` plus `tokio`.
+- **HTTP transport:** `axum` plus `tokio`, confined to request routing,
+  response streaming, body limits, and graceful-shutdown bridging.
+- **Domain execution:** synchronous operation pipelines for ingestion,
+  retrieval, storage, model calls, Docling process handling, admission, and
+  shutdown state.
 - **Inference:** `candle` and `tokenizers`, with CUDA or Apple Silicon Metal
   acceleration. CPU fallback is not supported for the configured models.
 - **Storage:** SQLite owns durable documents, versions, units, metadata, vector

@@ -608,8 +608,6 @@ impl RerankerRuntime {
                     document_chars = candidate.document_chars,
                     configured_max_tokens = self.max_tokens,
                     token_count = score.token_count,
-                    logit = score.logit,
-                    score = score.score,
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "reranker candidate pair scoring completed"
                 );

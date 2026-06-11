@@ -14,8 +14,11 @@ otherwise.
 
 ## Capabilities
 
-- Axum/Tokio operation-stream HTTP API for health, limits, ingest, search,
-  protected admin version controls, and protected shutdown.
+- Axum/Tokio confined to the HTTP transport shell for health, limits, ingest,
+  search, protected admin version controls, and protected shutdown.
+- Synchronous operation pipelines behind the transport shell for storage,
+  model calls, Docling process handling, admission, shutdown state, and CLI
+  operation.
 - Interactive `data-store` CLI client for operating the documented HTTP API.
 - Explicit Metal/CUDA accelerator selection with no CPU fallback.
 - Local Qwen3 dense embedding, ColBERT, and ModernBERT sequence-classification

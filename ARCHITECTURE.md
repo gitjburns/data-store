@@ -17,7 +17,11 @@ model runtime, and operational lifecycle are service-local concerns.
 
 ## Runtime Stack
 
-- HTTP server: Axum on Tokio.
+- HTTP transport shell: Axum on Tokio, confined to `main.rs` and the transport
+  layer of `http.rs`.
+- Domain execution: synchronous OS-thread operation pipelines, blocking
+  subprocess I/O, synchronous SQLite access, synchronous model calls, and
+  synchronous admission/shutdown state.
 - Inference: Candle plus tokenizers, using an explicitly selected accelerator.
 - Storage: SQLite with FTS5 for durable data and lexical search.
 - Dense retrieval: exact cosine scan over an in-memory active-vector cache.
@@ -37,6 +41,12 @@ initialized, inference readiness fails explicitly.
 Docling conversion runs in a separate Python CLI process. Its configured
 `[docling].device` is passed to Docling as `--device` and is independent from
 the Rust `[inference].device` used by Candle model inference.
+
+Axum/Tokio remains only as the HTTP transport boundary because the evaluated
+synchronous server crates did not satisfy the service's streaming, shutdown,
+and body-limit requirements. Domain code must not depend on Axum or Tokio
+types; operation pipelines communicate with the transport through
+service-owned synchronous boundaries.
 
 ## Configuration Ownership
 

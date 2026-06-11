@@ -1620,6 +1620,7 @@ impl StorageRuntime {
             });
         }
         let source_path = conversion.source.relative_path.display().to_string();
+        let vector_count = stored_vectors.len();
 
         info!(
             event = "storage.ingest_transaction.starting",
@@ -1665,6 +1666,26 @@ impl StorageRuntime {
             event = "storage.ingest_transaction.started",
             source_path, version_label, document_id, "ingest SQLite transaction started"
         );
+        // The SQLite transaction rolls back by drop; this makes each intentional pre-commit abort durable.
+        let log_ingest_transaction_aborting =
+            |phase: &'static str,
+             vector_count: usize,
+             published_at_ms: Option<u64>,
+             error: &ApiError| {
+                error!(
+                    event = "storage.ingest_transaction.aborting",
+                    source_path,
+                    version_label,
+                    document_id,
+                    phase,
+                    units = units.len(),
+                    vectors = vector_count,
+                    published_at_ms = ?published_at_ms,
+                    durable_commit_completed = false,
+                    error = %error,
+                    "ingest SQLite transaction aborting before commit"
+                );
+            };
 
         if let Err(source) = insert_document(
             &tx,
@@ -1685,6 +1706,7 @@ impl StorageRuntime {
                 error = %source,
                 "ingest document metadata persistence failed"
             );
+            log_ingest_transaction_aborting("document_metadata", vector_count, None, &source);
             return Err(source);
         }
         info!(
@@ -1695,7 +1717,17 @@ impl StorageRuntime {
             units = units.len(),
             "ingest document metadata persisted"
         );
-        emit_ingest_storage_progress(&mut progress, "persisting document metadata", 1, 1)?;
+        if let Err(source) =
+            emit_ingest_storage_progress(&mut progress, "persisting document metadata", 1, 1)
+        {
+            log_ingest_transaction_aborting(
+                "document_metadata_progress",
+                vector_count,
+                None,
+                &source,
+            );
+            return Err(source);
+        }
         for (index, ((unit, vector), colbert_vector)) in units
             .iter()
             .zip(stored_vectors.iter())
@@ -1719,6 +1751,7 @@ impl StorageRuntime {
                     error = %error,
                     "ingest unit persistence failed"
                 );
+                log_ingest_transaction_aborting("id_validation", vector_count, None, &error);
                 return Err(error);
             }
             if let Err(source) = insert_unit(&tx, unit, version_label) {
@@ -1734,6 +1767,7 @@ impl StorageRuntime {
                     error = %source,
                     "ingest unit persistence failed"
                 );
+                log_ingest_transaction_aborting("unit_row", vector_count, None, &source);
                 return Err(source);
             }
             if let Err(source) = insert_dense_vector(&tx, vector, dense, now_ms) {
@@ -1749,6 +1783,7 @@ impl StorageRuntime {
                     error = %source,
                     "ingest unit persistence failed"
                 );
+                log_ingest_transaction_aborting("dense_vector_row", vector_count, None, &source);
                 return Err(source);
             }
             if let Err(source) =
@@ -1766,6 +1801,7 @@ impl StorageRuntime {
                     error = %source,
                     "ingest unit persistence failed"
                 );
+                log_ingest_transaction_aborting("colbert_vector_row", vector_count, None, &source);
                 return Err(source);
             }
             if should_log_storage_checkpoint(index + 1, units.len()) {
@@ -1779,15 +1815,17 @@ impl StorageRuntime {
                     "ingest units and vectors persisted checkpoint"
                 );
             }
-            emit_ingest_storage_progress(
+            if let Err(source) = emit_ingest_storage_progress(
                 &mut progress,
                 "persisting units and vectors",
                 (index + 1) as u64,
                 units.len() as u64,
-            )?;
+            ) {
+                log_ingest_transaction_aborting("units_progress", vector_count, None, &source);
+                return Err(source);
+            }
         }
 
-        let vector_count = stored_vectors.len();
         let published_at_ms = match current_time_ms() {
             Ok(value) => value,
             Err(source) => {
@@ -1801,6 +1839,7 @@ impl StorageRuntime {
                     error = %source,
                     "ingest active-version publish failed"
                 );
+                log_ingest_transaction_aborting("publish_timestamp", vector_count, None, &source);
                 return Err(source);
             }
         };
@@ -1828,6 +1867,12 @@ impl StorageRuntime {
                     phase = "cache_lock",
                     error = %source,
                     "ingest active-version publish failed"
+                );
+                log_ingest_transaction_aborting(
+                    "cache_lock",
+                    vector_count,
+                    Some(published_at_ms),
+                    &source,
                 );
                 return Err(source);
             }
@@ -1861,6 +1906,12 @@ impl StorageRuntime {
                     phase = "cache_prepare",
                     error = %source,
                     "ingest active-version publish failed"
+                );
+                log_ingest_transaction_aborting(
+                    "cache_prepare",
+                    vector_count,
+                    Some(published_at_ms),
+                    &source,
                 );
                 return Err(source);
             }
@@ -1910,6 +1961,12 @@ impl StorageRuntime {
                 error = %source,
                 "ingest active-version publish failed"
             );
+            log_ingest_transaction_aborting(
+                "active_row_write",
+                vector_count,
+                Some(published_at_ms),
+                &source,
+            );
             return Err(source);
         }
         info!(
@@ -1922,7 +1979,17 @@ impl StorageRuntime {
             phase = "active_row_write",
             "ingest active-version row written"
         );
-        emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)?;
+        if let Err(source) =
+            emit_ingest_storage_progress(&mut progress, "committing ingest transaction", 1, 1)
+        {
+            log_ingest_transaction_aborting(
+                "commit_progress",
+                vector_count,
+                Some(published_at_ms),
+                &source,
+            );
+            return Err(source);
+        }
         info!(
             event = "storage.ingest_transaction.commit_starting",
             source_path,
@@ -2597,6 +2664,21 @@ impl StorageRuntime {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "active-version publish SQLite transaction started"
         );
+        // The SQLite transaction rolls back by drop; this makes each intentional pre-commit abort durable.
+        let log_active_version_publish_aborting = |phase: &'static str, error: &ApiError| {
+            error!(
+                event = "storage.active_version_publish.aborting",
+                source_path,
+                version_label,
+                vectors = vector_count,
+                published_at_ms,
+                phase,
+                durable_commit_completed = false,
+                error = %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "active-version publish transaction aborting before commit"
+            );
+        };
         info!(
             event = "storage.active_version_publish.active_row_writing",
             source_path,
@@ -2629,6 +2711,7 @@ impl StorageRuntime {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "active-version publish failed"
             );
+            log_active_version_publish_aborting("active_row_write", &source);
             return Err(source);
         }
         info!(
