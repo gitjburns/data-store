@@ -21,6 +21,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
+// Axum, Tokio channels, and HTTP body bytes are confined to this transport
+// module. Operation pipelines run on standard threads and cross this boundary
+// only through OperationStreamSender, so synchronous domain work never depends
+// on async runtime types directly.
 use crate::{
     docling::{DoclingProgressUpdate, convert_source_to_markdown, panic_payload_message},
     error::{ApiError, OperationErrorDetail},
@@ -1539,22 +1543,51 @@ impl OperationFailure {
     }
 }
 
+enum OperationStreamSendStatus {
+    Sent,
+    Full,
+    Closed,
+}
+
+struct OperationStreamSender {
+    sender: mpsc::Sender<Result<Bytes, Infallible>>,
+}
+
+impl OperationStreamSender {
+    /// Own the Tokio response-body channel at the transport boundary.
+    fn new(sender: mpsc::Sender<Result<Bytes, Infallible>>) -> Self {
+        Self { sender }
+    }
+
+    /// Try to deliver a reporting line without blocking synchronous operation work.
+    fn try_send_line(&self, line: Vec<u8>) -> OperationStreamSendStatus {
+        match self.sender.try_send(Ok(Bytes::from(line))) {
+            Ok(()) => OperationStreamSendStatus::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => OperationStreamSendStatus::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => OperationStreamSendStatus::Closed,
+        }
+    }
+
+    /// Deliver a terminal line through the response stream and report client loss explicitly.
+    fn blocking_send_line(&self, line: Vec<u8>) -> Result<(), ApiError> {
+        self.sender
+            .blocking_send(Ok(Bytes::from(line)))
+            .map_err(|_| operation_stream_closed_api_error())
+    }
+}
+
 struct OperationEmitter {
     operation_id: String,
     operation: &'static str,
     sequence: u64,
     started: Instant,
-    sender: mpsc::Sender<Result<Bytes, Infallible>>,
+    sender: OperationStreamSender,
     reporting_delivery_open: bool,
 }
 
 impl OperationEmitter {
     /// Create a sequence-owning emitter for one accepted operation stream.
-    fn new(
-        operation_id: String,
-        operation: &'static str,
-        sender: mpsc::Sender<Result<Bytes, Infallible>>,
-    ) -> Self {
+    fn new(operation_id: String, operation: &'static str, sender: OperationStreamSender) -> Self {
         Self {
             operation_id,
             operation,
@@ -1742,13 +1775,13 @@ impl OperationEmitter {
         event: OperationEvent,
     ) -> Result<(), ApiError> {
         let line = self.serialize_event_line(event_type, sequence, stage, message, event)?;
-        match self.sender.try_send(Ok(line)) {
-            Ok(()) => {
+        match self.sender.try_send_line(line) {
+            OperationStreamSendStatus::Sent => {
                 let delivery = Ok(());
                 self.log_delivery_result(event_type, sequence, stage, message, &delivery);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            OperationStreamSendStatus::Full => {
                 info!(
                     event = "operation.reporting_event_not_delivered",
                     operation = self.operation,
@@ -1763,7 +1796,7 @@ impl OperationEmitter {
                 );
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            OperationStreamSendStatus::Closed => {
                 let delivery = Err(operation_stream_closed_api_error());
                 self.log_delivery_result(event_type, sequence, stage, message, &delivery);
                 delivery
@@ -1781,10 +1814,7 @@ impl OperationEmitter {
         event: OperationEvent,
     ) -> Result<(), ApiError> {
         let line = self.serialize_event_line(event_type, sequence, stage, message, event)?;
-        let delivery = self
-            .sender
-            .blocking_send(Ok(line))
-            .map_err(operation_stream_closed_error);
+        let delivery = self.sender.blocking_send_line(line);
         self.log_delivery_result(event_type, sequence, stage, message, &delivery);
         delivery
     }
@@ -1797,7 +1827,7 @@ impl OperationEmitter {
         stage: Option<&str>,
         message: Option<&str>,
         event: OperationEvent,
-    ) -> Result<Bytes, ApiError> {
+    ) -> Result<Vec<u8>, ApiError> {
         let mut line = match serde_json::to_vec(&event) {
             Ok(line) => line,
             Err(source) => {
@@ -1819,7 +1849,7 @@ impl OperationEmitter {
             }
         };
         line.push(b'\n');
-        Ok(Bytes::from(line))
+        Ok(line)
     }
 
     /// Convert nonterminal stream-close failures into durable reporting-only diagnostics.
@@ -1958,11 +1988,6 @@ fn operation_stream_closed_api_error() -> ApiError {
     ApiError::InternalIo {
         message: OPERATION_STREAM_CLOSED_MESSAGE.to_string(),
     }
-}
-
-/// Build the canonical internal error for a response stream that closed before delivery.
-fn operation_stream_closed_error(_: mpsc::error::SendError<Result<Bytes, Infallible>>) -> ApiError {
-    operation_stream_closed_api_error()
 }
 
 /// Return whether an operation-stream error represents client delivery loss only.
@@ -2189,7 +2214,7 @@ async fn post_operation(
             operation,
             operation_id,
             request.payload,
-            sender,
+            OperationStreamSender::new(sender),
         );
     });
     info!(
@@ -2403,7 +2428,7 @@ fn run_operation_stream(
     operation: OperationName,
     operation_id: String,
     payload: serde_json::Value,
-    sender: mpsc::Sender<Result<Bytes, Infallible>>,
+    sender: OperationStreamSender,
 ) {
     let mut emitter = OperationEmitter::new(operation_id, operation.as_str(), sender);
     info!(

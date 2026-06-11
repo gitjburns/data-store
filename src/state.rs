@@ -382,8 +382,7 @@ impl ExclusiveGate {
     /// Block the calling thread until exclusive access is acquired.
     ///
     /// The Result is kept for the caller's diagnostic error path even though
-    /// poison is recovered on every branch; Phase 3 revisits the signature
-    /// when the async call sites are rewritten.
+    /// poison is recovered on every branch.
     fn acquire(&self) -> Result<(), String> {
         // The bool guarded by this lock stays valid after a holder panic, so
         // poison is recovered on acquire and release alike; std poison is

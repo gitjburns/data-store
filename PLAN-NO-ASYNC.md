@@ -13,8 +13,8 @@ Fallback ladder step 2 research is complete (2026-06-11): `oxhttp` and `astra`
 were both excluded, and the Open Decision is resolved by user decision via
 fallback step 3 — no crate swap; Axum/Tokio is retained as a confined
 transport shell (see the revised Goal and the Open Decision resolution).
-Phase 3 is complete (2026-06-11). Phase 4 is rescoped accordingly and is the
-next scheduled work item. Phase 5 has not started.
+Phase 3 is complete (2026-06-11). Phase 4 is complete (2026-06-11). Phase 5 is
+the next scheduled work item.
 
 Per the Note below, work is sequenced for development efficiency rather than
 for keeping intermediate builds functional. Interim phase acceptance is
@@ -297,8 +297,8 @@ Implementation notes:
   in Phase 3.
 - Shutdown uses a `ShutdownSignal` (`Mutex<bool>` + `Condvar` with
   `request()`/blocking `wait()`). `main.rs` keeps a temporary
-  `tokio::task::spawn_blocking` adapter for Axum graceful shutdown, removed
-  with the server in Phase 4.
+  `tokio::task::spawn_blocking` adapter for Axum graceful shutdown, replaced
+  by the final shell-owned bridge in Phase 4.
 - `ApiError::status_code()` became transport-neutral `status_u16()`; the
   `IntoResponse` rendering and `ErrorBody` moved into `http.rs`. One
   mechanical rename landed in `src/storage.rs`, which was not in the expected
@@ -498,6 +498,32 @@ Acceptance:
 Rescoped (2026-06-11) from "Replace Axum/Tokio Server" per the Open Decision
 resolution.
 
+Status: Complete (2026-06-11).
+
+Implementation notes:
+
+- `OperationEmitter` no longer names Tokio channel types directly. The
+  transport-owned `OperationStreamSender` wraps the Axum/Tokio response-body
+  channel and preserves the previous delivery behavior: nonterminal reporting
+  uses nonblocking delivery, terminal result/error delivery uses blocking
+  delivery, and delivery outcomes remain separately logged from backend
+  execution outcomes.
+- `main.rs` replaced the temporary Phase 1 `tokio::task::spawn_blocking`
+  graceful-shutdown adapter with a shell-owned bridge: a standard thread waits
+  on the blocking `ShutdownSignal`, logs its lifecycle, and wakes Axum graceful
+  shutdown through a Tokio oneshot confined to the transport shell.
+- `tokio` features were trimmed from `full` to `rt-multi-thread`, `net`, and
+  `sync`.
+- The stale `state.rs` comment referring to future async call-site cleanup was
+  removed.
+- Compile acceptance (`cargo fmt`, `cargo check`,
+  `cargo check --features metal`) passed. Containment scans confirmed no
+  `spawn_blocking`, `tokio::spawn`, or `block_in_place`, and no `tokio`/`axum`
+  references outside `src/main.rs` and `src/http.rs`.
+- Live HTTP route, operation-stream, protected-admin, and token-file shutdown
+  checks were not run in this session because the service was not started; they
+  remain Phase 5 runtime verification inputs.
+
 Scope:
 
 - Restrict `tokio`, `axum`, `tokio-stream`, and `tower-http` usage to
@@ -525,6 +551,7 @@ Expected files:
 - `Cargo.lock`
 - `src/http.rs`
 - `src/main.rs`
+- `src/state.rs` (comment cleanup only)
 
 Acceptance:
 

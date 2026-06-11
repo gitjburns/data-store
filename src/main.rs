@@ -28,6 +28,7 @@ use std::{
 };
 
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -1172,15 +1173,46 @@ fn generate_admin_shutdown_token() -> anyhow::Result<String> {
 
 /// Wait until the protected admin shutdown route signals service termination.
 async fn wait_for_shutdown_signal(signal: Arc<ShutdownSignal>) {
+    let (shutdown_ready, shutdown_waiting) = oneshot::channel();
     info!(
         event = "shutdown.wait_started",
         stage = "shutdown_signal_waiting",
         "waiting for shutdown signal"
     );
-    // Temporary Phase 1 adapter: the blocking condvar wait runs on Tokio's
-    // blocking pool so it does not pin an async worker thread. This shim is
-    // removed together with the Axum server in Phase 4.
-    match tokio::task::spawn_blocking(move || signal.wait()).await {
+    // The blocking domain signal stays on a standard thread; this async future
+    // exists only to bridge that signal into Axum graceful shutdown.
+    std::thread::spawn(move || {
+        let bridge_started = Instant::now();
+        info!(
+            event = "shutdown.signal_bridge_thread_started",
+            stage = "shutdown_signal_waiting",
+            task = "shutdown_signal_bridge",
+            "shutdown signal bridge thread started"
+        );
+        signal.wait();
+        match shutdown_ready.send(()) {
+            Ok(()) => {
+                info!(
+                    event = "shutdown.signal_bridge_thread_completed",
+                    stage = "shutdown_signal_received",
+                    task = "shutdown_signal_bridge",
+                    elapsed_ms = bridge_started.elapsed().as_millis() as u64,
+                    "shutdown signal bridge thread completed"
+                );
+            }
+            Err(()) => {
+                warn!(
+                    event = "shutdown.signal_bridge_thread_failed",
+                    stage = "shutdown_signal_forwarding",
+                    task = "shutdown_signal_bridge",
+                    elapsed_ms = bridge_started.elapsed().as_millis() as u64,
+                    "shutdown signal bridge receiver closed before signal forwarding"
+                );
+            }
+        }
+    });
+
+    match shutdown_waiting.await {
         Ok(()) => {
             info!(
                 event = "shutdown.signal_received",
@@ -1193,7 +1225,7 @@ async fn wait_for_shutdown_signal(signal: Arc<ShutdownSignal>) {
                 event = "shutdown.signal_wait_failed",
                 stage = "shutdown_signal_waiting",
                 error = %source,
-                "shutdown signal wait task failed before signal"
+                "shutdown signal bridge closed before signal"
             );
         }
     }
