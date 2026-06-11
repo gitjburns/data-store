@@ -445,7 +445,22 @@ Result payload:
         "bm25LatencyMs": 4201,
         "rrfFusionLatencyMs": 0,
         "candidateMaterializationLatencyMs": 365,
-        "rawDiagnosticsLatencyMs": 22
+        "rawDiagnosticsLatencyMs": 22,
+        "bm25": {
+          "ftsQueryPresent": true,
+          "ftsTermCount": 4,
+          "ftsQueryBytes": 38,
+          "activeVersionCount": 8,
+          "candidateLimit": 100,
+          "sqlParameterCount": 18,
+          "returnedCandidates": 100,
+          "connectionOpenLatencyMs": 0,
+          "filterBuildLatencyMs": 0,
+          "prepareLatencyMs": 0,
+          "queryExecutionLatencyMs": 0,
+          "rowIterationLatencyMs": 4201,
+          "totalLatencyMs": 4201
+        }
       }
     }
   }
@@ -474,6 +489,11 @@ Retrieval raw diagnostics itemize the `retrieving_candidates` operation stage:
 - `candidateMaterializationLatencyMs` is the time to load fused unit metadata,
   content, and persisted ColBERT document vectors.
 - `rawDiagnosticsLatencyMs` is raw retrieval diagnostics assembly time.
+- `raw.storage.retrieval.bm25` contains protocol-visible BM25 diagnostics:
+  FTS query presence, generated FTS term count and byte length, active-version
+  filter size, candidate limit, SQL parameter count, returned candidate count,
+  and the connection-open, filter-build, prepare, query-execution,
+  row-iteration, and total BM25 durations.
 
 Reranker raw diagnostics are backend-dependent:
 

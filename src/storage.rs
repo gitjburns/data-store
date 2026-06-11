@@ -285,6 +285,29 @@ struct Bm25Match {
 }
 
 #[derive(Debug)]
+struct Bm25SearchOutput {
+    matches: Vec<Bm25Match>,
+    diagnostics: Bm25SearchDiagnostics,
+}
+
+#[derive(Debug)]
+struct Bm25SearchDiagnostics {
+    fts_query_present: bool,
+    fts_term_count: usize,
+    fts_query_bytes: usize,
+    active_version_count: usize,
+    candidate_limit: usize,
+    sql_parameter_count: usize,
+    returned_candidates: usize,
+    connection_open_latency_ms: u64,
+    filter_build_latency_ms: u64,
+    prepare_latency_ms: u64,
+    query_execution_latency_ms: u64,
+    row_iteration_latency_ms: u64,
+    total_latency_ms: u64,
+}
+
+#[derive(Debug)]
 struct FusedMatch {
     unit_id: String,
     score: f64,
@@ -312,6 +335,7 @@ struct SearchRawInput<'a> {
     query_vector: &'a StoredDenseVector,
     dense_matches: &'a [DenseMatch],
     bm25_matches: &'a [Bm25Match],
+    bm25_diagnostics: &'a Bm25SearchDiagnostics,
     fused_matches: &'a [FusedMatch],
     bm25_query: Option<&'a str>,
     candidate_limit: usize,
@@ -2182,12 +2206,12 @@ impl StorageRuntime {
             active_sources = cache_snapshot.active_versions.len(),
             "search BM25 started"
         );
-        let bm25_matches = match self.search_bm25(
+        let bm25_output = match self.search_bm25(
             bm25_query.as_deref(),
             candidate_limit,
             &cache_snapshot.active_versions,
         ) {
-            Ok(matches) => matches,
+            Ok(output) => output,
             Err(source) => {
                 error!(
                     event = "storage.search_bm25.failed",
@@ -2204,6 +2228,8 @@ impl StorageRuntime {
                 return Err(source);
             }
         };
+        let bm25_matches = bm25_output.matches;
+        let bm25_diagnostics = bm25_output.diagnostics;
         let bm25_latency_ms = bm25_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.search_bm25.completed",
@@ -2212,6 +2238,15 @@ impl StorageRuntime {
             top_k,
             candidate_limit,
             matches = bm25_matches.len(),
+            fts_term_count = bm25_diagnostics.fts_term_count,
+            fts_query_bytes = bm25_diagnostics.fts_query_bytes,
+            active_versions = bm25_diagnostics.active_version_count,
+            sql_parameters = bm25_diagnostics.sql_parameter_count,
+            connection_open_ms = bm25_diagnostics.connection_open_latency_ms,
+            filter_build_ms = bm25_diagnostics.filter_build_latency_ms,
+            prepare_ms = bm25_diagnostics.prepare_latency_ms,
+            query_execution_ms = bm25_diagnostics.query_execution_latency_ms,
+            row_iteration_ms = bm25_diagnostics.row_iteration_latency_ms,
             elapsed_ms = bm25_latency_ms,
             "search BM25 completed"
         );
@@ -2340,6 +2375,7 @@ impl StorageRuntime {
             query_vector: &query_vector,
             dense_matches: &dense_matches,
             bm25_matches: &bm25_matches,
+            bm25_diagnostics: &bm25_diagnostics,
             fused_matches: &fused_matches,
             bm25_query: bm25_query.as_deref(),
             candidate_limit,
@@ -2408,15 +2444,26 @@ impl StorageRuntime {
         fts_query: Option<&str>,
         limit: usize,
         active_versions: &[ActiveDocumentVersion],
-    ) -> Result<Vec<Bm25Match>, ApiError> {
+    ) -> Result<Bm25SearchOutput, ApiError> {
+        let started = Instant::now();
         let Some(fts_query) = fts_query else {
-            return Ok(Vec::new());
+            return Ok(Bm25SearchOutput {
+                matches: Vec::new(),
+                diagnostics: empty_bm25_diagnostics(false, limit, active_versions.len(), started),
+            });
         };
         if limit == 0 || active_versions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Bm25SearchOutput {
+                matches: Vec::new(),
+                diagnostics: empty_bm25_diagnostics(true, limit, active_versions.len(), started),
+            });
         }
 
+        let connection_started = Instant::now();
         let connection = open_connection(&self.db_path)?;
+        let connection_open_latency_ms = connection_started.elapsed().as_millis() as u64;
+
+        let filter_started = Instant::now();
         let active_filter = active_versions
             .iter()
             .map(|_| "(units.source_path = ? AND units.version_label = ?)")
@@ -2430,12 +2477,19 @@ impl StorageRuntime {
             query_params.push(Value::from(active.version_label.clone()));
         }
         query_params.push(Value::from(limit as i64));
+        let sql_parameter_count = query_params.len();
+        let filter_build_latency_ms = filter_started.elapsed().as_millis() as u64;
+
+        let prepare_started = Instant::now();
         let mut statement = connection
             // ASC preserves SQLite FTS5's lower-is-better bm25() ordering.
             .prepare(&sql)
             .map_err(|source| {
                 storage_operation_error(format!("failed to prepare BM25 search: {source}"))
             })?;
+        let prepare_latency_ms = prepare_started.elapsed().as_millis() as u64;
+
+        let query_started = Instant::now();
         let rows = statement
             .query_map(params_from_iter(query_params), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
@@ -2443,6 +2497,9 @@ impl StorageRuntime {
             .map_err(|source| {
                 storage_operation_error(format!("failed to execute BM25 search: {source}"))
             })?;
+        let query_execution_latency_ms = query_started.elapsed().as_millis() as u64;
+
+        let row_iteration_started = Instant::now();
         let mut matches = Vec::new();
         for row in rows {
             let (unit_id, score) = row.map_err(|source| {
@@ -2459,8 +2516,27 @@ impl StorageRuntime {
                 rank: matches.len() + 1,
             });
         }
+        let row_iteration_latency_ms = row_iteration_started.elapsed().as_millis() as u64;
+        let diagnostics = Bm25SearchDiagnostics {
+            fts_query_present: true,
+            fts_term_count: count_fts_query_terms(fts_query),
+            fts_query_bytes: fts_query.len(),
+            active_version_count: active_versions.len(),
+            candidate_limit: limit,
+            sql_parameter_count,
+            returned_candidates: matches.len(),
+            connection_open_latency_ms,
+            filter_build_latency_ms,
+            prepare_latency_ms,
+            query_execution_latency_ms,
+            row_iteration_latency_ms,
+            total_latency_ms: started.elapsed().as_millis() as u64,
+        };
 
-        Ok(matches)
+        Ok(Bm25SearchOutput {
+            matches,
+            diagnostics,
+        })
     }
 
     /// Load durable unit metadata and content for already ranked fused matches.
@@ -2501,6 +2577,21 @@ impl StorageRuntime {
                     "dimension": input.query_vector.vector.len(),
                     "norm": input.query_vector.norm,
                     "fts": input.bm25_query
+                },
+                "bm25": {
+                    "ftsQueryPresent": input.bm25_diagnostics.fts_query_present,
+                    "ftsTermCount": input.bm25_diagnostics.fts_term_count,
+                    "ftsQueryBytes": input.bm25_diagnostics.fts_query_bytes,
+                    "activeVersionCount": input.bm25_diagnostics.active_version_count,
+                    "candidateLimit": input.bm25_diagnostics.candidate_limit,
+                    "sqlParameterCount": input.bm25_diagnostics.sql_parameter_count,
+                    "returnedCandidates": input.bm25_diagnostics.returned_candidates,
+                    "connectionOpenLatencyMs": input.bm25_diagnostics.connection_open_latency_ms,
+                    "filterBuildLatencyMs": input.bm25_diagnostics.filter_build_latency_ms,
+                    "prepareLatencyMs": input.bm25_diagnostics.prepare_latency_ms,
+                    "queryExecutionLatencyMs": input.bm25_diagnostics.query_execution_latency_ms,
+                    "rowIterationLatencyMs": input.bm25_diagnostics.row_iteration_latency_ms,
+                    "totalLatencyMs": input.bm25_diagnostics.total_latency_ms
                 },
                 "cache": {
                     "vectorCount": input.cache.unit_ids.len(),
@@ -3045,6 +3136,39 @@ fn build_fts_query(query: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" OR "),
     )
+}
+
+/// Build BM25 diagnostics for paths that skip SQLite work before opening the database.
+fn empty_bm25_diagnostics(
+    fts_query_present: bool,
+    candidate_limit: usize,
+    active_version_count: usize,
+    started: Instant,
+) -> Bm25SearchDiagnostics {
+    Bm25SearchDiagnostics {
+        fts_query_present,
+        fts_term_count: 0,
+        fts_query_bytes: 0,
+        active_version_count,
+        candidate_limit,
+        sql_parameter_count: 0,
+        returned_candidates: 0,
+        connection_open_latency_ms: 0,
+        filter_build_latency_ms: 0,
+        prepare_latency_ms: 0,
+        query_execution_latency_ms: 0,
+        row_iteration_latency_ms: 0,
+        total_latency_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Count terms in the internally generated FTS query format without treating it as user syntax.
+fn count_fts_query_terms(fts_query: &str) -> usize {
+    if fts_query.is_empty() {
+        0
+    } else {
+        fts_query.split(" OR ").count()
+    }
 }
 
 /// Fuse dense and BM25 candidates with reciprocal rank fusion.

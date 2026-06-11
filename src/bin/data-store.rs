@@ -1944,6 +1944,59 @@ fn retrieval_benchmark_breakdown(raw: &serde_json::Value) -> Vec<BenchmarkBreakd
         .collect()
 }
 
+/// Print protocol-surfaced BM25 diagnostics required by the search response contract.
+fn render_bm25_diagnostics(raw: &serde_json::Value) {
+    let bm25 = raw
+        .pointer("/storage/retrieval/bm25")
+        .expect("search response missing raw.storage.retrieval.bm25 diagnostics");
+    println!();
+    println!("BM25 diagnostics:");
+    println!(
+        "  fts query present: {}",
+        yes_no(required_raw_bool(bm25, "ftsQueryPresent"))
+    );
+    render_required_raw_u64(bm25, "ftsTermCount", "  fts terms");
+    render_required_raw_u64(bm25, "ftsQueryBytes", "  fts query bytes");
+    render_required_raw_u64(bm25, "activeVersionCount", "  active versions");
+    render_required_raw_u64(bm25, "candidateLimit", "  candidate limit");
+    render_required_raw_u64(bm25, "sqlParameterCount", "  sql parameters");
+    render_required_raw_u64(bm25, "returnedCandidates", "  returned candidates");
+    render_required_raw_ms(bm25, "connectionOpenLatencyMs", "  connection open");
+    render_required_raw_ms(bm25, "filterBuildLatencyMs", "  filter build");
+    render_required_raw_ms(bm25, "prepareLatencyMs", "  prepare");
+    render_required_raw_ms(bm25, "queryExecutionLatencyMs", "  query execution");
+    render_required_raw_ms(bm25, "rowIterationLatencyMs", "  row iteration");
+    render_required_raw_ms(bm25, "totalLatencyMs", "  total");
+}
+
+/// Read a required raw boolean diagnostic from a protocol diagnostics object.
+fn required_raw_bool(raw: &serde_json::Value, field: &str) -> bool {
+    raw.get(field)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("search response BM25 diagnostics missing boolean {field}"))
+}
+
+/// Print a required raw unsigned integer diagnostic.
+fn render_required_raw_u64(raw: &serde_json::Value, field: &str, label: &str) {
+    let value = raw
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("search response BM25 diagnostics missing integer {field}"));
+    println!("{label}: {value}");
+}
+
+/// Print a required millisecond diagnostic using the same seconds format as benchmarks.
+fn render_required_raw_ms(raw: &serde_json::Value, field: &str, label: &str) {
+    let value = raw
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("search response BM25 diagnostics missing integer {field}"));
+    println!(
+        "{label}: {}",
+        format_benchmark_duration(Duration::from_millis(value))
+    );
+}
+
 /// Format benchmark durations as seconds with millisecond precision.
 fn format_benchmark_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
@@ -2102,6 +2155,7 @@ fn render_search(
     if response.results.is_empty() {
         println!("No results");
         render_operation_benchmarks(benchmarks, &retrieval_breakdown);
+        render_bm25_diagnostics(&response.raw);
         return;
     }
     for (index, result) in response.results.iter().enumerate() {
@@ -2119,6 +2173,7 @@ fn render_search(
         print_indented_content(&render_content(&result.content, full_content));
     }
     render_operation_benchmarks(benchmarks, &retrieval_breakdown);
+    render_bm25_diagnostics(&response.raw);
 }
 
 /// Print a benchmark report after operation results so the result remains the first payload users inspect.
