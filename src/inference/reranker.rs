@@ -59,8 +59,11 @@ pub struct RerankerCandidateScore {
     pub unit_id: String,
     pub score: f32,
     pub rank: usize,
-    pub logit: f32,
-    pub token_count: usize,
+    // Raw diagnostics that not every reranker backend can provide. The local
+    // ModernBERT runtime always populates them; absent values must be omitted
+    // from diagnostics output, never synthesized.
+    pub logit: Option<f32>,
+    pub token_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +71,7 @@ struct RerankerSmoke {
     candidate_count: usize,
     max_token_count: usize,
     first_score: f32,
-    first_logit: f32,
+    first_logit: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +243,7 @@ impl RerankerRuntime {
                 candidate_count: 0,
                 max_token_count: 0,
                 first_score: 0.0,
-                first_logit: 0.0,
+                first_logit: None,
             },
         };
 
@@ -273,11 +276,16 @@ impl RerankerRuntime {
         let smoke_scores_result = runtime.score_candidates(SMOKE_QUERY, &smoke_candidates);
         match &smoke_scores_result {
             Ok(scores) => {
+                // Aggregate over present diagnostics; the local runtime
+                // populates every score, so nothing is dropped here.
                 let token_counts = scores
                     .iter()
-                    .map(|score| score.token_count)
+                    .filter_map(|score| score.token_count)
                     .collect::<Vec<_>>();
-                let logits = scores.iter().map(|score| score.logit).collect::<Vec<_>>();
+                let logits = scores
+                    .iter()
+                    .filter_map(|score| score.logit)
+                    .collect::<Vec<_>>();
                 let public_scores = scores.iter().map(|score| score.score).collect::<Vec<_>>();
                 info!(
                     event = "model_call.completed",
@@ -323,7 +331,7 @@ impl RerankerRuntime {
         })?;
         let max_token_count = smoke_scores
             .iter()
-            .map(|score| score.token_count)
+            .filter_map(|score| score.token_count)
             .max()
             .unwrap_or(0);
         runtime.smoke = RerankerSmoke {
@@ -340,7 +348,7 @@ impl RerankerRuntime {
     /// Return reranker readiness details and the ModernBERT classification contract.
     pub fn health_details(&self) -> Vec<String> {
         vec![format!(
-            "reranker runtime ready: mode {}, hidden {}, layers {}, max_tokens {}, classifier_pooling {}, classifier_activation {}, smoke_candidates {}, smoke_max_tokens {}, smoke_score {:.6}, smoke_logit {:.6}",
+            "reranker runtime ready: mode {}, hidden {}, layers {}, max_tokens {}, classifier_pooling {}, classifier_activation {}, smoke_candidates {}, smoke_max_tokens {}, smoke_score {:.6}, smoke_logit {}",
             RERANKER_ADAPTER_MODE,
             self.model.hidden_size(),
             self.model.layer_count(),
@@ -350,7 +358,12 @@ impl RerankerRuntime {
             self.smoke.candidate_count,
             self.smoke.max_token_count,
             self.smoke.first_score,
-            self.smoke.first_logit
+            // The local runtime always records a smoke logit; "absent" only
+            // appears for backends that cannot provide one.
+            self.smoke
+                .first_logit
+                .map(|logit| format!("{logit:.6}"))
+                .unwrap_or_else(|| "absent".to_string())
         )]
     }
 
@@ -444,7 +457,7 @@ impl RerankerRuntime {
             Ok(scores) => {
                 let max_token_count = scores
                     .iter()
-                    .map(|score| score.token_count)
+                    .filter_map(|score| score.token_count)
                     .max()
                     .unwrap_or(0);
                 info!(
@@ -574,8 +587,8 @@ impl RerankerRuntime {
                 unit_id: candidate.unit_id.clone(),
                 score,
                 rank: 0,
-                logit,
-                token_count: candidate.input_ids.len(),
+                logit: Some(logit),
+                token_count: Some(candidate.input_ids.len()),
             })
         })();
         match &result {

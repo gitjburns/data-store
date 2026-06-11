@@ -62,7 +62,21 @@ taking the pool size, and `config.example.toml` documents the new value. All
 static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
 pass. Default behavior is unchanged for existing configs.
 
-Phases 2-6 are not started. Each phase awaits its own explicit user approval
+Phase 2 (optional reranker diagnostics types) was implemented and verified on
+2026-06-10: `RerankerCandidateScore.logit` and `.token_count` are now
+`Option<f32>` / `Option<usize>`, populated as `Some(...)` by the local runtime
+with unchanged values. `RerankerSmoke.first_logit` is also optional; the
+pre-smoke placeholder is `None` instead of a fabricated `0.0`, and health
+details render a missing smoke logit as `absent`. Both raw-diagnostics JSON
+sites in `src/http.rs` (`raw.reranker.scores` and `finalResults`) insert
+`logit`/`tokenCount` fields only when present and never synthesize values;
+`mode` remains the local constant. Local-backend JSON output and log values
+are unchanged. All static checks (`cargo fmt`, `cargo check`,
+`cargo check --features metal`) pass. Note: the plan's original `http.rs`
+line references (~2698-2725) had drifted; the actual sites were ~1412-1420
+and ~2735-2751.
+
+Phases 3-6 are not started. Each phase awaits its own explicit user approval
 before implementation.
 
 The service remains completely offline during all development phases. Phases

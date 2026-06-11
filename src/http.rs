@@ -1410,13 +1410,20 @@ async fn execute_search(
             "candidateLimit": top_k,
             "candidateCount": reranker_scores.len(),
             "scores": reranker_scores.iter().map(|score| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "unitId": score.unit_id,
                     "score": score.score,
-                    "rank": score.rank,
-                    "logit": score.logit,
-                    "tokenCount": score.token_count
-                })
+                    "rank": score.rank
+                });
+                // Optional diagnostics are omitted when the reranker backend
+                // cannot provide them; values are never synthesized.
+                if let Some(logit) = score.logit {
+                    entry["logit"] = serde_json::json!(logit);
+                }
+                if let Some(token_count) = score.token_count {
+                    entry["tokenCount"] = serde_json::json!(token_count);
+                }
+                entry
             }).collect::<Vec<_>>(),
             "finalResults": final_result_raw
         }
@@ -2732,12 +2739,10 @@ fn build_reranker_results(
             source_path: candidate.source_path.clone(),
             page_numbers: candidate.page_numbers.clone(),
         });
-        raw.push(serde_json::json!({
+        let mut raw_entry = serde_json::json!({
             "unitId": candidate.unit_id,
             "rerankerScore": score.score,
             "rerankerRank": score.rank,
-            "rerankerLogit": score.logit,
-            "rerankerTokenCount": score.token_count,
             "colbertScore": colbert_score.score,
             "colbertRank": colbert_score.rank,
             "colbertQueryTokens": colbert_score.query_tokens,
@@ -2748,7 +2753,16 @@ fn build_reranker_results(
             "denseSimilarity": candidate.dense_similarity,
             "bm25Rank": candidate.bm25_rank,
             "bm25Score": candidate.bm25_score
-        }));
+        });
+        // Optional reranker diagnostics are omitted when the backend cannot
+        // provide them; values are never synthesized.
+        if let Some(logit) = score.logit {
+            raw_entry["rerankerLogit"] = serde_json::json!(logit);
+        }
+        if let Some(token_count) = score.token_count {
+            raw_entry["rerankerTokenCount"] = serde_json::json!(token_count);
+        }
+        raw.push(raw_entry);
     }
 
     Ok((results, raw))
