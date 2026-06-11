@@ -315,8 +315,9 @@ bounded excerpt of matched content.
 
 After search results, the client prints a `Benchmarks:` summary. The
 `retrieving_candidates` row is the client-observed duration for that streamed
-operation stage. When the response includes `raw.retrieval` timing fields, the
-client must print indented child rows beneath `retrieving_candidates` for:
+operation stage. When the response includes `raw.storage.retrieval` timing
+fields, the client must print indented child rows beneath
+`retrieving_candidates` for:
 
 - `retrieving_candidates.query_vector_validation`
 - `retrieving_candidates.dense_scan`

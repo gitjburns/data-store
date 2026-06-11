@@ -436,15 +436,17 @@ Result payload:
       "mode": "dense_bm25_rrf_colbert_reranker",
       "topK": 3
     },
-    "retrieval": {
-      "mode": "dense_bm25_rrf_candidate_pool",
-      "latencyMs": 4711,
-      "queryVectorValidationLatencyMs": 0,
-      "denseLatencyMs": 123,
-      "bm25LatencyMs": 4201,
-      "rrfFusionLatencyMs": 0,
-      "candidateMaterializationLatencyMs": 365,
-      "rawDiagnosticsLatencyMs": 22
+    "storage": {
+      "retrieval": {
+        "mode": "dense_bm25_rrf_candidate_pool",
+        "latencyMs": 4711,
+        "queryVectorValidationLatencyMs": 0,
+        "denseLatencyMs": 123,
+        "bm25LatencyMs": 4201,
+        "rrfFusionLatencyMs": 0,
+        "candidateMaterializationLatencyMs": 365,
+        "rawDiagnosticsLatencyMs": 22
+      }
     }
   }
 }
@@ -464,7 +466,7 @@ Search semantics:
 
 Retrieval raw diagnostics itemize the `retrieving_candidates` operation stage:
 
-- `raw.retrieval.latencyMs` is the server-side candidate-pool duration.
+- `raw.storage.retrieval.latencyMs` is the server-side candidate-pool duration.
 - `queryVectorValidationLatencyMs` is dense query-vector validation time.
 - `denseLatencyMs` is exact dense scan time over the active vector cache.
 - `bm25LatencyMs` is SQLite FTS5 BM25 query time.

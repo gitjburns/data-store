@@ -1928,7 +1928,7 @@ fn retrieval_benchmark_breakdown(raw: &serde_json::Value) -> Vec<BenchmarkBreakd
         ),
     ];
 
-    let Some(retrieval) = raw.get("retrieval") else {
+    let Some(retrieval) = raw.pointer("/storage/retrieval") else {
         return Vec::new();
     };
 
