@@ -1951,6 +1951,7 @@ fn render_bm25_diagnostics(raw: &serde_json::Value) {
         .expect("search response missing raw.storage.retrieval.bm25 diagnostics");
     println!();
     println!("BM25 diagnostics:");
+    println!("  mode: {}", required_raw_str(bm25, "mode"));
     println!(
         "  fts query present: {}",
         yes_no(required_raw_bool(bm25, "ftsQueryPresent"))
@@ -1961,12 +1962,33 @@ fn render_bm25_diagnostics(raw: &serde_json::Value) {
     render_required_raw_u64(bm25, "candidateLimit", "  candidate limit");
     render_required_raw_u64(bm25, "sqlParameterCount", "  sql parameters");
     render_required_raw_u64(bm25, "returnedCandidates", "  returned candidates");
+    render_required_raw_u64(
+        bm25,
+        "strictReturnedCandidates",
+        "  strict returned candidates",
+    );
+    println!(
+        "  fallback ran: {}",
+        yes_no(required_raw_bool(bm25, "fallbackRan"))
+    );
+    render_required_raw_u64(
+        bm25,
+        "fallbackReturnedCandidates",
+        "  fallback returned candidates",
+    );
     render_required_raw_ms(bm25, "connectionOpenLatencyMs", "  connection open");
     render_required_raw_ms(bm25, "filterBuildLatencyMs", "  filter build");
     render_required_raw_ms(bm25, "prepareLatencyMs", "  prepare");
     render_required_raw_ms(bm25, "queryExecutionLatencyMs", "  query execution");
     render_required_raw_ms(bm25, "rowIterationLatencyMs", "  row iteration");
     render_required_raw_ms(bm25, "totalLatencyMs", "  total");
+}
+
+/// Read a required raw string diagnostic from a protocol diagnostics object.
+fn required_raw_str<'a>(raw: &'a serde_json::Value, field: &str) -> &'a str {
+    raw.get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("search response BM25 diagnostics missing string {field}"))
 }
 
 /// Read a required raw boolean diagnostic from a protocol diagnostics object.
