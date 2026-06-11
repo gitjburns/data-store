@@ -137,7 +137,14 @@ API-key file read boundaries without logging the key. `reqwest` now enables
 static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
 pass.
 
-Phase 6 is not started. It awaits explicit user approval before implementation.
+Phase 6 documentation was implemented on 2026-06-11: `README.md`,
+`ARCHITECTURE.md`, `PROTOCOL.md`, and `SPEC-SERVER.md` now document the
+config-selected reranker backend, local-vs-HTTP behavior, no-fallback invariant,
+startup smoke/readiness behavior, backend-dependent raw diagnostics,
+`http_rerank`, optional `logit`/`tokenCount` fields, the reranker candidate pool
+knob, and model-call gate scope. Manual runtime validation remains pending and
+requires a reachable Cohere-compatible endpoint, provider/API-key config, and
+explicit approval to start or stop the service.
 
 The service remains completely offline during all development phases. Phases
 do not need to preserve runnable between-phase functionality; each phase must
@@ -281,7 +288,7 @@ chain; phase 6 is last.
 - `PROTOCOL.md`: raw reranker diagnostics fields documented as
   backend-dependent (`logit`/`token_count` optional, `mode` values).
 - `SPEC-SERVER.md`: reranker stage and config sections updated to match.
-- Manual runtime validation per the Verification Plan.
+- Manual runtime validation per the Verification Plan. Pending.
 
 ## Out Of Scope
 

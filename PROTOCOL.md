@@ -277,10 +277,13 @@ The top-level `ready` flag depends on readiness-critical components. Diagnostic
 components, such as admission counters and logging state, can be present
 without controlling top-level readiness.
 
-The inference component includes accelerator, model-artifact, model-load, and
-startup smoke diagnostics. ColBERT readiness includes a max-capacity document
-encoding smoke check so long-sequence document-vector failures are reported
-before ingest is accepted as ready.
+The inference component includes accelerator, model-artifact, model-load,
+configured reranker backend, and startup smoke diagnostics. ColBERT readiness
+includes a max-capacity document encoding smoke check so long-sequence
+document-vector failures are reported before ingest is accepted as ready. The
+configured reranker backend also performs startup smoke scoring; an unreachable
+HTTP reranker endpoint makes inference unready rather than falling back to the
+local backend.
 
 ### `sources`
 
@@ -448,6 +451,18 @@ Search semantics:
 - `raw` preserves stage diagnostics for dense retrieval, BM25, RRF, ColBERT,
   reranker, final-result provenance, latency, cache metadata, and active
   versions.
+
+Reranker raw diagnostics are backend-dependent:
+
+- `raw.reranker.mode` is `modernbert_sequence_classifier` for the local
+  ModernBERT backend and `http_rerank` for an HTTP Cohere-compatible backend.
+- `raw.reranker.scores[]` always includes `unitId`, `score`, and `rank`.
+  `logit` and `tokenCount` appear only when the backend provides them.
+- `raw.reranker.finalResults[]` always includes `unitId`, `rerankerScore`, and
+  `rerankerRank` plus earlier-stage provenance. `rerankerLogit` and
+  `rerankerTokenCount` appear only when the backend provides them.
+- HTTP reranker scores use the provider `relevance_score` as the public score;
+  the service does not synthesize logits or token counts.
 
 Consumers should treat `raw` as diagnostic data. Its top-level stage objects and
 documented mode strings are stable operational signals, but individual

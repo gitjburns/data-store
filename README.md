@@ -20,14 +20,16 @@ otherwise.
   model calls, Docling process handling, admission, shutdown state, and CLI
   operation.
 - Interactive `data-store` CLI client for operating the documented HTTP API.
-- Explicit Metal/CUDA accelerator selection with no CPU fallback.
-- Local Qwen3 dense embedding, ColBERT, and ModernBERT sequence-classification
-  reranker runtimes through Candle.
+- Explicit Metal/CUDA accelerator selection for local Candle inference with no
+  CPU fallback.
+- Local Qwen3 dense embedding and ColBERT runtimes through Candle, plus a
+  config-selected final reranker backend: local Candle ModernBERT or an HTTP
+  Cohere-compatible rerank endpoint.
 - PDF ingest through Docling, deterministic unit splitting, dense and ColBERT
   embedding, SQLite persistence, and FTS5 population.
 - Startup-loaded in-memory dense vector cache with exact cosine retrieval.
 - SQLite FTS5 BM25, dense/BM25 over-fetch, RRF fusion, persisted ColBERT
-  MaxSim reranking, and ModernBERT sequence-classification reranking.
+  MaxSim reranking, and config-selected final reranking.
 - Immutable source-document versions with active-version publish and protected
   rollback.
 - Explicit `--setup-storage` schema setup; normal runtime validates existing
@@ -39,23 +41,35 @@ otherwise.
 Create a local `config.toml` from `config.example.toml`. The local config is
 machine-specific and should point at:
 
-- local model directories for Qwen3 embedding, ColBERT-Zero, and ModernBERT
-  reranker
+- local model directories for Qwen3 embedding and ColBERT-Zero
+- either a local ModernBERT reranker model directory or a remote
+  Cohere-compatible rerank endpoint with model name, timeout, and optional API
+  key file
 - a service-owned corpus root for source files
 - a service-owned index root for SQLite and Docling conversion artifacts
 - the Python executable for environment diagnostics and the directly launched Docling executable
 - the CLI operation timeout and explicit Docling document timeout, PDF backend,
   OCR mode, Docling device, thread count, and page batch size
-- the selected Rust inference accelerator backend and device index
+- the selected Rust inference accelerator backend and device index for local
+  Candle inference
 - required request, retrieval, admission, logging, and admin token-file settings
 
-The service has no CPU inference fallback. If `inference.device = "metal"`, run
-with `--features metal`. CUDA support is separate operational verification
-work; this runbook documents the locally used Metal path.
+The service has no CPU fallback for local Candle inference. If
+`inference.device = "metal"`, run with `--features metal`. CUDA support is
+separate operational verification work; this runbook documents the locally used
+Metal path.
 
 Docling's `[docling].device` setting is passed to the Python Docling CLI as
 `--device` and is separate from `[inference].device`, which controls the
-Rust/Candle dense embedding, ColBERT, and reranker runtimes.
+Rust/Candle dense embedding, ColBERT, and local reranker runtimes.
+
+`[models.reranker].backend` selects exactly one final reranker backend. Use
+`backend = "local"` with `path` and `max_tokens` for the in-process Candle
+ModernBERT runtime, or `backend = "http"` with `endpoint`, `model`,
+`timeout_seconds`, and optional `api_key_file_path` for a remote endpoint
+speaking the Cohere-compatible rerank contract. The service never falls back
+between reranker backends; local misconfiguration or an unreachable HTTP
+backend fails readiness or search explicitly.
 
 ## First-Time Storage Setup
 
@@ -252,8 +266,9 @@ curl -N -X POST \
 
 The top-level `ready` flag is based on readiness-critical components:
 
-- `inference`: accelerator, model artifacts, tokenizer/model load, and startup
-  smoke checks, including ColBERT max-capacity document encoding
+- `inference`: accelerator, model artifacts, tokenizer/model load, configured
+  reranker backend, and startup smoke checks, including ColBERT max-capacity
+  document encoding and reranker backend smoke scoring
 - `storage_cache`: SQLite schema validation and active dense-cache load
 
 Diagnostic-only components remain visible without making the service unready:
@@ -325,10 +340,12 @@ curl -N -X POST \
 
 Search is synchronous. It captures the active document-version snapshot at
 request admission and uses that same snapshot through dense retrieval, BM25,
-RRF, ColBERT MaxSim, ModernBERT reranking, and result materialization. The
-terminal `result` event contains public results plus raw stage diagnostics.
-Reranker raw diagnostics expose `mode: "modernbert_sequence_classifier"`, one
-raw `logit`, and the public sigmoid `score` per reranked candidate.
+RRF, ColBERT MaxSim, final reranking, and result materialization. The terminal
+`result` event contains public results plus raw stage diagnostics. Reranker raw
+diagnostics expose a backend-dependent `mode`: `modernbert_sequence_classifier`
+for the local backend and `http_rerank` for the HTTP backend. Local diagnostics
+include raw `logit` and `tokenCount` values when available; HTTP diagnostics
+omit those fields and use the provider `relevance_score` as the public score.
 
 If the configured ingest/search admission gate is saturated, the endpoint
 emits a terminal `error` event with status `503 Service Unavailable`. The
@@ -406,6 +423,9 @@ cargo check --features metal
   Cargo feature and verify the configured device.
 - Missing model artifacts or tokenizer files: fix local model paths in
   `config.toml`; readiness must fail clearly rather than falling back.
+- HTTP reranker startup or search failure: inspect the API error and service
+  log for endpoint, status, score-count, elapsed-time, and bounded response-body
+  context. The service does not silently retry through the local reranker.
 - Docling conversion failure: inspect the API error and service log. The service
   does not silently switch PDF backends or OCR modes.
 - `401 Unauthorized` on protected operations: use the current startup token

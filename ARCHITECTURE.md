@@ -22,7 +22,9 @@ model runtime, and operational lifecycle are service-local concerns.
 - Domain execution: synchronous OS-thread operation pipelines, blocking
   subprocess I/O, synchronous SQLite access, synchronous model calls, and
   synchronous admission/shutdown state.
-- Inference: Candle plus tokenizers, using an explicitly selected accelerator.
+- Inference: Candle plus tokenizers for local dense, ColBERT, and optional
+  local reranker work, using an explicitly selected accelerator; the final
+  reranker may instead use a configured HTTP endpoint.
 - Storage: SQLite with FTS5 for durable data and lexical search.
 - Dense retrieval: exact cosine scan over an in-memory active-vector cache.
 - Conversion: Docling launched as a configured executable.
@@ -36,7 +38,10 @@ available and compiled into the binary through the matching Cargo feature:
 - `cuda` for NVIDIA CUDA.
 
 There is no automatic device fallback. If the requested accelerator cannot be
-initialized, inference readiness fails explicitly.
+initialized for local inference, inference readiness fails explicitly. The
+configured reranker backend is also exclusive: HTTP reranker failures do not
+fall back to the local ModernBERT runtime, and local reranker failures do not
+fall back to HTTP.
 
 Docling conversion runs in a separate Python CLI process. Its configured
 `[docling].device` is passed to Docling as `--device` and is independent from
@@ -61,6 +66,7 @@ All operational service behavior is config-backed in the service TOML config:
 - Docling executable, document timeout, PDF backend, OCR mode, Docling device,
   thread count, and page batch size.
 - Local model artifact paths and model shape limits.
+- Reranker backend selection and backend-specific fields.
 - Retrieval defaults, candidate-pool sizes, and unit sizing.
 
 Required paths are absolute except for `logging.file_path` and
@@ -71,15 +77,16 @@ are startup configuration errors.
 
 ## Model Runtime
 
-The service loads local model artifacts at startup and reports readiness through
-the `health` operation. The retained `/v1/health` route reports the same
-readiness data during migration compatibility.
+The service loads local model artifacts and the configured reranker backend at
+startup, then reports readiness through the `health` operation. The retained
+`/v1/health` route reports the same readiness data during migration
+compatibility.
 
 | Runtime | Model role | Output |
 |---|---|---|
 | Dense | Qwen3 embedding | One normalized dense vector per query or passage |
 | ColBERT | Late interaction | One 128-dimensional vector per token |
-| Reranker | ModernBERT sequence classifier | Raw relevance logit and sigmoid score per candidate |
+| Reranker | Config-selected final ranking backend | Public relevance score per candidate, plus backend-dependent raw diagnostics |
 
 Dense embeddings use query instruction formatting for queries, raw passage text
 for documents, last-token pooling, and L2 normalization.
@@ -91,9 +98,14 @@ Startup smoke checks include max-capacity ColBERT document encoding so
 long-sequence accelerator failures are reported through readiness rather than
 after ingest work has already completed conversion and dense embedding.
 
-The reranker tokenizes query/document pairs as ModernBERT sequence pairs,
-scores one raw single-label relevance logit per candidate, and converts that
-logit to the public search score with a sigmoid.
+The local reranker backend tokenizes query/document pairs as ModernBERT
+sequence pairs, scores one raw single-label relevance logit per candidate, and
+converts that logit to the public search score with a sigmoid. The HTTP
+reranker backend sends the candidate documents to a Cohere-compatible rerank
+endpoint with `{model, query, documents, top_n}` and maps returned
+`results[{index, relevance_score}]` entries back to unit IDs. HTTP diagnostics
+omit raw logit and token-count fields because that contract does not provide
+them.
 
 ## Operation Protocol
 
@@ -225,7 +237,7 @@ The `search` operation is synchronous and streamed. The high-level stages are:
 8. Fuse dense and BM25 candidate lists with Reciprocal Rank Fusion.
 9. Load persisted ColBERT document vectors for the bounded RRF pool.
 10. Embed the query with ColBERT and MaxSim-rerank the candidate pool.
-11. Rerank the ColBERT-ranked candidates with the ModernBERT sequence-classification reranker.
+11. Rerank the configured final candidate pool with the selected reranker backend.
 12. Emit public top-K results and raw diagnostics for every stage.
 
 Dense tie-breaking is deterministic by `unitId` ascending. Public result scores
@@ -247,8 +259,9 @@ admission permits.
 The `health` operation reports top-level readiness and component diagnostics.
 Readiness-critical components are:
 
-- `inference`: accelerator, model artifacts, model loading, and startup smoke,
-  including ColBERT max-capacity document encoding.
+- `inference`: accelerator, model artifacts, model loading, configured
+  reranker backend, and startup smoke, including ColBERT max-capacity document
+  encoding and reranker backend smoke scoring.
 - `storage_cache`: SQLite validation and active dense-cache load.
 
 Diagnostic-only components include admission counters and logging state.
@@ -280,8 +293,10 @@ and operation task finish. Persistence-affecting workflows log durable
 transaction boundaries separately from active-version/cache publish boundaries.
 These logs preserve compact operational facts such as operation ID, source
 reference, version label, unit/vector counts, stage elapsed milliseconds, status,
-and error kind/message without logging contents, vectors, tokens, or large raw
-payloads.
+and error kind/message without logging contents, vectors, tokens, credentials,
+or large raw payloads. HTTP reranker calls log endpoint/model identity, request
+shape, HTTP status, score counts, elapsed milliseconds, and bounded failure-body
+excerpts without logging API keys or document contents.
 
 ## Admin Token
 
@@ -331,6 +346,11 @@ API itself.
 - Search must use one captured active-version snapshot for the full request.
 - Raw retrieval diagnostics must preserve per-stage provenance rather than
   replacing it with summaries.
+- The configured reranker backend is exclusive. An unreachable HTTP reranker
+  backend fails readiness or search explicitly; it must not trigger a local
+  reranker fallback.
+- The shared model-call gate protects local accelerator work. HTTP reranker
+  network scoring must not hold that gate or block unrelated local model calls.
 - No silent fallbacks across accelerators, models, vector sources, Docling
   backends, OCR modes, or search-time ColBERT document-vector recomputation.
 - Ingest durable state, active-version publication, and in-memory active cache

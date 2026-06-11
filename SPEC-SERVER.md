@@ -17,7 +17,7 @@ references and search queries.
 - Document ingestion from service-owned corpus files.
 - Docling conversion, unit splitting, dense embeddings, persisted ColBERT
   document vectors, SQLite storage, FTS, active-version cache, ColBERT scoring,
-  and ModernBERT sequence-classification reranking.
+  and config-selected final reranking.
 - Immutable source-document versioning, active-version publish, retained-version
   listing, rollback, health, limits, and graceful shutdown.
 - Runtime admin token-file handoff for local operators.
@@ -38,32 +38,34 @@ references and search queries.
 - **Domain execution:** synchronous operation pipelines for ingestion,
   retrieval, storage, model calls, Docling process handling, admission, and
   shutdown state.
-- **Inference:** `candle` and `tokenizers`, with CUDA or Apple Silicon Metal
-  acceleration. CPU fallback is not supported for the configured models.
+- **Inference:** `candle` and `tokenizers` for local dense, ColBERT, and
+  optional local reranker work, with CUDA or Apple Silicon Metal acceleration.
+  CPU fallback is not supported for local models.
 - **Storage:** SQLite owns durable documents, versions, units, metadata, vector
   blobs, ColBERT document vectors, and FTS.
 - **Retrieval cache:** dense retrieval uses an explicit in-memory flat vector
   cache with exact cosine similarity over active document versions.
 - **Late interaction:** ColBERT scoring runs over a bounded candidate pool and
   loads persisted document token vectors from SQLite.
-- **Final ranking:** ModernBERT sequence-classification reranker scoring
-  produces the public result order.
+- **Final ranking:** a config-selected reranker backend produces the public
+  result order. Supported backends are local Candle ModernBERT and HTTP
+  Cohere-compatible rerank.
 - **Ownership:** the service owns corpus resolution, conversion, chunking,
   embeddings, durable storage, retrieval cache, indexes, config, and lifecycle
   controls.
 
 ## 3. Models
 
-Models load from local `.safetensors` into accelerator memory during startup.
-Startup and readiness diagnostics must make model failures explicit. The HTTP
-process may still bind so health and operation errors can report why inference
-is unavailable.
+Local models load from `.safetensors` into accelerator memory during startup.
+Startup and readiness diagnostics must make model and configured reranker
+backend failures explicit. The HTTP process may still bind so health and
+operation errors can report why inference is unavailable.
 
 | Slot | Model | Key params | Formatting | Output |
 |---|---|---|---|---|
 | Dense | Qwen/Qwen3-Embedding-8B | 4096-d Matryoshka, 32k ctx | Query: instruct prefix; passage: raw | 1-D vector with last-token pooling |
 | Late-interaction | lightonai/ColBERT-Zero | 128-d/token, about 512 ctx | `search_query:` / `search_document:` | 2-D `[num_tokens,128]` tensor, no pooling |
-| Reranker | Alibaba-NLP/gte-reranker-modernbert-base | 8192 ctx, single-label classifier | `[CLS]` query `[SEP]` document `[SEP]` | raw logit and sigmoid score |
+| Reranker | Config-selected local ModernBERT or HTTP Cohere-compatible endpoint | Backend-specific | Local sequence pair or HTTP `{model, query, documents, top_n}` | Public relevance score plus backend-dependent diagnostics |
 
 ## 4. Storage Schema
 
@@ -167,8 +169,7 @@ new successful ingested state.
 7. ColBERT embeds the query, loads persisted candidate document token vectors
    for the captured versions from SQLite, and MaxSim reranks only the fused
    candidate pool.
-8. ModernBERT sequence-classification reranker rescores the ColBERT-ranked
-   candidate pool.
+8. The selected reranker backend rescores the configured final candidate pool.
 9. Return top-K in final reranker order.
 
 ## 6. Operation Protocol
@@ -379,6 +380,12 @@ Result payload:
 }
 ```
 
+The `modernbert_sequence_classifier` raw example includes local-only diagnostic
+fields. For `mode: "http_rerank"`, `scores[]` omits `logit` and `tokenCount`,
+and `finalResults[]` omits `rerankerLogit` and `rerankerTokenCount`. HTTP
+reranker scores are the provider `relevance_score`; the service must not
+synthesize logits or token counts.
+
 ### `versions`
 
 Authentication: bearer token required.
@@ -519,9 +526,14 @@ Service-owned config includes:
   - `logging.level`
 - Admin token file:
   - `admin.token_file_path`
-- Model paths.
-- Reranker token cap:
-  - `models.reranker.max_tokens`, `8192` for the local ModernBERT reranker.
+- Model paths for local dense and ColBERT runtimes.
+- Reranker backend configuration:
+  - `models.reranker.backend`: `local` or `http`.
+  - `models.reranker.path` and `models.reranker.max_tokens`, required only for
+    the local ModernBERT backend.
+  - `models.reranker.endpoint`, `models.reranker.model`, and
+    `models.reranker.timeout_seconds`, required only for the HTTP backend.
+  - `models.reranker.api_key_file_path`, optional for the HTTP backend.
 - Inference device and device index.
 - Docling paths and PDF defaults.
 - Corpus path.
@@ -533,6 +545,7 @@ Service-owned config includes:
   - `rrfK`
   - candidate over-fetch multiplier
   - `colbert_candidate_pool_size`
+  - `reranker_candidate_pool_size`
   - `minSearchUnitChars`
   - chunk sizing
 
@@ -552,6 +565,11 @@ ColBERT MaxSim reranking. ColBERT document token embeddings are persisted during
 ingestion and loaded from SQLite during search. Search-time document-vector
 recomputation is not a normal fallback path.
 
+Final reranking uses `retrieval.reranker_candidate_pool_size`. The effective
+pool is `max(reranker_candidate_pool_size, requested topK)`, clamped to the
+available ColBERT-ranked candidates. Final public results remain limited to
+`topK`.
+
 Service logs are human-readable structured lines with stable event fields. They
 must not contain the admin token, document contents, vector values, or other
 oversized retrieval internals.
@@ -569,19 +587,21 @@ output remains out of search scope until that ingest commits durable storage and
 publishes the new active snapshot. An admitted search must not fail with `503`
 solely because an ingest operation is running.
 
-Shared accelerator and model runtimes must be made safe for overlapping
-admitted operations. The implementation may serialize individual model calls or
-small model-call batches when required by the accelerator/runtime, but it must
-not serialize whole ingest and search operations as the concurrency mechanism.
+Shared accelerator and local model runtimes must be made safe for overlapping
+admitted operations. The implementation may serialize individual local model
+calls or small local model-call batches when required by the accelerator/runtime,
+but it must not serialize whole ingest and search operations as the concurrency
+mechanism. HTTP reranker network scoring must not hold the shared local
+model-call gate.
 For example, an ingest may yield between per-unit dense or ColBERT document
 embedding calls so a search can run query embedding, ColBERT scoring, and
 reranking against the captured active corpus.
 
 Model outputs are validated at the inference boundary before storage or ranking
-code consumes them. Dense vectors, ColBERT token vectors, reranker logits, and
-derived scores must be finite and dimensionally valid. Non-finite model output
-is an inference failure with model-call diagnostics, not a downstream storage
-failure.
+code consumes them. Dense vectors, ColBERT token vectors, reranker scores, and
+any backend-provided reranker logits must be finite and dimensionally valid.
+Non-finite model output is an inference failure with model-call diagnostics, not
+a downstream storage failure.
 
 The first operation-stream implementation does not need to guarantee
 cancellation support, queue position, or resumable streams.
