@@ -33,7 +33,7 @@ impl ModelArtifactSet {
         Ok(Self {
             dense: ModelArtifacts::load("dense", &config.dense.path)?,
             colbert: ModelArtifacts::load("colbert", &config.colbert.path)?,
-            reranker: ModelArtifacts::load("reranker", &config.reranker.path)?,
+            reranker: ModelArtifacts::load("reranker", config.reranker.local_path()?)?,
         })
     }
 

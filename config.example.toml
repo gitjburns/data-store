@@ -132,10 +132,34 @@ query_max_tokens = 512
 document_max_tokens = 512
 
 [models.reranker]
-# Local Qwen3 reranker model directory.
+# Reranker backend selection. There is no fallback between backends; the
+# configured backend is exclusive and misconfiguration is a startup error.
+#
+# Valid values:
+# - local: In-process Candle ModernBERT sequence-classification runtime on the
+#   [inference] accelerator. Requires path and max_tokens. The http-only fields
+#   (endpoint, model, timeout_seconds, api_key_file_path) must not be set.
+# - http: Remote endpoint speaking the Cohere-compatible rerank contract
+#   (vLLM, Cohere, Jina). Requires endpoint, model, and timeout_seconds;
+#   api_key_file_path is optional. The local-only fields (path, max_tokens)
+#   must not be set.
+backend = "local"
+# Local reranker model directory. Required when backend = "local".
 path = "/absolute/path/to/qwen3-reranker-4b"
-# Maximum token count accepted by the reranker runtime.
+# Maximum token count accepted by the local reranker runtime. Required when
+# backend = "local".
 max_tokens = 32768
+# HTTP backend example: replace the local fields above with these.
+#
+# Cohere-compatible rerank endpoint URL; must start with http:// or https://.
+#endpoint = "https://api.example.com/v1/rerank"
+# Model name sent in HTTP rerank requests.
+#model = "rerank-model-name"
+# HTTP rerank request timeout in seconds.
+#timeout_seconds = 60
+# Optional owner-only file containing the API key sent as a bearer token.
+# Relative paths resolve from the Rust service root.
+#api_key_file_path = ".data-store-rerank-api-key"
 
 [retrieval]
 # Default result count when /v1/search omits topK.

@@ -1,4 +1,8 @@
-use std::{env, fs, net::SocketAddr, path::PathBuf};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -162,10 +166,61 @@ pub struct ColbertModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RerankerModelConfig {
-    /// Local model artifact directory for ModernBERT sequence-classification reranking.
-    pub path: PathBuf,
-    /// Runtime token cap for reranker query/document pairs.
-    pub max_tokens: u32,
+    /// Explicit reranker backend selection. There is no fallback between backends.
+    pub backend: RerankerBackendKind,
+    /// Local model artifact directory for ModernBERT sequence-classification
+    /// reranking. Required when backend = "local"; forbidden otherwise.
+    pub path: Option<PathBuf>,
+    /// Runtime token cap for reranker query/document pairs. Required when
+    /// backend = "local"; forbidden otherwise.
+    pub max_tokens: Option<u32>,
+    /// Cohere-compatible rerank endpoint URL. Required when backend = "http";
+    /// forbidden otherwise.
+    pub endpoint: Option<String>,
+    /// Model name sent in HTTP rerank requests. Required when backend = "http";
+    /// forbidden otherwise.
+    pub model: Option<String>,
+    /// HTTP rerank request timeout in seconds. Required when backend = "http";
+    /// forbidden otherwise.
+    pub timeout_seconds: Option<u64>,
+    /// Optional owner-only file holding the HTTP rerank API key. Allowed only
+    /// when backend = "http".
+    pub api_key_file_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankerBackendKind {
+    /// In-process Candle ModernBERT sequence-classification runtime.
+    Local,
+    /// HTTP client speaking the Cohere-compatible rerank contract.
+    Http,
+}
+
+impl RerankerModelConfig {
+    /// Return the local model artifact directory. Config validation guarantees
+    /// presence for the local backend; the http backend has no local path.
+    pub fn local_path(&self) -> Result<&Path, ApiError> {
+        match (self.backend, self.path.as_deref()) {
+            (RerankerBackendKind::Local, Some(path)) => Ok(path),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.reranker has no local model path unless backend = \"local\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Return the local runtime token cap. Config validation guarantees
+    /// presence for the local backend; the http backend has no local token cap.
+    pub fn local_max_tokens(&self) -> Result<u32, ApiError> {
+        match (self.backend, self.max_tokens) {
+            (RerankerBackendKind::Local, Some(max_tokens)) => Ok(max_tokens),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.reranker has no local max_tokens unless backend = \"local\""
+                    .to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,7 +302,6 @@ impl ServiceConfig {
         )?;
         require_absolute_path("models.dense.path", &self.models.dense.path)?;
         require_absolute_path("models.colbert.path", &self.models.colbert.path)?;
-        require_absolute_path("models.reranker.path", &self.models.reranker.path)?;
 
         require_non_empty("docling.pdf_backend", &self.docling.pdf_backend)?;
         if !matches!(
@@ -289,10 +343,7 @@ impl ServiceConfig {
             "models.colbert.document_max_tokens",
             self.models.colbert.document_max_tokens,
         )?;
-        require_positive(
-            "models.reranker.max_tokens",
-            self.models.reranker.max_tokens,
-        )?;
+        validate_reranker_backend_fields(&self.models.reranker)?;
         require_positive("retrieval.default_top_k", self.retrieval.default_top_k)?;
         require_positive("retrieval.max_top_k", self.retrieval.max_top_k)?;
         require_positive("retrieval.rrf_k", self.retrieval.rrf_k)?;
@@ -429,6 +480,85 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
         setup_storage,
         foreground,
     })
+}
+
+/// Validate per-backend required and forbidden [models.reranker] fields. Each
+/// backend's required fields must be present and valid, and the other
+/// backend's fields must be absent so misconfiguration fails at startup
+/// instead of being silently ignored.
+fn validate_reranker_backend_fields(reranker: &RerankerModelConfig) -> Result<(), ApiError> {
+    match reranker.backend {
+        RerankerBackendKind::Local => {
+            let Some(path) = reranker.path.as_ref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.path is required when backend = \"local\""
+                        .to_string(),
+                });
+            };
+            require_absolute_path("models.reranker.path", path)?;
+            let Some(max_tokens) = reranker.max_tokens else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.max_tokens is required when backend = \"local\""
+                        .to_string(),
+                });
+            };
+            require_positive("models.reranker.max_tokens", max_tokens)?;
+            if reranker.endpoint.is_some()
+                || reranker.model.is_some()
+                || reranker.timeout_seconds.is_some()
+                || reranker.api_key_file_path.is_some()
+            {
+                return Err(ApiError::InvalidConfig {
+                    message:
+                        "models.reranker with backend = \"local\" must not set endpoint, model, timeout_seconds, or api_key_file_path"
+                            .to_string(),
+                });
+            }
+        }
+        RerankerBackendKind::Http => {
+            if reranker.path.is_some() || reranker.max_tokens.is_some() {
+                return Err(ApiError::InvalidConfig {
+                    message:
+                        "models.reranker with backend = \"http\" must not set path or max_tokens"
+                            .to_string(),
+                });
+            }
+            let Some(endpoint) = reranker.endpoint.as_deref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.endpoint is required when backend = \"http\""
+                        .to_string(),
+                });
+            };
+            require_non_empty("models.reranker.endpoint", endpoint)?;
+            let trimmed_endpoint = endpoint.trim();
+            if !trimmed_endpoint.starts_with("http://") && !trimmed_endpoint.starts_with("https://")
+            {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.endpoint must start with http:// or https://"
+                        .to_string(),
+                });
+            }
+            let Some(model) = reranker.model.as_deref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.model is required when backend = \"http\""
+                        .to_string(),
+                });
+            };
+            require_non_empty("models.reranker.model", model)?;
+            let Some(timeout_seconds) = reranker.timeout_seconds else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.reranker.timeout_seconds is required when backend = \"http\""
+                        .to_string(),
+                });
+            };
+            require_positive_u64("models.reranker.timeout_seconds", timeout_seconds)?;
+            if let Some(api_key_file_path) = reranker.api_key_file_path.as_ref() {
+                require_non_empty_path("models.reranker.api_key_file_path", api_key_file_path)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Ensure a path field uses an absolute path.

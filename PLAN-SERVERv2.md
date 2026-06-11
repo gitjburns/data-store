@@ -48,6 +48,10 @@ Decisions recorded from planning discussion:
   heading inclusion, short-unit merging) are later phases tracked outside
   this plan.
 
+## Note
+
+The code does not need to work until all development phases are complete.
+
 ## Current Status
 
 Planning complete as of 2026-06-10. The implementation scope was restructured
@@ -76,7 +80,27 @@ are unchanged. All static checks (`cargo fmt`, `cargo check`,
 line references (~2698-2725) had drifted; the actual sites were ~1412-1420
 and ~2735-2751.
 
-Phases 3-6 are not started. Each phase awaits its own explicit user approval
+Phase 3 (config backend selection) was implemented and verified on
+2026-06-10 with one approved design deviation: the config-level discriminated
+union was deferred to Phase 4. `RerankerModelConfig` remains a flat struct
+with a required `backend` tag (new `RerankerBackendKind` enum, `local`/`http`)
+and all backend-specific fields as `Option`: `path`/`max_tokens` (local) and
+`endpoint`/`model`/`timeout_seconds`/`api_key_file_path` (http). A new
+`validate_reranker_backend_fields` helper enforces per-backend required
+fields at config load (absolute local path, positive values, `http://` or
+`https://` endpoint prefix) and rejects the other backend's fields when
+present. Accessors `local_path()`/`local_max_tokens()` return `Result` so
+local-only consumers (`artifacts.rs`, `reranker.rs`) never unwrap raw
+options; a `backend = "http"` config now parses and validates but fails
+inference startup explicitly through those accessors until Phase 5 rewires
+initialization. The `http.rs` reranking-start log field became `Option<u32>`
+with unchanged local rendering. `config.example.toml` documents both modes;
+existing configs must add `backend = "local"` under `[models.reranker]`. All
+static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
+pass. Phase 4 introduces the discriminated union when wrapping the runtime
+in `RerankerBackend`.
+
+Phases 4-6 are not started. Each phase awaits its own explicit user approval
 before implementation.
 
 The service remains completely offline during all development phases. Phases

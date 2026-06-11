@@ -203,7 +203,9 @@ impl RerankerRuntime {
         device: &Device,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        validate_reranker_config(config)?;
+        // Validated present by config load for the local backend this runtime serves.
+        let max_tokens = config.local_max_tokens()?;
+        validate_reranker_config(max_tokens)?;
 
         progress("reranker_tokenizer_loading")?;
         let mut tokenizer = Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|source| {
@@ -216,7 +218,7 @@ impl RerankerRuntime {
         progress("reranker_tokenizer_ready")?;
         progress("reranker_config_loading")?;
         let model_config = load_modernbert_config(&artifacts.config_path)?;
-        validate_modernbert_config(&model_config, config)?;
+        validate_modernbert_config(&model_config, max_tokens)?;
         progress("reranker_config_ready")?;
         progress("reranker_safetensors_validating")?;
         validate_root_safetensors(artifacts, &model_config)?;
@@ -234,7 +236,7 @@ impl RerankerRuntime {
             tokenizer,
             model,
             device: device.clone(),
-            max_tokens: config.max_tokens as usize,
+            max_tokens: max_tokens as usize,
             cls_token_id: model_config.cls_token_id,
             sep_token_id: model_config.sep_token_id,
             classifier_pooling: model_config.classifier_pooling.clone(),
@@ -1446,11 +1448,10 @@ impl TensorInventory {
 }
 
 /// Validate reranker service config values that affect pair construction and memory use.
-fn validate_reranker_config(config: &RerankerModelConfig) -> Result<(), ApiError> {
-    if config.max_tokens as usize <= PAIR_SPECIAL_TOKEN_COUNT + 1 {
+fn validate_reranker_config(max_tokens: u32) -> Result<(), ApiError> {
+    if max_tokens as usize <= PAIR_SPECIAL_TOKEN_COUNT + 1 {
         return Err(inference_error(format!(
-            "models.reranker.max_tokens must leave room for [CLS] query [SEP] document [SEP], got {}",
-            config.max_tokens
+            "models.reranker.max_tokens must leave room for [CLS] query [SEP] document [SEP], got {max_tokens}"
         )));
     }
 
@@ -1488,7 +1489,7 @@ fn load_modernbert_config(path: &Path) -> Result<ModernBertConfig, ApiError> {
 /// Ensure the root model config is the expected ModernBERT sequence-classifier contract.
 fn validate_modernbert_config(
     model_config: &ModernBertConfig,
-    config: &RerankerModelConfig,
+    max_tokens: u32,
 ) -> Result<(), ApiError> {
     if model_config.model_type != EXPECTED_MODEL_TYPE {
         return Err(inference_error(format!(
@@ -1571,10 +1572,10 @@ fn validate_modernbert_config(
             "reranker RoPE theta values must be finite and greater than zero".to_string(),
         ));
     }
-    if config.max_tokens as usize > model_config.max_position_embeddings {
+    if max_tokens as usize > model_config.max_position_embeddings {
         return Err(inference_error(format!(
             "models.reranker.max_tokens {} exceeds reranker max_position_embeddings {}",
-            config.max_tokens, model_config.max_position_embeddings
+            max_tokens, model_config.max_position_embeddings
         )));
     }
     for (label, token_id) in [
