@@ -569,14 +569,98 @@ Acceptance:
 
 ### Phase 5: Diagnostic Parity And Documentation
 
-Scope:
+Status: Analysis complete (2026-06-11). Implementation not started.
 
-- Compare logs before and after rewrite against `DIAGNOSTICS.md`.
-- Update service docs to remove Axum/Tokio references.
-- Update runbooks only after behavior is verified.
+The Phase 5 diagnostics analysis was performed against `DIAGNOSTICS.md` after
+Phase 4 completed. The service currently fails diagnostic parity on a small
+set of specific items; the next session can begin with the implementation
+scope below without repeating broad code exploration.
+
+Analysis result:
+
+- Overall diagnostics evaluation: FAIL.
+- Startup, parent/child handoff, operation streams, Docling process handling,
+  spawned operation threads, source resolution, model calls, search pipeline,
+  shutdown, and CLI ambiguous stream loss have substantial diagnostic coverage.
+- Runtime verification has not been run yet. Starting/stopping the service and
+  forcing runtime failures still requires explicit user approval and depends on
+  local config/model availability.
+
+Specific failures found:
+
+- Storage ingest transaction abort visibility is incomplete. In
+  `src/storage.rs`, `StorageRuntime::ingest_document` logs transaction begin,
+  commit attempt, commit failure, commit success, and cache swap, but error
+  returns after transaction begin and before commit rely on SQLite transaction
+  drop for rollback without a durable `aborting`/`rolled back` log. Relevant
+  region begins at `storage.ingest_transaction.started` and the following
+  persistence/publish error paths.
+- Active-version rollback publish abort visibility is incomplete. In
+  `src/storage.rs`, `StorageRuntime::publish_source_version_with_vectors` logs
+  active-version publish transaction begin and commit, but pre-commit errors
+  after transaction begin do not explicitly log that the transaction is being
+  aborted.
+- Reranker per-candidate service logs include model outputs. In
+  `src/inference/reranker.rs`, `RerankerRuntime::score_tokenized_candidate`
+  logs `logit` and public `score` on each `model_call.completed` event. The
+  API raw diagnostics may keep these values, but service logs must not emit
+  per-candidate model outputs/logits.
+- Documentation is not yet updated for the final Phase 4 transport decision.
+  `README.md` and `ARCHITECTURE.md` still describe Axum/Tokio as primary
+  runtime technology rather than as a confined transport shell with synchronous
+  domain work behind it. This was expected to remain until Phase 5.
+
+Specific Phase 5 scope:
+
+1. Add explicit transaction-abort logs in `src/storage.rs` for
+   `StorageRuntime::ingest_document`.
+   - Add a local helper if useful, but keep it small and storage-local.
+   - Before every post-begin, pre-commit return path, log an event such as
+     `storage.ingest_transaction.aborting`.
+   - Include source path, version label, document ID, failing phase, unit/vector
+     counts when available, publish timestamp when available, error, and whether
+     durable commit had not yet happened.
+   - Do not change schema, transaction semantics, cache-publish ordering, or
+     ingest behavior.
+2. Add explicit transaction-abort logs in `src/storage.rs` for
+   `StorageRuntime::publish_source_version_with_vectors`.
+   - Before every post-begin, pre-commit return path, log an event such as
+     `storage.active_version_publish.aborting`.
+   - Include source path, version label, vector count, published timestamp,
+     failing phase, error, and whether durable commit had not yet happened.
+   - Do not change rollback semantics or active cache publish ordering.
+3. Remove per-candidate reranker model outputs from service logs in
+   `src/inference/reranker.rs`.
+   - Remove `logit = score.logit` and `score = score.score` from the
+     `model_call.completed` log in `RerankerRuntime::score_tokenized_candidate`.
+   - Preserve compact shape/count facts such as candidate index/count, unit ID,
+     query/document chars, configured max tokens, token count, and elapsed time.
+   - Do not change API response raw diagnostics or reranker scoring behavior.
+4. Run compile verification after the code changes.
+   - `cargo fmt`
+   - `cargo check`
+   - `cargo check --features metal`
+   - These commands should be run from `service/data-store/` unless the user
+     directs otherwise.
+5. After code verification, propose a safe runtime-verification subset before
+   running service processes, then update docs only after behavior is verified.
+   - Runtime scenarios from the previous required list remain candidates, but
+     the next session should first identify which can be forced safely with the
+     available local config/model setup.
+   - Documentation updates should cover the final architecture: Axum/Tokio is
+     retained as a confined transport shell in `src/main.rs` and the transport
+     layer of `src/http.rs`; operation pipelines, storage, model calls,
+     Docling process handling, admission/shutdown state, and CLI operation use
+     synchronous domain code.
+   - Update `README.md` and `ARCHITECTURE.md` first. Touch `DIAGNOSTICS.md`,
+     `SPEC-SERVER.md`, or `PROTOCOL.md` only if runtime verification or wording
+     audit finds transport wording that is incorrect under the final Phase 4
+     decision.
 
 Expected files:
 
+- `src/storage.rs`
+- `src/inference/reranker.rs`
 - `README.md`
 - `ARCHITECTURE.md`
 - `DIAGNOSTICS.md` if standards need transport-neutral wording
