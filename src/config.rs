@@ -221,6 +221,48 @@ impl RerankerModelConfig {
             }),
         }
     }
+
+    /// Return the HTTP rerank endpoint. Config validation guarantees presence
+    /// for the HTTP backend; the local backend has no endpoint.
+    pub fn http_endpoint(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.endpoint.as_deref()) {
+            (RerankerBackendKind::Http, Some(endpoint)) => Ok(endpoint.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.reranker has no endpoint unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Return the HTTP rerank model name sent in provider requests.
+    pub fn http_model(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.model.as_deref()) {
+            (RerankerBackendKind::Http, Some(model)) => Ok(model.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.reranker has no model unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Return the configured HTTP rerank timeout in seconds.
+    pub fn http_timeout_seconds(&self) -> Result<u64, ApiError> {
+        match (self.backend, self.timeout_seconds) {
+            (RerankerBackendKind::Http, Some(timeout_seconds)) => Ok(timeout_seconds),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.reranker has no timeout_seconds unless backend = \"http\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Resolve the optional HTTP API-key file path against the Rust service root.
+    pub fn resolved_http_api_key_file_path(&self) -> Option<PathBuf> {
+        let path = self.api_key_file_path.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+
+        Some(service_root().join(path))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

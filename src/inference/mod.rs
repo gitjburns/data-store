@@ -7,7 +7,10 @@ mod reranker;
 mod reranker_backend;
 mod tensor_ops;
 
-use crate::{config::ServiceConfig, error::ApiError};
+use crate::{
+    config::{RerankerBackendKind, ServiceConfig},
+    error::ApiError,
+};
 
 pub use artifacts::ModelArtifactSet;
 pub use colbert::{ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime};
@@ -86,12 +89,27 @@ impl InferenceRuntime {
         )?;
         progress("colbert_ready")?;
         progress("reranker_loading")?;
-        let reranker = RerankerBackend::Local(RerankerRuntime::load_with_progress(
-            &artifacts.reranker,
-            &config.models.reranker,
-            &device.candle,
-            progress,
-        )?);
+        let reranker = match config.models.reranker.backend {
+            RerankerBackendKind::Local => {
+                let reranker_artifacts =
+                    artifacts
+                        .reranker
+                        .as_ref()
+                        .ok_or_else(|| ApiError::InferenceInit {
+                            message: "local reranker backend has no validated artifacts"
+                                .to_string(),
+                        })?;
+                RerankerBackend::Local(RerankerRuntime::load_with_progress(
+                    reranker_artifacts,
+                    &config.models.reranker,
+                    &device.candle,
+                    progress,
+                )?)
+            }
+            RerankerBackendKind::Http => {
+                RerankerBackend::load_http_with_progress(&config.models.reranker, progress)?
+            }
+        };
         progress("reranker_ready")?;
 
         Ok(Self {

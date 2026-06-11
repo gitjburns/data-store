@@ -56,7 +56,6 @@ const ROLLBACK_STATUS_ROLLED_BACK: &str = "rolled_back";
 const SEARCH_MODE_FULL_RETRIEVAL: &str = "dense_bm25_rrf_colbert_reranker";
 const COLBERT_MODE_PERSISTED_MAXSIM: &str = "persisted_candidate_pool_maxsim";
 const COLBERT_DOCUMENT_VECTOR_SOURCE_SQLITE: &str = "sqlite";
-const RERANKER_MODE_MODERNBERT_SEQUENCE_CLASSIFIER: &str = "modernbert_sequence_classifier";
 const RERANKER_CANDIDATE_SOURCE_COLBERT_POOL: &str = "colbert_ranked_candidate_pool";
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const OPERATION_STREAM_CHANNEL_CAPACITY: usize = 16;
@@ -1285,10 +1284,13 @@ fn execute_search(
         query_chars,
         top_k,
         candidates = reranker_candidates.len(),
+        backend = inference.reranker.kind(),
+        mode = inference.reranker.mode(),
+        uses_model_gate = inference.reranker.uses_local_model_gate(),
         max_tokens = state.config.models.reranker.max_tokens,
         "search reranking started"
     );
-    let reranker_score_result = {
+    let reranker_score_result = if inference.reranker.uses_local_model_gate() {
         let _model_permit = match state.acquire_model_call_gate(
             &operation_id,
             "reranker",
@@ -1323,6 +1325,18 @@ fn execute_search(
                 .reranker
                 .score_candidates(&request.query, &reranker_candidates)
         }
+    } else if let Some(operation_emitter) = emitter.as_deref_mut() {
+        inference.reranker.score_candidates_with_progress(
+            &request.query,
+            &reranker_candidates,
+            |current, total| {
+                operation_emitter.progress("reranking", "reranking candidates", current, total)
+            },
+        )
+    } else {
+        inference
+            .reranker
+            .score_candidates(&request.query, &reranker_candidates)
     };
     let reranker_scores = match reranker_score_result {
         Ok(scores) => scores,
@@ -1431,7 +1445,7 @@ fn execute_search(
             "rankedCandidateCount": colbert_scores.len()
         },
         "reranker": {
-            "mode": RERANKER_MODE_MODERNBERT_SEQUENCE_CLASSIFIER,
+            "mode": inference.reranker.mode(),
             "candidateSource": RERANKER_CANDIDATE_SOURCE_COLBERT_POOL,
             "colbertCandidateCount": colbert_scores.len(),
             "candidateLimit": top_k,

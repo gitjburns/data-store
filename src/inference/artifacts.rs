@@ -5,7 +5,10 @@ use std::{
 
 use tokenizers::Tokenizer;
 
-use crate::{config::ModelConfig, error::ApiError};
+use crate::{
+    config::{ModelConfig, RerankerBackendKind},
+    error::ApiError,
+};
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
@@ -15,7 +18,7 @@ pub const SAFETENSORS_EXTENSION: &str = "safetensors";
 pub struct ModelArtifactSet {
     pub dense: ModelArtifacts,
     pub colbert: ModelArtifacts,
-    pub reranker: ModelArtifacts,
+    pub reranker: Option<ModelArtifacts>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,17 +36,24 @@ impl ModelArtifactSet {
         Ok(Self {
             dense: ModelArtifacts::load("dense", &config.dense.path)?,
             colbert: ModelArtifacts::load("colbert", &config.colbert.path)?,
-            reranker: ModelArtifacts::load("reranker", config.reranker.local_path()?)?,
+            reranker: match config.reranker.backend {
+                RerankerBackendKind::Local => Some(ModelArtifacts::load(
+                    "reranker",
+                    config.reranker.local_path()?,
+                )?),
+                RerankerBackendKind::Http => None,
+            },
         })
     }
 
     /// Return readiness details for all configured model artifact groups.
     pub fn health_details(&self) -> Vec<String> {
-        vec![
-            self.dense.health_detail(),
-            self.colbert.health_detail(),
-            self.reranker.health_detail(),
-        ]
+        let mut details = vec![self.dense.health_detail(), self.colbert.health_detail()];
+        match &self.reranker {
+            Some(reranker) => details.push(reranker.health_detail()),
+            None => details.push("reranker artifacts ready: remote HTTP backend".to_string()),
+        }
+        details
     }
 }
 

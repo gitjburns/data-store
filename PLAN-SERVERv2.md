@@ -121,8 +121,23 @@ variant with unchanged progress milestones. `src/http.rs` required zero
 edits: both scoring call sites and type imports compile unchanged. All static
 checks (`cargo fmt`, `cargo check`, `cargo check --features metal`) pass.
 
-Phases 5-6 are not started. Each phase awaits its own explicit user approval
-before implementation.
+Phase 5 (HTTP reranker client) was implemented and verified on 2026-06-11:
+`RerankerBackend` now has an `Http(HttpRerankerClient)` variant that speaks the
+Cohere-compatible rerank contract, maps provider result indexes back to unit
+IDs, omits unavailable `logit`/`tokenCount` diagnostics, and reports
+`mode = "http_rerank"`. `InferenceRuntime::initialize_with_progress` now
+branches on the configured reranker backend with no fallback; local backends
+continue to load ModernBERT artifacts, while HTTP backends skip local reranker
+artifact validation and run startup smoke scoring through the configured
+endpoint. Search acquires the model-call gate only for the local backend.
+HTTP diagnostics log request start, input readiness, HTTP status, score counts,
+elapsed time, endpoint/model, bounded response-body excerpts on failure, and
+API-key file read boundaries without logging the key. `reqwest` now enables
+`rustls-tls`, and `Cargo.lock` includes the resulting TLS dependency graph. All
+static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
+pass.
+
+Phase 6 is not started. It awaits explicit user approval before implementation.
 
 The service remains completely offline during all development phases. Phases
 do not need to preserve runnable between-phase functionality; each phase must
