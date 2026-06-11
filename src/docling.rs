@@ -1,22 +1,19 @@
 use std::{
+    any::Any,
     fs,
+    io::Read,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc::SyncSender,
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-    sync::mpsc,
-    task::{self, JoinHandle},
-    time::sleep,
-};
 use tracing::{error, info};
 
 use crate::{
@@ -90,11 +87,11 @@ struct DoclingProgressSnapshot {
 /// Convert one resolved PDF source to markdown using only service-configured Docling options.
 ///
 /// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
-pub async fn convert_source_to_markdown(
+pub fn convert_source_to_markdown(
     config: &DoclingConfig,
     index_root: &Path,
     source: ResolvedSource,
-    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
 ) -> Result<DoclingConversionResult, ApiError> {
     let options = resolve_docling_options(config)?;
     let output_dir = create_conversion_output_dir(index_root)?;
@@ -106,8 +103,7 @@ pub async fn convert_source_to_markdown(
         &output_dir,
         &source,
         progress_sender,
-    )
-    .await?;
+    )?;
     let stdout = truncate_diagnostic_text(&output.stdout);
     let stderr = truncate_diagnostic_text(&output.stderr);
 
@@ -238,13 +234,13 @@ fn build_docling_args(
 /// Run the configured Docling executable directly with no stdin and no shell interpretation.
 ///
 /// The caller owns diagnostic truncation so success and failure paths preserve the same output shape.
-async fn run_docling(
+fn run_docling(
     config: &DoclingConfig,
     args: &[String],
     index_root: &Path,
     output_dir: &Path,
     source: &ResolvedSource,
-    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
 ) -> Result<DoclingRunOutput, ApiError> {
     let started = Instant::now();
     info!(
@@ -302,7 +298,7 @@ async fn run_docling(
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
-        process_id = ?process_id,
+        process_id,
         timeout_seconds = config.document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process spawned"
@@ -316,7 +312,7 @@ async fn run_docling(
                 source_requested = %source.requested,
                 relative_source = %source.relative_path.display(),
                 output_dir = %output_dir.display(),
-                process_id = ?process_id,
+                process_id,
                 pipe = "stdout",
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Docling child stdout pipe unavailable"
@@ -335,7 +331,7 @@ async fn run_docling(
                 source_requested = %source.requested,
                 relative_source = %source.relative_path.display(),
                 output_dir = %output_dir.display(),
-                process_id = ?process_id,
+                process_id,
                 pipe = "stderr",
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Docling child stderr pipe unavailable"
@@ -353,42 +349,51 @@ async fn run_docling(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
         pipe = "stdout",
-        process_id = ?process_id,
+        process_id,
         source_requested = %source_requested,
         relative_source = %relative_source,
         output_dir = %output_dir_for_log,
-        "Docling child output reader task spawned"
+        "Docling child output reader thread spawned"
     );
-    let stdout_reader = tokio::spawn(read_child_output(
-        stdout,
-        "stdout",
-        process_id,
-        source_requested.clone(),
-        relative_source.clone(),
-        output_dir_for_log.clone(),
-        None,
-        None,
-    ));
+    let stdout_source_requested = source_requested.clone();
+    let stdout_relative_source = relative_source.clone();
+    let stdout_output_dir = output_dir_for_log.clone();
+    let stdout_reader = thread::spawn(move || {
+        read_child_output(
+            stdout,
+            "stdout",
+            process_id,
+            stdout_source_requested,
+            stdout_relative_source,
+            stdout_output_dir,
+            None,
+            None,
+        )
+    });
     info!(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
         pipe = "stderr",
-        process_id = ?process_id,
+        process_id,
         source_requested = %source_requested,
         relative_source = %relative_source,
         output_dir = %output_dir_for_log,
-        "Docling child output reader task spawned"
+        "Docling child output reader thread spawned"
     );
-    let stderr_reader = tokio::spawn(read_child_output(
-        stderr,
-        "stderr",
-        process_id,
-        source_requested,
-        relative_source,
-        output_dir_for_log,
-        progress_sender.clone(),
-        Some(progress_state.clone()),
-    ));
+    let stderr_progress_sender = progress_sender.clone();
+    let stderr_progress_state = progress_state.clone();
+    let stderr_reader = thread::spawn(move || {
+        read_child_output(
+            stderr,
+            "stderr",
+            process_id,
+            source_requested,
+            relative_source,
+            output_dir_for_log,
+            stderr_progress_sender,
+            Some(stderr_progress_state),
+        )
+    });
     let expected_markdown_path = expected_markdown_artifact_path(output_dir, &source.absolute_path);
     let (status, timed_out) = wait_for_docling_process(
         &mut child,
@@ -400,15 +405,14 @@ async fn run_docling(
         progress_state,
         progress_sender,
         expected_markdown_path,
-    )
-    .await?;
+    )?;
     info!(
         event = "docling.process.wait_completed",
         executable_path = %config.docling_path.display(),
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
-        process_id = ?process_id,
+        process_id,
         timed_out,
         exit_code = ?status.code(),
         signal = ?status.signal(),
@@ -416,8 +420,8 @@ async fn run_docling(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process wait completed"
     );
-    let stdout = join_child_output(stdout_reader, "stdout", process_id, started).await;
-    let stderr = join_child_output(stderr_reader, "stderr", process_id, started).await;
+    let stdout = join_child_output(stdout_reader, "stdout", process_id, started);
+    let stderr = join_child_output(stderr_reader, "stderr", process_id, started);
     let stdout = stdout?;
     let stderr = stderr?;
     let stdout_diagnostic = truncate_diagnostic_text(&stdout);
@@ -429,7 +433,7 @@ async fn run_docling(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
-            process_id = ?process_id,
+            process_id,
             timed_out,
             exit_code = ?status.code(),
             signal = ?status.signal(),
@@ -448,7 +452,7 @@ async fn run_docling(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
-            process_id = ?process_id,
+            process_id,
             timed_out,
             exit_code = ?status.code(),
             signal = ?status.signal(),
@@ -469,15 +473,15 @@ async fn run_docling(
 }
 
 /// Wait for Docling while emitting post-100% activity feedback at a bounded cadence.
-async fn wait_for_docling_process(
-    child: &mut tokio::process::Child,
+fn wait_for_docling_process(
+    child: &mut Child,
     config: &DoclingConfig,
     output_dir: &Path,
     source: &ResolvedSource,
-    process_id: Option<u32>,
+    process_id: u32,
     started: Instant,
     progress_state: Arc<Mutex<DoclingProgressState>>,
-    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     expected_markdown_path: PathBuf,
 ) -> Result<(ExitStatus, bool), ApiError> {
     let timeout_duration = Duration::from_secs(config.document_timeout_seconds);
@@ -494,7 +498,7 @@ async fn wait_for_docling_process(
                     source_requested = %source.requested,
                     relative_source = %source.relative_path.display(),
                     output_dir = %output_dir.display(),
-                    process_id = ?process_id,
+                    process_id,
                     timeout_seconds = config.document_timeout_seconds,
                     error = %wait_error,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -507,8 +511,7 @@ async fn wait_for_docling_process(
         }
 
         if started.elapsed() >= timeout_duration {
-            return timeout_docling_process(child, config, output_dir, source, process_id, started)
-                .await;
+            return timeout_docling_process(child, config, output_dir, source, process_id, started);
         }
 
         let now = Instant::now();
@@ -523,24 +526,23 @@ async fn wait_for_docling_process(
                 timeout_duration,
                 &snapshot,
                 progress_sender.as_ref(),
-                expected_markdown_path.clone(),
-            )
-            .await;
+                &expected_markdown_path,
+            );
         }
 
         let poll_duration = Duration::from_millis(DOCLING_WAIT_POLL_MILLIS)
             .min(timeout_duration.saturating_sub(started.elapsed()));
-        sleep(poll_duration).await;
+        thread::sleep(poll_duration);
     }
 }
 
 /// Kill a Docling child after the configured document timeout has been reached.
-async fn timeout_docling_process(
-    child: &mut tokio::process::Child,
+fn timeout_docling_process(
+    child: &mut Child,
     config: &DoclingConfig,
     output_dir: &Path,
     source: &ResolvedSource,
-    process_id: Option<u32>,
+    process_id: u32,
     started: Instant,
 ) -> Result<(ExitStatus, bool), ApiError> {
     error!(
@@ -549,13 +551,13 @@ async fn timeout_docling_process(
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
-        process_id = ?process_id,
+        process_id,
         timeout_seconds = config.document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process timeout reached"
     );
-    let kill_result = child.start_kill();
-    let status = match child.wait().await {
+    let kill_result = child.kill();
+    let status = match child.wait() {
         Ok(status) => status,
         Err(io_error) => {
             error!(
@@ -564,7 +566,7 @@ async fn timeout_docling_process(
                 source_requested = %source.requested,
                 relative_source = %source.relative_path.display(),
                 output_dir = %output_dir.display(),
-                process_id = ?process_id,
+                process_id,
                 timeout_seconds = config.document_timeout_seconds,
                 kill_requested = kill_result.is_ok(),
                 error = %io_error,
@@ -583,7 +585,7 @@ async fn timeout_docling_process(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
-            process_id = ?process_id,
+            process_id,
             exit_code = ?status.code(),
             signal = ?status.signal(),
             timeout_seconds = config.document_timeout_seconds,
@@ -600,28 +602,16 @@ async fn timeout_docling_process(
 }
 
 /// Emit one synthetic post-100% progress update with process and artifact metrics.
-async fn emit_post_100_docling_feedback(
-    process_id: Option<u32>,
+fn emit_post_100_docling_feedback(
+    process_id: u32,
     output_dir: &Path,
     source: &ResolvedSource,
     started: Instant,
     timeout_duration: Duration,
     progress_snapshot: &DoclingProgressSnapshot,
-    progress_sender: Option<&mpsc::Sender<DoclingProgressUpdate>>,
-    expected_markdown_path: PathBuf,
+    progress_sender: Option<&SyncSender<DoclingProgressUpdate>>,
+    expected_markdown_path: &Path,
 ) {
-    let Some(process_id) = process_id else {
-        info!(
-            event = "docling.post_100_feedback.skipped",
-            source_requested = %source.requested,
-            relative_source = %source.relative_path.display(),
-            output_dir = %output_dir.display(),
-            reason = "missing_process_id",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Docling post-100 feedback skipped"
-        );
-        return;
-    };
     let timeout_remaining = timeout_duration.saturating_sub(started.elapsed());
     let latest_progress_message = progress_snapshot
         .latest_message
@@ -643,35 +633,13 @@ async fn emit_post_100_docling_feedback(
         "Docling post-100 feedback inspection started"
     );
 
-    let output_dir_for_inspection = output_dir.to_path_buf();
     let sample_duration = Duration::from_secs(POST_100_SAMPLE_SECONDS);
-    let inspection = task::spawn_blocking(move || {
-        inspect_docling_activity(
-            process_id,
-            &output_dir_for_inspection,
-            &expected_markdown_path,
-            sample_duration,
-        )
-    })
-    .await;
-    let report = match inspection {
-        Ok(report) => report,
-        Err(join_error) => {
-            error!(
-                event = "docling.post_100_feedback.failed",
-                source_requested = %source.requested,
-                relative_source = %source.relative_path.display(),
-                output_dir = %output_dir.display(),
-                process_id,
-                is_panic = join_error.is_panic(),
-                is_cancelled = join_error.is_cancelled(),
-                error = %join_error,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Docling post-100 feedback inspection task failed"
-            );
-            return;
-        }
-    };
+    let report = inspect_docling_activity(
+        process_id,
+        output_dir,
+        expected_markdown_path,
+        sample_duration,
+    );
     log_post_100_report(
         &report,
         process_id,
@@ -683,13 +651,10 @@ async fn emit_post_100_docling_feedback(
     let message = format_docling_activity_message(&report, started.elapsed(), timeout_remaining);
 
     if let Some(progress_sender) = progress_sender {
-        if let Err(error) = progress_sender
-            .send(DoclingProgressUpdate {
-                message,
-                percentage: None,
-            })
-            .await
-        {
+        if let Err(error) = progress_sender.send(DoclingProgressUpdate {
+            message,
+            percentage: None,
+        }) {
             error!(
                 event = "docling.post_100_feedback.delivery_failed",
                 source_requested = %source.requested,
@@ -806,25 +771,25 @@ fn truncate_progress_message_for_log(value: &str) -> String {
 }
 
 /// Read one child-process pipe while preserving bounded diagnostics and optional progress.
-async fn read_child_output<R>(
+fn read_child_output<R>(
     mut reader: R,
     label: &'static str,
-    process_id: Option<u32>,
+    process_id: u32,
     source_requested: String,
     relative_source: String,
     output_dir: String,
-    progress_sender: Option<mpsc::Sender<DoclingProgressUpdate>>,
+    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     progress_state: Option<Arc<Mutex<DoclingProgressState>>>,
 ) -> Result<String, ApiError>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: Read,
 {
     let started = Instant::now();
     info!(
         event = "docling.child_output_reader.started",
         task_purpose = "read_docling_child_output",
         pipe = label,
-        process_id = ?process_id,
+        process_id,
         source_requested = %source_requested,
         relative_source = %relative_source,
         output_dir = %output_dir,
@@ -834,14 +799,14 @@ where
     let mut output = String::new();
     let mut buffer = [0_u8; CHILD_OUTPUT_READ_CHUNK_BYTES];
     loop {
-        let bytes_read = match reader.read(&mut buffer).await {
+        let bytes_read = match reader.read(&mut buffer) {
             Ok(bytes_read) => bytes_read,
             Err(source) => {
                 error!(
                     event = "docling.child_output_reader.failed",
                     task_purpose = "read_docling_child_output",
                     pipe = label,
-                    process_id = ?process_id,
+                    process_id,
                     source_requested = %source_requested,
                     relative_source = %relative_source,
                     output_dir = %output_dir,
@@ -861,7 +826,7 @@ where
                 event = "docling.child_output_reader.completed",
                 task_purpose = "read_docling_child_output",
                 pipe = label,
-                process_id = ?process_id,
+                process_id,
                 source_requested = %source_requested,
                 relative_source = %relative_source,
                 output_dir = %output_dir,
@@ -879,14 +844,12 @@ where
                 progress_sender.as_ref(),
                 progress_state.as_ref(),
                 &chunk,
-            )
-            .await
-            {
+            ) {
                 error!(
                     event = "docling.child_output_reader.failed",
                     task_purpose = "read_docling_child_output",
                     pipe = label,
-                    process_id = ?process_id,
+                    process_id,
                     source_requested = %source_requested,
                     relative_source = %relative_source,
                     output_dir = %output_dir,
@@ -903,50 +866,67 @@ where
     }
 }
 
-/// Join one child-output reader task and label failures with the pipe name.
-async fn join_child_output(
+/// Join one child-output reader thread and label failures with the pipe name.
+fn join_child_output(
     handle: JoinHandle<Result<String, ApiError>>,
     label: &'static str,
-    process_id: Option<u32>,
+    process_id: u32,
     process_started: Instant,
 ) -> Result<String, ApiError> {
-    match handle.await {
+    match handle.join() {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => {
             error!(
                 event = "docling.child_output_reader.task_failed",
                 task_purpose = "read_docling_child_output",
                 pipe = label,
-                process_id = ?process_id,
+                process_id,
                 error_kind = error.error_kind(),
                 error = %error,
                 elapsed_ms = process_started.elapsed().as_millis() as u64,
-                "Docling child output reader task returned an error"
+                "Docling child output reader thread returned an error"
             );
             Err(error)
         }
-        Err(source) => {
+        // std thread joins fail only on panic; there is no cancellation state.
+        Err(panic_payload) => {
+            let panic_message = panic_payload_message(panic_payload.as_ref());
             error!(
                 event = "docling.child_output_reader.join_failed",
                 task_purpose = "read_docling_child_output",
                 pipe = label,
-                process_id = ?process_id,
-                is_panic = source.is_panic(),
-                is_cancelled = source.is_cancelled(),
-                error = %source,
+                process_id,
+                is_panic = true,
+                panic_message = %panic_message,
                 elapsed_ms = process_started.elapsed().as_millis() as u64,
-                "Docling child output reader task join failed"
+                "Docling child output reader thread join failed"
             );
             Err(ApiError::InternalIo {
-                message: format!("Docling {label} reader task failed: {source}"),
+                message: format!("Docling {label} reader thread panicked: {panic_message}"),
             })
         }
     }
 }
 
+/// Extract a bounded, readable message from a joined thread's panic payload.
+///
+/// Shared with thread-join boundaries outside this module so panic diagnostics
+/// stay consistent across spawned-work owners.
+pub(crate) fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    };
+
+    truncate_diagnostic_text(&message)
+}
+
 /// Emit and record parsed Docling progress from one stderr chunk.
-async fn emit_docling_progress_from_chunk(
-    sender: Option<&mpsc::Sender<DoclingProgressUpdate>>,
+fn emit_docling_progress_from_chunk(
+    sender: Option<&SyncSender<DoclingProgressUpdate>>,
     progress_state: Option<&Arc<Mutex<DoclingProgressState>>>,
     chunk: &str,
 ) -> Result<(), ApiError> {
@@ -956,14 +936,10 @@ async fn emit_docling_progress_from_chunk(
                 record_docling_progress(progress_state, &progress);
             }
             if let Some(sender) = sender {
-                sender
-                    .send(progress)
-                    .await
-                    .map_err(|_| ApiError::InternalIo {
-                        message:
-                            "operation response stream closed before Docling progress delivery"
-                                .to_string(),
-                    })?;
+                sender.send(progress).map_err(|_| ApiError::InternalIo {
+                    message: "operation response stream closed before Docling progress delivery"
+                        .to_string(),
+                })?;
             }
         }
     }

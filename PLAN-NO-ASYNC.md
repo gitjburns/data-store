@@ -5,7 +5,16 @@
 Planning document for replacing the standalone Data Store service's async
 server/runtime plumbing with synchronous threading and blocking I/O.
 
-Phase 1 is complete (2026-06-11). Phases 2-5 have not started.
+Phase 1 is complete (2026-06-11). Phase 2 is complete (2026-06-11): the
+`http.rs` ingest caller restructure, the `docling.rs` synchronous rewrite, and
+the `tiny_http` prototype are done. The prototype failed the streaming-flush
+criterion, so `tiny_http` was excluded from the Phase 4 server selection.
+Fallback ladder step 2 research is complete (2026-06-11): `oxhttp` and `astra`
+were both excluded, and the Open Decision is resolved by user decision via
+fallback step 3 — no crate swap; Axum/Tokio is retained as a confined
+transport shell (see the revised Goal and the Open Decision resolution).
+Phase 4 is rescoped accordingly. The next scheduled work item is Phase 3.
+Phases 3-5 have not started.
 
 Per the Note below, work is sequenced for development efficiency rather than
 for keeping intermediate builds functional. Interim phase acceptance is
@@ -14,14 +23,24 @@ behavior verification is deferred to Phases 4-5.
 
 ## Goal
 
-Remove Axum/Tokio async runtime usage from `service/data-store/` while
+Confine Axum/Tokio async runtime usage in `service/data-store/` to a thin
+transport shell (`main.rs` plus the transport layer of `http.rs`) while
 preserving the existing service behavior, documented HTTP API, operation-stream
 NDJSON contract, admin protections, startup/background lifecycle, and
 diagnostic guarantees.
 
-The target is no async in the service. Normal OS threads, synchronous channels,
-blocking sockets, blocking subprocess I/O, and synchronous SQLite/model calls
-are preferred.
+The target is zero async in domain logic. Operation pipelines, storage, model
+calls, Docling process handling, and admission/shutdown state use normal OS
+threads, synchronous channels, blocking subprocess I/O, and synchronous
+SQLite/model calls. Async may exist only inside the transport shell, and
+domain code must never name a `tokio`/`axum` type.
+
+Revision (2026-06-11): the original goal was full Axum/Tokio removal. After
+fallback ladder steps 1-2 eliminated every candidate synchronous server crate
+(see Open Decision), the user decided to retain the proven Axum/Tokio
+transport and enforce containment instead. This preserves the rewrite's
+motivation — no async leaking into domain logic — while keeping the verified
+streaming, shutdown, and body-limit behavior of the existing transport.
 
 ## Rationale
 
@@ -179,6 +198,11 @@ as part of dependency cleanup.
 
 ### Transport
 
+Revision (2026-06-11): superseded by the Open Decision resolution. The
+transport remains Axum/Tokio as a confined shell; no synchronous server crate
+is selected. The candidate text and selection criteria below are retained as
+the record the candidates were evaluated against.
+
 Use a synchronous HTTP server with blocking request handlers. A request handler
 owns one request from decoding through response completion.
 
@@ -311,6 +335,87 @@ Acceptance:
 
 ### Phase 2: Convert Docling To Synchronous Process Handling
 
+Status: Complete (2026-06-11). The `docling.rs` synchronous rewrite and the
+`tiny_http` prototype are done. The prototype verdict is FAIL; see the Open
+Decision section.
+
+Implementation notes (`http.rs` caller restructure):
+
+- The `http.rs` ingest Docling call site no longer uses `tokio::pin!` +
+  `tokio::select!`. Conversion runs as an independent task with cloned
+  `DoclingConfig`/`index_root` ownership; the caller forwards progress
+  in a receive-until-disconnect loop, then joins the task. Channel disconnect
+  is the completion signal, so this lands on the target architecture's shape.
+  The follow-up swap to `std::thread::spawn`, `std::sync::mpsc`, and
+  `JoinHandle::join` landed with the `docling.rs` rewrite below.
+- The progress sender is moved unconditionally (`then_some`) so the caller
+  never retains a sender when there is no emitter; a retained sender would
+  keep the channel open and stall the receive loop.
+- `drain_docling_progress` was removed; draining is inherent in the receive
+  loop, including after delivery failure, so bounded progress sends cannot
+  block conversion.
+
+Implementation notes (`docling.rs` synchronous rewrite, 2026-06-11):
+
+- `docling.rs` is fully synchronous and tokio-free: `std::process::Command`
+  spawn, one `std::thread::spawn` reader thread per pipe, `SyncSender`
+  progress delivery, a `try_wait` + `thread::sleep` poll loop, and
+  kill-then-wait on timeout.
+- The post-100 feedback path calls `inspect_docling_activity` directly; the
+  `tokio::task::spawn_blocking` wrapper and its join-error log path were
+  removed.
+- `process_id` is plain `u32` end to end (std `Child::id()` is infallible,
+  unlike tokio's `Option<u32>`); the dead `missing_process_id` skip path was
+  removed. Log values now render as `123` rather than `Some(123)`; the
+  Phase 5 diagnostic-parity comparison must account for that formatting
+  change.
+- Thread join failures (reader threads and the `http.rs` conversion join) log
+  their existing event names with `is_panic = true` plus a bounded
+  `panic_message` extracted by a shared `pub(crate) panic_payload_message`
+  helper in `docling.rs`; `is_cancelled` was dropped because std thread joins
+  fail only on panic. All other log event names and fields are unchanged.
+- The `http.rs` blocking `recv()`/`join()` calls inside still-async
+  `execute_ingest` are accepted interim Tokio-worker blocking per the offline
+  note; Phase 3 removes the async callers.
+- Compile acceptance (`cargo fmt`, `cargo check`,
+  `cargo check --features metal`) passed for both sessions; runtime
+  acceptance remains deferred per the offline-development decision.
+
+Implementation notes (`tiny_http` prototype, 2026-06-11):
+
+- `tiny_http = "0.12.0"` was added under `[dev-dependencies]` (version
+  confirmed against docs.rs/crates.io in the approved session), and
+  `examples/tiny_http_prototype.rs` was added as a throwaway harness. The
+  harness runs a tiny_http server and an in-process `reqwest::blocking`
+  client in one process and prints a PASS/FAIL verdict per Phase 4 selection
+  criterion. Streaming flush is measured by timestamping NDJSON line arrivals
+  against a 300ms server-side emit delay.
+- Prototype run results (`cargo run --example tiny_http_prototype`):
+  - NDJSON streaming flush: FAIL. Five lines emitted 300ms apart arrived as
+    one terminal burst; inter-arrival gaps were sub-microsecond.
+  - Request body limiting: PASS (declared-length 413 rejection plus bounded
+    `take` read).
+  - Authorization header access: PASS (200 with token, 401 without).
+  - Write-error observability: FAIL, but contaminated by the buffering
+    failure: the client could not disconnect mid-stream because no bytes
+    arrived until the body completed, so `respond()` finished successfully
+    before the disconnect. Not independent evidence either way.
+  - Shutdown wakeup via `Server::unblock()`: PASS (accept loop exited in
+    under 1ms).
+- Failure analysis (unverified from crate source; observed behavior is
+  consistent): tiny_http selects chunked encoding correctly for
+  `data_length: None`, but pipes the body reader through a
+  `chunked_transfer` encoder that buffers internally and flushes only when
+  full or at EOF. `with_chunked_threshold` controls chunked-vs-Content-Length
+  selection only; there is no per-event flush API.
+- Decision: `tiny_http` is excluded from the Phase 4 server selection. The
+  harness and the dev-dependency are retained so the same harness can verify
+  the next candidate crate; the dev-dependency is removed when the Phase 4
+  server crate is selected.
+- Compile acceptance (`cargo fmt`, `cargo check`,
+  `cargo check --features metal`) passed; the prototype run was the approved
+  runtime verification for this item.
+
 Scope:
 
 - Change `convert_source_to_markdown` and internal Docling helpers to
@@ -340,6 +445,13 @@ Acceptance:
 
 ### Phase 3: Convert Operation Pipelines To Synchronous Functions
 
+Design decision deferred to the Phase 3 planning session: how operation
+threads hand events to the async response stream. Candidate shape: operation
+threads call a transport-owned emitter abstraction whose implementation may
+use `blocking_send` from a real OS thread — legal outside async context,
+unlike the original `progress_blocking` panic inside an async task. Either
+way, domain code must not name a `tokio` type.
+
 Scope:
 
 - Make `execute_ingest`, `execute_search`, `execute_operation`, and terminal
@@ -363,19 +475,31 @@ Acceptance:
 - Operation stream result/error delivery remains separately logged from backend
   execution.
 
-### Phase 4: Replace Axum/Tokio Server
+### Phase 4: Confine Async Runtime To Transport Shell
+
+Rescoped (2026-06-11) from "Replace Axum/Tokio Server" per the Open Decision
+resolution.
 
 Scope:
 
-- Choose and add a synchronous HTTP server crate.
-- Replace Axum router and handlers with synchronous route dispatch.
-- Implement JSON body limit handling.
-- Implement route-specific JSON responses.
-- Implement `POST /v1/operations` NDJSON streaming.
-- Implement protected admin routes.
-- Replace Tokio listener/server lifecycle in `main.rs`.
-- Remove `axum`, `tokio`, `tokio-stream`, and `tower-http` dependencies once
-  unused.
+- Restrict `tokio`, `axum`, `tokio-stream`, and `tower-http` usage to
+  `main.rs` and the transport layer of `http.rs`; domain code must not name
+  async types.
+- Trim `tokio` features from `full` to the features the shell actually uses.
+- Keep route dispatch, JSON body limit handling, route-specific JSON
+  responses, `POST /v1/operations` NDJSON streaming, and protected admin
+  routes on the existing Axum implementation.
+- Replace the temporary Phase 1 `tokio::task::spawn_blocking` graceful
+  shutdown adapter in `main.rs` with the final shell-owned bridge.
+- Add boundary documentation at the shell: module-level comments stating what
+  the containment boundary is, why it exists (the `progress_blocking` panic
+  class: synchronous domain work running inside async tasks), and that
+  crossing it is a rule violation, not a style preference.
+- Done early (2026-06-11): the `tiny_http` dev-dependency and
+  `examples/tiny_http_prototype.rs` are removed; the harness existed solely
+  to select a replacement server crate, and no crate will be selected.
+  `Cargo.lock` was pruned via approved `cargo check`, which passed. The
+  example file was deleted by the user.
 
 Expected files:
 
@@ -383,14 +507,14 @@ Expected files:
 - `Cargo.lock`
 - `src/http.rs`
 - `src/main.rs`
-- `src/error.rs`
-- `src/state.rs`
 
 Acceptance:
 
 - `cargo fmt`
 - `cargo check`
 - `cargo check --features metal`
+- `tokio`/`axum` references outside `main.rs` and the `http.rs` transport
+  layer: none (verifiable with `rg`).
 - `/v1/health` and `/v1/limits` compatibility routes work.
 - `POST /v1/operations` streams status/progress/result/error NDJSON.
 - Route-specific ingest/search/admin compatibility routes still work during
@@ -485,3 +609,57 @@ inside the service during an approved implementation session. The prototype
 requires runtime verification (flush behavior is not provable by compile
 checks), so it needs explicit approval to add the dependency and to run the
 prototype process.
+
+Prototype verdict (2026-06-11): `tiny_http` 0.12.0 FAILED the streaming-flush
+criterion (full-body buffering of chunked NDJSON; see Phase 2 implementation
+notes) and is excluded. The fallback ladder below is now active; step 2 is the
+next scheduled work item. `examples/tiny_http_prototype.rs` is retained as the
+candidate-verification harness.
+
+Fallback ladder if `tiny_http` fails the prototype (decided 2026-06-11):
+
+1. Hand-rolling an HTTP layer on `std::net::TcpListener` is excluded by user
+   decision and is not a fallback.
+2. Research alternative synchronous server crates in an approved session.
+   Candidates from unverified training knowledge: `oxhttp`, `astra`. Notes to
+   verify: `rouille` wraps `tiny_http` and inherits its transport behavior;
+   `astra` reuses hyper protocol internals, which needs checking against the
+   no-async-runtime goal. Any candidate must pass the same prototype harness
+   before selection.
+3. If no synchronous crate satisfies the selection criteria, pause and
+   reassess the plan with the user — most plausibly confining the async
+   runtime to a thin transport shell while all domain work behind it stays
+   synchronous, preserving the rewrite's motivation (no async leaking into
+   domain logic) even if not its letter.
+
+Step 2 research findings (2026-06-11, crates.io/docs.rs/repository
+inspection):
+
+- `oxhttp` 0.3.2: zero async dependencies (`http` + `httparse` plus optional
+  TLS), blocking handlers, and `Body::from_read` chunked streaming. Excluded:
+  no shutdown mechanism at all (`ListeningServer` exposes only `join()`; the
+  accept loop has no break condition), the socket is wrapped in a `BufWriter`
+  with no per-chunk `flush()` visible in `server.rs` (encoder internals
+  unverified; same failure shape as `tiny_http`), no built-in request body
+  limiting plus unbounded drain of leftover request bodies, write errors
+  reported via `eprintln!` rather than at a handler-observable boundary, and
+  the docs describe the server as a work in progress for use behind a reverse
+  proxy.
+- `astra` 0.4.0: blocking handlers over hyper protocol internals driven by a
+  private mio event loop on a background thread — an embedded async runtime
+  in all but name, failing the no-async-runtime letter. Also: no documented
+  stop/shutdown API, no built-in body limiting, plausible but unverified
+  per-chunk flush, and modest adoption (~16k downloads, last release
+  2024-11). Excluded without prototyping once the step 3 resolution below
+  made the question moot.
+
+Resolution (2026-06-11, user decision): fallback ladder step 3 is invoked. No
+synchronous server crate is selected. The service retains Axum/Tokio as a
+confined transport shell with all domain work synchronous on OS threads; see
+the revised Goal and the rescoped Phase 4. Rationale: every evaluated
+synchronous crate fails at least one selection criterion on paper or in the
+harness, while the existing Axum transport has verified streaming flush,
+graceful shutdown, and body-limit behavior in this service today. Containment
+preserves the rewrite's motivation (no async in domain logic) and is
+enforceable by review: `tokio`/`axum` references outside the shell must be
+zero.

@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::{
-    docling::{DoclingProgressUpdate, convert_source_to_markdown},
+    docling::{DoclingProgressUpdate, convert_source_to_markdown, panic_payload_message},
     error::{ApiError, OperationErrorDetail},
     inference::{
         ColbertCandidateScore, ColbertDocumentEmbedding, RerankerCandidateInput,
@@ -496,67 +496,62 @@ async fn execute_ingest(
         requested_source = %requested_source,
         "ingest Docling conversion started"
     );
-    let (docling_progress_sender, mut docling_progress_receiver) =
-        mpsc::channel(OPERATION_STREAM_CHANNEL_CAPACITY);
-    let progress_sender = if emitter.is_some() {
-        Some(docling_progress_sender)
-    } else {
-        None
-    };
-    let conversion_future = convert_source_to_markdown(
-        &state.config.docling,
-        &state.config.storage.index_root,
-        source,
-        progress_sender,
-    );
-    tokio::pin!(conversion_future);
-    let mut docling_progress_channel_open = emitter.is_some();
+    let (docling_progress_sender, docling_progress_receiver) =
+        std::sync::mpsc::sync_channel(OPERATION_STREAM_CHANNEL_CAPACITY);
+    // Move the sender unconditionally so the parent never retains one; a retained
+    // sender would keep the channel open and stall the forwarding loop below.
+    let progress_sender = emitter.is_some().then_some(docling_progress_sender);
+    // Run conversion on an independent thread so progress delivery to the client
+    // never controls backend conversion; channel disconnect signals conversion end.
+    let docling_config = state.config.docling.clone();
+    let index_root = state.config.storage.index_root.clone();
+    let conversion_thread = std::thread::spawn(move || {
+        convert_source_to_markdown(&docling_config, &index_root, source, progress_sender)
+    });
     let mut docling_progress_delivery_open = emitter.is_some();
-    let conversion = loop {
-        tokio::select! {
-            result = &mut conversion_future => {
-                let conversion = match result {
-                    Ok(conversion) => conversion,
-                    Err(source) => {
-                        error!(
-                            event = "ingest.docling_conversion.failed",
-                            operation = "ingest",
-                            operation_id = %operation_id,
-                            requested_source = %requested_source,
-                            error = %source,
-                            elapsed_ms = conversion_started.elapsed().as_millis() as u64,
-                            "ingest Docling conversion failed"
-                        );
-                        return Err(source);
-                    }
-                };
-                drain_docling_progress(
-                    &mut emitter,
-                    &mut docling_progress_receiver,
-                    &mut docling_progress_delivery_open,
-                    &operation_id,
-                    &requested_source,
-                    &conversion_started,
-                ).await;
-                break conversion;
-            }
-            progress = docling_progress_receiver.recv(), if docling_progress_channel_open => {
-                match progress {
-                    Some(progress) => {
-                        forward_docling_progress(
-                            &mut emitter,
-                            progress,
-                            &mut docling_progress_delivery_open,
-                            &operation_id,
-                            &requested_source,
-                            &conversion_started,
-                        ).await;
-                    }
-                    None => {
-                        docling_progress_channel_open = false;
-                    }
-                }
-            }
+    // Receiving until disconnect drains all conversion progress even after a
+    // delivery failure, so bounded progress sends never block the conversion.
+    while let Ok(progress) = docling_progress_receiver.recv() {
+        forward_docling_progress(
+            &mut emitter,
+            progress,
+            &mut docling_progress_delivery_open,
+            &operation_id,
+            &requested_source,
+            &conversion_started,
+        )
+        .await;
+    }
+    let conversion = match conversion_thread.join() {
+        Ok(Ok(conversion)) => conversion,
+        Ok(Err(source)) => {
+            error!(
+                event = "ingest.docling_conversion.failed",
+                operation = "ingest",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                error = %source,
+                elapsed_ms = conversion_started.elapsed().as_millis() as u64,
+                "ingest Docling conversion failed"
+            );
+            return Err(source);
+        }
+        // std thread joins fail only on panic; there is no cancellation state.
+        Err(panic_payload) => {
+            let panic_message = panic_payload_message(panic_payload.as_ref());
+            error!(
+                event = "ingest.docling_conversion.task_join_failed",
+                operation = "ingest",
+                operation_id = %operation_id,
+                requested_source = %requested_source,
+                is_panic = true,
+                panic_message = %panic_message,
+                elapsed_ms = conversion_started.elapsed().as_millis() as u64,
+                "ingest Docling conversion thread join failed"
+            );
+            return Err(ApiError::InternalIo {
+                message: format!("Docling conversion thread panicked: {panic_message}"),
+            });
         }
     };
     let conversion_latency_ms = conversion_started.elapsed().as_millis() as u64;
@@ -2142,28 +2137,6 @@ async fn forward_docling_progress(
             "ingest Docling progress delivery failed; conversion continues"
         );
         *delivery_open = false;
-    }
-}
-
-/// Flush parsed Docling progress without allowing stream delivery to abort completed conversion.
-async fn drain_docling_progress(
-    emitter: &mut Option<&mut OperationEmitter>,
-    receiver: &mut mpsc::Receiver<DoclingProgressUpdate>,
-    delivery_open: &mut bool,
-    operation_id: &str,
-    requested_source: &str,
-    conversion_started: &Instant,
-) {
-    while let Ok(progress) = receiver.try_recv() {
-        forward_docling_progress(
-            emitter,
-            progress,
-            delivery_open,
-            operation_id,
-            requested_source,
-            conversion_started,
-        )
-        .await;
     }
 }
 
