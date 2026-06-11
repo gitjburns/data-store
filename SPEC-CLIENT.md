@@ -313,6 +313,21 @@ Output: streamed operation status and progress, followed by ranked results with
 score, source path, unit ID, page numbers, heading path when present, and a
 bounded excerpt of matched content.
 
+After search results, the client prints a `Benchmarks:` summary. The
+`retrieving_candidates` row is the client-observed duration for that streamed
+operation stage. When the response includes `raw.retrieval` timing fields, the
+client must print indented child rows beneath `retrieving_candidates` for:
+
+- `retrieving_candidates.query_vector_validation`
+- `retrieving_candidates.dense_scan`
+- `retrieving_candidates.bm25`
+- `retrieving_candidates.rrf_fusion`
+- `retrieving_candidates.candidate_materialization`
+- `retrieving_candidates.raw_diagnostics`
+
+The child rows are server-reported diagnostic timings, not independent stream
+stages.
+
 The client rendering is excerpted only; service search behavior is unchanged.
 
 ### `search-full <query> [topK]` / `--search-full <query> [topK]`
@@ -412,6 +427,8 @@ Client output should be concise but complete enough for operation:
 - Do not print the bearer token.
 - Do not log the bearer token.
 - Do not print raw JSON responses as the normal interface.
+- Use raw search diagnostics only to render documented human-readable summaries,
+  such as retrieval benchmark child rows.
 
 Search result excerpts should be long enough to be useful in a terminal while
 preventing accidental output floods. The exact excerpt length is an

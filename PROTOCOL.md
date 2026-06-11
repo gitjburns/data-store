@@ -435,6 +435,16 @@ Result payload:
     "search": {
       "mode": "dense_bm25_rrf_colbert_reranker",
       "topK": 3
+    },
+    "retrieval": {
+      "mode": "dense_bm25_rrf_candidate_pool",
+      "latencyMs": 4711,
+      "queryVectorValidationLatencyMs": 0,
+      "denseLatencyMs": 123,
+      "bm25LatencyMs": 4201,
+      "rrfFusionLatencyMs": 0,
+      "candidateMaterializationLatencyMs": 365,
+      "rawDiagnosticsLatencyMs": 22
     }
   }
 }
@@ -451,6 +461,17 @@ Search semantics:
 - `raw` preserves stage diagnostics for dense retrieval, BM25, RRF, ColBERT,
   reranker, final-result provenance, latency, cache metadata, and active
   versions.
+
+Retrieval raw diagnostics itemize the `retrieving_candidates` operation stage:
+
+- `raw.retrieval.latencyMs` is the server-side candidate-pool duration.
+- `queryVectorValidationLatencyMs` is dense query-vector validation time.
+- `denseLatencyMs` is exact dense scan time over the active vector cache.
+- `bm25LatencyMs` is SQLite FTS5 BM25 query time.
+- `rrfFusionLatencyMs` is dense/BM25 Reciprocal Rank Fusion time.
+- `candidateMaterializationLatencyMs` is the time to load fused unit metadata,
+  content, and persisted ColBERT document vectors.
+- `rawDiagnosticsLatencyMs` is raw retrieval diagnostics assembly time.
 
 Reranker raw diagnostics are backend-dependent:
 

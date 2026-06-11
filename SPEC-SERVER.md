@@ -355,6 +355,16 @@ Result payload:
   ],
   "latencyMs": 103500,
   "raw": {
+    "retrieval": {
+      "mode": "dense_bm25_rrf_candidate_pool",
+      "latencyMs": 4711,
+      "queryVectorValidationLatencyMs": 0,
+      "denseLatencyMs": 123,
+      "bm25LatencyMs": 4201,
+      "rrfFusionLatencyMs": 0,
+      "candidateMaterializationLatencyMs": 365,
+      "rawDiagnosticsLatencyMs": 22
+    },
     "reranker": {
       "mode": "modernbert_sequence_classifier",
       "scores": [
@@ -379,6 +389,12 @@ Result payload:
   }
 }
 ```
+
+The `retrieval` raw object must expose timing fields that break down the
+`retrieving_candidates` stage into query-vector validation, dense scan, BM25,
+RRF fusion, candidate materialization, and raw-diagnostics assembly. These
+fields are diagnostic timing data; public search result ranking is still the
+final reranker order.
 
 The `modernbert_sequence_classifier` raw example includes local-only diagnostic
 fields. For `mode: "http_rerank"`, `scores[]` omits `logit` and `tokenCount`,

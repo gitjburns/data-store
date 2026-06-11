@@ -319,8 +319,11 @@ struct SearchRawInput<'a> {
     top_k: u32,
     rrf_k: u32,
     overfetch_multiplier: u32,
+    query_vector_validation_latency_ms: u64,
     dense_latency_ms: u64,
     bm25_latency_ms: u64,
+    rrf_fusion_latency_ms: u64,
+    candidate_materialization_latency_ms: u64,
     latency_ms: u64,
 }
 
@@ -2089,6 +2092,7 @@ impl StorageRuntime {
             colbert_candidate_pool_size = retrieval.colbert_candidate_pool_size,
             "search candidate pool construction started"
         );
+        let validation_started = Instant::now();
         let query_vector = match validate_vector(
             "search-query".to_string(),
             query_vector,
@@ -2112,6 +2116,7 @@ impl StorageRuntime {
                 return Err(source);
             }
         };
+        let query_vector_validation_latency_ms = validation_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.search_query_vector.validation_completed",
             operation_id,
@@ -2119,6 +2124,7 @@ impl StorageRuntime {
             top_k,
             vector_dimension = query_vector.vector.len(),
             vector_norm = query_vector.norm,
+            elapsed_ms = query_vector_validation_latency_ms,
             "search query vector validation completed"
         );
         let cache_snapshot = snapshot.cache;
@@ -2228,13 +2234,14 @@ impl StorageRuntime {
             retrieval.colbert_candidate_pool_size as usize,
             retrieval.rrf_k,
         );
+        let rrf_fusion_latency_ms = fusion_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.search_rrf_fusion.completed",
             operation_id,
             query_chars,
             top_k,
             fused_matches = fused_matches.len(),
-            elapsed_ms = fusion_started.elapsed().as_millis() as u64,
+            elapsed_ms = rrf_fusion_latency_ms,
             "search RRF fusion completed"
         );
         let materialization_started = Instant::now();
@@ -2304,6 +2311,8 @@ impl StorageRuntime {
             );
             return Err(source);
         }
+        let candidate_materialization_latency_ms =
+            materialization_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.search_candidate_materialization.completed",
             operation_id,
@@ -2312,10 +2321,9 @@ impl StorageRuntime {
             fused_matches = fused_matches.len(),
             loaded_units = units.len(),
             candidates = candidates.len(),
-            elapsed_ms = materialization_started.elapsed().as_millis() as u64,
+            elapsed_ms = candidate_materialization_latency_ms,
             "search candidate materialization completed"
         );
-        let latency_ms = started.elapsed().as_millis() as u64;
         let raw_started = Instant::now();
         info!(
             event = "storage.search_raw_diagnostics.started",
@@ -2327,7 +2335,7 @@ impl StorageRuntime {
             fused_matches = fused_matches.len(),
             "search raw diagnostics assembly started"
         );
-        let raw = match self.build_search_raw(SearchRawInput {
+        let mut raw = match self.build_search_raw(SearchRawInput {
             cache: &cache_snapshot,
             query_vector: &query_vector,
             dense_matches: &dense_matches,
@@ -2339,9 +2347,12 @@ impl StorageRuntime {
             top_k,
             rrf_k: retrieval.rrf_k,
             overfetch_multiplier: retrieval.candidate_overfetch_multiplier,
+            query_vector_validation_latency_ms,
             dense_latency_ms,
             bm25_latency_ms,
-            latency_ms,
+            rrf_fusion_latency_ms,
+            candidate_materialization_latency_ms,
+            latency_ms: 0,
         }) {
             Ok(raw) => raw,
             Err(source) => {
@@ -2360,12 +2371,16 @@ impl StorageRuntime {
                 return Err(source);
             }
         };
+        let raw_diagnostics_latency_ms = raw_started.elapsed().as_millis() as u64;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        raw["retrieval"]["latencyMs"] = serde_json::json!(latency_ms);
+        raw["retrieval"]["rawDiagnosticsLatencyMs"] = serde_json::json!(raw_diagnostics_latency_ms);
         info!(
             event = "storage.search_raw_diagnostics.completed",
             operation_id,
             query_chars,
             top_k,
-            elapsed_ms = raw_started.elapsed().as_millis() as u64,
+            elapsed_ms = raw_diagnostics_latency_ms,
             "search raw diagnostics assembly completed"
         );
         info!(
@@ -2472,8 +2487,11 @@ impl StorageRuntime {
             "retrieval": {
                 "mode": RETRIEVAL_MODE_DENSE_BM25_RRF_POOL,
                 "latencyMs": input.latency_ms,
+                "queryVectorValidationLatencyMs": input.query_vector_validation_latency_ms,
                 "denseLatencyMs": input.dense_latency_ms,
                 "bm25LatencyMs": input.bm25_latency_ms,
+                "rrfFusionLatencyMs": input.rrf_fusion_latency_ms,
+                "candidateMaterializationLatencyMs": input.candidate_materialization_latency_ms,
                 "topK": input.top_k,
                 "firstStageCandidateLimit": input.candidate_limit,
                 "colbertCandidatePoolSize": input.colbert_candidate_pool_size,

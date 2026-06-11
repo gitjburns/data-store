@@ -390,6 +390,7 @@ struct SearchRequest {
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
     results: Vec<SearchResult>,
+    raw: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,6 +609,13 @@ struct BenchmarkEntry {
     /// Registry-owned stage label for one finished benchmark row.
     stage: &'static str,
     /// Local wall-clock duration between this stage and the next benchmark boundary.
+    elapsed: Duration,
+}
+
+struct BenchmarkBreakdownEntry {
+    /// Stable child-row label printed under a parent benchmark row.
+    stage: &'static str,
+    /// Server-reported duration for one substage.
     elapsed: Duration,
 }
 
@@ -1900,6 +1908,42 @@ fn tracked_ingest_benchmark_stage(stage: &str) -> Option<&'static str> {
         .find(|tracked_stage| *tracked_stage == stage)
 }
 
+/// Extract server-side substages for the streamed retrieving_candidates row.
+fn retrieval_benchmark_breakdown(raw: &serde_json::Value) -> Vec<BenchmarkBreakdownEntry> {
+    const RETRIEVAL_BENCHMARK_FIELDS: &[(&str, &str)] = &[
+        (
+            "queryVectorValidationLatencyMs",
+            "retrieving_candidates.query_vector_validation",
+        ),
+        ("denseLatencyMs", "retrieving_candidates.dense_scan"),
+        ("bm25LatencyMs", "retrieving_candidates.bm25"),
+        ("rrfFusionLatencyMs", "retrieving_candidates.rrf_fusion"),
+        (
+            "candidateMaterializationLatencyMs",
+            "retrieving_candidates.candidate_materialization",
+        ),
+        (
+            "rawDiagnosticsLatencyMs",
+            "retrieving_candidates.raw_diagnostics",
+        ),
+    ];
+
+    let Some(retrieval) = raw.get("retrieval") else {
+        return Vec::new();
+    };
+
+    RETRIEVAL_BENCHMARK_FIELDS
+        .iter()
+        .filter_map(|(field, stage)| {
+            let elapsed_ms = retrieval.get(*field)?.as_u64()?;
+            Some(BenchmarkBreakdownEntry {
+                stage: *stage,
+                elapsed: Duration::from_millis(elapsed_ms),
+            })
+        })
+        .collect()
+}
+
 /// Format benchmark durations as seconds with millisecond precision.
 fn format_benchmark_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
@@ -2045,7 +2089,7 @@ fn render_ingest(response: IngestResponse, benchmarks: Option<BenchmarkReport>) 
     println!("Document ID: {}", response.document_id);
     println!("Version label: {}", response.version_label);
     println!("Units ingested: {}", response.units_ingested);
-    render_operation_benchmarks(benchmarks);
+    render_operation_benchmarks(benchmarks, &[]);
 }
 
 /// Print ranked search results, then append the client-side benchmark report when available.
@@ -2054,9 +2098,10 @@ fn render_search(
     full_content: bool,
     benchmarks: Option<BenchmarkReport>,
 ) {
+    let retrieval_breakdown = retrieval_benchmark_breakdown(&response.raw);
     if response.results.is_empty() {
         println!("No results");
-        render_operation_benchmarks(benchmarks);
+        render_operation_benchmarks(benchmarks, &retrieval_breakdown);
         return;
     }
     for (index, result) in response.results.iter().enumerate() {
@@ -2073,11 +2118,14 @@ fn render_search(
         println!("   content:");
         print_indented_content(&render_content(&result.content, full_content));
     }
-    render_operation_benchmarks(benchmarks);
+    render_operation_benchmarks(benchmarks, &retrieval_breakdown);
 }
 
 /// Print a benchmark report after operation results so the result remains the first payload users inspect.
-fn render_operation_benchmarks(benchmarks: Option<BenchmarkReport>) {
+fn render_operation_benchmarks(
+    benchmarks: Option<BenchmarkReport>,
+    retrieval_breakdown: &[BenchmarkBreakdownEntry],
+) {
     let Some(benchmarks) = benchmarks else {
         return;
     };
@@ -2089,6 +2137,15 @@ fn render_operation_benchmarks(benchmarks: Option<BenchmarkReport>) {
             entry.stage,
             format_benchmark_duration(entry.elapsed)
         );
+        if entry.stage == "retrieving_candidates" {
+            for child in retrieval_breakdown {
+                println!(
+                    "  {}: {}",
+                    child.stage,
+                    format_benchmark_duration(child.elapsed)
+                );
+            }
+        }
     }
     println!();
     println!("Total: {}", format_benchmark_duration(benchmarks.total));
