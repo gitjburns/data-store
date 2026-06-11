@@ -50,8 +50,14 @@ Decisions recorded from planning discussion:
 
 ## Current Status
 
-Planning complete as of 2026-06-10. No code changes have been made.
-Implementation awaits explicit user approval.
+Planning complete as of 2026-06-10. The implementation scope was restructured
+the same day into six phases, each estimated at no more than 20k tokens with
+code-generation confidence of at least 90%. No code changes have been made.
+Each phase awaits its own explicit user approval before implementation.
+
+The service remains completely offline during all development phases. Phases
+do not need to preserve runnable between-phase functionality; each phase must
+end compile-clean per the Verification Plan.
 
 ## Design Decisions
 
@@ -71,8 +77,11 @@ Implementation awaits explicit user approval.
    `{model, query, documents[], top_n = documents.len()}` to the configured
    endpoint and maps `results[{index, relevance_score}]` back to `unit_id` by
    index. The returned `relevance_score` is the public score,
-   provider-authoritative. vLLM endpoint-path and auth specifics are
-   unverified until first live test; expect one fix iteration.
+   provider-authoritative. Live testing uses public provider rerank
+   endpoints speaking this contract (e.g. Cohere, Jina). vLLM remains a
+   required deployment target through the same contract; its endpoint-path
+   and auth specifics are verified when that server is set up, which is out
+   of scope for this plan.
 4. **Diagnostics honesty.** The HTTP API returns no raw logit or token count.
    `RerankerCandidateScore.logit` and `.token_count` become `Option` values.
    Raw search diagnostics report `mode` per backend
@@ -90,8 +99,8 @@ Implementation awaits explicit user approval.
 6. **Transport.** `reqwest::blocking::Client` (already a dependency, used by
    the CLI) called inside the existing `tokio::task::block_in_place` scope.
    No new async boundary. `Cargo.toml` adds the `rustls-tls` feature to
-   reqwest so `https://` provider endpoints work later with zero further
-   changes; plain `http://` to the private vLLM server is unaffected.
+   reqwest because `https://` public provider endpoints are the live testing
+   target; plain `http://` to the private vLLM server remains supported.
 7. **Readiness.** The HTTP backend runs the existing smoke-check semantics at
    startup (same smoke query/documents, sent through the real endpoint).
    Smoke failure makes the inference component unready and fails startup
@@ -105,54 +114,80 @@ Implementation awaits explicit user approval.
 
 ## Implementation Plan
 
-### 1. Config: backend selection and pool size
+The work is divided into six phases. Each phase requires its own explicit
+user approval before implementation, must end compile-clean per the
+Verification Plan, and must stay within its estimated effort. Phases 1 and 2
+are order-independent; phases 3, 4, and 5 are a sequential type-dependency
+chain; phase 6 is last.
+
+### Phase 1: Reranker candidate pool size knob
+
+- `src/config.rs`: add `reranker_candidate_pool_size` to `RetrievalConfig`
+  with serde default 10 and positive-value validation.
+- `src/http.rs`: `build_reranker_candidates` (~2652-2679) takes the effective
+  pool size instead of `top_k`; caller (~1206) computes
+  `max(reranker_candidate_pool_size, top_k)`, clamped to the available
+  ColBERT-ranked candidates. Final results remain `take(top_k)` by reranker
+  score.
+- `config.example.toml`: document the new retrieval value with comments.
+- The serde default preserves exact current behavior for existing configs.
+
+### Phase 2: Optional reranker diagnostics types
+
+- `src/inference/reranker.rs`: `RerankerCandidateScore.logit` and
+  `.token_count` become `Option<f32>` / `Option<usize>`; the local runtime
+  populates them as today. No behavior change to local scoring.
+- `src/http.rs`: result materialization and raw diagnostics (~2698-2725)
+  handle the optional `logit`/`token_count`, omitting absent fields. The
+  `mode` value remains the local constant in this phase.
+
+### Phase 3: Config backend selection
 
 - `src/config.rs` (~164-169, 287-306): restructure `RerankerModelConfig`
-  around the `backend` tag with per-backend required fields and cross-field
-  validation; add `reranker_candidate_pool_size` to `RetrievalConfig` with
-  serde default 10 and positive-value validation.
-- `config.example.toml`: document both backend modes and the new retrieval
-  value with comments.
+  around the required `backend` tag with per-backend required fields and
+  cross-field validation at config load:
+  - `backend = "local"` requires the existing `path` and `max_tokens`.
+  - `backend = "http"` requires `endpoint`, `model`, and `timeout_seconds`;
+    optional `api_key_file_path`.
+- `config.example.toml`: document both backend modes with comments.
+- The `http` variant has no runtime consumer until Phase 5. The service is
+  offline during development, so no temporary runtime rejection guard is
+  added.
 
-### 2. Backend enum and HTTP client
+### Phase 4: Backend enum with Local variant
 
-- New `src/inference/reranker_backend.rs`: `RerankerBackend` enum;
-  `HttpRerankerClient` holding the blocking client, endpoint, model name,
-  timeout, and optional API key; request/response serde types; startup smoke
-  check; scoring entry points mirroring the local API.
+- New `src/inference/reranker_backend.rs`: `RerankerBackend` enum with the
+  `Local(RerankerRuntime)` variant wrapping the existing runtime and exposing
+  the same public scoring API.
+- `src/inference/mod.rs` (~19-20, 87-92, 105-112): `InferenceRuntime.reranker`
+  becomes `RerankerBackend`; `initialize_with_progress` constructs the
+  `Local` variant as today; `health_details` passes through backend details
+  including backend kind.
+- Call sites dispatch through the enum. Mechanical wrap; zero behavior
+  change.
+
+### Phase 5: HTTP reranker client
+
+- `src/inference/reranker_backend.rs`: add the `Http(HttpRerankerClient)`
+  variant; `HttpRerankerClient` holds the blocking reqwest client, endpoint,
+  model name, timeout, and optional API key read at startup from
+  `api_key_file_path`; request/response serde types for the
+  Cohere-compatible contract; startup smoke check through the real endpoint;
+  scoring entry points mirroring the local API.
+- `src/inference/mod.rs`: `initialize_with_progress` branches on the
+  configured backend (HTTP constructs the client and runs the HTTP smoke
+  check).
+- `src/http.rs`: reranking stage (~1235-1320) acquires the model-call gate
+  only for the `Local` backend; raw diagnostics emit the per-backend `mode`
+  string (`http_rerank` for HTTP); stage lifecycle logging keeps its existing
+  shape; progress for the HTTP backend reports a single completion step.
+- `Cargo.toml`: add the `rustls-tls` feature to reqwest.
 - Diagnostic boundaries per `DIAGNOSTICS-ONBOARDING.md`: request started,
   input ready (candidate count, document chars), completed (HTTP status,
   scores returned, elapsed ms), failed (status code, bounded response-body
   excerpt, elapsed ms). Endpoint and model are logged; the API key never is.
 
-### 3. Local runtime type adjustments
-
-- `src/inference/reranker.rs`: `RerankerCandidateScore.logit` and
-  `.token_count` become `Option<f32>` / `Option<usize>`; the local runtime
-  populates them as today. No behavior change to local scoring.
-
-### 4. Runtime wiring
-
-- `src/inference/mod.rs` (~19-20, 87-92, 105-112): `InferenceRuntime.reranker`
-  becomes `RerankerBackend`; `initialize_with_progress` branches on the
-  configured backend (local loads model artifacts as today; HTTP constructs
-  the client and runs the HTTP smoke check); `health_details` passes through
-  backend details including backend kind.
-
-### 5. Search call-site changes
-
-- `src/http.rs`:
-  - `build_reranker_candidates` (~2652-2679) takes the effective pool size
-    instead of `top_k`; caller (~1206) computes
-    `max(reranker_candidate_pool_size, top_k)`.
-  - Reranking stage (~1235-1320) acquires the model-call gate only for the
-    `Local` backend.
-  - Result materialization and raw diagnostics (~2698-2725) handle optional
-    `logit`/`token_count` and emit the per-backend `mode` string.
-  - Stage lifecycle logging keeps its existing shape; progress for the HTTP
-    backend reports a single completion step.
-
-### 6. Documentation updates
+### Phase 6: Documentation and live validation
 
 - `README.md`: reranker backend prerequisites and config description.
 - `ARCHITECTURE.md`: model runtime section (reranker backend abstraction,
@@ -162,19 +197,23 @@ Implementation awaits explicit user approval.
 - `PROTOCOL.md`: raw reranker diagnostics fields documented as
   backend-dependent (`logit`/`token_count` optional, `mode` values).
 - `SPEC-SERVER.md`: reranker stage and config sections updated to match.
+- Manual runtime validation per the Verification Plan.
 
 ## Out Of Scope
 
 - Embedding or ColBERT backend migration (later phases).
 - Evaluation harness, text-preparation fixes, FTS tokenizer changes.
-- Any vLLM server-side setup or model deployment.
+- Any vLLM server-side setup, model deployment, or validation against the
+  local vLLM engine. vLLM support through the same Cohere-compatible
+  contract remains a requirement of the HTTP backend design.
 - Removal of the local Candle reranker implementation.
 - Raising the default pool size or changing default `topK`.
 - Multi-corpus support.
 
 ## Verification Plan
 
-Static verification (no approval needed beyond this plan):
+Static verification at the end of every phase (no approval needed beyond the
+phase approval):
 
 ```bash
 cargo fmt --manifest-path service/data-store/Cargo.toml
@@ -182,8 +221,10 @@ cargo check --manifest-path service/data-store/Cargo.toml
 cargo check --manifest-path service/data-store/Cargo.toml --features metal
 ```
 
-Manual runtime validation (requires user approval to start/stop the service
-and a reachable vLLM rerank endpoint):
+Manual runtime validation happens in Phase 6 only; the service stays offline
+during phases 1-5 (requires user approval to start/stop the service and a
+reachable public rerank API endpoint; the configured `api_key_file_path` is
+required for public providers):
 
 1. `backend = "local"`: service starts, smoke passes, search behavior and
    logs unchanged, results identical to pre-change behavior.
@@ -197,12 +238,23 @@ and a reachable vLLM rerank endpoint):
 
 ## Estimate And Confidence
 
-- Estimated development effort: ~90k tokens (range 70-120k), including doc
-  updates and check iterations.
-- First-try confidence: 65%. Compile-clean and internally correct ~80%; the
-  discount reflects unverified vLLM rerank-endpoint specifics (exact path,
-  auth header, response field naming). Expect one short fix iteration after
-  the first live call against the inference server.
+Per-phase estimates and first-try confidence for the generated code:
+
+| Phase | Scope | Estimate | Confidence |
+| --- | --- | --- | --- |
+| 1 | Pool-size knob | ~10k tokens | 95% |
+| 2 | Optional diagnostics types | ~12k tokens | 95% |
+| 3 | Config backend selection | ~12k tokens | 92% |
+| 4 | Backend enum, Local variant | ~15k tokens | 90% |
+| 5 | HTTP reranker client | ~20k tokens | 90% |
+| 6 | Documentation and live validation | ~15k tokens | 90% |
+
+Total estimated development effort: ~84k tokens.
+
+Confidence covers the success of the code generated in each phase, verified
+by the static checks. It assumes a public Cohere-compatible rerank endpoint
+is available for Phase 6 live validation; external-dependency failures
+surfaced there are operational findings, not code-confidence factors.
 
 ## Approval Reminder
 
