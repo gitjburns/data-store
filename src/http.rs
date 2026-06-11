@@ -286,7 +286,7 @@ async fn post_ingest(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "HTTP route request decoded"
     );
-    let response = match execute_ingest(&state, request, None).await {
+    let response = match execute_ingest(&state, request, None) {
         Ok(response) => response,
         Err(error) => {
             log_route_failed("/v1/ingest", "ingest_executing", &error, &started);
@@ -310,7 +310,7 @@ async fn post_ingest(
 }
 
 /// Execute the ingest pipeline shared by the route-specific and operation-stream APIs.
-async fn execute_ingest(
+fn execute_ingest(
     state: &AppState,
     request: IngestRequest,
     mut emitter: Option<&mut OperationEmitter>,
@@ -372,8 +372,7 @@ async fn execute_ingest(
         &mut emitter,
         "source_resolving",
         "resolving source reference",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.source_resolution.started",
         operation_id = %operation_id,
@@ -410,8 +409,7 @@ async fn execute_ingest(
         &mut emitter,
         "existing_source_checking",
         "checking existing source version",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.existing_source_check.started",
         operation_id = %operation_id,
@@ -487,8 +485,7 @@ async fn execute_ingest(
         &mut emitter,
         "docling_converting",
         "converting source document",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.docling_conversion.started",
         operation = "ingest",
@@ -519,8 +516,7 @@ async fn execute_ingest(
             &operation_id,
             &requested_source,
             &conversion_started,
-        )
-        .await;
+        );
     }
     let conversion = match conversion_thread.join() {
         Ok(Ok(conversion)) => conversion,
@@ -570,8 +566,7 @@ async fn execute_ingest(
         &mut emitter,
         "unit_splitting",
         "splitting document into retrieval units",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.unit_splitting.started",
         operation_id = %operation_id,
@@ -602,8 +597,7 @@ async fn execute_ingest(
         "retrieval units ready",
         base_units.len() as u64,
         base_units.len() as u64,
-    )
-    .await?;
+    )?;
     let splitting_latency_ms = splitting_started.elapsed().as_millis() as u64;
     let version_label = allocate_version_label()?;
     let versioned_document_id =
@@ -621,7 +615,7 @@ async fn execute_ingest(
     );
     let inference = state.inference()?;
     let dense_embedding_started = Instant::now();
-    emit_operation_status(&mut emitter, "dense_embedding", "embedding document units").await?;
+    emit_operation_status(&mut emitter, "dense_embedding", "embedding document units")?;
     info!(
         event = "ingest.dense_embedding.started",
         operation_id = %operation_id,
@@ -684,8 +678,7 @@ async fn execute_ingest(
             "embedding document units",
             (index + 1) as u64,
             total_units,
-        )
-        .await?;
+        )?;
     }
     let dense_embedding_latency_ms = dense_embedding_started.elapsed().as_millis() as u64;
     info!(
@@ -702,8 +695,7 @@ async fn execute_ingest(
         &mut emitter,
         "colbert_embedding",
         "embedding ColBERT document vectors",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.colbert_embedding.started",
         operation_id = %operation_id,
@@ -771,8 +763,7 @@ async fn execute_ingest(
             "embedding ColBERT document vectors",
             (index + 1) as u64,
             total_units,
-        )
-        .await?;
+        )?;
     }
     let colbert_vector_count = colbert_vectors.len();
     let colbert_vector_values = colbert_vectors
@@ -796,8 +787,7 @@ async fn execute_ingest(
         &mut emitter,
         "storage_publishing",
         "publishing document version",
-    )
-    .await?;
+    )?;
     info!(
         event = "ingest.storage_publishing.started",
         operation_id = %operation_id,
@@ -819,7 +809,7 @@ async fn execute_ingest(
         &state.config.models.colbert,
         emitter.as_deref_mut().map(|emitter| {
             move |message: &'static str, current: u64, total: u64| {
-                emitter.progress_blocking("storage_publishing", message, current, total)
+                emitter.progress("storage_publishing", message, current, total)
             }
         }),
     ) {
@@ -911,7 +901,7 @@ async fn post_search(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "HTTP route request decoded"
     );
-    let response = match execute_search(&state, request, None).await {
+    let response = match execute_search(&state, request, None) {
         Ok(response) => response,
         Err(error) => {
             log_route_failed("/v1/search", "search_executing", &error, &started);
@@ -935,7 +925,7 @@ async fn post_search(
 }
 
 /// Execute the retrieval pipeline shared by the route-specific and operation-stream APIs.
-async fn execute_search(
+fn execute_search(
     state: &AppState,
     request: SearchRequest,
     mut emitter: Option<&mut OperationEmitter>,
@@ -1016,7 +1006,7 @@ async fn execute_search(
     };
     let inference = state.inference()?;
     let embedding_started = Instant::now();
-    emit_operation_status(&mut emitter, "embedding_query", "embedding search query").await?;
+    emit_operation_status(&mut emitter, "embedding_query", "embedding search query")?;
     info!(
         event = "search.query_embedding.started",
         operation_id = %operation_id,
@@ -1083,8 +1073,7 @@ async fn execute_search(
         &mut emitter,
         "retrieving_candidates",
         "retrieving candidate units",
-    )
-    .await?;
+    )?;
     info!(
         event = "search.retrieval.started",
         operation_id = %operation_id,
@@ -1148,8 +1137,7 @@ async fn execute_search(
         &mut emitter,
         "colbert_scoring",
         "scoring ColBERT candidates",
-    )
-    .await?;
+    )?;
     info!(
         event = "search.colbert_scoring.started",
         operation_id = %operation_id,
@@ -1186,20 +1174,18 @@ async fn execute_search(
             }
         };
         if let Some(operation_emitter) = emitter.as_deref_mut() {
-            tokio::task::block_in_place(|| {
-                inference.colbert.score_persisted_candidates_with_progress(
-                    &request.query,
-                    &colbert_candidates,
-                    |current, total| {
-                        operation_emitter.progress_blocking(
-                            "colbert_scoring",
-                            "scoring ColBERT candidates",
-                            current,
-                            total,
-                        )
-                    },
-                )
-            })
+            inference.colbert.score_persisted_candidates_with_progress(
+                &request.query,
+                &colbert_candidates,
+                |current, total| {
+                    operation_emitter.progress(
+                        "colbert_scoring",
+                        "scoring ColBERT candidates",
+                        current,
+                        total,
+                    )
+                },
+            )
         } else {
             inference
                 .colbert
@@ -1288,7 +1274,7 @@ async fn execute_search(
         "search reranker candidate assembly completed"
     );
     let reranker_started = Instant::now();
-    emit_operation_status(&mut emitter, "reranking", "reranking candidates").await?;
+    emit_operation_status(&mut emitter, "reranking", "reranking candidates")?;
     info!(
         event = "search.reranking.started",
         operation_id = %operation_id,
@@ -1321,20 +1307,13 @@ async fn execute_search(
             }
         };
         if let Some(operation_emitter) = emitter.as_deref_mut() {
-            tokio::task::block_in_place(|| {
-                inference.reranker.score_candidates_with_progress(
-                    &request.query,
-                    &reranker_candidates,
-                    |current, total| {
-                        operation_emitter.progress_blocking(
-                            "reranking",
-                            "reranking candidates",
-                            current,
-                            total,
-                        )
-                    },
-                )
-            })
+            inference.reranker.score_candidates_with_progress(
+                &request.query,
+                &reranker_candidates,
+                |current, total| {
+                    operation_emitter.progress("reranking", "reranking candidates", current, total)
+                },
+            )
         } else {
             inference
                 .reranker
@@ -1374,8 +1353,7 @@ async fn execute_search(
         &mut emitter,
         "result_assembling",
         "assembling search results",
-    )
-    .await?;
+    )?;
     info!(
         event = "search.result_assembly.started",
         operation_id = %operation_id,
@@ -1588,7 +1566,7 @@ impl OperationEmitter {
     }
 
     /// Emit one newline-worthy status event for a real operation boundary.
-    async fn status(&mut self, stage: &'static str, message: &'static str) -> Result<(), ApiError> {
+    fn status(&mut self, stage: &'static str, message: &'static str) -> Result<(), ApiError> {
         let sequence = self.next_sequence();
         let event = OperationEvent::Status {
             operation_id: self.operation_id.clone(),
@@ -1608,11 +1586,10 @@ impl OperationEmitter {
             "operation status event ready"
         );
         self.send_reporting("status", sequence, Some(stage), Some(message), event)
-            .await
     }
 
-    /// Emit one counted progress event through the async operation stream.
-    async fn progress(
+    /// Emit one counted progress event through the operation stream.
+    fn progress(
         &mut self,
         stage: &'static str,
         message: &'static str,
@@ -1643,15 +1620,10 @@ impl OperationEmitter {
             );
         }
         self.send_reporting("progress", sequence, Some(stage), Some(message), event)
-            .await
     }
 
-    /// Emit one uncounted progress event through the async operation stream.
-    async fn progress_message(
-        &mut self,
-        stage: &'static str,
-        message: String,
-    ) -> Result<(), ApiError> {
+    /// Emit one uncounted progress event through the operation stream.
+    fn progress_message(&mut self, stage: &'static str, message: String) -> Result<(), ApiError> {
         let sequence = self.next_sequence();
         let event = OperationEvent::Progress {
             operation_id: self.operation_id.clone(),
@@ -1662,114 +1634,10 @@ impl OperationEmitter {
             total: None,
         };
         self.send_reporting("progress", sequence, Some(stage), None, event)
-            .await
-    }
-
-    /// Emit one counted progress event from synchronous pipeline stages without blocking the runtime.
-    fn progress_blocking(
-        &mut self,
-        stage: &'static str,
-        message: &'static str,
-        current: u64,
-        total: u64,
-    ) -> Result<(), ApiError> {
-        let sequence = self.next_sequence();
-        let event = OperationEvent::Progress {
-            operation_id: self.operation_id.clone(),
-            sequence,
-            stage: Some(stage.to_string()),
-            message: Some(message.to_string()),
-            current: Some(current),
-            total: Some(total),
-        };
-        if should_log_progress_checkpoint(current, total) {
-            info!(
-                event = "operation.progress_checkpoint",
-                operation = self.operation,
-                operation_id = %self.operation_id,
-                sequence,
-                stage,
-                message,
-                current,
-                total,
-                elapsed_ms = self.started.elapsed().as_millis() as u64,
-                "operation progress checkpoint"
-            );
-        }
-        if !self.reporting_delivery_open {
-            return Ok(());
-        }
-
-        let mut line = match serde_json::to_vec(&event) {
-            Ok(line) => line,
-            Err(source) => {
-                error!(
-                    event = "operation.event_prepare_failed",
-                    operation = self.operation,
-                    operation_id = %self.operation_id,
-                    sequence,
-                    event_type = "progress",
-                    stage,
-                    message,
-                    error = %source,
-                    elapsed_ms = self.started.elapsed().as_millis() as u64,
-                    "operation event preparation failed"
-                );
-                return Err(ApiError::InternalIo {
-                    message: format!("failed to serialize operation event: {source}"),
-                });
-            }
-        };
-        line.push(b'\n');
-        match self.sender.try_send(Ok(Bytes::from(line))) {
-            Ok(()) => {
-                let delivery = Ok(());
-                self.log_delivery_result(
-                    "progress",
-                    sequence,
-                    Some(stage),
-                    Some(message),
-                    &delivery,
-                );
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                info!(
-                    event = "operation.reporting_event_not_delivered",
-                    operation = self.operation,
-                    operation_id = %self.operation_id,
-                    sequence,
-                    event_type = "progress",
-                    stage,
-                    message,
-                    reason = "stream_channel_full",
-                    elapsed_ms = self.started.elapsed().as_millis() as u64,
-                    "operation reporting event not delivered"
-                );
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                let delivery = Err(operation_stream_closed_api_error());
-                self.log_delivery_result(
-                    "progress",
-                    sequence,
-                    Some(stage),
-                    Some(message),
-                    &delivery,
-                );
-                self.finish_reporting_delivery(
-                    "progress",
-                    sequence,
-                    Some(stage),
-                    Some(message),
-                    delivery,
-                )
-            }
-        }
     }
 
     /// Emit one terminal success event and let the response stream finish.
-    async fn result<T: Serialize>(&mut self, payload: T) -> Result<(), ApiError> {
+    fn result<T: Serialize>(&mut self, payload: T) -> Result<(), ApiError> {
         let next_sequence = self.sequence + 1;
         let payload = match serde_json::to_value(payload) {
             Ok(payload) => payload,
@@ -1817,11 +1685,10 @@ impl OperationEmitter {
             Some(&terminal_status),
             event,
         )
-        .await
     }
 
     /// Emit one terminal error event and let the response stream finish.
-    async fn error(&mut self, stage: &'static str, error: ApiError) -> Result<(), ApiError> {
+    fn error(&mut self, stage: &'static str, error: ApiError) -> Result<(), ApiError> {
         let error_message = error.to_string();
         let detail = error.operation_error_detail();
         let error_status = detail.status;
@@ -1846,11 +1713,10 @@ impl OperationEmitter {
             "operation terminal error ready"
         );
         self.send("error", sequence, Some(stage), Some(&error_message), event)
-            .await
     }
 
     /// Send one nonterminal reporting event without letting client disconnects abort backend work.
-    async fn send_reporting(
+    fn send_reporting(
         &mut self,
         event_type: &'static str,
         sequence: u64,
@@ -1862,12 +1728,12 @@ impl OperationEmitter {
             return Ok(());
         }
 
-        let delivery = self.send(event_type, sequence, stage, message, event).await;
+        let delivery = self.try_send(event_type, sequence, stage, message, event);
         self.finish_reporting_delivery(event_type, sequence, stage, message, delivery)
     }
 
-    /// Serialize and send one complete NDJSON line.
-    async fn send(
+    /// Serialize and try to send one reporting NDJSON line without blocking domain work.
+    fn try_send(
         &mut self,
         event_type: &'static str,
         sequence: u64,
@@ -1875,6 +1741,63 @@ impl OperationEmitter {
         message: Option<&str>,
         event: OperationEvent,
     ) -> Result<(), ApiError> {
+        let line = self.serialize_event_line(event_type, sequence, stage, message, event)?;
+        match self.sender.try_send(Ok(line)) {
+            Ok(()) => {
+                let delivery = Ok(());
+                self.log_delivery_result(event_type, sequence, stage, message, &delivery);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                info!(
+                    event = "operation.reporting_event_not_delivered",
+                    operation = self.operation,
+                    operation_id = %self.operation_id,
+                    sequence,
+                    event_type,
+                    stage = stage.unwrap_or("none"),
+                    message = message.unwrap_or("none"),
+                    reason = "stream_channel_full",
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    "operation reporting event not delivered"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let delivery = Err(operation_stream_closed_api_error());
+                self.log_delivery_result(event_type, sequence, stage, message, &delivery);
+                delivery
+            }
+        }
+    }
+
+    /// Serialize and send one complete NDJSON line.
+    fn send(
+        &mut self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        event: OperationEvent,
+    ) -> Result<(), ApiError> {
+        let line = self.serialize_event_line(event_type, sequence, stage, message, event)?;
+        let delivery = self
+            .sender
+            .blocking_send(Ok(line))
+            .map_err(operation_stream_closed_error);
+        self.log_delivery_result(event_type, sequence, stage, message, &delivery);
+        delivery
+    }
+
+    /// Serialize one operation event into an owned NDJSON body chunk.
+    fn serialize_event_line(
+        &self,
+        event_type: &'static str,
+        sequence: u64,
+        stage: Option<&str>,
+        message: Option<&str>,
+        event: OperationEvent,
+    ) -> Result<Bytes, ApiError> {
         let mut line = match serde_json::to_vec(&event) {
             Ok(line) => line,
             Err(source) => {
@@ -1896,13 +1819,7 @@ impl OperationEmitter {
             }
         };
         line.push(b'\n');
-        let delivery = self
-            .sender
-            .send(Ok(Bytes::from(line)))
-            .await
-            .map_err(operation_stream_closed_error);
-        self.log_delivery_result(event_type, sequence, stage, message, &delivery);
-        delivery
+        Ok(Bytes::from(line))
     }
 
     /// Convert nonterminal stream-close failures into durable reporting-only diagnostics.
@@ -1988,20 +1905,20 @@ impl OperationEmitter {
 }
 
 /// Emit a status event only when the shared pipeline is serving an operation stream.
-async fn emit_operation_status(
+fn emit_operation_status(
     emitter: &mut Option<&mut OperationEmitter>,
     stage: &'static str,
     message: &'static str,
 ) -> Result<(), ApiError> {
     if let Some(emitter) = emitter.as_deref_mut() {
-        emitter.status(stage, message).await?;
+        emitter.status(stage, message)?;
     }
 
     Ok(())
 }
 
 /// Emit a progress event only when the shared pipeline is serving an operation stream.
-async fn emit_operation_progress(
+fn emit_operation_progress(
     emitter: &mut Option<&mut OperationEmitter>,
     stage: &'static str,
     message: &'static str,
@@ -2009,7 +1926,7 @@ async fn emit_operation_progress(
     total: u64,
 ) -> Result<(), ApiError> {
     if let Some(emitter) = emitter.as_deref_mut() {
-        emitter.progress(stage, message, current, total).await?;
+        emitter.progress(stage, message, current, total)?;
     }
 
     Ok(())
@@ -2057,42 +1974,37 @@ fn is_operation_stream_closed_error(error: &ApiError) -> bool {
 }
 
 /// Emit one uncounted progress event only when the pipeline serves an operation stream.
-async fn emit_operation_progress_message(
+fn emit_operation_progress_message(
     emitter: &mut Option<&mut OperationEmitter>,
     stage: &'static str,
     message: String,
 ) -> Result<(), ApiError> {
     if let Some(emitter) = emitter.as_deref_mut() {
-        emitter.progress_message(stage, message).await?;
+        emitter.progress_message(stage, message)?;
     }
 
     Ok(())
 }
 
 /// Forward one parsed Docling progress update to the operation stream.
-async fn emit_docling_progress(
+fn emit_docling_progress(
     emitter: &mut Option<&mut OperationEmitter>,
     progress: DoclingProgressUpdate,
 ) -> Result<(), ApiError> {
     match progress.percentage {
-        Some(percentage) => {
-            emit_operation_progress(
-                emitter,
-                "docling_converting",
-                "loading model weights",
-                percentage,
-                100,
-            )
-            .await
-        }
-        None => {
-            emit_operation_progress_message(emitter, "docling_converting", progress.message).await
-        }
+        Some(percentage) => emit_operation_progress(
+            emitter,
+            "docling_converting",
+            "loading model weights",
+            percentage,
+            100,
+        ),
+        None => emit_operation_progress_message(emitter, "docling_converting", progress.message),
     }
 }
 
 /// Forward one Docling progress update without letting client delivery control backend conversion.
-async fn forward_docling_progress(
+fn forward_docling_progress(
     emitter: &mut Option<&mut OperationEmitter>,
     progress: DoclingProgressUpdate,
     delivery_open: &mut bool,
@@ -2105,7 +2017,7 @@ async fn forward_docling_progress(
     }
 
     let was_delivery_open = operation_reporting_delivery_open(emitter);
-    if let Err(error) = emit_docling_progress(emitter, progress).await {
+    if let Err(error) = emit_docling_progress(emitter, progress) {
         error!(
             event = "ingest.docling_progress_delivery.failed",
             operation = "ingest",
@@ -2271,15 +2183,14 @@ async fn post_operation(
     let task_operation = operation;
     let task_operation_id = operation_id.clone();
     let response_operation_id = operation_id.clone();
-    let handle = tokio::spawn(async move {
+    let handle = std::thread::spawn(move || {
         run_operation_stream(
             stream_state,
             operation,
             operation_id,
             request.payload,
             sender,
-        )
-        .await;
+        );
     });
     info!(
         event = "operation.task_spawned",
@@ -2290,11 +2201,11 @@ async fn post_operation(
         elapsed_ms = setup_started.elapsed().as_millis() as u64,
         "operation stream task spawned"
     );
-    tokio::spawn(async move {
+    std::thread::spawn(move || {
         let join_started = Instant::now();
         let mut observed_child_outcome = "completed";
         let mut observed_child_panicked = false;
-        let mut observed_child_cancelled = false;
+        let observed_child_cancelled = false;
         info!(
             event = "operation.task_join_watcher_started",
             operation = task_operation.as_str(),
@@ -2303,7 +2214,7 @@ async fn post_operation(
             task = "operation_stream_join_watcher",
             "operation task join watcher started"
         );
-        match handle.await {
+        match handle.join() {
             Ok(()) => {
                 info!(
                     event = "operation.task_join_completed",
@@ -2315,10 +2226,10 @@ async fn post_operation(
                     "operation task join completed"
                 );
             }
-            Err(source) => {
+            Err(panic_payload) => {
                 observed_child_outcome = "join_failed";
-                observed_child_panicked = source.is_panic();
-                observed_child_cancelled = source.is_cancelled();
+                observed_child_panicked = true;
+                let panic_message = panic_payload_message(panic_payload.as_ref());
                 error!(
                     event = "operation.task_join_failed",
                     operation = task_operation.as_str(),
@@ -2327,8 +2238,9 @@ async fn post_operation(
                     task = "operation_stream",
                     is_panic = observed_child_panicked,
                     is_cancelled = observed_child_cancelled,
+                    panic_message = %panic_message,
                     elapsed_ms = join_started.elapsed().as_millis() as u64,
-                    error = %source,
+                    error = %panic_message,
                     "operation task join failed"
                 );
             }
@@ -2486,7 +2398,7 @@ async fn post_operation_control(
 }
 
 /// Run accepted operation work and convert post-acceptance failures into terminal stream errors.
-async fn run_operation_stream(
+fn run_operation_stream(
     state: Arc<AppState>,
     operation: OperationName,
     operation_id: String,
@@ -2502,7 +2414,7 @@ async fn run_operation_stream(
         elapsed_ms = emitter.started.elapsed().as_millis() as u64,
         "operation stream accepted"
     );
-    if let Err(failure) = execute_operation(state, operation, payload, &mut emitter).await {
+    if let Err(failure) = execute_operation(state, operation, payload, &mut emitter) {
         let error_message = failure.error.to_string();
         let error_kind = failure.error.error_kind();
         let status = failure.error.status_u16();
@@ -2517,7 +2429,7 @@ async fn run_operation_stream(
             elapsed_ms = emitter.started.elapsed().as_millis() as u64,
             "operation stream failed"
         );
-        let _ = emitter.error(failure.stage, failure.error).await;
+        let _ = emitter.error(failure.stage, failure.error);
         info!(
             event = "operation.task_finished",
             operation = operation.as_str(),
@@ -2541,7 +2453,7 @@ async fn run_operation_stream(
 }
 
 /// Dispatch one accepted operation to the route-compatible service implementation.
-async fn execute_operation(
+fn execute_operation(
     state: Arc<AppState>,
     operation: OperationName,
     payload: serde_json::Value,
@@ -2551,58 +2463,50 @@ async fn execute_operation(
         OperationName::Health => {
             emitter
                 .status("health_checking", "reading service health")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
-            emit_terminal_result(emitter, operation.as_str(), state.health()).await
+            emit_terminal_result(emitter, operation.as_str(), state.health())
         }
         OperationName::Limits => {
             emitter
                 .status("limits_reading", "reading request and retrieval limits")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
-            emit_terminal_result(emitter, operation.as_str(), build_limits_response(&state)).await
+            emit_terminal_result(emitter, operation.as_str(), build_limits_response(&state))
         }
         OperationName::Sources => {
             emitter
                 .status("sources_listing", "listing ingested source documents")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_ingested_sources(&state)
                 .map_err(|error| OperationFailure::new("sources_listing", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
         OperationName::Ingest => {
             let request = decode_operation_payload(payload, operation.as_str())
                 .map_err(|error| OperationFailure::new("request_validating", error))?;
             emitter
                 .status("ingest_running", "running ingest pipeline")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_ingest(&state, request, Some(emitter))
-                .await
                 .map_err(|error| OperationFailure::new("ingest_running", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
         OperationName::Search => {
             let request = decode_operation_payload(payload, operation.as_str())
                 .map_err(|error| OperationFailure::new("request_validating", error))?;
             emitter
                 .status("search_running", "running search pipeline")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_search(&state, request, Some(emitter))
-                .await
                 .map_err(|error| OperationFailure::new("search_running", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
         OperationName::Versions => {
             emitter
                 .status("versions_listing", "listing retained document versions")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_document_versions(&state)
                 .map_err(|error| OperationFailure::new("versions_listing", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
         OperationName::Rollback => {
             let request = decode_operation_payload(payload, operation.as_str())
@@ -2612,31 +2516,29 @@ async fn execute_operation(
                     "rollback_publishing",
                     "publishing retained document version",
                 )
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_document_version_rollback(&state, request)
                 .map_err(|error| OperationFailure::new("rollback_publishing", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
         OperationName::Shutdown => {
             emitter
                 .status("shutdown_requesting", "requesting graceful shutdown")
-                .await
                 .map_err(|error| OperationFailure::new("operation_streaming", error))?;
             let response = execute_shutdown(&state)
                 .map_err(|error| OperationFailure::new("shutdown_requesting", error))?;
-            emit_terminal_result(emitter, operation.as_str(), response).await
+            emit_terminal_result(emitter, operation.as_str(), response)
         }
     }
 }
 
 /// Emit a terminal result without treating client delivery failure as execution failure.
-async fn emit_terminal_result<T: Serialize>(
+fn emit_terminal_result<T: Serialize>(
     emitter: &mut OperationEmitter,
     operation: &'static str,
     response: T,
 ) -> Result<(), OperationFailure> {
-    if let Err(error) = emitter.result(response).await {
+    if let Err(error) = emitter.result(response) {
         error!(
             event = "operation.terminal_result_emit_failed",
             operation,

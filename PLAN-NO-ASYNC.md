@@ -13,8 +13,8 @@ Fallback ladder step 2 research is complete (2026-06-11): `oxhttp` and `astra`
 were both excluded, and the Open Decision is resolved by user decision via
 fallback step 3 — no crate swap; Axum/Tokio is retained as a confined
 transport shell (see the revised Goal and the Open Decision resolution).
-Phase 4 is rescoped accordingly. The next scheduled work item is Phase 3.
-Phases 3-5 have not started.
+Phase 3 is complete (2026-06-11). Phase 4 is rescoped accordingly and is the
+next scheduled work item. Phase 5 has not started.
 
 Per the Note below, work is sequenced for development efficiency rather than
 for keeping intermediate builds functional. Interim phase acceptance is
@@ -445,12 +445,30 @@ Acceptance:
 
 ### Phase 3: Convert Operation Pipelines To Synchronous Functions
 
-Design decision deferred to the Phase 3 planning session: how operation
-threads hand events to the async response stream. Candidate shape: operation
-threads call a transport-owned emitter abstraction whose implementation may
-use `blocking_send` from a real OS thread — legal outside async context,
-unlike the original `progress_blocking` panic inside an async task. Either
-way, domain code must not name a `tokio` type.
+Status: Complete (2026-06-11).
+
+Implementation notes:
+
+- `execute_ingest`, `execute_search`, `run_operation_stream`,
+  `execute_operation`, operation progress helpers, and terminal result emission
+  are synchronous.
+- Operation-stream work is spawned with `std::thread::spawn`; a separate
+  standard-thread join watcher logs normal completion or panic with a bounded
+  panic message. The previous `tokio::spawn` operation task and Tokio join
+  watcher were removed.
+- `OperationEmitter` is synchronous. Nonterminal status/progress delivery uses
+  `try_send` so reporting does not block backend work. Terminal result/error
+  delivery uses `blocking_send` from the OS operation thread so terminal
+  delivery remains a distinct logged boundary. Axum/Tokio channel ownership
+  remains confined to the transport layer of `http.rs`.
+- `tokio::task::block_in_place` was removed from ColBERT and reranker progress
+  paths; model progress callbacks now call the synchronous emitter directly.
+- The previous `progress_blocking` compatibility method was removed; storage,
+  ColBERT, and reranker progress use the same synchronous progress path.
+- Compile acceptance (`cargo fmt`, `cargo check`,
+  `cargo check --features metal`) passed. A scan confirmed no
+  operation-pipeline `.await`, no `tokio::spawn`, and no `block_in_place` in
+  `src/http.rs`; remaining async functions are Axum route handlers.
 
 Scope:
 
