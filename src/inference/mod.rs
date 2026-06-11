@@ -4,6 +4,7 @@ mod dense;
 mod device;
 mod qwen3;
 mod reranker;
+mod reranker_backend;
 mod tensor_ops;
 
 use crate::{config::ServiceConfig, error::ApiError};
@@ -13,6 +14,7 @@ pub use colbert::{ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntim
 pub use dense::DenseEmbeddingRuntime;
 pub use device::SelectedDevice;
 pub use reranker::{RerankerCandidateInput, RerankerCandidateScore, RerankerRuntime};
+pub use reranker_backend::RerankerBackend;
 
 pub type InferenceProgress<'progress> = &'progress mut dyn FnMut(&str) -> Result<(), ApiError>;
 
@@ -22,7 +24,7 @@ pub struct InferenceRuntime {
     pub artifacts: ModelArtifactSet,
     pub dense: DenseEmbeddingRuntime,
     pub colbert: ColbertRuntime,
-    pub reranker: RerankerRuntime,
+    pub reranker: RerankerBackend,
 }
 
 impl InferenceRuntime {
@@ -84,12 +86,12 @@ impl InferenceRuntime {
         )?;
         progress("colbert_ready")?;
         progress("reranker_loading")?;
-        let reranker = RerankerRuntime::load_with_progress(
+        let reranker = RerankerBackend::Local(RerankerRuntime::load_with_progress(
             &artifacts.reranker,
             &config.models.reranker,
             &device.candle,
             progress,
-        )?;
+        )?);
         progress("reranker_ready")?;
 
         Ok(Self {

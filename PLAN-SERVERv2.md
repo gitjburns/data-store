@@ -100,7 +100,28 @@ static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
 pass. Phase 4 introduces the discriminated union when wrapping the runtime
 in `RerankerBackend`.
 
-Phases 4-6 are not started. Each phase awaits its own explicit user approval
+Phase 4 (backend enum with Local variant) was implemented and verified on
+2026-06-10 with one approved design decision: the config-level discriminated
+union deferred from Phase 3 is dropped permanently rather than implemented.
+`RerankerModelConfig` stays a flat struct with the `backend` tag,
+`validate_reranker_backend_fields`, and the `Result` accessors. Rationale: the
+runtime enum provides compiler-enforced backend dispatch where branching
+actually occurs; the config is parsed once, validated centrally, and fails
+fast at startup with targeted operator-facing messages; and serde
+internally-tagged enums do not support `deny_unknown_fields`, so converting
+risked weakening strict unknown-field rejection. New
+`src/inference/reranker_backend.rs` defines `RerankerBackend` with the single
+`Local(RerankerRuntime)` variant exposing `kind()`, `health_details()` (which
+prepends `reranker backend: <kind>` to the runtime details),
+`score_candidates`, and `score_candidates_with_progress` with the generic
+progress-closure signature preserved via enum dispatch.
+`InferenceRuntime.reranker` is now `RerankerBackend`, and
+`initialize_with_progress` wraps the loaded local runtime in the `Local`
+variant with unchanged progress milestones. `src/http.rs` required zero
+edits: both scoring call sites and type imports compile unchanged. All static
+checks (`cargo fmt`, `cargo check`, `cargo check --features metal`) pass.
+
+Phases 5-6 are not started. Each phase awaits its own explicit user approval
 before implementation.
 
 The service remains completely offline during all development phases. Phases
