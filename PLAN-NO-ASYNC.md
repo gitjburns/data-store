@@ -5,8 +5,12 @@
 Planning document for replacing the standalone Data Store service's async
 server/runtime plumbing with synchronous threading and blocking I/O.
 
-No implementation has started. This plan is intended for phased work in future
-sessions.
+Phase 1 is complete (2026-06-11). Phases 2-5 have not started.
+
+Per the Note below, work is sequenced for development efficiency rather than
+for keeping intermediate builds functional. Interim phase acceptance is
+`cargo fmt`, `cargo check`, and `cargo check --features metal`; runtime
+behavior verification is deferred to Phases 4-5.
 
 ## Goal
 
@@ -35,6 +39,10 @@ Async complexity has already leaked into synchronous domain work. One concrete
 failure was `OperationEmitter::progress_blocking` using Tokio `blocking_send`
 from inside an async operation task, causing ingest to panic during synchronous
 storage publish.
+
+## Note
+
+The app will remain offline during all phases of development. We should sequence the updates in an order that makes development efficient rather than what will keep the app functional between phases.
 
 ## Current Async Inventory
 
@@ -130,6 +138,9 @@ Async/runtime responsibilities:
 
 - Tokio semaphore for fail-fast admission.
 - Tokio oneshot for shutdown signaling.
+- Tokio capacity-1 semaphore (`model_call_gate`) with async acquisition
+  serializing accelerator-backed model calls. (Omitted from the original
+  inventory; discovered and converted during Phase 1.)
 
 Synchronous responsibilities that can stay conceptually intact:
 
@@ -248,6 +259,31 @@ inferred process state.
 
 ### Phase 1: Make State And Errors Transport-Neutral
 
+Status: Complete (2026-06-11).
+
+Implementation notes:
+
+- Admission gates use an atomic in-flight counter with RAII permit decrement
+  on drop (the recommended option).
+- `model_call_gate`, missing from the original `state.rs` inventory, was also
+  converted: it is now a synchronous `Mutex<bool>` + `Condvar` exclusive gate
+  with a synchronous `acquire_model_call_gate`. The five async call sites in
+  `http.rs` call it blocking; interim blocking of Tokio worker threads is
+  accepted because the service is offline, and the async callers are removed
+  in Phase 3.
+- Shutdown uses a `ShutdownSignal` (`Mutex<bool>` + `Condvar` with
+  `request()`/blocking `wait()`). `main.rs` keeps a temporary
+  `tokio::task::spawn_blocking` adapter for Axum graceful shutdown, removed
+  with the server in Phase 4.
+- `ApiError::status_code()` became transport-neutral `status_u16()`; the
+  `IntoResponse` rendering and `ErrorBody` moved into `http.rs`. One
+  mechanical rename landed in `src/storage.rs`, which was not in the expected
+  file list.
+- The runtime acceptance items below (admission counts, live 503, shutdown
+  confirmation) were deferred per the offline-development decision; compile
+  acceptance (`cargo fmt`, `cargo check`, `cargo check --features metal`)
+  passed.
+
 Scope:
 
 - Remove Tokio semaphore from `state.rs`.
@@ -283,6 +319,9 @@ Scope:
   and reader threads.
 - Replace Tokio progress channel with `std::sync::mpsc`.
 - Preserve Docling logs and bounded diagnostics.
+- Prototype `tiny_http` NDJSON streaming, body limiting, and shutdown wakeup
+  with a throwaway example to settle the Phase 4 server-crate decision early
+  (see Open Decision).
 
 Expected files:
 
@@ -440,6 +479,9 @@ JSON field names and status codes as contracts.
 
 Select the synchronous HTTP server crate before Phase 4.
 
-Recommended first investigation: prototype `tiny_http` response streaming and
-shutdown behavior using a temporary throwaway example inside the service during
-an approved implementation session.
+First investigation is scheduled into Phase 2 scope: prototype `tiny_http`
+response streaming and shutdown behavior using a temporary throwaway example
+inside the service during an approved implementation session. The prototype
+requires runtime verification (flush behavior is not provable by compile
+checks), so it needs explicit approval to add the dependency and to run the
+prototype process.

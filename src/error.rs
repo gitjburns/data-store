@@ -1,13 +1,7 @@
 use std::{io, path::PathBuf};
 
-use axum::{
-    Json,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
 use serde::Serialize;
 use thiserror::Error;
-use tracing::{error, warn};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -66,11 +60,6 @@ pub enum ApiError {
     ServiceUnavailable { message: String },
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: ErrorDetail,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct OperationErrorDetail {
     pub status: u16,
@@ -78,18 +67,16 @@ pub struct OperationErrorDetail {
     message: String,
 }
 
-type ErrorDetail = OperationErrorDetail;
-
 impl ApiError {
-    /// Return the HTTP status code that corresponds to this error.
-    pub fn status_code(&self) -> StatusCode {
+    /// Return the numeric HTTP status code for this error without depending on transport types.
+    pub fn status_u16(&self) -> u16 {
         match self {
-            Self::BadRequest { .. } | Self::SourceResolution { .. } => StatusCode::BAD_REQUEST,
-            Self::SourceAlreadyIngested { .. } => StatusCode::CONFLICT,
-            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
-            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::DoclingConversion { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::BadRequest { .. } | Self::SourceResolution { .. } => 400,
+            Self::SourceAlreadyIngested { .. } => 409,
+            Self::PayloadTooLarge { .. } => 413,
+            Self::Unauthorized { .. } => 401,
+            Self::ServiceUnavailable { .. } => 503,
+            Self::DoclingConversion { .. } => 422,
             Self::ConfigRead { .. }
             | Self::ConfigParse { .. }
             | Self::InvalidConfig { .. }
@@ -99,7 +86,7 @@ impl ApiError {
             | Self::InternalIo { .. }
             | Self::UnitSplitting { .. }
             | Self::StorageInit { .. }
-            | Self::StorageOperation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::StorageOperation { .. } => 500,
         }
     }
 
@@ -129,46 +116,9 @@ impl ApiError {
     /// Build the structured error payload used by HTTP errors and operation streams.
     pub fn operation_error_detail(&self) -> OperationErrorDetail {
         OperationErrorDetail {
-            status: self.status_code().as_u16(),
+            status: self.status_u16(),
             kind: self.error_kind().to_string(),
             message: self.to_string(),
         }
-    }
-}
-
-impl IntoResponse for ApiError {
-    /// Render service errors as explicit JSON API responses.
-    fn into_response(self) -> Response {
-        let status = self.status_code();
-        let error_kind = self.error_kind();
-        let message = self.to_string();
-        // Central response logging guarantees every failed HTTP request is
-        // visible even when the failing stage returned before its completion log.
-        if status.is_server_error() {
-            error!(
-                event = "api.error_response",
-                status = status.as_u16(),
-                error_kind,
-                error = %message,
-                "API error response"
-            );
-        } else {
-            warn!(
-                event = "api.error_response",
-                status = status.as_u16(),
-                error_kind,
-                error = %message,
-                "API error response"
-            );
-        }
-        let body = ErrorBody {
-            error: ErrorDetail {
-                status: status.as_u16(),
-                kind: error_kind.to_string(),
-                message,
-            },
-        };
-
-        (status, Json(body)).into_response()
     }
 }

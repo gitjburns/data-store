@@ -28,7 +28,6 @@ use std::{
 };
 
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -38,7 +37,7 @@ use crate::{
     http::build_router,
     inference::InferenceRuntime,
     logging::init_file_logging,
-    state::AppState,
+    state::{AppState, ShutdownSignal},
     storage::{StorageRuntime, setup_storage},
 };
 
@@ -465,13 +464,13 @@ async fn run_http_service(
             return Err(source.into());
         }
     };
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let shutdown_signal = Arc::new(ShutdownSignal::default());
     let state = Arc::new(AppState::new(
         config,
         Ok(inference),
         Ok(storage),
         admin_shutdown_token.clone(),
-        shutdown_sender,
+        Arc::clone(&shutdown_signal),
     ));
     let app = build_router(state).layer(TraceLayer::new_for_http());
     reporter.report(format!(
@@ -506,7 +505,7 @@ async fn run_http_service(
         "data store service listening"
     );
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_receiver))
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_signal))
         .await;
     admin_token_file.cleanup_if_current();
     serve_result?;
@@ -1172,13 +1171,16 @@ fn generate_admin_shutdown_token() -> anyhow::Result<String> {
 }
 
 /// Wait until the protected admin shutdown route signals service termination.
-async fn wait_for_shutdown_signal(receiver: oneshot::Receiver<()>) {
+async fn wait_for_shutdown_signal(signal: Arc<ShutdownSignal>) {
     info!(
         event = "shutdown.wait_started",
         stage = "shutdown_signal_waiting",
         "waiting for shutdown signal"
     );
-    match receiver.await {
+    // Temporary Phase 1 adapter: the blocking condvar wait runs on Tokio's
+    // blocking pool so it does not pin an async worker thread. This shim is
+    // removed together with the Axum server in Phase 4.
+    match tokio::task::spawn_blocking(move || signal.wait()).await {
         Ok(()) => {
             info!(
                 event = "shutdown.signal_received",
@@ -1188,10 +1190,10 @@ async fn wait_for_shutdown_signal(receiver: oneshot::Receiver<()>) {
         }
         Err(source) => {
             warn!(
-                event = "shutdown.signal_receiver_closed",
+                event = "shutdown.signal_wait_failed",
                 stage = "shutdown_signal_waiting",
                 error = %source,
-                "shutdown signal sender dropped before signal"
+                "shutdown signal wait task failed before signal"
             );
         }
     }

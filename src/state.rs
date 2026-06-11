@@ -1,9 +1,11 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{error, info};
 
 use crate::{
@@ -21,19 +23,19 @@ pub struct AppState {
     storage: Result<StorageRuntime, ApiError>,
     ingest_admission: AdmissionGate,
     search_admission: AdmissionGate,
-    model_call_gate: Arc<Semaphore>,
+    model_call_gate: Arc<ExclusiveGate>,
     admin_shutdown_token: String,
-    shutdown_sender: Mutex<Option<oneshot::Sender<()>>>,
+    shutdown_signal: Arc<ShutdownSignal>,
 }
 
 #[derive(Debug)]
 pub struct AdmissionPermit {
-    _permit: OwnedSemaphorePermit,
+    in_flight: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 pub struct ModelCallPermit {
-    _permit: OwnedSemaphorePermit,
+    gate: Arc<ExclusiveGate>,
     operation_id: String,
     model_role: &'static str,
     call_purpose: &'static str,
@@ -49,7 +51,21 @@ pub struct AdmissionSnapshot {
 #[derive(Debug)]
 struct AdmissionGate {
     max_in_flight: usize,
-    semaphore: Arc<Semaphore>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Cross-thread shutdown latch signaled once by the protected shutdown operation.
+#[derive(Debug, Default)]
+pub struct ShutdownSignal {
+    requested: Mutex<bool>,
+    changed: Condvar,
+}
+
+/// Exclusive waiting gate that serializes accelerator-backed model calls across operations.
+#[derive(Debug)]
+struct ExclusiveGate {
+    busy: Mutex<bool>,
+    released: Condvar,
 }
 
 impl AppState {
@@ -59,11 +75,11 @@ impl AppState {
         inference: Result<InferenceRuntime, ApiError>,
         storage: Result<StorageRuntime, ApiError>,
         admin_shutdown_token: String,
-        shutdown_sender: oneshot::Sender<()>,
+        shutdown_signal: Arc<ShutdownSignal>,
     ) -> Self {
         let ingest_admission = AdmissionGate::new(config.server.max_in_flight_ingest);
         let search_admission = AdmissionGate::new(config.server.max_in_flight_search);
-        let model_call_gate = Arc::new(Semaphore::new(1));
+        let model_call_gate = Arc::new(ExclusiveGate::new());
 
         Self {
             config,
@@ -73,7 +89,7 @@ impl AppState {
             search_admission,
             model_call_gate,
             admin_shutdown_token,
-            shutdown_sender: Mutex::new(Some(shutdown_sender)),
+            shutdown_signal,
         }
     }
 
@@ -106,7 +122,7 @@ impl AppState {
     }
 
     /// Wait for exclusive access to the shared accelerator-backed model runtimes.
-    pub async fn acquire_model_call_gate(
+    pub fn acquire_model_call_gate(
         &self,
         operation_id: &str,
         model_role: &'static str,
@@ -117,26 +133,23 @@ impl AppState {
             event = "model_gate.waiting",
             operation_id, model_role, call_purpose, "model execution gate wait started"
         );
-        let permit = match self.model_call_gate.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(source) => {
-                let error = ApiError::InferenceInit {
-                    message: format!(
-                        "model execution gate closed before {model_role} {call_purpose}: {source}"
-                    ),
-                };
-                error!(
-                    event = "model_gate.failed",
-                    operation_id,
-                    model_role,
-                    call_purpose,
-                    error = %error,
-                    wait_ms = wait_started.elapsed().as_millis() as u64,
-                    "model execution gate acquisition failed"
-                );
-                return Err(error);
-            }
-        };
+        if let Err(source) = self.model_call_gate.acquire() {
+            let error = ApiError::InferenceInit {
+                message: format!(
+                    "model execution gate failed before {model_role} {call_purpose}: {source}"
+                ),
+            };
+            error!(
+                event = "model_gate.failed",
+                operation_id,
+                model_role,
+                call_purpose,
+                error = %error,
+                wait_ms = wait_started.elapsed().as_millis() as u64,
+                "model execution gate acquisition failed"
+            );
+            return Err(error);
+        }
         info!(
             event = "model_gate.acquired",
             operation_id,
@@ -147,7 +160,7 @@ impl AppState {
         );
 
         Ok(ModelCallPermit {
-            _permit: permit,
+            gate: Arc::clone(&self.model_call_gate),
             operation_id: operation_id.to_string(),
             model_role,
             call_purpose,
@@ -183,8 +196,23 @@ impl AppState {
             stage = "signal_requesting",
             "shutdown signal requested"
         );
-        let mut sender = match self.shutdown_sender.lock() {
-            Ok(sender) => sender,
+        match self.shutdown_signal.request() {
+            Ok(true) => {
+                info!(
+                    event = "shutdown.signal.sent",
+                    stage = "signal_sent",
+                    "shutdown signal sent"
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                info!(
+                    event = "shutdown.signal.already_requested",
+                    stage = "signal_already_requested",
+                    "shutdown signal was already requested"
+                );
+                Ok(())
+            }
             Err(source) => {
                 error!(
                     event = "shutdown.signal.failed",
@@ -192,36 +220,9 @@ impl AppState {
                     error = %source,
                     "shutdown signal lock failed"
                 );
-                return Err(ApiError::InternalIo {
-                    message: format!("shutdown signal lock is poisoned: {source}"),
-                });
+                Err(ApiError::InternalIo { message: source })
             }
-        };
-        let Some(sender) = sender.take() else {
-            info!(
-                event = "shutdown.signal.already_requested",
-                stage = "signal_sender_absent",
-                "shutdown signal was already requested"
-            );
-            return Ok(());
-        };
-
-        if sender.send(()).is_err() {
-            error!(
-                event = "shutdown.signal.failed",
-                stage = "signal_sending",
-                "shutdown signal receiver was unavailable"
-            );
-            return Err(ApiError::InternalIo {
-                message: "failed to signal service shutdown".to_string(),
-            });
         }
-        info!(
-            event = "shutdown.signal.sent",
-            stage = "signal_sent",
-            "shutdown signal sent"
-        );
-        Ok(())
     }
 
     /// Return current service health and readiness diagnostics.
@@ -300,8 +301,15 @@ impl AppState {
     }
 }
 
+impl Drop for AdmissionPermit {
+    /// Return the held admission slot when the permit leaves scope.
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Drop for ModelCallPermit {
-    /// Log the release side of the model-call boundary when the exclusive permit leaves scope.
+    /// Release exclusive model access and log the release side of the model-call boundary.
     fn drop(&mut self) {
         info!(
             event = "model_gate.released",
@@ -311,6 +319,121 @@ impl Drop for ModelCallPermit {
             held_ms = self.acquired_at.elapsed().as_millis() as u64,
             "model execution gate released"
         );
+        self.gate.release();
+    }
+}
+
+impl ShutdownSignal {
+    /// Mark shutdown as requested and wake all waiters; returns false when already requested.
+    pub fn request(&self) -> Result<bool, String> {
+        let mut requested = self
+            .requested
+            .lock()
+            .map_err(|source| format!("shutdown signal lock is poisoned: {source}"))?;
+        if *requested {
+            return Ok(false);
+        }
+        *requested = true;
+        self.changed.notify_all();
+        Ok(true)
+    }
+
+    /// Block the calling thread until shutdown has been requested.
+    pub fn wait(&self) {
+        // A poisoned latch means a holder panicked while flipping the flag.
+        // Proceeding to shutdown keeps the failure visible instead of leaving
+        // the server waiting forever on a broken latch.
+        let mut requested = match self.requested.lock() {
+            Ok(requested) => requested,
+            Err(_poisoned) => {
+                error!(
+                    event = "shutdown.signal.lock_poisoned",
+                    stage = "signal_waiting",
+                    "shutdown signal lock was poisoned while waiting; proceeding to shutdown"
+                );
+                return;
+            }
+        };
+        while !*requested {
+            match self.changed.wait(requested) {
+                Ok(guard) => requested = guard,
+                Err(_poisoned) => {
+                    error!(
+                        event = "shutdown.signal.lock_poisoned",
+                        stage = "signal_waiting",
+                        "shutdown signal wait was poisoned; proceeding to shutdown"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl ExclusiveGate {
+    /// Create an idle gate.
+    fn new() -> Self {
+        Self {
+            busy: Mutex::new(false),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Block the calling thread until exclusive access is acquired.
+    ///
+    /// The Result is kept for the caller's diagnostic error path even though
+    /// poison is recovered on every branch; Phase 3 revisits the signature
+    /// when the async call sites are rewritten.
+    fn acquire(&self) -> Result<(), String> {
+        // The bool guarded by this lock stays valid after a holder panic, so
+        // poison is recovered on acquire and release alike; std poison is
+        // sticky, and failing here would turn one panic into permanent
+        // model-call failures.
+        let mut busy = match self.busy.lock() {
+            Ok(busy) => busy,
+            Err(poisoned) => {
+                error!(
+                    event = "model_gate.lock_poisoned",
+                    stage = "gate_acquiring",
+                    "model gate lock was poisoned during acquire; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        while *busy {
+            busy = match self.released.wait(busy) {
+                Ok(busy) => busy,
+                Err(poisoned) => {
+                    error!(
+                        event = "model_gate.lock_poisoned",
+                        stage = "gate_waiting",
+                        "model gate wait was poisoned; recovering"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+        }
+        *busy = true;
+        Ok(())
+    }
+
+    /// Release exclusive access and wake one waiting acquirer.
+    fn release(&self) {
+        let mut busy = match self.busy.lock() {
+            Ok(busy) => busy,
+            Err(poisoned) => {
+                // The poisoned lock still holds a valid bool; recover it so a
+                // panicked holder cannot deadlock every later model call.
+                error!(
+                    event = "model_gate.lock_poisoned",
+                    stage = "gate_releasing",
+                    "model gate lock was poisoned during release; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        *busy = false;
+        self.released.notify_one();
     }
 }
 
@@ -329,37 +452,46 @@ impl AdmissionGate {
 
         Self {
             max_in_flight,
-            semaphore: Arc::new(Semaphore::new(max_in_flight)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Acquire one permit immediately or fail with a visible saturation diagnostic.
     fn try_acquire(&self, operation: &'static str) -> Result<AdmissionPermit, ApiError> {
-        let permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
-            ApiError::ServiceUnavailable {
-                message: format!(
-                    "{operation} admission saturated: in-flight {}/{}",
-                    self.in_flight(),
-                    self.max_in_flight
-                ),
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_in_flight {
+                return Err(ApiError::ServiceUnavailable {
+                    message: format!(
+                        "{operation} admission saturated: in-flight {current}/{}",
+                        self.max_in_flight
+                    ),
+                });
             }
-        })?;
-
-        Ok(AdmissionPermit { _permit: permit })
+            // Compare-exchange keeps admission fail-fast and lock-free: a lost
+            // race retries against the observed count instead of waiting.
+            match self.in_flight.compare_exchange(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(AdmissionPermit {
+                        in_flight: Arc::clone(&self.in_flight),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Capture exact current gate counters without mutating admission state.
     fn snapshot(&self) -> AdmissionSnapshot {
         AdmissionSnapshot {
             max_in_flight: self.max_in_flight,
-            in_flight: self.in_flight(),
+            in_flight: self.in_flight.load(Ordering::Acquire),
         }
-    }
-
-    /// Compute current in-flight work from the semaphore's remaining permits.
-    fn in_flight(&self) -> usize {
-        self.max_in_flight
-            .saturating_sub(self.semaphore.available_permits())
     }
 }
 

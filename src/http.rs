@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     docling::{DoclingProgressUpdate, convert_source_to_markdown},
-    error::ApiError,
+    error::{ApiError, OperationErrorDetail},
     inference::{
         ColbertCandidateScore, ColbertDocumentEmbedding, RerankerCandidateInput,
         RerankerCandidateScore,
@@ -178,17 +178,70 @@ fn log_route_started(route: &'static str, stage: &'static str) -> Instant {
     started
 }
 
+/// JSON envelope for route-level error responses rendered by the Axum transport.
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: OperationErrorDetail,
+}
+
+impl IntoResponse for ApiError {
+    /// Render service errors as explicit JSON API responses.
+    fn into_response(self) -> Response {
+        let error_kind = self.error_kind();
+        let message = self.to_string();
+        let mut detail = self.operation_error_detail();
+        // status_u16 only emits valid HTTP status codes; a conversion failure is
+        // a programming error surfaced as a logged 500 instead of a panic.
+        let status = match StatusCode::from_u16(detail.status) {
+            Ok(status) => status,
+            Err(source) => {
+                error!(
+                    event = "api.error_status_invalid",
+                    status = detail.status,
+                    error = %source,
+                    "API error status conversion failed"
+                );
+                // Keep the JSON body consistent with the HTTP status actually sent.
+                detail.status = 500;
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        // Central response logging guarantees every failed HTTP request is
+        // visible even when the failing stage returned before its completion log.
+        if status.is_server_error() {
+            error!(
+                event = "api.error_response",
+                status = status.as_u16(),
+                error_kind,
+                error = %message,
+                "API error response"
+            );
+        } else {
+            warn!(
+                event = "api.error_response",
+                status = status.as_u16(),
+                error_kind,
+                error = %message,
+                "API error response"
+            );
+        }
+        let body = ErrorBody { error: detail };
+
+        (status, Json(body)).into_response()
+    }
+}
+
 /// Log a route-local failure before the shared API error renderer loses route context.
 fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, started: &Instant) {
-    let status = error.status_code();
+    let status = error.status_u16();
     let error_kind = error.error_kind();
     let error_message = error.to_string();
-    if status.is_server_error() {
+    if status >= 500 {
         error!(
             event = "http.route.failed",
             route,
             stage,
-            status = status.as_u16(),
+            status,
             error_kind,
             error = %error_message,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -199,7 +252,7 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
             event = "http.route.failed",
             route,
             stage,
-            status = status.as_u16(),
+            status,
             error_kind,
             error = %error_message,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -275,7 +328,7 @@ async fn execute_ingest(
             rejected_field = "source",
             max_ingest_source_chars = state.config.server.max_ingest_source_chars,
             source_chars = requested_source.chars().count(),
-            status = source.status_code().as_u16(),
+            status = source.status_u16(),
             error_kind = source.error_kind(),
             error = %source,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -397,7 +450,7 @@ async fn execute_ingest(
                 source_path,
                 active_version_label,
                 force = force_requested,
-                status = error.status_code().as_u16(),
+                status = error.status_u16(),
                 error_kind = error.error_kind(),
                 error = %error,
                 elapsed_ms = duplicate_check_started.elapsed().as_millis() as u64,
@@ -586,28 +639,26 @@ async fn execute_ingest(
     let mut vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
         let vector = {
-            let _model_permit = match state
-                .acquire_model_call_gate(&operation_id, "dense", "passage_embedding")
-                .await
-            {
-                Ok(permit) => permit,
-                Err(source) => {
-                    error!(
-                        event = "ingest.dense_embedding.failed",
-                        operation_id = %operation_id,
-                        requested_source = %requested_source,
-                        version_label = %version_label,
-                        unit_id = %unit.unit_id,
-                        completed_units = index,
-                        total_units = units.len(),
-                        phase = "model_gate_acquire",
-                        error = %source,
-                        elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
-                        "ingest dense embedding failed"
-                    );
-                    return Err(source);
-                }
-            };
+            let _model_permit =
+                match state.acquire_model_call_gate(&operation_id, "dense", "passage_embedding") {
+                    Ok(permit) => permit,
+                    Err(source) => {
+                        error!(
+                            event = "ingest.dense_embedding.failed",
+                            operation_id = %operation_id,
+                            requested_source = %requested_source,
+                            version_label = %version_label,
+                            unit_id = %unit.unit_id,
+                            completed_units = index,
+                            total_units = units.len(),
+                            phase = "model_gate_acquire",
+                            error = %source,
+                            elapsed_ms = dense_embedding_started.elapsed().as_millis() as u64,
+                            "ingest dense embedding failed"
+                        );
+                        return Err(source);
+                    }
+                };
             match inference.dense.embed_passage_vector(&unit.content) {
                 Ok(vector) => vector,
                 Err(source) => {
@@ -669,28 +720,27 @@ async fn execute_ingest(
     let mut colbert_vectors = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
         let embedding = {
-            let _model_permit = match state
-                .acquire_model_call_gate(&operation_id, "colbert", "document_embedding")
-                .await
-            {
-                Ok(permit) => permit,
-                Err(source) => {
-                    error!(
-                        event = "ingest.colbert_embedding.failed",
-                        operation_id = %operation_id,
-                        requested_source = %requested_source,
-                        version_label = %version_label,
-                        unit_id = %unit.unit_id,
-                        completed_units = index,
-                        total_units = units.len(),
-                        phase = "model_gate_acquire",
-                        error = %source,
-                        elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
-                        "ingest ColBERT embedding failed"
-                    );
-                    return Err(source);
-                }
-            };
+            let _model_permit =
+                match state.acquire_model_call_gate(&operation_id, "colbert", "document_embedding")
+                {
+                    Ok(permit) => permit,
+                    Err(source) => {
+                        error!(
+                            event = "ingest.colbert_embedding.failed",
+                            operation_id = %operation_id,
+                            requested_source = %requested_source,
+                            version_label = %version_label,
+                            unit_id = %unit.unit_id,
+                            completed_units = index,
+                            total_units = units.len(),
+                            phase = "model_gate_acquire",
+                            error = %source,
+                            elapsed_ms = colbert_embedding_started.elapsed().as_millis() as u64,
+                            "ingest ColBERT embedding failed"
+                        );
+                        return Err(source);
+                    }
+                };
             match inference
                 .colbert
                 .embed_document(&unit.unit_id, &unit.content)
@@ -915,7 +965,7 @@ async fn execute_search(
             max_query_chars,
             max_top_k,
             top_k = ?request.top_k,
-            status = source.status_code().as_u16(),
+            status = source.status_u16(),
             error_kind = source.error_kind(),
             error = %source,
             "search request validation failed"
@@ -982,27 +1032,25 @@ async fn execute_search(
         "search query embedding started"
     );
     let query_vector = {
-        let _model_permit = match state
-            .acquire_model_call_gate(&operation_id, "dense", "query_embedding")
-            .await
-        {
-            Ok(permit) => permit,
-            Err(source) => {
-                error!(
-                    event = "search.query_embedding.failed",
-                    operation_id = %operation_id,
-                    query_chars,
-                    top_k,
-                    max_tokens = state.config.models.dense.max_tokens,
-                    model_dimension = state.config.models.dense.dimension,
-                    phase = "model_gate_acquire",
-                    error = %source,
-                    elapsed_ms = embedding_started.elapsed().as_millis() as u64,
-                    "search query embedding failed"
-                );
-                return Err(source);
-            }
-        };
+        let _model_permit =
+            match state.acquire_model_call_gate(&operation_id, "dense", "query_embedding") {
+                Ok(permit) => permit,
+                Err(source) => {
+                    error!(
+                        event = "search.query_embedding.failed",
+                        operation_id = %operation_id,
+                        query_chars,
+                        top_k,
+                        max_tokens = state.config.models.dense.max_tokens,
+                        model_dimension = state.config.models.dense.dimension,
+                        phase = "model_gate_acquire",
+                        error = %source,
+                        elapsed_ms = embedding_started.elapsed().as_millis() as u64,
+                        "search query embedding failed"
+                    );
+                    return Err(source);
+                }
+            };
         match inference.dense.embed_query_vector(&request.query) {
             Ok(vector) => vector,
             Err(source) => {
@@ -1120,10 +1168,11 @@ async fn execute_search(
         "search ColBERT scoring started"
     );
     let colbert_score_result = {
-        let _model_permit = match state
-            .acquire_model_call_gate(&operation_id, "colbert", "persisted_candidate_scoring")
-            .await
-        {
+        let _model_permit = match state.acquire_model_call_gate(
+            &operation_id,
+            "colbert",
+            "persisted_candidate_scoring",
+        ) {
             Ok(permit) => permit,
             Err(source) => {
                 error!(
@@ -1255,10 +1304,11 @@ async fn execute_search(
         "search reranking started"
     );
     let reranker_score_result = {
-        let _model_permit = match state
-            .acquire_model_call_gate(&operation_id, "reranker", "candidate_batch_scoring")
-            .await
-        {
+        let _model_permit = match state.acquire_model_call_gate(
+            &operation_id,
+            "reranker",
+            "candidate_batch_scoring",
+        ) {
             Ok(permit) => permit,
             Err(source) => {
                 error!(
@@ -1880,7 +1930,7 @@ impl OperationEmitter {
                     event_type,
                     stage = stage.unwrap_or("none"),
                     message = message.unwrap_or("none"),
-                    status = error.status_code().as_u16(),
+                    status = error.status_u16(),
                     error_kind = error.error_kind(),
                     error = %error,
                     elapsed_ms = self.started.elapsed().as_millis() as u64,
@@ -2067,7 +2117,7 @@ async fn forward_docling_progress(
             operation_id = %operation_id,
             requested_source = %requested_source,
             stage = "docling_converting",
-            status = error.status_code().as_u16(),
+            status = error.status_u16(),
             error_kind = error.error_kind(),
             error = %error,
             elapsed_ms = conversion_started.elapsed().as_millis() as u64,
@@ -2085,7 +2135,7 @@ async fn forward_docling_progress(
             operation_id = %operation_id,
             requested_source = %requested_source,
             stage = "docling_converting",
-            status = error.status_code().as_u16(),
+            status = error.status_u16(),
             error_kind = error.error_kind(),
             error = %error,
             elapsed_ms = conversion_started.elapsed().as_millis() as u64,
@@ -2368,17 +2418,17 @@ fn log_operation_stream_setup_failed(
     error: &ApiError,
     started: &Instant,
 ) {
-    let status = error.status_code();
+    let status = error.status_u16();
     let error_kind = error.error_kind();
     let error_message = error.to_string();
-    if status.is_server_error() {
+    if status >= 500 {
         error!(
             event = "operation.stream_setup_failed",
             route = "/v1/operations",
             operation = operation.unwrap_or("unknown"),
             operation_id = operation_id.unwrap_or("unknown"),
             stage,
-            status = status.as_u16(),
+            status,
             error_kind,
             error = %error_message,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2391,7 +2441,7 @@ fn log_operation_stream_setup_failed(
             operation = operation.unwrap_or("unknown"),
             operation_id = operation_id.unwrap_or("unknown"),
             stage,
-            status = status.as_u16(),
+            status,
             error_kind,
             error = %error_message,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2452,7 +2502,7 @@ async fn post_operation_control(
         operation_id = %operation_id,
         stage = "control_reserved",
         control_type = %request.control_type,
-        status = error.status_code().as_u16(),
+        status = error.status_u16(),
         error_kind = error.error_kind(),
         error = %error,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2482,7 +2532,7 @@ async fn run_operation_stream(
     if let Err(failure) = execute_operation(state, operation, payload, &mut emitter).await {
         let error_message = failure.error.to_string();
         let error_kind = failure.error.error_kind();
-        let status = failure.error.status_code().as_u16();
+        let status = failure.error.status_u16();
         info!(
             event = "operation.failed",
             operation = operation.as_str(),
@@ -2619,7 +2669,7 @@ async fn emit_terminal_result<T: Serialize>(
             operation,
             operation_id = %emitter.operation_id,
             stage = "terminal_result_emitting",
-            status = error.status_code().as_u16(),
+            status = error.status_u16(),
             error_kind = error.error_kind(),
             error = %error,
             elapsed_ms = emitter.started.elapsed().as_millis() as u64,
@@ -2847,7 +2897,7 @@ fn execute_ingested_sources(
             error!(
                 event = "sources.listing_failed",
                 stage = "storage_runtime",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2862,7 +2912,7 @@ fn execute_ingested_sources(
             error!(
                 event = "sources.listing_failed",
                 stage = "storage_listing",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2957,7 +3007,7 @@ fn execute_document_versions(
             error!(
                 event = "admin.document_versions.failed",
                 stage = "storage_runtime",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2972,7 +3022,7 @@ fn execute_document_versions(
             error!(
                 event = "admin.document_versions.failed",
                 stage = "storage_listing",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3104,7 +3154,7 @@ fn execute_document_version_rollback(
             version_label = %requested_version_label,
             max_ingest_source_chars = state.config.server.max_ingest_source_chars,
             source_chars = requested_source.chars().count(),
-            status = source.status_code().as_u16(),
+            status = source.status_u16(),
             error_kind = source.error_kind(),
             error = %source,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3120,7 +3170,7 @@ fn execute_document_version_rollback(
                 source_path = %requested_source,
                 version_label = %requested_version_label,
                 stage = "storage_runtime",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3138,7 +3188,7 @@ fn execute_document_version_rollback(
                 source_path = %requested_source,
                 version_label = %requested_version_label,
                 stage = "storage_rollback",
-                status = source.status_code().as_u16(),
+                status = source.status_u16(),
                 error_kind = source.error_kind(),
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,

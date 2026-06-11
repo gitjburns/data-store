@@ -1431,7 +1431,7 @@ impl StorageRuntime {
                 version_label,
                 db_path = %self.db_path.display(),
                 phase = "version_lookup",
-                status = error.status_code().as_u16(),
+                status = error.status_u16(),
                 error_kind = error.error_kind(),
                 error = %error,
                 elapsed_ms = started.elapsed().as_millis() as u64,
