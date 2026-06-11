@@ -52,8 +52,18 @@ Decisions recorded from planning discussion:
 
 Planning complete as of 2026-06-10. The implementation scope was restructured
 the same day into six phases, each estimated at no more than 20k tokens with
-code-generation confidence of at least 90%. No code changes have been made.
-Each phase awaits its own explicit user approval before implementation.
+code-generation confidence of at least 90%.
+
+Phase 1 (reranker candidate pool size knob) was implemented and verified on
+2026-06-10: `reranker_candidate_pool_size` added to `RetrievalConfig` with
+serde default 10 and positive-value validation, the search path computes the
+effective pool as `max(configured, top_k)` with `build_reranker_candidates`
+taking the pool size, and `config.example.toml` documents the new value. All
+static checks (`cargo fmt`, `cargo check`, `cargo check --features metal`)
+pass. Default behavior is unchanged for existing configs.
+
+Phases 2-6 are not started. Each phase awaits its own explicit user approval
+before implementation.
 
 The service remains completely offline during all development phases. Phases
 do not need to preserve runnable between-phase functionality; each phase must

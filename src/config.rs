@@ -181,6 +181,11 @@ pub struct RetrievalConfig {
     #[serde(default = "default_colbert_candidate_pool_size")]
     /// Bounded RRF candidate pool size sent into ColBERT MaxSim.
     pub colbert_candidate_pool_size: u32,
+    #[serde(default = "default_reranker_candidate_pool_size")]
+    /// Bounded ColBERT-ranked candidate pool size sent into the reranker; the
+    /// effective pool is max(this value, requested topK), clamped to available
+    /// ColBERT-ranked candidates.
+    pub reranker_candidate_pool_size: u32,
     /// Minimum unit text length retained as searchable content.
     pub min_search_unit_chars: u32,
     /// Unit tokenizer cap aligned to ColBERT document capacity.
@@ -299,6 +304,10 @@ impl ServiceConfig {
             "retrieval.colbert_candidate_pool_size",
             self.retrieval.colbert_candidate_pool_size,
         )?;
+        require_positive(
+            "retrieval.reranker_candidate_pool_size",
+            self.retrieval.reranker_candidate_pool_size,
+        )?;
         acknowledge_non_negative(
             "retrieval.min_search_unit_chars",
             self.retrieval.min_search_unit_chars,
@@ -367,6 +376,12 @@ fn service_root() -> PathBuf {
 /// Return the Phase 11F default bounded ColBERT reranking pool size.
 fn default_colbert_candidate_pool_size() -> u32 {
     100
+}
+
+/// Return the default reranker candidate pool size, preserving the previous
+/// hard topK cap for configs that omit the value.
+fn default_reranker_candidate_pool_size() -> u32 {
+    10
 }
 
 /// Resolve supported CLI options, falling back to `config.toml`.

@@ -1192,6 +1192,14 @@ async fn execute_search(
         "search ColBERT scoring completed"
     );
     let reranker_candidate_started = Instant::now();
+    // Effective reranker pool is the configured size or the requested topK,
+    // whichever is larger; assembly below clamps it to the available
+    // ColBERT-ranked candidates.
+    let reranker_pool_size = state
+        .config
+        .retrieval
+        .reranker_candidate_pool_size
+        .max(top_k);
     info!(
         event = "search.reranker_candidates.started",
         operation_id = %operation_id,
@@ -1199,28 +1207,31 @@ async fn execute_search(
         top_k,
         storage_candidates = storage_output.candidates.len(),
         colbert_scores = colbert_scores.len(),
-        reranker_candidate_limit = top_k,
+        reranker_candidate_limit = reranker_pool_size,
         "search reranker candidate assembly started"
     );
-    let reranker_candidates =
-        match build_reranker_candidates(&storage_output.candidates, &colbert_scores, top_k) {
-            Ok(candidates) => candidates,
-            Err(source) => {
-                error!(
-                    event = "search.reranker_candidates.failed",
-                    operation_id = %operation_id,
-                    query_chars,
-                    top_k,
-                    storage_candidates = storage_output.candidates.len(),
-                    colbert_scores = colbert_scores.len(),
-                    reranker_candidate_limit = top_k,
-                    error = %source,
-                    elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
-                    "search reranker candidate assembly failed"
-                );
-                return Err(source);
-            }
-        };
+    let reranker_candidates = match build_reranker_candidates(
+        &storage_output.candidates,
+        &colbert_scores,
+        reranker_pool_size,
+    ) {
+        Ok(candidates) => candidates,
+        Err(source) => {
+            error!(
+                event = "search.reranker_candidates.failed",
+                operation_id = %operation_id,
+                query_chars,
+                top_k,
+                storage_candidates = storage_output.candidates.len(),
+                colbert_scores = colbert_scores.len(),
+                reranker_candidate_limit = reranker_pool_size,
+                error = %source,
+                elapsed_ms = reranker_candidate_started.elapsed().as_millis() as u64,
+                "search reranker candidate assembly failed"
+            );
+            return Err(source);
+        }
+    };
     info!(
         event = "search.reranker_candidates.completed",
         operation_id = %operation_id,
@@ -2648,17 +2659,17 @@ fn generate_operation_id() -> String {
     format!("server-{millis}-{counter}")
 }
 
-/// Build final reranker inputs from the ColBERT-ranked candidate pool while preserving candidate identity.
+/// Build reranker inputs from the top pool-size ColBERT-ranked candidates while preserving candidate identity.
 fn build_reranker_candidates(
     candidates: &[SearchCandidate],
     colbert_scores: &[ColbertCandidateScore],
-    top_k: u32,
+    pool_size: u32,
 ) -> Result<Vec<RerankerCandidateInput>, ApiError> {
     let candidate_by_id = candidates
         .iter()
         .map(|candidate| (candidate.unit_id.as_str(), candidate))
         .collect::<HashMap<_, _>>();
-    let reranker_limit = top_k as usize;
+    let reranker_limit = pool_size as usize;
     let mut reranker_candidates = Vec::with_capacity(colbert_scores.len().min(reranker_limit));
     for score in colbert_scores.iter().take(reranker_limit) {
         let Some(candidate) = candidate_by_id.get(score.unit_id.as_str()) else {
