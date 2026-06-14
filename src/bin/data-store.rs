@@ -1960,7 +1960,7 @@ fn render_bm25_diagnostics(raw: &serde_json::Value) {
     render_required_raw_u64(bm25, "ftsQueryBytes", "  fts query bytes");
     render_required_raw_u64(bm25, "activeVersionCount", "  active versions");
     render_required_raw_u64(bm25, "candidateLimit", "  candidate limit");
-    render_required_raw_u64(bm25, "sqlParameterCount", "  sql parameters");
+    render_required_raw_u64(bm25, "unfilteredCandidates", "  unfiltered candidates");
     render_required_raw_u64(bm25, "returnedCandidates", "  returned candidates");
     render_required_raw_u64(
         bm25,
@@ -1977,7 +1977,7 @@ fn render_bm25_diagnostics(raw: &serde_json::Value) {
         "  fallback returned candidates",
     );
     render_required_raw_ms(bm25, "connectionOpenLatencyMs", "  connection open");
-    render_required_raw_ms(bm25, "filterBuildLatencyMs", "  filter build");
+    render_required_raw_ms(bm25, "postFilterLatencyMs", "  post filter");
     render_required_raw_ms(bm25, "prepareLatencyMs", "  prepare");
     render_required_raw_ms(bm25, "queryExecutionLatencyMs", "  query execution");
     render_required_raw_ms(bm25, "rowIterationLatencyMs", "  row iteration");

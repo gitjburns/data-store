@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -299,13 +299,13 @@ struct Bm25SearchDiagnostics {
     fts_query_bytes: usize,
     active_version_count: usize,
     candidate_limit: usize,
-    sql_parameter_count: usize,
+    unfiltered_candidates: usize,
     returned_candidates: usize,
     strict_returned_candidates: usize,
     fallback_ran: bool,
     fallback_returned_candidates: usize,
     connection_open_latency_ms: u64,
-    filter_build_latency_ms: u64,
+    post_filter_latency_ms: u64,
     prepare_latency_ms: u64,
     query_execution_latency_ms: u64,
     row_iteration_latency_ms: u64,
@@ -319,8 +319,16 @@ struct Bm25Queries {
 }
 
 #[derive(Debug)]
+struct Bm25RawMatch {
+    unit_id: String,
+    source_path: String,
+    version_label: String,
+    score: f64,
+}
+
+#[derive(Debug)]
 struct Bm25QueryRun {
-    matches: Vec<Bm25Match>,
+    matches: Vec<Bm25RawMatch>,
     prepare_latency_ms: u64,
     query_execution_latency_ms: u64,
     row_iteration_latency_ms: u64,
@@ -405,7 +413,7 @@ struct CompositeForeignKeySpec {
 }
 
 const DATABASE_FILE_NAME: &str = "data-store.sqlite3";
-const EXPECTED_SCHEMA_VERSION: i64 = 3;
+const EXPECTED_SCHEMA_VERSION: i64 = 4;
 const DENSE_VECTOR_FORMAT: &str = "little_endian_f32";
 const COLBERT_DOCUMENT_VECTOR_FORMAT: &str = "little_endian_f32_row_major";
 const DOCUMENT_STATUS_INGESTED: &str = "ingested";
@@ -414,15 +422,10 @@ const F32_BYTE_WIDTH: usize = std::mem::size_of::<f32>();
 const STORAGE_SCHEMA_SQL: &str = include_str!("../sql/schema.sql");
 const ENABLE_FOREIGN_KEYS_SQL: &str = "PRAGMA foreign_keys = ON;";
 const GET_SCHEMA_VERSION_SQL: &str = "PRAGMA user_version;";
-const BM25_SEARCH_SQL_PREFIX: &str = "
-WITH active_snapshot(source_path, version_label) AS (VALUES ";
-const BM25_SEARCH_SQL_SUFFIX: &str = ")
-SELECT units.unit_id, units_fts.rank AS bm25_score
+const BM25_SEARCH_SQL: &str = "
+SELECT units.unit_id, units.source_path, units.version_label, units_fts.rank AS bm25_score
 FROM units_fts
 JOIN units ON units.rowid = units_fts.rowid
-JOIN active_snapshot active
-  ON active.source_path = units.source_path
- AND active.version_label = units.version_label
 WHERE units_fts MATCH ?
 ORDER BY units_fts.rank ASC, units.unit_id ASC
 LIMIT ?";
@@ -2358,12 +2361,12 @@ impl StorageRuntime {
             fts_term_count = bm25_diagnostics.fts_term_count,
             fts_query_bytes = bm25_diagnostics.fts_query_bytes,
             active_versions = bm25_diagnostics.active_version_count,
-            sql_parameters = bm25_diagnostics.sql_parameter_count,
+            unfiltered_candidates = bm25_diagnostics.unfiltered_candidates,
             strict_returned_candidates = bm25_diagnostics.strict_returned_candidates,
             fallback_ran = bm25_diagnostics.fallback_ran,
             fallback_returned_candidates = bm25_diagnostics.fallback_returned_candidates,
             connection_open_ms = bm25_diagnostics.connection_open_latency_ms,
-            filter_build_ms = bm25_diagnostics.filter_build_latency_ms,
+            post_filter_ms = bm25_diagnostics.post_filter_latency_ms,
             prepare_ms = bm25_diagnostics.prepare_latency_ms,
             query_execution_ms = bm25_diagnostics.query_execution_latency_ms,
             row_iteration_ms = bm25_diagnostics.row_iteration_latency_ms,
@@ -2585,31 +2588,29 @@ impl StorageRuntime {
         let connection = open_connection(&self.db_path)?;
         let connection_open_latency_ms = connection_started.elapsed().as_millis() as u64;
 
-        let filter_started = Instant::now();
-        let active_snapshot_values = active_versions
+        let active_set: HashSet<(&str, &str)> = active_versions
             .iter()
-            .map(|_| "(?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql =
-            format!("{BM25_SEARCH_SQL_PREFIX}{active_snapshot_values}{BM25_SEARCH_SQL_SUFFIX}");
-        let sql_parameter_count = 2 + active_versions.len() * 2;
-        let filter_build_latency_ms = filter_started.elapsed().as_millis() as u64;
+            .map(|v| (v.source_path.as_str(), v.version_label.as_str()))
+            .collect();
+        let sql_limit = limit * 2;
 
         let mut prepare_latency_ms = 0;
         let mut query_execution_latency_ms = 0;
         let mut row_iteration_latency_ms = 0;
+        let mut unfiltered_candidates = 0;
         let mut strict_returned_candidates = 0;
         let mut fallback_ran = false;
         let mut fallback_returned_candidates = 0;
-        let (matches, fts_query, mode) = if let Some(strict_query) = queries.strict_query.as_deref()
+        let (raw_matches, fts_query, mode) = if let Some(strict_query) =
+            queries.strict_query.as_deref()
         {
-            let strict_run =
-                execute_bm25_query(&connection, &sql, strict_query, limit, active_versions)?;
+            let strict_run = execute_bm25_query(&connection, strict_query, sql_limit)?;
             prepare_latency_ms += strict_run.prepare_latency_ms;
             query_execution_latency_ms += strict_run.query_execution_latency_ms;
             row_iteration_latency_ms += strict_run.row_iteration_latency_ms;
-            strict_returned_candidates = strict_run.matches.len();
+            unfiltered_candidates += strict_run.matches.len();
+            let strict_filtered = filter_bm25_active(strict_run.matches, &active_set, limit);
+            strict_returned_candidates = strict_filtered.len();
             let should_fallback = strict_returned_candidates < limit
                 && queries
                     .broad_query
@@ -2621,29 +2622,32 @@ impl StorageRuntime {
                         "BM25 fallback was requested without a broad query".to_string(),
                     )
                 })?;
-                let fallback_run =
-                    execute_bm25_query(&connection, &sql, broad_query, limit, active_versions)?;
+                let fallback_run = execute_bm25_query(&connection, broad_query, sql_limit)?;
                 prepare_latency_ms += fallback_run.prepare_latency_ms;
                 query_execution_latency_ms += fallback_run.query_execution_latency_ms;
                 row_iteration_latency_ms += fallback_run.row_iteration_latency_ms;
+                unfiltered_candidates += fallback_run.matches.len();
                 fallback_ran = true;
-                fallback_returned_candidates = fallback_run.matches.len();
+                let fallback_filtered =
+                    filter_bm25_active(fallback_run.matches, &active_set, limit);
+                fallback_returned_candidates = fallback_filtered.len();
                 (
-                    fallback_run.matches,
+                    fallback_filtered,
                     broad_query.to_string(),
                     "strict_broad_fallback",
                 )
             } else {
-                (strict_run.matches, strict_query.to_string(), "strict")
+                (strict_filtered, strict_query.to_string(), "strict")
             }
         } else if let Some(broad_query) = queries.broad_query.as_deref() {
-            let broad_run =
-                execute_bm25_query(&connection, &sql, broad_query, limit, active_versions)?;
+            let broad_run = execute_bm25_query(&connection, broad_query, sql_limit)?;
             prepare_latency_ms += broad_run.prepare_latency_ms;
             query_execution_latency_ms += broad_run.query_execution_latency_ms;
             row_iteration_latency_ms += broad_run.row_iteration_latency_ms;
-            fallback_returned_candidates = broad_run.matches.len();
-            (broad_run.matches, broad_query.to_string(), "broad")
+            unfiltered_candidates += broad_run.matches.len();
+            let broad_filtered = filter_bm25_active(broad_run.matches, &active_set, limit);
+            fallback_returned_candidates = broad_filtered.len();
+            (broad_filtered, broad_query.to_string(), "broad")
         } else {
             return Ok(Bm25SearchOutput {
                 matches: Vec::new(),
@@ -2651,6 +2655,17 @@ impl StorageRuntime {
                 diagnostics: empty_bm25_diagnostics(false, limit, active_versions.len(), started),
             });
         };
+        let post_filter_started = Instant::now();
+        let matches: Vec<Bm25Match> = raw_matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, raw)| Bm25Match {
+                unit_id: raw.unit_id,
+                score: raw.score,
+                rank: index + 1,
+            })
+            .collect();
+        let post_filter_latency_ms = post_filter_started.elapsed().as_millis() as u64;
         let diagnostics = Bm25SearchDiagnostics {
             mode,
             fts_query_present: true,
@@ -2658,13 +2673,13 @@ impl StorageRuntime {
             fts_query_bytes: fts_query.len(),
             active_version_count: active_versions.len(),
             candidate_limit: limit,
-            sql_parameter_count,
+            unfiltered_candidates,
             returned_candidates: matches.len(),
             strict_returned_candidates,
             fallback_ran,
             fallback_returned_candidates,
             connection_open_latency_ms,
-            filter_build_latency_ms,
+            post_filter_latency_ms,
             prepare_latency_ms,
             query_execution_latency_ms,
             row_iteration_latency_ms,
@@ -2724,13 +2739,13 @@ impl StorageRuntime {
                     "ftsQueryBytes": input.bm25_diagnostics.fts_query_bytes,
                     "activeVersionCount": input.bm25_diagnostics.active_version_count,
                     "candidateLimit": input.bm25_diagnostics.candidate_limit,
-                    "sqlParameterCount": input.bm25_diagnostics.sql_parameter_count,
+                    "unfilteredCandidates": input.bm25_diagnostics.unfiltered_candidates,
                     "returnedCandidates": input.bm25_diagnostics.returned_candidates,
                     "strictReturnedCandidates": input.bm25_diagnostics.strict_returned_candidates,
                     "fallbackRan": input.bm25_diagnostics.fallback_ran,
                     "fallbackReturnedCandidates": input.bm25_diagnostics.fallback_returned_candidates,
                     "connectionOpenLatencyMs": input.bm25_diagnostics.connection_open_latency_ms,
-                    "filterBuildLatencyMs": input.bm25_diagnostics.filter_build_latency_ms,
+                    "postFilterLatencyMs": input.bm25_diagnostics.post_filter_latency_ms,
                     "prepareLatencyMs": input.bm25_diagnostics.prepare_latency_ms,
                     "queryExecutionLatencyMs": input.bm25_diagnostics.query_execution_latency_ms,
                     "rowIterationLatencyMs": input.bm25_diagnostics.row_iteration_latency_ms,
@@ -3303,35 +3318,32 @@ fn is_fts_stopword(term: &str) -> bool {
     FTS_STOPWORDS.contains(&term)
 }
 
-/// Run one concrete BM25 FTS query against the already-built active-version filter.
+/// Run one BM25 FTS query without active-version filtering; caller post-filters.
 fn execute_bm25_query(
     connection: &Connection,
-    sql: &str,
     fts_query: &str,
     limit: usize,
-    active_versions: &[ActiveDocumentVersion],
 ) -> Result<Bm25QueryRun, ApiError> {
-    let mut query_params = Vec::<Value>::with_capacity(2 + active_versions.len() * 2);
-    for active in active_versions {
-        query_params.push(Value::from(active.source_path.clone()));
-        query_params.push(Value::from(active.version_label.clone()));
-    }
-    query_params.push(Value::from(fts_query.to_string()));
-    query_params.push(Value::from(limit as i64));
+    let query_params: Vec<Value> = vec![
+        Value::from(fts_query.to_string()),
+        Value::from(limit as i64),
+    ];
 
     let prepare_started = Instant::now();
-    let mut statement = connection
-        // ASC preserves SQLite FTS5's lower-is-better rank ordering.
-        .prepare(sql)
-        .map_err(|source| {
-            storage_operation_error(format!("failed to prepare BM25 search: {source}"))
-        })?;
+    let mut statement = connection.prepare(BM25_SEARCH_SQL).map_err(|source| {
+        storage_operation_error(format!("failed to prepare BM25 search: {source}"))
+    })?;
     let prepare_latency_ms = prepare_started.elapsed().as_millis() as u64;
 
     let query_started = Instant::now();
     let rows = statement
         .query_map(params_from_iter(query_params), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
         })
         .map_err(|source| {
             storage_operation_error(format!("failed to execute BM25 search: {source}"))
@@ -3341,7 +3353,7 @@ fn execute_bm25_query(
     let row_iteration_started = Instant::now();
     let mut matches = Vec::new();
     for row in rows {
-        let (unit_id, score) = row.map_err(|source| {
+        let (unit_id, source_path, version_label, score) = row.map_err(|source| {
             storage_operation_error(format!("failed to read BM25 candidate: {source}"))
         })?;
         if !score.is_finite() {
@@ -3349,10 +3361,11 @@ fn execute_bm25_query(
                 "BM25 score for {unit_id} is non-finite"
             )));
         }
-        matches.push(Bm25Match {
+        matches.push(Bm25RawMatch {
             unit_id,
+            source_path,
+            version_label,
             score,
-            rank: matches.len() + 1,
         });
     }
     let row_iteration_latency_ms = row_iteration_started.elapsed().as_millis() as u64;
@@ -3363,6 +3376,19 @@ fn execute_bm25_query(
         query_execution_latency_ms,
         row_iteration_latency_ms,
     })
+}
+
+/// Retain only BM25 matches belonging to captured active versions and truncate to the limit.
+fn filter_bm25_active(
+    raw_matches: Vec<Bm25RawMatch>,
+    active_set: &HashSet<(&str, &str)>,
+    limit: usize,
+) -> Vec<Bm25RawMatch> {
+    raw_matches
+        .into_iter()
+        .filter(|m| active_set.contains(&(m.source_path.as_str(), m.version_label.as_str())))
+        .take(limit)
+        .collect()
 }
 
 /// Build BM25 diagnostics for paths that skip SQLite work before opening the database.
@@ -3379,13 +3405,13 @@ fn empty_bm25_diagnostics(
         fts_query_bytes: 0,
         active_version_count,
         candidate_limit,
-        sql_parameter_count: 0,
+        unfiltered_candidates: 0,
         returned_candidates: 0,
         strict_returned_candidates: 0,
         fallback_ran: false,
         fallback_returned_candidates: 0,
         connection_open_latency_ms: 0,
-        filter_build_latency_ms: 0,
+        post_filter_latency_ms: 0,
         prepare_latency_ms: 0,
         query_execution_latency_ms: 0,
         row_iteration_latency_ms: 0,

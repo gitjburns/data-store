@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS units (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_units_document_sequence
 ON units(document_id, sequence);
 
+CREATE INDEX IF NOT EXISTS idx_units_source_version
+ON units(source_path, version_label);
+
 CREATE TABLE IF NOT EXISTS dense_vectors (
   unit_id TEXT PRIMARY KEY REFERENCES units(unit_id) ON DELETE CASCADE,
   dimension INTEGER NOT NULL,
@@ -74,4 +77,4 @@ CREATE TABLE IF NOT EXISTS colbert_document_vectors (
 CREATE VIRTUAL TABLE IF NOT EXISTS units_fts
 USING fts5(content, content='units', content_rowid='rowid');
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
