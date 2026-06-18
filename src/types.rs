@@ -64,6 +64,8 @@ pub struct IngestResponse {
     pub units_ingested: u32,
 
     pub status: String,
+
+    pub benchmarks: OperationBenchmarks,
 }
 
 #[derive(Debug, Deserialize)]

@@ -207,7 +207,7 @@ Notes:
 
 ## Phase 3 — Server: ingest benchmarks (incl. nested storage substages) + ingest INSTALL doc
 
-- Status: Not started
+- Status: Done
 - Effort: ~15–20K tokens (estimate)
 - Confidence: ~91% (estimate; the only non-mechanical risk is the `storage.rs`
   return-type change, which is compiler-guided with a single caller)
@@ -276,7 +276,43 @@ change additive: do not reorder or remove any existing persist/commit/publish
 logging.
 
 Notes:
-- (record findings / commit refs here)
+- `storage.rs`: changed `ingest_document` return type `()` →
+  `IngestStoragePhaseLatencies` (new `#[derive(Debug, Clone, Copy)]` struct with
+  `vector_validation_ms`, `document_persistence_ms`, `cache_preparation_ms`,
+  `commit_ms`). Decision: the struct lives in `storage.rs` (storage-layer return
+  contract, not a serialized API type; it is folded into `OperationBenchmarks` at
+  the `http.rs` boundary). Added 4 `Instant`s bounding the validation work, the
+  document+unit persistence loop, the cache-lock+prepare region, and `tx.commit()`.
+  Additive only: no reordering of persist/commit/publish/cache-swap, no log
+  added/removed/moved. Success path returns the struct at the function's final
+  expression; all error arms already returned `Err` and were untouched.
+- `types.rs`: added `pub benchmarks: OperationBenchmarks` as the LAST field of
+  `IngestResponse` (no `raw` field exists, so SearchResponse's "before raw"
+  placement maps to "last").
+- `http.rs` `execute_ingest`: bound the returned latencies (`Ok(latencies) =>
+  latencies`; the match is now `;`-terminated). Assembled `OperationBenchmarks` in
+  order `[docling_converting, unit_splitting, dense_embedding, colbert_embedding,
+  storage_publishing(+4 children: vector_validation, document_persistence,
+  cache_preparation, commit)]`, `totalMs = latency_ms`, via the existing
+  `leaf_benchmark_stage` helper; set `benchmarks` on `IngestResponse`. `raw` and
+  all logs unchanged. `source_resolution`/prep/duplicate-check/active-row-write/
+  cache-swap intentionally fall into the honest `Total − sum(rows)` remainder.
+- `data-store.rs`: no change (verified — client already deserializes and
+  recursively renders `benchmarks`; the legacy client-side ingest timer remains
+  dead-but-present and is Phase 4's cleanup).
+- `INSTALL.md`: rewrote the ingest `Benchmarks:` paragraph to be
+  server-authoritative with the nested `storage_publishing` substages and
+  honest-remainder wording, mirroring the search section.
+- Pre-edit verification: confirmed real line numbers against source — stage
+  latency vars (`conversion_latency_ms` 556, `splitting_latency_ms` 604,
+  `dense_embedding_latency_ms` 686, `colbert_embedding_latency_ms` 777,
+  `storage_latency_ms` 834, `latency_ms` 844) and the single `ingest_document`
+  caller (`http.rs:805`) all exact.
+- Verified: `cargo fmt` (reformatted `storage.rs` whitespace only), `cargo check`,
+  and `cargo check --features metal` all clean except the 4 pre-existing dead
+  client-timing warnings scheduled for Phase 4 deletion. Manual operator render
+  check (`data-store --ingest <file>`) deferred to the user; the agent does not
+  start/stop the service.
 
 ---
 

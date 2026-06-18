@@ -218,10 +218,14 @@ with no client-side timing. It includes `search_preparation`, the streamed
 search stages with the nested `retrieving_candidates` substages, and a
 server-reported `Total` (the whole-operation duration). Rows may not sum exactly
 to `Total`; the small unattributed remainder is shown rather than hidden.
-`ingest` prints a client-side `Benchmarks:` summary after the ingest
-result for `docling_converting`, `unit_splitting`, `dense_embedding`,
-`colbert_embedding`, and `storage_publishing`; its total is the sum of those
-rows. Quote multi-word queries and any argument containing spaces. Long
+`ingest` prints a server-authoritative `Benchmarks:` summary after the ingest
+result, computed by the server and rendered by the client with no client-side
+timing. It includes `docling_converting`, `unit_splitting`, `dense_embedding`,
+`colbert_embedding`, and `storage_publishing` with its nested
+`vector_validation`, `document_persistence`, `cache_preparation`, and `commit`
+substages, and a server-reported `Total` (the whole-operation duration). Rows
+may not sum exactly to `Total`; the small unattributed remainder is shown rather
+than hidden. Quote multi-word queries and any argument containing spaces. Long
 operations stream status and counted progress while they run. The CLI updates
 the current stage line in place and prints a newline when each stage completes.
 The `shutdown` command sends the protected operation directly and prints the

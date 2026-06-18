@@ -802,7 +802,7 @@ fn execute_ingest(
         colbert_document_vectors = colbert_vector_count,
         "ingest storage publishing started"
     );
-    match storage.ingest_document(
+    let storage_phase_latencies = match storage.ingest_document(
         &conversion,
         &version_label,
         &units,
@@ -816,7 +816,7 @@ fn execute_ingest(
             }
         }),
     ) {
-        Ok(()) => {}
+        Ok(latencies) => latencies,
         Err(source) => {
             error!(
                 event = "ingest.storage_publishing.failed",
@@ -830,7 +830,7 @@ fn execute_ingest(
             );
             return Err(source);
         }
-    }
+    };
     let storage_latency_ms = storage_started.elapsed().as_millis() as u64;
     info!(
         event = "ingest.storage_publishing.completed",
@@ -870,6 +870,35 @@ fn execute_ingest(
         "ingest completed"
     );
 
+    let benchmarks = OperationBenchmarks {
+        stages: vec![
+            leaf_benchmark_stage("docling_converting", conversion_latency_ms),
+            leaf_benchmark_stage("unit_splitting", splitting_latency_ms),
+            leaf_benchmark_stage("dense_embedding", dense_embedding_latency_ms),
+            leaf_benchmark_stage("colbert_embedding", colbert_embedding_latency_ms),
+            BenchmarkStage {
+                stage: "storage_publishing".to_string(),
+                elapsed_ms: storage_latency_ms,
+                children: vec![
+                    leaf_benchmark_stage(
+                        "vector_validation",
+                        storage_phase_latencies.vector_validation_ms,
+                    ),
+                    leaf_benchmark_stage(
+                        "document_persistence",
+                        storage_phase_latencies.document_persistence_ms,
+                    ),
+                    leaf_benchmark_stage(
+                        "cache_preparation",
+                        storage_phase_latencies.cache_preparation_ms,
+                    ),
+                    leaf_benchmark_stage("commit", storage_phase_latencies.commit_ms),
+                ],
+            },
+        ],
+        total_ms: latency_ms,
+    };
+
     Ok(IngestResponse {
         document_id: first_unit
             .map(|unit| unit.document_id.clone())
@@ -877,6 +906,7 @@ fn execute_ingest(
         version_label,
         units_ingested: units.len() as u32,
         status: INGEST_STATUS_INGESTED.to_string(),
+        benchmarks,
     })
 }
 

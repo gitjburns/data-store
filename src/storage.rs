@@ -40,6 +40,18 @@ pub struct UnitColbertDocumentVector {
     pub vector: Vec<f32>,
 }
 
+/// Durable storage substage latencies for one ingest, returned to the operation
+/// layer so it can build the public `storage_publishing` benchmark children.
+/// Additive measurement only: producing these does not change the persist,
+/// commit, publish, or cache-swap ordering.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestStoragePhaseLatencies {
+    pub vector_validation_ms: u64,
+    pub document_persistence_ms: u64,
+    pub cache_preparation_ms: u64,
+    pub commit_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct SearchCandidatePoolOutput {
     pub candidates: Vec<SearchCandidate>,
@@ -1660,7 +1672,7 @@ impl StorageRuntime {
         dense: &DenseModelConfig,
         colbert: &ColbertModelConfig,
         mut progress: Option<F>,
-    ) -> Result<(), ApiError>
+    ) -> Result<IngestStoragePhaseLatencies, ApiError>
     where
         F: FnMut(&'static str, u64, u64) -> Result<(), ApiError>,
     {
@@ -1692,6 +1704,7 @@ impl StorageRuntime {
             colbert_document_vectors = colbert_vectors.len(),
             "ingest vector validation started"
         );
+        let vector_validation_started = Instant::now();
         let stored_vectors = match vectors
             .into_iter()
             .map(|value| {
@@ -1731,6 +1744,7 @@ impl StorageRuntime {
                 return Err(source);
             }
         };
+        let vector_validation_ms = vector_validation_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.ingest_vectors.validation_completed",
             source_path = %conversion.source.relative_path.display(),
@@ -1832,6 +1846,7 @@ impl StorageRuntime {
                 );
             };
 
+        let document_persistence_started = Instant::now();
         if let Err(source) = insert_document(
             &tx,
             conversion,
@@ -1970,6 +1985,7 @@ impl StorageRuntime {
                 return Err(source);
             }
         }
+        let document_persistence_ms = document_persistence_started.elapsed().as_millis() as u64;
 
         let published_at_ms = match current_time_ms() {
             Ok(value) => value,
@@ -1997,6 +2013,7 @@ impl StorageRuntime {
             published_at_ms,
             "ingest active-version publish starting"
         );
+        let cache_preparation_started = Instant::now();
         let mut cache = match self.cache.lock().map_err(|source| {
             storage_operation_error(format!("dense cache lock is poisoned: {source}"))
         }) {
@@ -2063,6 +2080,7 @@ impl StorageRuntime {
         };
         let published_cache_vectors = published_cache.unit_ids.len();
         let published_cache_active_sources = published_cache.active_versions.len();
+        let cache_preparation_ms = cache_preparation_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.ingest_publish.cache_prepared",
             source_path,
@@ -2145,6 +2163,7 @@ impl StorageRuntime {
             published_at_ms,
             "ingest SQLite transaction commit starting"
         );
+        let commit_started = Instant::now();
         if let Err(source) = tx.commit().map_err(|source| {
             storage_operation_error(format!("failed to commit ingest transaction: {source}"))
         }) {
@@ -2160,6 +2179,7 @@ impl StorageRuntime {
             );
             return Err(source);
         }
+        let commit_ms = commit_started.elapsed().as_millis() as u64;
         info!(
             event = "storage.ingest_transaction.committed",
             source_path,
@@ -2204,7 +2224,12 @@ impl StorageRuntime {
             "ingested document version published"
         );
 
-        Ok(())
+        Ok(IngestStoragePhaseLatencies {
+            vector_validation_ms,
+            document_persistence_ms,
+            cache_preparation_ms,
+            commit_ms,
+        })
     }
 
     /// Build the bounded first-stage candidate pool with dense exact scan, SQLite FTS5 BM25, and RRF fusion.
