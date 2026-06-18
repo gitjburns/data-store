@@ -318,26 +318,93 @@ Notes:
 
 ## Phase 4 — Client cleanup: delete dead client-timing code
 
-- Status: Not started
-- Effort: ~6–9K tokens (estimate)
-- Confidence: ~95% (estimate; compiler-guided)
+- Status: Done
+- Effort: ~7–10K tokens (estimate; +1K vs. original for the wrapper collapse)
+- Confidence: ~93% (estimate; compiler-guided, a few extra mechanical call-site edits)
 - Files: `src/bin/data-store.rs`
 
-Steps: delete the timing structs / specs / consts / functions and wiring listed
-under "Key verified facts" (timers, specs, roles,
-`BenchmarkReport` / `BenchmarkEntry` / `BenchmarkBreakdownEntry`, label consts,
-`retrieval_benchmark_breakdown`, `OperationOutput.benchmarks` /
-`OperationStreamOutput.benchmarks`, `read_operation_stream` timer wiring, and the
-`send_operation_output` benchmark plumbing). Keep `format_benchmark_duration`.
+Resolved design decision (Option A — full collapse). Removing the dead client
+`benchmarks` field leaves `OperationOutput<T>` / `OperationStreamOutput` as
+single-field wrappers and makes `send_ingest_operation` / `send_search_operation`
+near-duplicates of `send_operation` (their only remaining difference is
+`print_elapsed = false`). Those wrappers/helpers were introduced solely to carry
+client benchmark data (their doc comments say "preserving client-side benchmark
+data"), so they are part of the dead benchmark plumbing. Decision: delete them
+too. `send_operation_output` returns the payload directly, `read_operation_stream`
+returns `serde_json::Value` directly, and the ingest/search/search-full call sites
+call `send_operation_output(context, <NAME>, payload, false, false)?` directly.
+The minor cost (two bare positional booleans at three call sites instead of named
+helpers) was accepted by the user in favor of removing the dead abstraction.
+
+Verified deletion inventory (current line numbers in `src/bin/data-store.rs`):
+- Consts `SEARCH_HTTP_TO_FIRST_STATUS_LABEL`, `SEARCH_PREPARATION_LABEL` (28–29).
+- `SearchBenchmarkRole`, `SearchStageSpec`, `SEARCH_STAGE_SPECS`,
+  `INGEST_STAGE_SPECS` and their comments (131–186).
+- Structs `SearchBenchmarkTimer`, `ActiveBenchmarkStage`, `BenchmarkEntry`,
+  `BenchmarkBreakdownEntry`, `BenchmarkReport`, `IngestBenchmarkTimer` (614–658).
+- `OperationOutput<T>` and `OperationStreamOutput` structs (600–612) — removed
+  entirely, not just their `benchmarks` field (Option A collapse).
+- Helpers `send_ingest_operation` / `send_search_operation` (1305–1319) — removed
+  (Option A collapse).
+- `impl SearchBenchmarkTimer`, `impl IngestBenchmarkTimer` (1751–1918).
+- `search_stage_spec`, `tracked_ingest_benchmark_stage`,
+  `retrieval_benchmark_breakdown` (1921–1969).
+- `read_operation_stream` timer wiring: timer init (1392–1393), the two
+  `observe_stage` call pairs in Status/Progress (1467–1472, 1490–1495), and the
+  terminal `benchmarks` build + `OperationStreamOutput` construction (1505–1516).
+- `send_operation_output` `benchmarks` plumbing and `OperationOutput`
+  construction (1375–1379).
+
+Steps:
+1. Delete the structs/specs/consts/impls/helpers in the inventory above.
+2. Collapse return types: `send_operation_output<T>` → `Result<T>` (deserialize
+   and return the payload directly; keep the `print_elapsed` behavior);
+   `read_operation_stream` → `Result<serde_json::Value>` (return the terminal
+   payload value directly).
+3. Update `send_operation` to return `send_operation_output(..., true)` directly.
+4. Repoint the ingest/search/search-full call sites (1214/1223/1232) to
+   `send_operation_output(context, <NAME>, payload, false, false)?`, passing the
+   result straight into `render_ingest` / `render_search`.
+5. Keep `format_benchmark_duration` (still used by BM25 diagnostics) and the
+   server-side renderer `render_operation_benchmarks` / `render_benchmark_stage`.
 
 Verify: `cargo fmt`, `cargo check` (+ `--features metal`) clean with no
 dead-code warnings; re-run search + ingest to confirm output is unchanged from
 Phase 2 / Phase 3.
 
-Risk notes: lowest. Pure deletion guided by the compiler.
+Risk notes: low. Mostly compiler-guided deletion; the only additions beyond the
+literal list are the wrapper collapse and ~4 call-site edits, all checked by the
+compiler. No behavior change.
 
 Notes:
-- (record findings / commit refs here)
+- `data-store.rs` (only file changed). Deleted per inventory: consts
+  `SEARCH_HTTP_TO_FIRST_STATUS_LABEL` / `SEARCH_PREPARATION_LABEL`; the stage
+  registry (`SearchBenchmarkRole`, `SearchStageSpec`, `SEARCH_STAGE_SPECS`,
+  `INGEST_STAGE_SPECS`); the eight structs (`OperationOutput`,
+  `OperationStreamOutput`, `SearchBenchmarkTimer`, `ActiveBenchmarkStage`,
+  `BenchmarkEntry`, `BenchmarkBreakdownEntry`, `BenchmarkReport`,
+  `IngestBenchmarkTimer`); the wrappers `send_ingest_operation` /
+  `send_search_operation`; both timer `impl` blocks; and the free fns
+  `search_stage_spec`, `tracked_ingest_benchmark_stage`,
+  `retrieval_benchmark_breakdown`.
+- Option A collapse implemented: `read_operation_stream` →
+  `Result<serde_json::Value>` (returns the terminal payload directly; timer init
+  and the two Status/Progress `observe_stage` pairs removed);
+  `send_operation_output<T>` → `Result<T>` (deserializes the returned `Value`
+  directly; `print_elapsed` behavior preserved); `send_operation` returns
+  `send_operation_output(..., true)` directly. Ingest/search/search-full call
+  sites now call `send_operation_output(context, <NAME>, payload, false, false)?`
+  and pass the payload straight into `render_ingest` / `render_search`.
+- Kept: client `OperationBenchmarks` / `BenchmarkStage` deserialize mirrors,
+  `render_operation_benchmarks` / `render_benchmark_stage`, and
+  `format_benchmark_duration` (still used by BM25 diagnostics).
+- Verified: `cargo fmt`, `cargo check`, `cargo check --features metal` all clean
+  with zero warnings — the four dead-code warnings carried since Phase 2/3 are
+  gone. `rg` confirmed no remaining references to any deleted symbol. No behavior
+  change; benchmark output still renders from the server-authoritative
+  `OperationBenchmarks` payload. Manual operator render check
+  (`data-store --search` / `--ingest`) deferred to the user; the agent does not
+  start/stop the service.
 
 ---
 

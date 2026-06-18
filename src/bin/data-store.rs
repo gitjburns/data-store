@@ -25,8 +25,6 @@ const SHUTDOWN_STATUS_COMPLETE: &str = "shutdown_complete";
 const SOURCE_ALREADY_INGESTED_ERROR_KIND: &str = "source_already_ingested";
 const INGEST_OPERATION_NAME: &str = "ingest";
 const SEARCH_OPERATION_NAME: &str = "search";
-const SEARCH_HTTP_TO_FIRST_STATUS_LABEL: &str = "http_to_first_status";
-const SEARCH_PREPARATION_LABEL: &str = "search_preparation";
 
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
@@ -127,63 +125,6 @@ struct CommandSpec {
     /// Argument parser shape plus constructor used to build the typed command.
     arguments: CommandArguments,
 }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SearchBenchmarkRole {
-    /// The stage marks the beginning of the search wall-clock total but is not printed as its own row.
-    TotalStart,
-    /// The stage is timed until the next benchmarked stage or terminal operation event.
-    TimedStep,
-}
-
-struct SearchStageSpec {
-    /// Stable stage label emitted by the server operation stream.
-    stage: &'static str,
-    /// How the CLI benchmark timer should interpret this stage.
-    benchmark_role: SearchBenchmarkRole,
-}
-
-// Keep search stage benchmark metadata in one table so adding, removing, or
-// reordering benchmarked server stages does not require changing timer logic.
-// The CLI still relies on the server's stable stage strings; this registry is
-// the local presentation contract for which stages appear in the summary.
-const SEARCH_STAGE_SPECS: &[SearchStageSpec] = &[
-    SearchStageSpec {
-        stage: "search_running",
-        benchmark_role: SearchBenchmarkRole::TotalStart,
-    },
-    SearchStageSpec {
-        stage: "embedding_query",
-        benchmark_role: SearchBenchmarkRole::TimedStep,
-    },
-    SearchStageSpec {
-        stage: "retrieving_candidates",
-        benchmark_role: SearchBenchmarkRole::TimedStep,
-    },
-    SearchStageSpec {
-        stage: "colbert_scoring",
-        benchmark_role: SearchBenchmarkRole::TimedStep,
-    },
-    SearchStageSpec {
-        stage: "reranking",
-        benchmark_role: SearchBenchmarkRole::TimedStep,
-    },
-    SearchStageSpec {
-        stage: "result_assembling",
-        benchmark_role: SearchBenchmarkRole::TimedStep,
-    },
-];
-
-// Ingest benchmarks intentionally track only the expensive document-processing
-// stages the operator asked to see. Request setup, source resolution, and
-// duplicate checks are omitted from both the rows and the ingest total.
-const INGEST_STAGE_SPECS: &[&str] = &[
-    "docling_converting",
-    "unit_splitting",
-    "dense_embedding",
-    "colbert_embedding",
-    "storage_publishing",
-];
 
 // Keep command metadata in one table so REPL parsing, CLI parsing, and help
 // rendering cannot drift apart. This is the Rust equivalent of a C dispatch
@@ -595,66 +536,6 @@ struct LastStreamEvent {
     event_type: &'static str,
     stage: Option<String>,
     message: Option<String>,
-}
-
-struct OperationOutput<T> {
-    /// Deserialized terminal operation payload returned by the service.
-    payload: T,
-    /// Optional operation benchmark data captured from streamed stage events.
-    benchmarks: Option<BenchmarkReport>,
-}
-
-struct OperationStreamOutput {
-    /// Raw terminal operation payload; callers deserialize it into the expected response type.
-    payload: serde_json::Value,
-    /// Optional operation benchmark data captured while reading the same operation stream.
-    benchmarks: Option<BenchmarkReport>,
-}
-
-struct SearchBenchmarkTimer {
-    /// Local wall-clock start for the measured HTTP operation.
-    total_started_at: Instant,
-    /// First server status for search; the next timed stage closes search preparation.
-    search_started_at: Option<Instant>,
-    /// Currently timed row in the benchmark table; it closes when the next timed stage begins.
-    active_stage: Option<ActiveBenchmarkStage>,
-    /// Completed rows printed in the same order the server emitted them.
-    completed_stages: Vec<BenchmarkEntry>,
-}
-
-struct ActiveBenchmarkStage {
-    /// Registry-owned stage label, safe to print directly in the benchmark summary.
-    stage: &'static str,
-    /// Local wall-clock instant when this stage first appeared in the stream.
-    started_at: Instant,
-}
-
-struct BenchmarkEntry {
-    /// Registry-owned stage label for one finished benchmark row.
-    stage: &'static str,
-    /// Local wall-clock duration between this stage and the next benchmark boundary.
-    elapsed: Duration,
-}
-
-struct BenchmarkBreakdownEntry {
-    /// Stable child-row label printed under a parent benchmark row.
-    stage: &'static str,
-    /// Server-reported duration for one substage.
-    elapsed: Duration,
-}
-
-struct BenchmarkReport {
-    /// Completed benchmark rows printed after the operation result.
-    entries: Vec<BenchmarkEntry>,
-    /// Search uses a wall-clock envelope; ingest uses the sum of its tracked rows.
-    total: Duration,
-}
-
-struct IngestBenchmarkTimer {
-    /// Currently timed ingest row; repeated progress for the same stage keeps this row open.
-    active_stage: Option<ActiveBenchmarkStage>,
-    /// Completed ingest rows in the stage order emitted by the server.
-    completed_stages: Vec<BenchmarkEntry>,
 }
 
 #[derive(Debug)]
@@ -1211,30 +1092,42 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 source,
                 force: force.then_some(true),
             };
-            let output = send_ingest_operation(
+            render_ingest(send_operation_output(
                 context,
+                INGEST_OPERATION_NAME,
                 serde_json::to_value(request)
                     .context("failed to encode ingest operation payload")?,
-            )?;
-            render_ingest(output.payload);
+                false,
+                false,
+            )?);
         }
         Command::Search { query, top_k } => {
             let request = SearchRequest { query, top_k };
-            let output = send_search_operation(
-                context,
-                serde_json::to_value(request)
-                    .context("failed to encode search operation payload")?,
-            )?;
-            render_search(output.payload, false);
+            render_search(
+                send_operation_output(
+                    context,
+                    SEARCH_OPERATION_NAME,
+                    serde_json::to_value(request)
+                        .context("failed to encode search operation payload")?,
+                    false,
+                    false,
+                )?,
+                false,
+            );
         }
         Command::SearchFull { query, top_k } => {
             let request = SearchRequest { query, top_k };
-            let output = send_search_operation(
-                context,
-                serde_json::to_value(request)
-                    .context("failed to encode search operation payload")?,
-            )?;
-            render_search(output.payload, true);
+            render_search(
+                send_operation_output(
+                    context,
+                    SEARCH_OPERATION_NAME,
+                    serde_json::to_value(request)
+                        .context("failed to encode search operation payload")?,
+                    false,
+                    false,
+                )?,
+                true,
+            );
         }
         Command::Versions => {
             render_versions(send_operation(context, "versions", empty_payload(), true)?);
@@ -1299,23 +1192,7 @@ fn send_operation<T>(
 where
     T: DeserializeOwned,
 {
-    Ok(send_operation_output(context, operation, payload, protected, true)?.payload)
-}
-
-/// Send one ingest operation while preserving client-side benchmark data for final output.
-fn send_ingest_operation(
-    context: &ClientContext,
-    payload: serde_json::Value,
-) -> Result<OperationOutput<IngestResponse>> {
-    send_operation_output(context, INGEST_OPERATION_NAME, payload, false, false)
-}
-
-/// Send one search operation while preserving client-side benchmark data for result rendering.
-fn send_search_operation(
-    context: &ClientContext,
-    payload: serde_json::Value,
-) -> Result<OperationOutput<SearchResponse>> {
-    send_operation_output(context, SEARCH_OPERATION_NAME, payload, false, false)
+    send_operation_output(context, operation, payload, protected, true)
 }
 
 /// Send one operation and optionally print the generic whole-operation elapsed line.
@@ -1325,7 +1202,7 @@ fn send_operation_output<T>(
     payload: serde_json::Value,
     protected: bool,
     print_elapsed: bool,
-) -> Result<OperationOutput<T>>
+) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -1372,11 +1249,8 @@ where
     if print_elapsed {
         println!("Elapsed: {} ms", started.elapsed().as_millis());
     }
-    Ok(OperationOutput {
-        payload: serde_json::from_value(payload.payload)
-            .with_context(|| format!("failed to parse {operation} result payload"))?,
-        benchmarks: payload.benchmarks,
-    })
+    serde_json::from_value(payload)
+        .with_context(|| format!("failed to parse {operation} result payload"))
 }
 
 /// Read streamed operation events until the service emits a terminal result or error.
@@ -1387,10 +1261,8 @@ fn read_operation_stream(
     method: &str,
     target_url: &str,
     started: Instant,
-) -> Result<OperationStreamOutput> {
+) -> Result<serde_json::Value> {
     let mut renderer = StreamRenderer::new();
-    let mut benchmark_timer = SearchBenchmarkTimer::for_operation(operation, started);
-    let mut ingest_benchmark_timer = IngestBenchmarkTimer::for_operation(operation);
     let mut reader = BufReader::new(response);
     let mut last_event: Option<LastStreamEvent> = None;
     let mut line = String::new();
@@ -1464,12 +1336,6 @@ fn read_operation_stream(
                     stage: stage.clone(),
                     message: message.clone(),
                 });
-                if let Some(timer) = benchmark_timer.as_mut() {
-                    timer.observe_stage(stage.as_deref());
-                }
-                if let Some(timer) = ingest_benchmark_timer.as_mut() {
-                    timer.observe_stage(stage.as_deref());
-                }
                 renderer.render_status(&operation_id, sequence, stage, message)?
             }
             OperationEvent::Progress {
@@ -1487,12 +1353,6 @@ fn read_operation_stream(
                     stage: stage.clone(),
                     message: message.clone(),
                 });
-                if let Some(timer) = benchmark_timer.as_mut() {
-                    timer.observe_stage(stage.as_deref());
-                }
-                if let Some(timer) = ingest_benchmark_timer.as_mut() {
-                    timer.observe_stage(stage.as_deref());
-                }
                 renderer.render_progress(&operation_id, sequence, stage, message, current, total)?
             }
             OperationEvent::Result {
@@ -1502,18 +1362,7 @@ fn read_operation_stream(
             } => {
                 renderer.finish_progress_line()?;
                 println!("Result: operationId={operation_id} sequence={sequence}");
-                let benchmarks = benchmark_timer
-                    .as_mut()
-                    .and_then(SearchBenchmarkTimer::finish)
-                    .or_else(|| {
-                        ingest_benchmark_timer
-                            .as_mut()
-                            .and_then(IngestBenchmarkTimer::finish)
-                    });
-                return Ok(OperationStreamOutput {
-                    payload,
-                    benchmarks,
-                });
+                return Ok(payload);
             }
             OperationEvent::Error {
                 operation_id,
@@ -1746,226 +1595,6 @@ fn source_already_ingested_message(error: &ErrorDetail) -> Option<&str> {
     }
 
     None
-}
-
-impl SearchBenchmarkTimer {
-    /// Create a search-only timer so non-search operation output remains unchanged.
-    fn for_operation(operation: &str, total_started_at: Instant) -> Option<Self> {
-        if operation != SEARCH_OPERATION_NAME {
-            return None;
-        }
-
-        Some(Self {
-            total_started_at,
-            search_started_at: None,
-            active_stage: None,
-            completed_stages: Vec::new(),
-        })
-    }
-
-    /// Record one observed operation stage using the search stage registry as the timing contract.
-    fn observe_stage(&mut self, stage: Option<&str>) {
-        let Some(stage) = stage else {
-            return;
-        };
-        let now = Instant::now();
-        let Some(stage_spec) = search_stage_spec(stage) else {
-            return;
-        };
-
-        match stage_spec.benchmark_role {
-            SearchBenchmarkRole::TotalStart => self.record_http_to_first_status(now),
-            SearchBenchmarkRole::TimedStep => self.observe_timed_stage(stage_spec.stage, now),
-        }
-    }
-
-    /// Record the request/response startup bucket once, ending at the first server status event.
-    fn record_http_to_first_status(&mut self, finished_at: Instant) {
-        if self.search_started_at.is_none() {
-            self.search_started_at = Some(finished_at);
-        }
-        if self
-            .completed_stages
-            .iter()
-            .any(|entry| entry.stage == SEARCH_HTTP_TO_FIRST_STATUS_LABEL)
-        {
-            return;
-        }
-        self.completed_stages.insert(
-            0,
-            BenchmarkEntry {
-                stage: SEARCH_HTTP_TO_FIRST_STATUS_LABEL,
-                elapsed: finished_at.duration_since(self.total_started_at),
-            },
-        );
-    }
-
-    /// Start a timed benchmark row unless repeated progress keeps reporting the same stage.
-    fn observe_timed_stage(&mut self, stage: &'static str, started_at: Instant) {
-        self.record_search_preparation(started_at);
-        if self
-            .active_stage
-            .as_ref()
-            .is_some_and(|active| active.stage == stage)
-        {
-            return;
-        }
-
-        self.finish_active_stage(started_at);
-        self.active_stage = Some(ActiveBenchmarkStage { stage, started_at });
-    }
-
-    /// Close the search-preparation gap from first search status to the first concrete pipeline stage.
-    fn record_search_preparation(&mut self, finished_at: Instant) {
-        let Some(search_started_at) = self.search_started_at.take() else {
-            return;
-        };
-        self.completed_stages.push(BenchmarkEntry {
-            stage: SEARCH_PREPARATION_LABEL,
-            elapsed: finished_at.duration_since(search_started_at),
-        });
-    }
-
-    /// Close the active stage and return a report that can be printed after search results.
-    fn finish(&mut self) -> Option<BenchmarkReport> {
-        let finished_at = Instant::now();
-        self.finish_active_stage(finished_at);
-        if self.completed_stages.is_empty() {
-            return None;
-        }
-        Some(BenchmarkReport {
-            entries: std::mem::take(&mut self.completed_stages),
-            total: finished_at.duration_since(self.total_started_at),
-        })
-    }
-
-    /// Move the active stage into the completed list using the supplied wall-clock boundary.
-    fn finish_active_stage(&mut self, finished_at: Instant) {
-        let Some(active_stage) = self.active_stage.take() else {
-            return;
-        };
-        self.completed_stages.push(BenchmarkEntry {
-            stage: active_stage.stage,
-            elapsed: finished_at.duration_since(active_stage.started_at),
-        });
-    }
-}
-
-impl IngestBenchmarkTimer {
-    /// Create an ingest-only timer so non-ingest operation output remains unchanged.
-    fn for_operation(operation: &str) -> Option<Self> {
-        if operation != INGEST_OPERATION_NAME {
-            return None;
-        }
-
-        Some(Self {
-            active_stage: None,
-            completed_stages: Vec::new(),
-        })
-    }
-
-    /// Record one observed ingest stage when it is part of the requested benchmark subset.
-    fn observe_stage(&mut self, stage: Option<&str>) {
-        let Some(stage) = stage else {
-            return;
-        };
-        let Some(stage) = tracked_ingest_benchmark_stage(stage) else {
-            return;
-        };
-        let now = Instant::now();
-        if self
-            .active_stage
-            .as_ref()
-            .is_some_and(|active| active.stage == stage)
-        {
-            return;
-        }
-
-        self.finish_active_stage(now);
-        self.active_stage = Some(ActiveBenchmarkStage {
-            stage,
-            started_at: now,
-        });
-    }
-
-    /// Close the active ingest row and return a report whose total is the sum of tracked rows.
-    fn finish(&mut self) -> Option<BenchmarkReport> {
-        self.finish_active_stage(Instant::now());
-        if self.completed_stages.is_empty() {
-            return None;
-        }
-        let total = self
-            .completed_stages
-            .iter()
-            .map(|entry| entry.elapsed)
-            .sum::<Duration>();
-        Some(BenchmarkReport {
-            entries: std::mem::take(&mut self.completed_stages),
-            total,
-        })
-    }
-
-    /// Move the active ingest stage into the completed list using the supplied boundary.
-    fn finish_active_stage(&mut self, finished_at: Instant) {
-        let Some(active_stage) = self.active_stage.take() else {
-            return;
-        };
-        self.completed_stages.push(BenchmarkEntry {
-            stage: active_stage.stage,
-            elapsed: finished_at.duration_since(active_stage.started_at),
-        });
-    }
-}
-
-/// Look up one server-emitted search stage in the CLI benchmark registry.
-fn search_stage_spec(stage: &str) -> Option<&'static SearchStageSpec> {
-    SEARCH_STAGE_SPECS
-        .iter()
-        .find(|stage_spec| stage_spec.stage == stage)
-}
-
-/// Return the stable ingest stage label when it should appear in CLI benchmarks.
-fn tracked_ingest_benchmark_stage(stage: &str) -> Option<&'static str> {
-    INGEST_STAGE_SPECS
-        .iter()
-        .copied()
-        .find(|tracked_stage| *tracked_stage == stage)
-}
-
-/// Extract server-side substages for the streamed retrieving_candidates row.
-fn retrieval_benchmark_breakdown(raw: &serde_json::Value) -> Vec<BenchmarkBreakdownEntry> {
-    const RETRIEVAL_BENCHMARK_FIELDS: &[(&str, &str)] = &[
-        (
-            "queryVectorValidationLatencyMs",
-            "retrieving_candidates.query_vector_validation",
-        ),
-        ("denseLatencyMs", "retrieving_candidates.dense_scan"),
-        ("bm25LatencyMs", "retrieving_candidates.bm25"),
-        ("rrfFusionLatencyMs", "retrieving_candidates.rrf_fusion"),
-        (
-            "candidateMaterializationLatencyMs",
-            "retrieving_candidates.candidate_materialization",
-        ),
-        (
-            "rawDiagnosticsLatencyMs",
-            "retrieving_candidates.raw_diagnostics",
-        ),
-    ];
-
-    let Some(retrieval) = raw.pointer("/storage/retrieval") else {
-        return Vec::new();
-    };
-
-    RETRIEVAL_BENCHMARK_FIELDS
-        .iter()
-        .filter_map(|(field, stage)| {
-            let elapsed_ms = retrieval.get(*field)?.as_u64()?;
-            Some(BenchmarkBreakdownEntry {
-                stage: *stage,
-                elapsed: Duration::from_millis(elapsed_ms),
-            })
-        })
-        .collect()
 }
 
 /// Print protocol-surfaced BM25 diagnostics required by the search response contract.
