@@ -4,7 +4,7 @@
 
 Please read:
 
-services/data-store/BENCHMARKS-PLAN.md
+service/data-store/BENCHMARKS-PLAN.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 

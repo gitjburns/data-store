@@ -39,10 +39,10 @@ use crate::{
         build_versioned_document_id,
     },
     types::{
-        DocumentVersionRollbackRequest, DocumentVersionRollbackResponse, HealthResponse,
-        IngestRequest, IngestResponse, LimitsResponse, OperationControlRequest, OperationEvent,
-        OperationRequest, RequestLimitsResponse, RetrievalLimitsResponse, SearchRequest,
-        SearchResponse, SearchResult, ShutdownResponse,
+        BenchmarkStage, DocumentVersionRollbackRequest, DocumentVersionRollbackResponse,
+        HealthResponse, IngestRequest, IngestResponse, LimitsResponse, OperationBenchmarks,
+        OperationControlRequest, OperationEvent, OperationRequest, RequestLimitsResponse,
+        RetrievalLimitsResponse, SearchRequest, SearchResponse, SearchResult, ShutdownResponse,
     },
     units::{assign_units_to_document_version, split_conversion_into_units},
 };
@@ -1405,16 +1405,69 @@ fn execute_search(
             return Err(source);
         }
     };
+    let result_assembling_latency_ms = result_assembly_started.elapsed().as_millis() as u64;
     info!(
         event = "search.result_assembly.completed",
         operation_id = %operation_id,
         query_chars,
         top_k,
         results = results.len(),
-        elapsed_ms = result_assembly_started.elapsed().as_millis() as u64,
+        elapsed_ms = result_assembling_latency_ms,
         "search result assembly completed"
     );
     let latency_ms = started.elapsed().as_millis() as u64;
+    // Assemble server-authoritative benchmarks before `raw` consumes
+    // `storage_output.raw`; retrieval substages are read from that lossless
+    // payload (the only place storage emits them).
+    let benchmarks = OperationBenchmarks {
+        stages: vec![
+            leaf_benchmark_stage(
+                "search_preparation",
+                embedding_started.duration_since(started).as_millis() as u64,
+            ),
+            leaf_benchmark_stage("embedding_query", embedding_latency_ms),
+            BenchmarkStage {
+                stage: "retrieving_candidates".to_string(),
+                elapsed_ms: retrieval_latency_ms,
+                children: vec![
+                    leaf_benchmark_stage(
+                        "query_vector_validation",
+                        retrieval_substage_ms(
+                            &storage_output.raw,
+                            "queryVectorValidationLatencyMs",
+                        )?,
+                    ),
+                    leaf_benchmark_stage(
+                        "dense",
+                        retrieval_substage_ms(&storage_output.raw, "denseLatencyMs")?,
+                    ),
+                    leaf_benchmark_stage(
+                        "bm25",
+                        retrieval_substage_ms(&storage_output.raw, "bm25LatencyMs")?,
+                    ),
+                    leaf_benchmark_stage(
+                        "rrf_fusion",
+                        retrieval_substage_ms(&storage_output.raw, "rrfFusionLatencyMs")?,
+                    ),
+                    leaf_benchmark_stage(
+                        "candidate_materialization",
+                        retrieval_substage_ms(
+                            &storage_output.raw,
+                            "candidateMaterializationLatencyMs",
+                        )?,
+                    ),
+                    leaf_benchmark_stage(
+                        "raw_diagnostics",
+                        retrieval_substage_ms(&storage_output.raw, "rawDiagnosticsLatencyMs")?,
+                    ),
+                ],
+            },
+            leaf_benchmark_stage("colbert_scoring", colbert_latency_ms),
+            leaf_benchmark_stage("reranking", reranker_latency_ms),
+            leaf_benchmark_stage("result_assembling", result_assembling_latency_ms),
+        ],
+        total_ms: latency_ms,
+    };
     let raw = serde_json::json!({
         "search": {
             "mode": SEARCH_MODE_FULL_RETRIEVAL,
@@ -1491,8 +1544,31 @@ fn execute_search(
     Ok(SearchResponse {
         results,
         latency_ms,
+        benchmarks,
         raw,
     })
+}
+
+/// Build a leaf benchmark stage (no children) for the operation benchmark contract.
+fn leaf_benchmark_stage(stage: &str, elapsed_ms: u64) -> BenchmarkStage {
+    BenchmarkStage {
+        stage: stage.to_string(),
+        elapsed_ms,
+        children: Vec::new(),
+    }
+}
+
+/// Read a measured retrieval substage latency from the lossless search raw
+/// payload. Fails explicitly when the contract field is absent or non-numeric
+/// rather than silently substituting a value, since these substages are always
+/// produced on the full-retrieval search path.
+fn retrieval_substage_ms(raw: &serde_json::Value, key: &str) -> Result<u64, ApiError> {
+    raw.get("retrieval")
+        .and_then(|retrieval| retrieval.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::StorageOperation {
+            message: format!("search retrieval diagnostics missing substage latency '{key}'"),
+        })
 }
 
 #[derive(Debug, Clone, Copy)]

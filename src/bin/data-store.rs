@@ -369,6 +369,24 @@ struct IngestRequest {
     force: Option<bool>,
 }
 
+/// Client mirror of the server's per-operation benchmark tree. The client
+/// renders this as-is and performs no timing of its own.
+#[derive(Debug, Deserialize)]
+struct OperationBenchmarks {
+    stages: Vec<BenchmarkStage>,
+    #[serde(rename = "totalMs")]
+    total_ms: u64,
+}
+
+/// One measured stage in a server benchmark tree; `children` is empty for leaves.
+#[derive(Debug, Deserialize)]
+struct BenchmarkStage {
+    stage: String,
+    #[serde(rename = "elapsedMs")]
+    elapsed_ms: u64,
+    children: Vec<BenchmarkStage>,
+}
+
 #[derive(Debug, Deserialize)]
 struct IngestResponse {
     #[serde(rename = "documentId")]
@@ -378,6 +396,9 @@ struct IngestResponse {
     #[serde(rename = "unitsIngested")]
     units_ingested: u32,
     status: String,
+    // Server-authoritative benchmarks; absent until the ingest server phase lands.
+    #[serde(default)]
+    benchmarks: Option<OperationBenchmarks>,
 }
 
 #[derive(Debug, Serialize)]
@@ -390,6 +411,9 @@ struct SearchRequest {
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
     results: Vec<SearchResult>,
+    // Server-authoritative benchmarks; the server always emits these for search.
+    #[serde(default)]
+    benchmarks: Option<OperationBenchmarks>,
     raw: serde_json::Value,
 }
 
@@ -1192,7 +1216,7 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 serde_json::to_value(request)
                     .context("failed to encode ingest operation payload")?,
             )?;
-            render_ingest(output.payload, output.benchmarks);
+            render_ingest(output.payload);
         }
         Command::Search { query, top_k } => {
             let request = SearchRequest { query, top_k };
@@ -1201,7 +1225,7 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 serde_json::to_value(request)
                     .context("failed to encode search operation payload")?,
             )?;
-            render_search(output.payload, false, output.benchmarks);
+            render_search(output.payload, false);
         }
         Command::SearchFull { query, top_k } => {
             let request = SearchRequest { query, top_k };
@@ -1210,7 +1234,7 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 serde_json::to_value(request)
                     .context("failed to encode search operation payload")?,
             )?;
-            render_search(output.payload, true, output.benchmarks);
+            render_search(output.payload, true);
         }
         Command::Versions => {
             render_versions(send_operation(context, "versions", empty_payload(), true)?);
@@ -2158,25 +2182,20 @@ fn render_limits(response: LimitsResponse) {
     println!("  max topK: {}", response.retrieval.max_top_k);
 }
 
-/// Print the durable ingest result, then append tracked ingest stage benchmarks.
-fn render_ingest(response: IngestResponse, benchmarks: Option<BenchmarkReport>) {
+/// Print the durable ingest result, then append server-authoritative ingest stage benchmarks.
+fn render_ingest(response: IngestResponse) {
     println!("Status: {}", response.status);
     println!("Document ID: {}", response.document_id);
     println!("Version label: {}", response.version_label);
     println!("Units ingested: {}", response.units_ingested);
-    render_operation_benchmarks(benchmarks, &[]);
+    render_operation_benchmarks(response.benchmarks);
 }
 
-/// Print ranked search results, then append the client-side benchmark report when available.
-fn render_search(
-    response: SearchResponse,
-    full_content: bool,
-    benchmarks: Option<BenchmarkReport>,
-) {
-    let retrieval_breakdown = retrieval_benchmark_breakdown(&response.raw);
+/// Print ranked search results, then append the server-authoritative benchmark report when available.
+fn render_search(response: SearchResponse, full_content: bool) {
     if response.results.is_empty() {
         println!("No results");
-        render_operation_benchmarks(benchmarks, &retrieval_breakdown);
+        render_operation_benchmarks(response.benchmarks);
         render_bm25_diagnostics(&response.raw);
         return;
     }
@@ -2194,38 +2213,38 @@ fn render_search(
         println!("   content:");
         print_indented_content(&render_content(&result.content, full_content));
     }
-    render_operation_benchmarks(benchmarks, &retrieval_breakdown);
+    render_operation_benchmarks(response.benchmarks);
     render_bm25_diagnostics(&response.raw);
 }
 
-/// Print a benchmark report after operation results so the result remains the first payload users inspect.
-fn render_operation_benchmarks(
-    benchmarks: Option<BenchmarkReport>,
-    retrieval_breakdown: &[BenchmarkBreakdownEntry],
-) {
+/// Print the server's benchmark tree after operation results so the result remains the first payload users inspect.
+fn render_operation_benchmarks(benchmarks: Option<OperationBenchmarks>) {
     let Some(benchmarks) = benchmarks else {
         return;
     };
     println!();
     println!("Benchmarks:");
-    for entry in benchmarks.entries {
-        println!(
-            "{}: {}",
-            entry.stage,
-            format_benchmark_duration(entry.elapsed)
-        );
-        if entry.stage == "retrieving_candidates" {
-            for child in retrieval_breakdown {
-                println!(
-                    "  {}: {}",
-                    child.stage,
-                    format_benchmark_duration(child.elapsed)
-                );
-            }
-        }
+    for stage in &benchmarks.stages {
+        render_benchmark_stage(stage, 0);
     }
     println!();
-    println!("Total: {}", format_benchmark_duration(benchmarks.total));
+    println!(
+        "Total: {}",
+        format_benchmark_duration(Duration::from_millis(benchmarks.total_ms))
+    );
+}
+
+/// Print one server benchmark stage and its children, indented two spaces per depth level.
+fn render_benchmark_stage(stage: &BenchmarkStage, depth: usize) {
+    let indent = "  ".repeat(depth);
+    println!(
+        "{indent}{}: {}",
+        stage.stage,
+        format_benchmark_duration(Duration::from_millis(stage.elapsed_ms))
+    );
+    for child in &stage.children {
+        render_benchmark_stage(child, depth + 1);
+    }
 }
 
 /// Print active ingested source documents without retained-version diagnostics.

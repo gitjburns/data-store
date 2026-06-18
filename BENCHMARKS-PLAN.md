@@ -104,7 +104,7 @@ approval before any code change** (repo rule). Keep this file's `Status` and
 
 ## Phase 1 — Server: search benchmarks
 
-- Status: Not started
+- Status: Done
 - Effort: ~8–12K tokens (estimate)
 - Confidence: ~92% (estimate)
 - Files: `src/types.rs`, `src/http.rs` (`execute_search`)
@@ -132,16 +132,36 @@ Risk notes: low. Additive only; no client break (verified no
 `deny_unknown_fields`); children sourced from the existing raw shape.
 
 Notes:
-- (record findings / commit refs here)
+- `types.rs`: added `OperationBenchmarks { stages, totalMs }` and
+  `BenchmarkStage { stage, elapsedMs, children }` (camelCase; `children` always
+  serialized, `[]` for leaves); added `benchmarks: OperationBenchmarks` to
+  `SearchResponse` (before `raw`).
+- `http.rs` `execute_search`: bound `result_assembling_latency_ms` (reused in the
+  existing completion log, value-identical). Assembled `OperationBenchmarks` in
+  order `[search_preparation (embedding_started − started), embedding_query,
+  retrieving_candidates(+6 children), colbert_scoring, reranking,
+  result_assembling]`, `totalMs = latency_ms`. Built before `raw` consumes
+  `storage_output.raw` (json! moves the value). `raw` and all logs unchanged.
+- Decision A — child stage names: `query_vector_validation, dense, bm25,
+  rrf_fusion, candidate_materialization, raw_diagnostics`.
+- Decision B — added `retrieval_substage_ms` helper returning
+  `ApiError::StorageOperation` on a missing/non-numeric substage key (no silent
+  default). Also added `leaf_benchmark_stage` helper to avoid repeated leaf
+  literals.
+- Verified: `cargo fmt`, `cargo check`, `cargo check --features metal` all clean,
+  no warnings. Manual client-side check deferred (client renders `benchmarks`
+  starting in Phase 2; no `deny_unknown_fields` so the new field is inert until
+  then).
 
 ---
 
 ## Phase 2 — Client: render server benchmarks + search README
 
-- Status: Not started
+- Status: Done
 - Effort: ~8–11K tokens (estimate)
 - Confidence: ~92% (estimate)
-- Files: `src/bin/data-store.rs`, `README.md` (search Benchmarks section)
+- Files: `src/bin/data-store.rs`, `INSTALL.md` (search Benchmarks section; the
+  benchmark CLI wording lives in `INSTALL.md`, not `README.md`)
 
 Steps:
 1. Add client mirror `OperationBenchmarks` / `BenchmarkStage`
@@ -152,7 +172,7 @@ Steps:
    recursively (stages → children → `Total`). Update `render_search` /
    `render_ingest` and their call sites (1195 / 1204 / 1213) to pass
    `response.benchmarks`; stop passing the client-timed `output.benchmarks`.
-3. README: update the search Benchmarks description — remove "client-side", drop
+3. INSTALL.md: update the search Benchmarks description — remove "client-side", drop
    `http_to_first_status`, and correct the total wording.
 
 Verify: `cargo check` (+ `--features metal`); run a search and confirm
@@ -164,36 +184,96 @@ Risk notes: low. Renderer swap; old timer code remains but unused
 (intentional, cleared in Phase 4).
 
 Notes:
-- (record findings / commit refs here)
+- `data-store.rs`: added `OperationBenchmarks`/`BenchmarkStage` deserialize
+  mirrors; `benchmarks: Option<OperationBenchmarks>` on client `SearchResponse`
+  and `IngestResponse` (`Option` so Phase 3 ingest needs no client change).
+  Rewrote `render_operation_benchmarks` to recurse the server stage tree via a
+  new `render_benchmark_stage(depth)` helper; removed the client
+  `retrieval_breakdown` path from rendering. Call sites (ingest, search,
+  search-full) stopped passing the client-timed benchmarks.
+- `INSTALL.md`: search Benchmarks section is now server-authoritative; dropped
+  `http_to_first_status` and "client-side"; clarified that rows may not sum to
+  `Total`. (Doc target corrected from `README.md` to `INSTALL.md`, where the
+  benchmark CLI wording actually lives.)
+- Verified `cargo fmt`, `cargo check`, `cargo check --features metal` clean
+  except the 4 intentional dead-code warnings (`OperationOutput.benchmarks`,
+  `BenchmarkBreakdownEntry`, `BenchmarkReport`, `retrieval_benchmark_breakdown`)
+  — all scheduled for Phase 4 deletion.
+- Manual render confirmed by operator: server-authoritative rows with nested
+  `retrieving_candidates` substages and a server `Total`; the small row-sum
+  remainder (e.g. rows 13.880s vs `Total` 13.885s) is shown, not hidden.
 
 ---
 
-## Phase 3 — Server: ingest benchmarks + ingest README
+## Phase 3 — Server: ingest benchmarks (incl. nested storage substages) + ingest INSTALL doc
 
 - Status: Not started
-- Effort: ~8–11K tokens (estimate)
-- Confidence: ~92% (estimate)
-- Files: `src/types.rs` (`IngestResponse`), `src/http.rs` (`execute_ingest`),
-  `README.md` (ingest Benchmarks section)
+- Effort: ~15–20K tokens (estimate)
+- Confidence: ~91% (estimate; the only non-mechanical risk is the `storage.rs`
+  return-type change, which is compiler-guided with a single caller)
+- Files: `src/types.rs` (`IngestResponse`), `src/storage.rs` (`ingest_document`),
+  `src/http.rs` (`execute_ingest`), `INSTALL.md` (ingest Benchmarks section).
+  No `src/bin/data-store.rs` change: the recursive `render_benchmark_stage`
+  (`data-store.rs:2238-2246`) already renders nested children, and Phase 2 added
+  `benchmarks: Option<OperationBenchmarks>` to the client `IngestResponse`.
 
-Open decision (resolve at session start): which ingest stages to show.
-Recommendation for consistency with search now showing `search_preparation`:
-`[source_resolution, docling_converting, unit_splitting, dense_embedding,
-colbert_embedding, storage_publishing]`, `totalMs = latency_ms`.
-(`duplicate_check` is negligible; include or omit.)
+Scope note: this is wider than the original Phase 3 framing ("values already
+measured; `types.rs` + `http.rs` only"). The agreed design adds
+**server-authoritative nested storage substages**, which requires new `Instant`s
+inside `storage.rs::ingest_document` and a return-type change there. The change
+is **purely additive measurement**: it does not reorder the durable
+persist/commit/publish/cache-swap sequence and removes no logging (respects the
+ARCHITECTURE same-transaction publish invariant and Observability-Is-Lossless).
+
+Resolved design decision — final ingest stage tree. Only descriptive stages are
+named; every constant-and-tiny boundary is folded into the honest remainder
+(never hidden), exactly as search does:
+
+```text
+docling_converting        <- conversion_latency_ms        (http.rs:556)
+unit_splitting            <- splitting_latency_ms          (http.rs:604)
+dense_embedding           <- dense_embedding_latency_ms    (http.rs:686)
+colbert_embedding         <- colbert_embedding_latency_ms  (http.rs:777)
+storage_publishing        <- storage_latency_ms            (http.rs:834)
+    vector_validation     <- NEW Instant   (storage.rs:1695-1741)
+    document_persistence  <- NEW Instant   (storage.rs:1835-1972)
+    cache_preparation     <- NEW Instant   (storage.rs:2000-2076)
+    commit                <- NEW Instant   (storage.rs:2148-2172)
+totalMs = latency_ms                        (http.rs:844)
+```
+
+Dropped as both invariable and immaterial (absorbed into the remainder):
+`ingest_preparation` (in-memory validation/admission/readiness; no snapshot
+capture, unlike search's `search_preparation`), `source_resolution` (filesystem
+stat), `duplicate_check` (one small SQLite lookup), `active_version_write`
+(single one-row UPSERT, no fsync before commit), `cache_swap` (in-memory move
+assignment). `Total` may exceed the sum of rows; the remainder is shown honestly.
 
 Steps:
-1. `types.rs`: add `benchmarks: OperationBenchmarks` to `IngestResponse`.
-2. `http.rs` `execute_ingest`: assemble `OperationBenchmarks` from the existing
-   `*_latency_ms` vars (`http.rs:399-844`), `totalMs = latency_ms` (844). Set it
-   on `IngestResponse`. Leave logs and raw unchanged.
-3. README: update the ingest Benchmarks description (server-authoritative; new
-   stage list and total semantics).
+1. `types.rs`: add `benchmarks: OperationBenchmarks` to `IngestResponse` (reuse
+   the existing `OperationBenchmarks` / `BenchmarkStage` types from Phase 1).
+2. `storage.rs` `ingest_document`: add 4 `Instant`s bounding `vector_validation`,
+   `document_persistence`, `cache_preparation`, and `commit`; return a new
+   `IngestStoragePhaseLatencies { vector_validation_ms, document_persistence_ms,
+   cache_preparation_ms, commit_ms }` in place of `()`. Additive only — no
+   reordering, no log changes.
+3. `http.rs` `execute_ingest`: consume the returned struct at the `ingest_document`
+   call (`http.rs:805`); assemble `OperationBenchmarks` with the 5 stages above
+   (`storage_publishing` carrying the 4 children via `leaf_benchmark_stage`),
+   `totalMs = latency_ms`. Set it on `IngestResponse`. Leave `raw` and all logs
+   unchanged. No `duplicate_check` binding (dropped).
+4. `INSTALL.md`: rewrite the ingest `Benchmarks:` section — server-authoritative,
+   the new 5-stage tree, drop "client-side" and "sum of those rows," and add the
+   server-total-with-honest-remainder wording (mirrors the search section).
 
-Verify: `cargo check` (+ `--features metal`); run an ingest and confirm
-authoritative rows and `Total` via the client (already rendering from Phase 2).
+Verify: `cargo fmt`, `cargo check`, `cargo check --features metal`; then the
+operator runs `data-store --ingest <file>` and confirms the rendered tree
+(nested `storage_publishing` substages) and the server `Total`.
 
-Risk notes: low. Mirrors Phase 1; the values are already measured.
+Risk notes: low–moderate. The `storage.rs` signature change is the only
+non-mechanical part and is compiler-guided (one caller, `http.rs:805`). Keep the
+change additive: do not reorder or remove any existing persist/commit/publish
+logging.
 
 Notes:
 - (record findings / commit refs here)
@@ -227,7 +307,9 @@ Notes:
 
 ## Summary
 
-- Total estimated effort: ~30–43K tokens across 4 phases (each < 15K).
+- Total estimated effort: ~37–52K tokens across 4 phases. Phase 3 expanded to
+  ~15–20K to add server-authoritative nested storage substages; the others
+  remain < 15K.
 - Confidence per phase: > 90%.
 - The end-to-end risk drivers (cross-phase runtime breakage; retrieval substage
   sourcing) were verified away before phasing, which is what keeps each phase

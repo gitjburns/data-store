@@ -212,10 +212,13 @@ data-store> exit
 ```
 
 `search` prints excerpts. `search-full` prints the full matched unit content.
-Both search commands print a client-side `Benchmarks:` summary after the
-rendered search results, including `http_to_first_status`,
-`search_preparation`, streamed search stages, and the measured HTTP operation
-total. `ingest` prints a client-side `Benchmarks:` summary after the ingest
+Both search commands print a server-authoritative `Benchmarks:` summary after
+the rendered search results, computed by the server and rendered by the client
+with no client-side timing. It includes `search_preparation`, the streamed
+search stages with the nested `retrieving_candidates` substages, and a
+server-reported `Total` (the whole-operation duration). Rows may not sum exactly
+to `Total`; the small unattributed remainder is shown rather than hidden.
+`ingest` prints a client-side `Benchmarks:` summary after the ingest
 result for `docling_converting`, `unit_splitting`, `dense_embedding`,
 `colbert_embedding`, and `storage_publishing`; its total is the sum of those
 rows. Quote multi-word queries and any argument containing spaces. Long

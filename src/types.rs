@@ -82,7 +82,32 @@ pub struct SearchResponse {
     #[serde(rename = "latencyMs")]
     pub latency_ms: u64,
 
+    pub benchmarks: OperationBenchmarks,
+
     pub raw: serde_json::Value,
+}
+
+/// Server-authoritative per-stage timing for one operation. The client renders
+/// this directly and measures nothing; it is additive to the lossless `raw`
+/// payload, never a replacement for it.
+#[derive(Debug, Serialize)]
+pub struct OperationBenchmarks {
+    pub stages: Vec<BenchmarkStage>,
+
+    #[serde(rename = "totalMs")]
+    pub total_ms: u64,
+}
+
+/// One measured stage in an operation benchmark tree. `children` is empty for
+/// leaf stages and is always serialized so consumers see an explicit shape.
+#[derive(Debug, Serialize)]
+pub struct BenchmarkStage {
+    pub stage: String,
+
+    #[serde(rename = "elapsedMs")]
+    pub elapsed_ms: u64,
+
+    pub children: Vec<BenchmarkStage>,
 }
 
 #[derive(Debug, Serialize)]
