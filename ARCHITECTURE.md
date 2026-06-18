@@ -244,6 +244,29 @@ Dense tie-breaking is deterministic by `unitId` ascending. Public result scores
 are final reranker scores, while dense, BM25, RRF, and ColBERT scores remain
 visible in `raw`.
 
+## Operation Benchmarks
+
+Search and ingest results carry a server-authoritative `benchmarks` object
+(`OperationBenchmarks`) alongside the lossless `raw` payload. The server measures
+every stage; the CLI client renders the tree and measures nothing.
+
+`benchmarks.stages` is an ordered tree of `BenchmarkStage { stage, elapsedMs,
+children }`, where `children` is empty for leaf stages and populated only where a
+stage has measured substages. `benchmarks.totalMs` is the whole-operation
+duration (`latencyMs`); stage rows may not sum exactly to `totalMs`, and the
+unattributed remainder is reported rather than hidden.
+
+Search stages are `search_preparation`, `embedding_query`,
+`retrieving_candidates` (children `query_vector_validation`, `dense`, `bm25`,
+`rrf_fusion`, `candidate_materialization`, `raw_diagnostics`), `colbert_scoring`,
+`reranking`, and `result_assembling`. Ingest stages are `docling_converting`,
+`unit_splitting`, `dense_embedding`, `colbert_embedding`, and `storage_publishing`
+(children `vector_validation`, `document_persistence`, `cache_preparation`,
+`commit`).
+
+`benchmarks` is additive: it never replaces `raw` stage diagnostics or the
+durable per-stage timings already written to the service log.
+
 ## Admission And Backpressure
 
 Ingest and search have separate config-backed maximum in-flight counts.
@@ -335,7 +358,9 @@ current token file immediately before sending the request in either mode and use
 the same bearer-token header required by curl clients. Client output is
 human-readable: it renders streamed status/progress events in place for the
 active stage, prints a newline when each stage completes, and then prints
-terminal results/errors. The `shutdown` command sends the protected operation
+terminal results/errors. Per-stage operation benchmarks in the terminal result
+are server-authoritative; the client renders the `benchmarks` tree and measures
+nothing. The `shutdown` command sends the protected operation
 directly and displays only the server-authored `shutdown_complete` terminal
 result as confirmation. Raw protocol payloads remain available through the HTTP
 API itself.
@@ -346,6 +371,9 @@ API itself.
 - Search must use one captured active-version snapshot for the full request.
 - Raw retrieval diagnostics must preserve per-stage provenance rather than
   replacing it with summaries.
+- Per-stage `benchmarks` are server-authoritative and additive. The server
+  computes them; the CLI client renders them and must not substitute client-side
+  timing. They never replace `raw` diagnostics or durable stage logs.
 - The configured reranker backend is exclusive. An unreachable HTTP reranker
   backend fails readiness or search explicitly; it must not trigger a local
   reranker fallback.

@@ -163,6 +163,44 @@ Consumers should display `kind`, `status`, and `message`. Consumers must not
 depend on exact message text unless this protocol explicitly documents that text
 as stable.
 
+## Operation Benchmarks
+
+`search` and `ingest` result payloads include an additive `benchmarks` object of
+server-authoritative per-stage timings. It supplements the lossless `raw`
+payload and never replaces it. The server measures every stage; consumers render
+`benchmarks` and must not substitute client-side timing.
+
+```json
+{
+  "stages": [
+    {
+      "stage": "stage_name",
+      "elapsedMs": 123,
+      "children": []
+    }
+  ],
+  "totalMs": 13885
+}
+```
+
+`benchmarks` fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `stages` | array | Ordered `BenchmarkStage` entries for the operation. |
+| `totalMs` | integer | Whole-operation duration. Stage rows may not sum exactly to `totalMs`; the unattributed remainder is reported honestly rather than hidden. |
+
+`BenchmarkStage` fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `stage` | string | Stable stage name. |
+| `elapsedMs` | integer | Server-measured duration for the stage. |
+| `children` | array | Nested `BenchmarkStage` entries. Empty for leaf stages and always present. |
+
+Stage names are stable operational signals. Each operation's result section
+lists that operation's stage tree.
+
 ## HTTP Status Codes
 
 Transport-level HTTP success means the operation stream was accepted and opened.
@@ -368,6 +406,22 @@ Result payload:
 }
 ```
 
+The result payload also includes the additive `benchmarks` object documented in
+the Operation Benchmarks section. Its ingest stage tree is:
+
+- `docling_converting`
+- `unit_splitting`
+- `dense_embedding`
+- `colbert_embedding`
+- `storage_publishing`
+  - `vector_validation`
+  - `document_persistence`
+  - `cache_preparation`
+  - `commit`
+
+`totalMs` is the whole ingest operation duration; the rows above may not sum to
+it, and the remainder is reported rather than hidden.
+
 Ingest semantics:
 
 - Every successful ingest creates a new immutable source-document version.
@@ -466,6 +520,25 @@ Result payload:
   }
 }
 ```
+
+The result payload also includes the additive `benchmarks` object documented in
+the Operation Benchmarks section. Its search stage tree is:
+
+- `search_preparation`
+- `embedding_query`
+- `retrieving_candidates`
+  - `query_vector_validation`
+  - `dense`
+  - `bm25`
+  - `rrf_fusion`
+  - `candidate_materialization`
+  - `raw_diagnostics`
+- `colbert_scoring`
+- `reranking`
+- `result_assembling`
+
+`totalMs` equals `latencyMs` (the whole search operation duration); the rows
+above may not sum to it, and the remainder is reported rather than hidden.
 
 Search semantics:
 
