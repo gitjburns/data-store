@@ -1,4 +1,7 @@
 target/
+models/
+sources
+index/
 config.toml
 .data-store-admin-token
 .data-store.history
