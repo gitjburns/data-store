@@ -123,10 +123,10 @@ Events are `status`, `progress`, `result`, and `error`; `result` and `error`
 are terminal.
 
 Supported operations are `health`, `limits`, `ingest`, `search`, `versions`,
-`rollback`, and `shutdown`. `versions`, `rollback`, and `shutdown` require the
-startup-scoped bearer token. The route-specific `/v1/...` and `/admin/...`
-endpoints remain available during migration as compatibility routes, but the
-operation stream is the documented consumer contract.
+`rollback`, `sources`, and `shutdown`. `versions`, `rollback`, and `shutdown`
+require the startup-scoped bearer token. The route-specific `/v1/...` and
+`/admin/...` endpoints remain available during migration as compatibility routes,
+but the operation stream is the documented consumer contract.
 
 ## Storage Model
 

@@ -418,6 +418,7 @@ The CLI `shutdown` command sends the same protected operation and requires the
 cargo fmt
 cargo check
 cargo check --features metal
+cargo clippy
 ```
 
 ## Common Operator Diagnostics
