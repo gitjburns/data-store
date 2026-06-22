@@ -1504,13 +1504,17 @@ impl OperationName {
 
 struct OperationFailure {
     stage: &'static str,
-    error: ApiError,
+    // Keep the operation Result error small without changing the concrete API error contract.
+    error: Box<ApiError>,
 }
 
 impl OperationFailure {
     /// Attach a protocol stage to an operation failure for terminal error events.
     fn new(stage: &'static str, error: ApiError) -> Self {
-        Self { stage, error }
+        Self {
+            stage,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -2425,7 +2429,7 @@ fn run_operation_stream(
             elapsed_ms = emitter.started.elapsed().as_millis() as u64,
             "operation stream failed"
         );
-        let _ = emitter.error(failure.stage, failure.error);
+        let _ = emitter.error(failure.stage, *failure.error);
         info!(
             event = "operation.task_finished",
             operation = operation.as_str(),

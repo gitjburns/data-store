@@ -99,12 +99,12 @@ impl InferenceRuntime {
                             message: "local reranker backend has no validated artifacts"
                                 .to_string(),
                         })?;
-                RerankerBackend::Local(RerankerRuntime::load_with_progress(
+                RerankerBackend::Local(Box::new(RerankerRuntime::load_with_progress(
                     reranker_artifacts,
                     &config.models.reranker,
                     &device.candle,
                     progress,
-                )?)
+                )?))
             }
             RerankerBackendKind::Http => {
                 RerankerBackend::load_http_with_progress(&config.models.reranker, progress)?

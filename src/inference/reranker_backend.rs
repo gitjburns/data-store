@@ -25,10 +25,11 @@ const HTTP_FAILURE_EXCERPT_CHARS: usize = 2048;
 
 /// Config-selected reranker backend. Exactly one backend is active per service
 /// instance and there is no fallback between variants. Enum dispatch (not trait
-/// objects) keeps the generic progress-closure scoring signature intact.
+/// objects) keeps the generic progress-closure scoring signature intact, and
+/// boxing only the larger local runtime keeps this selector cheap to move.
 #[derive(Debug, Clone)]
 pub enum RerankerBackend {
-    Local(RerankerRuntime),
+    Local(Box<RerankerRuntime>),
     Http(HttpRerankerClient),
 }
 

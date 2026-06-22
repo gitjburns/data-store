@@ -39,10 +39,25 @@ verified with:
 - `cargo check`
 - `cargo clippy`
 
-The remaining warnings are:
+Pass 3.1 is complete. The `OperationFailure` error-size warnings were addressed
+and verified with:
 
-- `result_large_err` in `src/http.rs`
-- `large_enum_variant` in `src/inference/reranker_backend.rs`
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy`
+
+Pass 3.2 is complete. The `RerankerBackend` enum-size warning was addressed and
+verified with:
+
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy`
+
+The Clippy warning cleanup is complete. Final verification passed with:
+
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy`
 
 Some warnings appear more than once because shared modules are compiled through
 multiple binaries. Fix the source warning once rather than chasing duplicate
@@ -278,6 +293,8 @@ shape.
 
 ### 3.1 OperationFailure Error Size
 
+Status: complete.
+
 Warnings:
 
 - `src/http.rs`: `execute_operation`
@@ -336,6 +353,8 @@ Verification focus:
 
 ### 3.2 RerankerBackend Enum Size
 
+Status: complete.
+
 Warning:
 
 - `src/inference/reranker_backend.rs`: `RerankerBackend`
@@ -389,13 +408,15 @@ Verification focus:
 
 ## Suggested Implementation Order
 
-1. Re-run `cargo clippy` and confirm the warning set.
-2. Pause for review before Pass 3 if the user has not already approved the
-   ownership/layout changes.
-3. Implement Pass 3.1 for `OperationFailure`.
-4. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-5. Implement Pass 3.2 for `RerankerBackend`.
-6. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
+Completed:
+
+1. Re-ran `cargo clippy` and confirmed the warning set.
+2. Paused for review and received approval before Pass 3 ownership/layout
+   changes.
+3. Implemented Pass 3.1 for `OperationFailure`.
+4. Ran `cargo fmt`, `cargo check`, and `cargo clippy`.
+5. Implemented Pass 3.2 for `RerankerBackend`.
+6. Ran `cargo fmt`, `cargo check`, and `cargo clippy`.
 
 ## Completion Criteria
 
