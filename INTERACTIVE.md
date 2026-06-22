@@ -20,7 +20,7 @@ We're working on the newly developed Rust-based data store service in service/da
 Only touch files in this directory unless the user explicitly asks otherwise.
 The user will give you instructions on what specifically we're working on after you finish onboarding.
 
-Please read the following files in order:
+Please read the following files one at a time, in the given order:
 
 README.md
 INSTALL.md

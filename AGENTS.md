@@ -11,118 +11,6 @@ When instructions conflict, follow this order:
    `DIAGNOSTICS-ONBOARDING.md`.
 4. Existing local code patterns, only when they do not conflict with the above.
 
-## Scope And Design Approval
-
-Exact scope wins by default. Do only what the user explicitly requested or
-approved.
-
-Implementation details inside the approved design may be handled independently.
-Design and architecture decisions must be proposed first and approved by the user
-before implementation.
-
-This user has extensive technology and software development experience, strong
-opinions about software design and architecture, and high standards. Do not make
-design choices on the user's behalf. Do not treat common framework patterns,
-"best practices", or model preference as approval to override the user's design
-judgment.
-
-Ask before any file write except the verification writes explicitly allowed by
-`Verification Behavior` after approved Rust source edits. This includes
-creating, modifying, deleting, moving, or generating code, config,
-documentation, plans, notes, scratch files, or artifacts. Before writing, state
-the target path and intended change, then wait for explicit approval.
-
-Any change to any configuration file requires explicit approval with no
-exceptions. Do not treat approval for related code, schemas, prompts, docs,
-tests, type fixes, mechanical consistency, or implementation follow-through as
-approval to edit config. State the exact config path and intended config change,
-then wait for explicit approval before modifying it.
-
-Also ask before:
-
-- Changing architecture, ownership boundaries, data flow, persistence, or API
-  contracts.
-- Introducing a new abstraction, dependency, framework pattern, fallback path, or
-  state-management mechanism.
-- Refactoring beyond the approved change.
-- Adding behavior, UI, logging, tests, or documentation not explicitly requested.
-- Choosing between viable design alternatives where tradeoffs exist.
-
-Allowed without separate approval:
-
-- Low-level implementation details required by an approved design.
-- Rust compiler fixes caused by the approved change, if they do not change
-  behavior beyond the approved intent.
-- Local mechanical edits needed to keep the approved change coherent.
-
-Approval to implement a specific plan includes the file writes needed for that
-approved scope, except configuration changes and any newly discovered design,
-scope, behavior, or side-effect decisions. Those still require explicit
-approval.
-
-Approval is not permission to guess. If scope, behavior, side effects, or user
-intent is ambiguous, stop and ask before acting. Approval covers only explicitly
-described behavior, not unstated assumptions or newly discovered implications.
-
-When in doubt, stop and ask one focused question.
-
-## Collaboration With This User
-
-The user is new to Rust. When a detail involves Rust-specific issues, explain it
-so the user can be informed and assist.
-
-Questions are requests for answers, never requests for action.
-
-Questions containing action language such as "can we", "should we", or "what if
-we" are not implicit approval. Respond with a proposal and ask before making
-changes.
-
-When proposing changes, explain:
-
-- What the change does.
-- How it works within the codebase.
-- Why you chose this approach.
-
-Effort estimates and confidence percentages are planning-session review
-metadata. Show them to the user before approval when required, but do not write
-them into repository plan files, specs, documentation, or implementation
-artifacts unless the user explicitly asks.
-
-After 2-3 failed attempts, stop and discuss rather than continuing to iterate.
-
-When genuinely uncertain, involve the user rather than guessing.
-
-When you discover something that changes your understanding of what needs to be
-done, pause and share that discovery before acting on it.
-
-If the user is right, say so. If they are wrong, say so.
-
-Do not ask whether the user restarted the server when they report that changes
-did not take effect. Assume the user already knows when restart is needed and
-investigate the root cause.
-
-## Asking Questions
-
-Ask exactly one focused question at a time.
-
-Do not ask multiple questions in one turn. Do not ask a list of questions and
-then ask which to tackle first. Do not bundle unrelated decisions together. The
-user should always know exactly what answer is needed next.
-
-Every question must include enough context for a high-quality answer:
-
-- Why the question matters.
-- What code, behavior, or design decision it affects.
-- The viable options.
-- The pros and cons of each option.
-- Your recommendation and why you recommend it.
-
-For questions about variables, functions, types, or calls, explain what they do
-and where they are used.
-
-Ask questions in the logical order needed to move the work forward. If one answer
-could change the next question, ask only the first question and wait.
-
 ## Verification Behavior
 
 Follow `PRINCIPLES.md` for repository verification policy. This section defines
@@ -237,47 +125,6 @@ Shared types/constants must be defined once and imported everywhere. If adding a
 new case requires edits in multiple files, look for a single-source-of-truth
 refactor.
 
-## Patch Hygiene
-
-When editing files:
-
-- Before every edit, read the exact current file region you intend to edit with
-  line numbers.
-- When editing a named section, first locate the heading with
-  `rg -n '^#+ .*Section Name' <file>` or an equivalent exact heading search,
-  then read the contiguous region around that located line. Do not guess line
-  ranges from memory or nearby context.
-- When reading multiple non-contiguous regions, prefer separate focused reads
-  over compound `sed` ranges. If output skips line numbers or appears truncated,
-  re-read each target region as one contiguous range before editing.
-- If a previous edit in this turn touched the same file, re-read the target
-  region before the next edit.
-- After an interrupted or aborted turn, inspect the current edited regions or
-  relevant diff before continuing. Treat partially applied edits as untrusted
-  until re-read, and remove or revise any stale partial design before adding new
-  changes.
-- Prefer one conceptual edit per patch. Do not combine distant or unrelated
-  edits unless each one is trivial and independently anchored.
-- Prefer small, targeted edits over large verbatim block replacements.
-- Anchor each edit on the smallest stable context that uniquely identifies it.
-- Do not reconstruct long existing code blocks from memory.
-- For large functions, edit imports, helper additions, and small internal edits
-  separately.
-- After a successful edit, re-read the changed region before making another
-  edit in the same file.
-- After re-reading each edited region, perform a comment sufficiency check before
-  moving on. If the edited code contains a non-obvious invariant, ownership
-  boundary, lifecycle rule, accounting rule, ordering rule, error-handling
-  policy, external-system contract, or intentionally preserved edge case, add or
-  update a nearby comment in the same edit sequence. Do not wait for the user to
-  ask for comments.
-- If an edit fails to match, stop and re-read the relevant file region before
-  retrying. Do not retry from memory.
-- Do not combine unrelated files in one edit unless the changes are trivial.
-- When running shell searches that include Markdown backticks, `$`, `*`,
-  brackets, parentheses, or other shell-active characters, wrap the search
-  pattern in single quotes.
-
 ## Implementation Rules
 
 - **Function signature changes**: When changing parameters, use
@@ -364,7 +211,9 @@ config, or protocol error with a generic message.
 
 ## Diagnostic Hygiene
 
-- Follow `DIAGNOSTICS.md` for diagnostics policy and implementation standards.
+- Follow `DIAGNOSTICS-ONBOARDING.md` for day-to-day diagnostics policy and
+  implementation standards; use `DIAGNOSTICS.md` for focused diagnostics audits
+  and evaluation sessions.
 - Before relying on diagnostics for a feature, identify the authoritative log or
   audit path from the applicable configuration, documentation, or
   implementation. If no authoritative path is documented or discoverable, treat
@@ -408,3 +257,41 @@ Do not perform these actions unless the user explicitly instructs you:
 
 Do not use git unless the user explicitly requests a git operation. If git is
 explicitly requested, run it from the project root only and never commit secrets.
+
+## Relocating or duplicating existing lines → use `span`, don't re-emit
+
+When you are **moving or duplicating a block of existing lines** — especially a
+large block, or one crossing files — do **not** re-emit the lines through the
+string-replace editor (`Edit`/`Write`/`MultiEdit`); use `span` instead.
+
+Address **each** endpoint — `from`, `to`, and the destination — by a
+**distinctive `--*-guard` substring** of its line (a long, unique substring, not a
+short fragment); you don't supply line numbers. A guard must match exactly one line
+or `span` fails loud, so for a **low-entropy line** (a bare `}`, a repeated flag)
+add a `--*-context <offset:substr>` neighbor (split on the first `:`; `offset` is
+signed, negative = a line above). The moved span `[from, to]` is **inclusive**.
+Land it `--before` or `--after` the destination line — to land at the **end** of a
+file, guard its last line and use `--after`; for the **top** of a file (or an
+empty file, which has no line to guard) use `--dest 0 --after`.
+
+**Move** existing lines to a new location (source is removed):
+
+```sh
+span move src.rs \
+  --from-guard 'fn parse' \
+  --to-guard   '}' --to-context '-1:return result' \
+  --dest-guard 'mod tests' --after
+```
+
+**Copy** existing lines to a new location (source is kept); cross-file shown
+here with `--dest-file`:
+
+```sh
+span copy lib.rs \
+  --from-guard 'fn parse_ok' \
+  --to-guard   '}' --to-context '-1:assert!(run' \
+  --dest-guard 'mod tests' --after \
+  --dest-file tests.rs
+```
+
+For authoring new text or replacing content, keep using the normal string editor.
