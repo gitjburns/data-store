@@ -97,7 +97,7 @@ sessions should not need another codebase exploration pass.
 
 - [x] Phase 1: Remove public legacy routes
 - [x] Phase 2: Remove admin legacy routes
-- [ ] Phase 3: Update operator and architecture docs
+- [x] Phase 3: Update operator and architecture docs
 - [ ] Phase 4: Update config comments
 - [ ] Phase 5: Reference sweep and plan status update
 - [ ] Phase 6: Run clippy cleanup and update agent instructions
@@ -273,7 +273,22 @@ Completion criteria:
 
 ## Phase 3: Update Operator and Architecture Docs
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Updated `README.md` to describe `GET /v1/health` as the supported
+  readiness/liveness route and `POST /v1/operations` as the operation endpoint
+  for all other consumer operations, including protected operations with bearer
+  authorization.
+- Updated `INSTALL.md` so startup handoff describes `/v1/health` as a readiness
+  URL rather than a compatibility URL.
+- Updated `ARCHITECTURE.md` to remove route-specific migration/compatibility
+  wording and document the supported `/v1/health` and `/v1/operations` route
+  surface.
+- Verified with the planned `rg` checks that the edited docs no longer contain
+  the stale compatibility wording or removed endpoint references, and that
+  supported `/v1/health` and `/v1/operations` references remain.
 
 Estimated effort: 7k-10k tokens.
 

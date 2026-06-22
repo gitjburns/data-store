@@ -463,9 +463,10 @@ Public operations do not require authentication. Protected operations require
 the startup-scoped bearer token printed as `admin_shutdown_token=<token>` or
 written to the configured admin token file.
 
-Route-specific endpoints such as `/v1/health`, `/v1/limits`, `/v1/sources`,
-`/v1/ingest`, `/v1/search`, and `/admin/...` remain available during migration as
-compatibility routes. New consumers should use `/v1/operations`.
+`GET /v1/health` is a supported readiness and liveness route for operators,
+startup handoff, and the CLI's post-stream-loss probe. All other consumer
+operations use `POST /v1/operations`. Protected operations use the same
+operation endpoint with bearer authorization.
 
 ## Health And Limits
 

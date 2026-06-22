@@ -102,7 +102,7 @@ first-time storage setup with the release binary when needed:
 
 Startup prints bootstrap and readiness details to stdout before the invoking
 parent process exits. It includes the current `admin_shutdown_token=<token>` for
-manual protected operations and a `/v1/health` compatibility URL for readiness
+manual protected operations and a `/v1/health` readiness URL for readiness
 checks.
 
 The default example config uses:
@@ -128,4 +128,3 @@ cargo check
 cargo check --features metal
 cargo clippy
 ```
-

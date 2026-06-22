@@ -78,9 +78,9 @@ are startup configuration errors.
 ## Model Runtime
 
 The service loads local model artifacts and the configured reranker backend at
-startup, then reports readiness through the `health` operation. The retained
-`/v1/health` route reports the same readiness data during migration
-compatibility.
+startup, then reports readiness through the `health` operation. The supported
+`/v1/health` route reports the same readiness data for operators, startup
+handoff, and CLI diagnostics.
 
 | Runtime | Model role | Output |
 |---|---|---|
@@ -124,9 +124,9 @@ are terminal.
 
 Supported operations are `health`, `limits`, `ingest`, `search`, `versions`,
 `rollback`, `sources`, and `shutdown`. `versions`, `rollback`, and `shutdown`
-require the startup-scoped bearer token. The route-specific `/v1/...` and
-`/admin/...` endpoints remain available during migration as compatibility routes,
-but the operation stream is the documented consumer contract.
+require the startup-scoped bearer token. Operations are exposed through
+`POST /v1/operations`, with `GET /v1/health` retained as the supported
+readiness route.
 
 ## Storage Model
 
