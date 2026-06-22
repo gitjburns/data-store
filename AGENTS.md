@@ -53,6 +53,11 @@ If compile, format, or lint checks fail because of the approved change, fix thos
 errors without asking again unless the fix changes behavior beyond the approved
 intent, expands scope, or requires a design decision.
 
+When `cargo clippy` passes but still emits warnings, fix any warning introduced
+by the approved change as part of that change. Report pre-existing warnings with
+a proposed cleanup path and resolve them only with explicit approval. The same
+behavior/scope/design exception above applies.
+
 If verification cannot be run, explain exactly why and what risk remains.
 
 ## Code Rules

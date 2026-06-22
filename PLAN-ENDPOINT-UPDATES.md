@@ -100,7 +100,7 @@ sessions should not need another codebase exploration pass.
 - [x] Phase 3: Update operator and architecture docs
 - [x] Phase 4: Update config comments
 - [x] Phase 5: Reference sweep and plan status update
-- [ ] Phase 6: Run clippy cleanup and update agent instructions
+- [x] Phase 6: Run clippy cleanup and update agent instructions
 
 ## Phase 1: Remove Public Legacy Routes
 
@@ -480,7 +480,17 @@ Completion criteria:
 
 ## Phase 6: Run Clippy Cleanup and Update Agent Instructions
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Clippy cleanup was carried out and verified under the separate
+  `PLAN-CLIPPY-WARNINGS.md`, which is complete with `cargo fmt`, `cargo check`,
+  and `cargo clippy` passing and no lint suppressions added.
+- Updated the `AGENTS.md` `Verification Behavior` section so warnings introduced
+  by an approved change are fixed as part of that change, and pre-existing
+  warnings surfaced by the same `cargo clippy` run are reported with a proposed
+  cleanup path and resolved only with explicit approval.
 
 Estimated effort: 25k-40k tokens.
 
