@@ -133,19 +133,14 @@ refactor.
 ## Implementation Rules
 
 - **Function signature changes**: When changing parameters, use
-  `rg -n "function_name\\(" src static` or an equivalent search and update every
+  `rg -n "function_name\\(" src` or an equivalent search and update every
   caller.
-- **Handler and event changes**: When changing `/api/chat`, streamed NDJSON
-  event fields, or event ordering, check both the Rust emitter and
-  `static/index.html` consumer.
-- **Tool-call changes**: When changing tool definitions, tool result shape, SQL
-  execution, or model-visible content, check the full path from provider response
-  to tool execution to model-fed tool message to browser event.
+- **Operation API and event changes**: When changing `POST /v1/operations`, the
+  streamed NDJSON event fields (`status`, `progress`, `result`, `error`), or
+  event ordering, check both the Rust emitter in `src/http.rs` and the CLI
+  consumer in `src/bin/data-store.rs`.
 - **Config changes**: Any config shape change requires explicit approval,
   updates to `config.example.toml`, and corresponding config parsing behavior.
-- **Prompt changes**: Treat system prompt changes as behavior changes. Check
-  schema generation, curated domain notes, and the model/tool assumptions
-  affected by the prompt.
 - **Async paths**: Follow `PRINCIPLES.md` for async and blocking-work policy.
   Before introducing or expanding async behavior, stop, explain why the change is
   needed under that policy, and get explicit approval before implementing it.
@@ -160,8 +155,8 @@ refactor.
 ## Migration Rule (Hard, No Exceptions)
 
 Never implement DB migrations in live runtime paths. This includes startup,
-config loading, server setup, request handlers, tool execution, schema prompt
-generation, and any code that runs as part of normal app execution.
+config loading, server setup, request handlers, and any code that runs as part
+of normal app execution.
 
 All schema and data migrations must be explicit one-time scripts run deliberately
 by the user/developer.
@@ -179,24 +174,12 @@ explain the intended change before editing.
   material. Never filter, narrow, reconstruct, rename, or omit observability
   fields except for explicit secret redaction. Derived views are additions, not
   replacements.
-- **Protocol round-trip**: OpenAI-compatible messages, assistant tool calls, tool
-  call IDs, and tool result messages must preserve round-trip correctness. Do not
-  narrow or rebuild protocol payloads in a way that loses unknown fields or
-  breaks provider compatibility.
-- **Tool execution**: `query_database` is the only model-facing data tool.
-  Changes to tool definitions, tool arguments, SQL execution, result caps,
-  truncation, or error shape affect correctness and auditability.
 - **SQLite access**: Database access must remain read-only, synchronous, bounded,
   and explicit. Do not add write-capable connections, hidden fallback data
   sources, or async wrappers.
 - **Configuration**: Config is strict and operationally significant. Missing
   files, missing keys, unknown keys, and missing required secrets are fatal
   errors.
-- **System prompt**: The generated schema summary and curated domain instructions
-  affect model correctness. Treat prompt changes as behavior changes.
-- **NDJSON event contract**: Browser-visible events must have explicit types and
-  terminal state. Changes require checking both Rust emission and browser
-  consumption.
 
 ## Debugging And User Feedback
 
@@ -207,8 +190,8 @@ Use targeted operator logs as the primary debugging tool. Add logs when existing
 logs do not explain operation start, boundary transitions, errors, completions,
 or elapsed time. Do not add noisy logging.
 
-User-facing feedback must appear inline in the browser UI or streamed chat
-events. Do not add modals, toasts, alerts, or tooltips unless the user
+User-facing feedback must appear inline in the CLI client output or streamed
+operation events. Do not add modals, toasts, alerts, or tooltips unless the user
 specifically asks for them.
 
 Errors must preserve source context. Do not replace a specific provider, SQL,
@@ -262,41 +245,3 @@ Do not perform these actions unless the user explicitly instructs you:
 
 Do not use git unless the user explicitly requests a git operation. If git is
 explicitly requested, run it from the project root only and never commit secrets.
-
-## Relocating or duplicating existing lines → use `span`, don't re-emit
-
-When you are **moving or duplicating a block of existing lines** — especially a
-large block, or one crossing files — do **not** re-emit the lines through the
-string-replace editor (`Edit`/`Write`/`MultiEdit`); use `span` instead.
-
-Address **each** endpoint — `from`, `to`, and the destination — by a
-**distinctive `--*-guard` substring** of its line (a long, unique substring, not a
-short fragment); you don't supply line numbers. A guard must match exactly one line
-or `span` fails loud, so for a **low-entropy line** (a bare `}`, a repeated flag)
-add a `--*-context <offset:substr>` neighbor (split on the first `:`; `offset` is
-signed, negative = a line above). The moved span `[from, to]` is **inclusive**.
-Land it `--before` or `--after` the destination line — to land at the **end** of a
-file, guard its last line and use `--after`; for the **top** of a file (or an
-empty file, which has no line to guard) use `--dest 0 --after`.
-
-**Move** existing lines to a new location (source is removed):
-
-```sh
-span move src.rs \
-  --from-guard 'fn parse' \
-  --to-guard   '}' --to-context '-1:return result' \
-  --dest-guard 'mod tests' --after
-```
-
-**Copy** existing lines to a new location (source is kept); cross-file shown
-here with `--dest-file`:
-
-```sh
-span copy lib.rs \
-  --from-guard 'fn parse_ok' \
-  --to-guard   '}' --to-context '-1:assert!(run' \
-  --dest-guard 'mod tests' --after \
-  --dest-file tests.rs
-```
-
-For authoring new text or replacing content, keep using the normal string editor.
