@@ -40,6 +40,17 @@ pub struct UnitColbertDocumentVector {
     pub vector: Vec<f32>,
 }
 
+/// Groups the document payload and model metadata that storage publishes atomically for one ingest.
+pub struct IngestDocumentInput<'a> {
+    pub conversion: &'a DoclingConversionResult,
+    pub version_label: &'a str,
+    pub units: &'a [RetrievalUnit],
+    pub vectors: Vec<UnitDenseVector>,
+    pub colbert_vectors: Vec<UnitColbertDocumentVector>,
+    pub dense: &'a DenseModelConfig,
+    pub colbert: &'a ColbertModelConfig,
+}
+
 /// Durable storage substage latencies for one ingest, returned to the operation
 /// layer so it can build the public `storage_publishing` benchmark children.
 /// Additive measurement only: producing these does not change the persist,
@@ -1664,18 +1675,22 @@ impl StorageRuntime {
     /// Persist one immutable document version, active map, and cache publish as one ingest boundary.
     pub fn ingest_document<F>(
         &self,
-        conversion: &DoclingConversionResult,
-        version_label: &str,
-        units: &[RetrievalUnit],
-        vectors: Vec<UnitDenseVector>,
-        colbert_vectors: Vec<UnitColbertDocumentVector>,
-        dense: &DenseModelConfig,
-        colbert: &ColbertModelConfig,
+        input: IngestDocumentInput<'_>,
         mut progress: Option<F>,
     ) -> Result<IngestStoragePhaseLatencies, ApiError>
     where
         F: FnMut(&'static str, u64, u64) -> Result<(), ApiError>,
     {
+        let IngestDocumentInput {
+            conversion,
+            version_label,
+            units,
+            vectors,
+            colbert_vectors,
+            dense,
+            colbert,
+        } = input;
+
         if units.len() != vectors.len() {
             return Err(ApiError::StorageOperation {
                 message: format!(
@@ -1847,17 +1862,15 @@ impl StorageRuntime {
             };
 
         let document_persistence_started = Instant::now();
-        if let Err(source) = insert_document(
-            &tx,
-            conversion,
-            version_label,
-            units.len(),
-            &document_id,
-            &source_sha256,
-            &markdown_sha256,
-            &diagnostics,
-            now_ms,
-        ) {
+        let document_metadata = DocumentMetadataInsert {
+            document_id: &document_id,
+            source_sha256: &source_sha256,
+            markdown_sha256: &markdown_sha256,
+            diagnostics_json: &diagnostics,
+            units_ingested: units.len(),
+            timestamp_ms: now_ms,
+        };
+        if let Err(source) = insert_document(&tx, conversion, version_label, &document_metadata) {
             error!(
                 event = "storage.ingest_document_metadata.failed",
                 source_path,
@@ -4421,35 +4434,41 @@ where
     })
 }
 
+// Carries the computed values for the immutable document-version row, separate
+// from the transaction and conversion context that define the persistence boundary.
+struct DocumentMetadataInsert<'a> {
+    document_id: &'a str,
+    source_sha256: &'a str,
+    markdown_sha256: &'a str,
+    diagnostics_json: &'a str,
+    units_ingested: usize,
+    timestamp_ms: u64,
+}
+
 /// Insert the immutable durable document-version row for one successful ingest.
 fn insert_document(
     tx: &rusqlite::Transaction<'_>,
     conversion: &DoclingConversionResult,
     version_label: &str,
-    units_ingested: usize,
-    document_id: &str,
-    source_sha256: &str,
-    markdown_sha256: &str,
-    diagnostics_json: &str,
-    timestamp_ms: u64,
+    metadata: &DocumentMetadataInsert<'_>,
 ) -> Result<(), ApiError> {
     tx.execute(
         INSERT_DOCUMENT_SQL,
         params![
             conversion.source.relative_path.display().to_string(),
             version_label,
-            document_id,
-            source_sha256,
+            metadata.document_id,
+            metadata.source_sha256,
             conversion.markdown_path.display().to_string(),
-            markdown_sha256,
+            metadata.markdown_sha256,
             &conversion.options.pdf_backend,
             &conversion.options.ocr_mode,
             Some(i64::from(conversion.options.page_batch_size)),
-            units_ingested as i64,
+            metadata.units_ingested as i64,
             DOCUMENT_STATUS_INGESTED,
-            diagnostics_json,
-            timestamp_ms as i64,
-            timestamp_ms as i64,
+            metadata.diagnostics_json,
+            metadata.timestamp_ms as i64,
+            metadata.timestamp_ms as i64,
         ],
     )
     .map_err(|source| storage_operation_error(format!("failed to insert document: {source}")))?;

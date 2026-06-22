@@ -35,8 +35,8 @@ use crate::{
     source::resolve_source_reference,
     state::AppState,
     storage::{
-        SearchCandidate, UnitColbertDocumentVector, UnitDenseVector, allocate_version_label,
-        build_versioned_document_id,
+        IngestDocumentInput, SearchCandidate, UnitColbertDocumentVector, UnitDenseVector,
+        allocate_version_label, build_versioned_document_id,
     },
     types::{
         BenchmarkStage, DocumentVersionRollbackRequest, DocumentVersionRollbackResponse,
@@ -699,13 +699,15 @@ fn execute_ingest(
         "ingest storage publishing started"
     );
     let storage_phase_latencies = match storage.ingest_document(
-        &conversion,
-        &version_label,
-        &units,
-        vectors,
-        colbert_vectors,
-        &state.config.models.dense,
-        &state.config.models.colbert,
+        IngestDocumentInput {
+            conversion: &conversion,
+            version_label: &version_label,
+            units: &units,
+            vectors,
+            colbert_vectors,
+            dense: &state.config.models.dense,
+            colbert: &state.config.models.colbert,
+        },
         emitter.map(|emitter| {
             move |message: &'static str, current: u64, total: u64| {
                 emitter.progress("storage_publishing", message, current, total)

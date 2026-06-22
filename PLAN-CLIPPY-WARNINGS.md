@@ -25,9 +25,15 @@ verified with:
 - `cargo check`
 - `cargo clippy`
 
+Pass 2.2 is complete. The storage ingest-context warnings were addressed and
+verified with:
+
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy`
+
 The remaining warnings are:
 
-- `too_many_arguments` in `src/storage.rs`
 - `too_many_arguments` in `src/units.rs`
 - `result_large_err` in `src/http.rs`
 - `large_enum_variant` in `src/inference/reranker_backend.rs`
@@ -135,6 +141,8 @@ Verification focus:
 - Existing log fields should remain present.
 
 ### 2.2 Storage Ingest Context
+
+Status: complete.
 
 Warnings:
 
@@ -374,16 +382,14 @@ Verification focus:
 ## Suggested Implementation Order
 
 1. Re-run `cargo clippy` and confirm the warning set.
-2. Implement Pass 2.2 for storage contexts.
+2. Implement Pass 2.3 for unit splitting contexts.
 3. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-4. Implement Pass 2.3 for unit splitting contexts.
-5. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-6. Pause for review before Pass 3 if the user has not already approved the
+4. Pause for review before Pass 3 if the user has not already approved the
    ownership/layout changes.
-7. Implement Pass 3.1 for `OperationFailure`.
+5. Implement Pass 3.1 for `OperationFailure`.
+6. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
+7. Implement Pass 3.2 for `RerankerBackend`.
 8. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-9. Implement Pass 3.2 for `RerankerBackend`.
-10. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
 
 ## Completion Criteria
 
