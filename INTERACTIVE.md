@@ -11,17 +11,10 @@ This guide helps new AI assistant instances quickly get the context needed to re
 
 ### Read files
 
-Read the following files in order. These files are essential for understanding the codebase, design decisions, and current state of the project:
-
-AGENTS.md — Agent developer rules and guidelines.
-PRINCIPLES.md — Design principles.
-
-We're working on the newly developed Rust-based data store service in service/data-store/
-Only touch files in this directory unless the user explicitly asks otherwise.
-The user will give you instructions on what specifically we're working on after you finish onboarding.
-
 Please read the following files one at a time, in the given order:
 
+AGENTS.md
+PRINCIPLES.md
 README.md
 INSTALL.md
 ARCHITECTURE.md
