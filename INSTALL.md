@@ -3,8 +3,7 @@
 First-time setup for the standalone Data Store service. This service is
 intentionally independent from the existing Node backend and frontend. It owns
 its own config, corpus, Docling conversion, SQLite storage, dense vector cache,
-and retrieval pipeline, and it currently runs alongside the existing
-Node-backed Data Store.
+and retrieval pipeline.
 
 For what the service does and how to operate it once running, see `README.md`.
 
@@ -56,6 +55,9 @@ Run schema setup deliberately before normal service startup:
 ```bash
 cargo run -- --config config.toml --setup-storage
 ```
+
+Storage setup runs no inference, so it needs no accelerator feature
+(`--features metal`).
 
 Normal runtime never creates tables, runs migrations, or repairs stale schemas.
 If startup health reports a missing database, missing table, or schema-version
