@@ -32,9 +32,15 @@ verified with:
 - `cargo check`
 - `cargo clippy`
 
+Pass 2.3 is complete. The unit splitting-context warnings were addressed and
+verified with:
+
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy`
+
 The remaining warnings are:
 
-- `too_many_arguments` in `src/units.rs`
 - `result_large_err` in `src/http.rs`
 - `large_enum_variant` in `src/inference/reranker_backend.rs`
 
@@ -207,6 +213,8 @@ Verification focus:
 - `cargo check` should confirm all caller updates.
 
 ### 2.3 Unit Splitting Context
+
+Status: complete.
 
 Warnings:
 
@@ -382,14 +390,12 @@ Verification focus:
 ## Suggested Implementation Order
 
 1. Re-run `cargo clippy` and confirm the warning set.
-2. Implement Pass 2.3 for unit splitting contexts.
-3. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-4. Pause for review before Pass 3 if the user has not already approved the
+2. Pause for review before Pass 3 if the user has not already approved the
    ownership/layout changes.
-5. Implement Pass 3.1 for `OperationFailure`.
+3. Implement Pass 3.1 for `OperationFailure`.
+4. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
+5. Implement Pass 3.2 for `RerankerBackend`.
 6. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
-7. Implement Pass 3.2 for `RerankerBackend`.
-8. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
 
 ## Completion Criteria
 

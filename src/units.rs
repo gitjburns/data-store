@@ -31,6 +31,21 @@ struct UnitBuilder {
     token_count: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UnitBuildContext<'a> {
+    document_id: &'a str,
+    source_path: &'a str,
+    min_chars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct UnitDraft {
+    heading_path: Vec<String>,
+    page_numbers: Vec<u32>,
+    content: String,
+    token_count: usize,
+}
+
 /// Split one converted markdown document into deterministic retrieval units.
 ///
 /// Units preserve heading boundaries, honor the ColBERT token cap, and drop content below the searchable-size floor.
@@ -53,26 +68,17 @@ pub fn split_conversion_into_units(
     let mut builder: Option<UnitBuilder> = None;
     let max_tokens = retrieval.max_unit_tokens as usize;
     let min_chars = retrieval.min_search_unit_chars as usize;
+    let unit_context = UnitBuildContext {
+        document_id: &document_id,
+        source_path: &source_path,
+        min_chars,
+    };
 
     for block in blocks {
         let token_count = count_tokens(&tokenizer, &block.content)?;
         if token_count > max_tokens {
-            flush_unit(
-                &mut builder,
-                &mut units,
-                &document_id,
-                &source_path,
-                min_chars,
-            );
-            split_oversized_block(
-                &tokenizer,
-                &block,
-                max_tokens,
-                min_chars,
-                &document_id,
-                &source_path,
-                &mut units,
-            )?;
+            flush_unit(&mut builder, &mut units, &unit_context);
+            split_oversized_block(&tokenizer, &block, max_tokens, &unit_context, &mut units)?;
             continue;
         }
 
@@ -86,19 +92,15 @@ pub fn split_conversion_into_units(
                 builder = Some(current);
             }
             Some(current) => {
-                let current_heading_path = current.heading_path.clone();
-                let current_page_numbers = current.page_numbers.clone();
-                let current_content = current.content;
-                let current_token_count = current.token_count;
                 push_unit(
                     &mut units,
-                    &document_id,
-                    &source_path,
-                    current_heading_path,
-                    current_page_numbers,
-                    current_content,
-                    current_token_count,
-                    min_chars,
+                    &unit_context,
+                    UnitDraft {
+                        heading_path: current.heading_path,
+                        page_numbers: current.page_numbers,
+                        content: current.content,
+                        token_count: current.token_count,
+                    },
                 );
                 builder = Some(UnitBuilder::from_block(block, token_count));
             }
@@ -108,13 +110,7 @@ pub fn split_conversion_into_units(
         }
     }
 
-    flush_unit(
-        &mut builder,
-        &mut units,
-        &document_id,
-        &source_path,
-        min_chars,
-    );
+    flush_unit(&mut builder, &mut units, &unit_context);
     Ok(units)
 }
 
@@ -299,25 +295,21 @@ fn split_oversized_block(
     tokenizer: &Tokenizer,
     block: &MarkdownBlock,
     max_tokens: usize,
-    min_chars: usize,
-    document_id: &str,
-    source_path: &str,
+    context: &UnitBuildContext<'_>,
     units: &mut Vec<RetrievalUnit>,
 ) -> Result<(), ApiError> {
     let mut builder: Option<UnitBuilder> = None;
     for sentence in split_sentences(&block.content) {
         let token_count = count_tokens(tokenizer, sentence)?;
         if token_count > max_tokens {
-            flush_unit(&mut builder, units, document_id, source_path, min_chars);
+            flush_unit(&mut builder, units, context);
             split_long_text_by_words(
                 tokenizer,
                 sentence,
                 &block.heading_path,
                 &block.page_numbers,
                 max_tokens,
-                min_chars,
-                document_id,
-                source_path,
+                context,
                 units,
             )?;
             continue;
@@ -343,13 +335,13 @@ fn split_oversized_block(
             Some(current) => {
                 push_unit(
                     units,
-                    document_id,
-                    source_path,
-                    current.heading_path,
-                    current.page_numbers,
-                    current.content,
-                    current.token_count,
-                    min_chars,
+                    context,
+                    UnitDraft {
+                        heading_path: current.heading_path,
+                        page_numbers: current.page_numbers,
+                        content: current.content,
+                        token_count: current.token_count,
+                    },
                 );
                 builder = Some(UnitBuilder::from_block(sentence_block, token_count));
             }
@@ -359,7 +351,7 @@ fn split_oversized_block(
         }
     }
 
-    flush_unit(&mut builder, units, document_id, source_path, min_chars);
+    flush_unit(&mut builder, units, context);
     Ok(())
 }
 
@@ -385,9 +377,7 @@ fn split_long_text_by_words(
     heading_path: &[String],
     page_numbers: &[u32],
     max_tokens: usize,
-    min_chars: usize,
-    document_id: &str,
-    source_path: &str,
+    context: &UnitBuildContext<'_>,
     units: &mut Vec<RetrievalUnit>,
 ) -> Result<(), ApiError> {
     let mut current_words = Vec::new();
@@ -400,13 +390,13 @@ fn split_long_text_by_words(
             let token_count = count_tokens(tokenizer, &content)?;
             push_unit(
                 units,
-                document_id,
-                source_path,
-                heading_path.to_vec(),
-                page_numbers.to_vec(),
-                content,
-                token_count,
-                min_chars,
+                context,
+                UnitDraft {
+                    heading_path: heading_path.to_vec(),
+                    page_numbers: page_numbers.to_vec(),
+                    content,
+                    token_count,
+                },
             );
             current_words.clear();
         }
@@ -419,13 +409,13 @@ fn split_long_text_by_words(
         let token_count = count_tokens(tokenizer, &content)?;
         push_unit(
             units,
-            document_id,
-            source_path,
-            heading_path.to_vec(),
-            page_numbers.to_vec(),
-            content,
-            token_count,
-            min_chars,
+            context,
+            UnitDraft {
+                heading_path: heading_path.to_vec(),
+                page_numbers: page_numbers.to_vec(),
+                content,
+                token_count,
+            },
         );
     }
 
@@ -445,53 +435,43 @@ fn build_word_candidate(current_words: &[String], word: &str) -> String {
 fn flush_unit(
     builder: &mut Option<UnitBuilder>,
     units: &mut Vec<RetrievalUnit>,
-    document_id: &str,
-    source_path: &str,
-    min_chars: usize,
+    context: &UnitBuildContext<'_>,
 ) {
     if let Some(current) = builder.take() {
         push_unit(
             units,
-            document_id,
-            source_path,
-            current.heading_path,
-            current.page_numbers,
-            current.content,
-            current.token_count,
-            min_chars,
+            context,
+            UnitDraft {
+                heading_path: current.heading_path,
+                page_numbers: current.page_numbers,
+                content: current.content,
+                token_count: current.token_count,
+            },
         );
     }
 }
 
 /// Add one retrieval unit when it has enough searchable content.
-fn push_unit(
-    units: &mut Vec<RetrievalUnit>,
-    document_id: &str,
-    source_path: &str,
-    heading_path: Vec<String>,
-    page_numbers: Vec<u32>,
-    content: String,
-    token_count: usize,
-    min_chars: usize,
-) {
-    let normalized_content = normalize_unit_content(&content);
-    if normalized_content.chars().count() < min_chars {
+fn push_unit(units: &mut Vec<RetrievalUnit>, context: &UnitBuildContext<'_>, draft: UnitDraft) {
+    let normalized_content = normalize_unit_content(&draft.content);
+    if normalized_content.chars().count() < context.min_chars {
         return;
     }
 
     let sequence = units.len() as u32;
     units.push(RetrievalUnit {
-        unit_id: format!("{document_id}:unit:{sequence:06}"),
-        document_id: document_id.to_string(),
+        unit_id: format!("{}:unit:{sequence:06}", context.document_id),
+        document_id: context.document_id.to_string(),
         sequence,
-        source_path: source_path.to_string(),
-        heading_path: heading_path
+        source_path: context.source_path.to_string(),
+        heading_path: draft
+            .heading_path
             .into_iter()
             .filter(|value| !value.trim().is_empty())
             .collect(),
-        page_numbers: unique_page_numbers(page_numbers),
+        page_numbers: unique_page_numbers(draft.page_numbers),
         content: normalized_content,
-        token_count,
+        token_count: draft.token_count,
     });
 }
 
