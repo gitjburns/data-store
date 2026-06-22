@@ -71,7 +71,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(get_health))
         .route("/v1/operations", post(post_operation))
         .route(
-            "/v1/operations/{operation_id}/control",
+            "/v1/operations/{operationId}/control",
             post(post_operation_control),
         )
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
@@ -2334,12 +2334,12 @@ async fn post_operation_control(
     Path(operation_id): Path<String>,
     payload: Result<Json<OperationControlRequest>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let started = log_route_started("/v1/operations/{operation_id}/control", "request_decoding");
+    let started = log_route_started("/v1/operations/{operationId}/control", "request_decoding");
     let Json(request) = match payload.map_err(json_rejection_to_api_error) {
         Ok(request) => request,
         Err(error) => {
             log_route_failed(
-                "/v1/operations/{operation_id}/control",
+                "/v1/operations/{operationId}/control",
                 "request_decoding",
                 &error,
                 &started,
@@ -2349,7 +2349,7 @@ async fn post_operation_control(
     };
     info!(
         event = "operation.control.request_decoded",
-        route = "/v1/operations/{operation_id}/control",
+        route = "/v1/operations/{operationId}/control",
         operation_id = %operation_id,
         stage = "request_decoded",
         control_type = %request.control_type,
@@ -2361,7 +2361,7 @@ async fn post_operation_control(
             message: "operation control type must be non-empty".to_string(),
         };
         log_route_failed(
-            "/v1/operations/{operation_id}/control",
+            "/v1/operations/{operationId}/control",
             "control_validating",
             &error,
             &started,
@@ -2377,7 +2377,7 @@ async fn post_operation_control(
     };
     warn!(
         event = "operation.control.rejected",
-        route = "/v1/operations/{operation_id}/control",
+        route = "/v1/operations/{operationId}/control",
         operation_id = %operation_id,
         stage = "control_reserved",
         control_type = %request.control_type,

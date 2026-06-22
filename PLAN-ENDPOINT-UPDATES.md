@@ -10,7 +10,7 @@ Keep:
 
 - `GET /v1/health`
 - `POST /v1/operations`
-- `POST /v1/operations/{operation_id}/control`
+- `POST /v1/operations/{operationId}/control`
 
 Remove:
 
@@ -99,7 +99,7 @@ sessions should not need another codebase exploration pass.
 - [x] Phase 2: Remove admin legacy routes
 - [x] Phase 3: Update operator and architecture docs
 - [x] Phase 4: Update config comments
-- [ ] Phase 5: Reference sweep and plan status update
+- [x] Phase 5: Reference sweep and plan status update
 - [ ] Phase 6: Run clippy cleanup and update agent instructions
 
 ## Phase 1: Remove Public Legacy Routes
@@ -422,7 +422,24 @@ Completion criteria:
 
 ## Phase 5: Reference Sweep and Plan Status Update
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Ran the planned reference sweeps across live code, operator docs,
+  architecture docs, protocol specs, and config files.
+- Confirmed no removed public endpoint strings remain for `/v1/limits`,
+  `/v1/sources`, `/v1/ingest`, or `/v1/search`.
+- Confirmed no removed admin endpoint strings remain for `/admin/shutdown` or
+  `/admin/document-versions`.
+- Confirmed stale compatibility wording is gone from the planned docs and kept
+  route references still describe `/v1/health` and `/v1/operations`.
+- Resolved the discovered operation-control path-template naming inconsistency
+  by standardizing public references and the Rust route string on
+  `/v1/operations/{operationId}/control`.
+- Verified the Rust route-template edit with `cargo fmt`, `cargo check`,
+  `cargo check --features metal`, and `cargo clippy`. Clippy completed with
+  pre-existing warnings that remain Phase 6 cleanup scope.
 
 Estimated effort: 3k-5k tokens.
 
