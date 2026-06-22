@@ -84,6 +84,26 @@ struct DoclingProgressSnapshot {
     completed_reported_for: Option<Duration>,
 }
 
+// Keep stable Docling process facts together so wait-time logs and feedback use
+// the same lifecycle identity without changing operation handles.
+struct DoclingProcessContext<'a> {
+    config: &'a DoclingConfig,
+    output_dir: &'a Path,
+    source: &'a ResolvedSource,
+    process_id: u32,
+    started: Instant,
+}
+
+// Reader threads need owned copies of diagnostic identity because their closures
+// outlive the stack frame that spawned the Docling process.
+struct DoclingChildOutputContext {
+    label: &'static str,
+    process_id: u32,
+    source_requested: String,
+    relative_source: String,
+    output_dir: String,
+}
+
 /// Convert one resolved PDF source to markdown using only service-configured Docling options.
 ///
 /// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
@@ -345,39 +365,40 @@ fn run_docling(
     let relative_source = source.relative_path.display().to_string();
     let output_dir_for_log = output_dir.display().to_string();
     let progress_state = Arc::new(Mutex::new(DoclingProgressState::default()));
+    let stdout_context = DoclingChildOutputContext {
+        label: "stdout",
+        process_id,
+        source_requested: source_requested.clone(),
+        relative_source: relative_source.clone(),
+        output_dir: output_dir_for_log.clone(),
+    };
     info!(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
-        pipe = "stdout",
-        process_id,
-        source_requested = %source_requested,
-        relative_source = %relative_source,
-        output_dir = %output_dir_for_log,
+        pipe = stdout_context.label,
+        process_id = stdout_context.process_id,
+        source_requested = %stdout_context.source_requested,
+        relative_source = %stdout_context.relative_source,
+        output_dir = %stdout_context.output_dir,
         "Docling child output reader thread spawned"
     );
-    let stdout_source_requested = source_requested.clone();
-    let stdout_relative_source = relative_source.clone();
-    let stdout_output_dir = output_dir_for_log.clone();
-    let stdout_reader = thread::spawn(move || {
-        read_child_output(
-            stdout,
-            "stdout",
-            process_id,
-            stdout_source_requested,
-            stdout_relative_source,
-            stdout_output_dir,
-            None,
-            None,
-        )
-    });
+    let stdout_reader =
+        thread::spawn(move || read_child_output(stdout, stdout_context, None, None));
+    let stderr_context = DoclingChildOutputContext {
+        label: "stderr",
+        process_id,
+        source_requested,
+        relative_source,
+        output_dir: output_dir_for_log,
+    };
     info!(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
-        pipe = "stderr",
-        process_id,
-        source_requested = %source_requested,
-        relative_source = %relative_source,
-        output_dir = %output_dir_for_log,
+        pipe = stderr_context.label,
+        process_id = stderr_context.process_id,
+        source_requested = %stderr_context.source_requested,
+        relative_source = %stderr_context.relative_source,
+        output_dir = %stderr_context.output_dir,
         "Docling child output reader thread spawned"
     );
     let stderr_progress_sender = progress_sender.clone();
@@ -385,23 +406,22 @@ fn run_docling(
     let stderr_reader = thread::spawn(move || {
         read_child_output(
             stderr,
-            "stderr",
-            process_id,
-            source_requested,
-            relative_source,
-            output_dir_for_log,
+            stderr_context,
             stderr_progress_sender,
             Some(stderr_progress_state),
         )
     });
     let expected_markdown_path = expected_markdown_artifact_path(output_dir, &source.absolute_path);
-    let (status, timed_out) = wait_for_docling_process(
-        &mut child,
+    let process_context = DoclingProcessContext {
         config,
         output_dir,
         source,
         process_id,
         started,
+    };
+    let (status, timed_out) = wait_for_docling_process(
+        &mut child,
+        &process_context,
         progress_state,
         progress_sender,
         expected_markdown_path,
@@ -475,15 +495,16 @@ fn run_docling(
 /// Wait for Docling while emitting post-100% activity feedback at a bounded cadence.
 fn wait_for_docling_process(
     child: &mut Child,
-    config: &DoclingConfig,
-    output_dir: &Path,
-    source: &ResolvedSource,
-    process_id: u32,
-    started: Instant,
+    context: &DoclingProcessContext<'_>,
     progress_state: Arc<Mutex<DoclingProgressState>>,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     expected_markdown_path: PathBuf,
 ) -> Result<(ExitStatus, bool), ApiError> {
+    let config = context.config;
+    let output_dir = context.output_dir;
+    let source = context.source;
+    let process_id = context.process_id;
+    let started = context.started;
     let timeout_duration = Duration::from_secs(config.document_timeout_seconds);
     let mut last_feedback_at = None;
 
@@ -511,7 +532,7 @@ fn wait_for_docling_process(
         }
 
         if started.elapsed() >= timeout_duration {
-            return timeout_docling_process(child, config, output_dir, source, process_id, started);
+            return timeout_docling_process(child, context);
         }
 
         let now = Instant::now();
@@ -519,10 +540,7 @@ fn wait_for_docling_process(
         if should_emit_post_100_feedback(&snapshot, last_feedback_at, now) {
             last_feedback_at = Some(now);
             emit_post_100_docling_feedback(
-                process_id,
-                output_dir,
-                source,
-                started,
+                context,
                 timeout_duration,
                 &snapshot,
                 progress_sender.as_ref(),
@@ -539,12 +557,13 @@ fn wait_for_docling_process(
 /// Kill a Docling child after the configured document timeout has been reached.
 fn timeout_docling_process(
     child: &mut Child,
-    config: &DoclingConfig,
-    output_dir: &Path,
-    source: &ResolvedSource,
-    process_id: u32,
-    started: Instant,
+    context: &DoclingProcessContext<'_>,
 ) -> Result<(ExitStatus, bool), ApiError> {
+    let config = context.config;
+    let output_dir = context.output_dir;
+    let source = context.source;
+    let process_id = context.process_id;
+    let started = context.started;
     error!(
         event = "docling.process.timeout_reached",
         executable_path = %config.docling_path.display(),
@@ -603,15 +622,16 @@ fn timeout_docling_process(
 
 /// Emit one synthetic post-100% progress update with process and artifact metrics.
 fn emit_post_100_docling_feedback(
-    process_id: u32,
-    output_dir: &Path,
-    source: &ResolvedSource,
-    started: Instant,
+    context: &DoclingProcessContext<'_>,
     timeout_duration: Duration,
     progress_snapshot: &DoclingProgressSnapshot,
     progress_sender: Option<&SyncSender<DoclingProgressUpdate>>,
     expected_markdown_path: &Path,
 ) {
+    let output_dir = context.output_dir;
+    let source = context.source;
+    let process_id = context.process_id;
+    let started = context.started;
     let timeout_remaining = timeout_duration.saturating_sub(started.elapsed());
     let latest_progress_message = progress_snapshot
         .latest_message
@@ -640,14 +660,7 @@ fn emit_post_100_docling_feedback(
         expected_markdown_path,
         sample_duration,
     );
-    log_post_100_report(
-        &report,
-        process_id,
-        output_dir,
-        source,
-        started,
-        timeout_remaining,
-    );
+    log_post_100_report(&report, context, timeout_remaining);
     let message = format_docling_activity_message(&report, started.elapsed(), timeout_remaining);
 
     if let Some(progress_sender) = progress_sender
@@ -672,12 +685,13 @@ fn emit_post_100_docling_feedback(
 /// Log the compact inspection report without storing raw stack samples.
 fn log_post_100_report(
     report: &DoclingActivityReport,
-    process_id: u32,
-    output_dir: &Path,
-    source: &ResolvedSource,
-    started: Instant,
+    context: &DoclingProcessContext<'_>,
     timeout_remaining: Duration,
 ) {
+    let output_dir = context.output_dir;
+    let source = context.source;
+    let process_id = context.process_id;
+    let started = context.started;
     info!(
         event = "docling.post_100_feedback.completed",
         source_requested = %source.requested,
@@ -773,17 +787,20 @@ fn truncate_progress_message_for_log(value: &str) -> String {
 /// Read one child-process pipe while preserving bounded diagnostics and optional progress.
 fn read_child_output<R>(
     mut reader: R,
-    label: &'static str,
-    process_id: u32,
-    source_requested: String,
-    relative_source: String,
-    output_dir: String,
+    context: DoclingChildOutputContext,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     progress_state: Option<Arc<Mutex<DoclingProgressState>>>,
 ) -> Result<String, ApiError>
 where
     R: Read,
 {
+    let DoclingChildOutputContext {
+        label,
+        process_id,
+        source_requested,
+        relative_source,
+        output_dir,
+    } = context;
     let started = Instant::now();
     info!(
         event = "docling.child_output_reader.started",
