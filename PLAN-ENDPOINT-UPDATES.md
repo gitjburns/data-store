@@ -95,15 +95,31 @@ sessions should not need another codebase exploration pass.
 
 ## Progress Tracker
 
-- [ ] Phase 1: Remove public legacy routes
-- [ ] Phase 2: Remove admin legacy routes
+- [x] Phase 1: Remove public legacy routes
+- [x] Phase 2: Remove admin legacy routes
 - [ ] Phase 3: Update operator and architecture docs
 - [ ] Phase 4: Update config comments
-- [ ] Phase 5: Final reference sweep and plan status update
+- [ ] Phase 5: Reference sweep and plan status update
+- [ ] Phase 6: Run clippy cleanup and update agent instructions
 
 ## Phase 1: Remove Public Legacy Routes
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Removed the public legacy route registrations for `/v1/limits`,
+  `/v1/sources`, `/v1/ingest`, and `/v1/search` from `src/http.rs`.
+- Deleted the thin public legacy handler functions `get_limits`, `get_sources`,
+  `post_ingest`, and `post_search`.
+- Kept the shared operation-stream execution paths intact, including
+  `build_limits_response`, `execute_ingested_sources`, `execute_ingest`, and
+  `execute_search`.
+- Updated adjacent `execute_ingest` and `execute_search` comments so they no
+  longer describe route-specific sharing.
+- Verified with `cargo fmt`, `cargo check`, `cargo check --features metal`,
+  `cargo clippy`, and the planned `rg` checks for removed public route strings
+  and handler names.
 
 Estimated effort: 10k-14k tokens.
 
@@ -174,7 +190,25 @@ Completion criteria:
 
 ## Phase 2: Remove Admin Legacy Routes
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Removed the admin legacy route registrations for `/admin/shutdown`,
+  `/admin/document-versions`, and `/admin/document-versions/rollback` from
+  `src/http.rs`.
+- Deleted the thin admin legacy handler functions `post_admin_shutdown`,
+  `get_admin_document_versions`, and
+  `post_admin_document_version_rollback`.
+- Kept protected operation-stream execution intact, including
+  `execute_shutdown`, `execute_document_versions`,
+  `execute_document_version_rollback`, `OperationName::is_protected`, and
+  protected-operation dispatch in `execute_operation`.
+- Updated the `build_router` comment so it describes the supported health,
+  operation, and operation-control routes.
+- Verified with `cargo fmt`, `cargo check`, `cargo check --features metal`,
+  `cargo clippy`, and the planned `rg` checks for removed admin route strings
+  and handler names.
 
 Estimated effort: 8k-12k tokens.
 
@@ -361,7 +395,7 @@ Completion criteria:
 - Config comments no longer point operators at removed route-specific endpoints.
 - Config values are unchanged.
 
-## Phase 5: Final Reference Sweep and Plan Status Update
+## Phase 5: Reference Sweep and Plan Status Update
 
 Status: Not started.
 
@@ -401,3 +435,63 @@ Completion criteria:
 - Remaining `/v1/operations` references describe the canonical operation API.
 - This plan file accurately reflects completed phase status after user approval
   to update it.
+
+## Phase 6: Run Clippy Cleanup and Update Agent Instructions
+
+Status: Not started.
+
+Estimated effort: 25k-40k tokens.
+
+Confidence: 80%.
+
+To get confidence to at least 90%, first run `cargo clippy` in the current
+workspace state and classify every warning by fix type, affected ownership
+boundary, and whether the fix is mechanical or design-affecting.
+
+Scope:
+
+- Run `cargo clippy` and capture the complete warning set produced by the
+  current workspace state.
+- Resolve all clippy warnings produced by that run.
+- Keep fixes local and mechanical where the warning clearly identifies a
+  behavior-preserving change.
+- Stop and seek explicit approval before any warning fix that changes
+  architecture, public API, ownership boundaries, async/blocking behavior,
+  configuration, persistence, protocol contracts, or diagnostic semantics.
+- Do not use `#[allow(...)]` to silence warnings unless a warning is genuinely
+  intentional and the reason is documented at the call site.
+- After warning fixes, run the required Rust verification:
+  - `cargo fmt`
+  - `cargo check`
+  - `cargo check --features metal`
+  - `cargo clippy`
+- At the end of the phase, update the agent instructions so future agents must
+  address clippy warnings when those warnings are originally surfaced during
+  approved verification, instead of leaving them for a later cleanup phase.
+
+Expected agent-instruction update:
+
+- Edit `AGENTS.md` to state that when `cargo clippy` is run as mandatory
+  verification and surfaces warnings, warnings caused by the approved change
+  must be fixed immediately, and pre-existing warnings surfaced during that run
+  must be reported with a proposed cleanup path unless the user has approved
+  resolving them in the current scope.
+- Preserve the existing rule that fixes requiring design, architecture, config,
+  behavior, diagnostics, async/blocking, protocol, or persistence decisions need
+  explicit approval before implementation.
+
+Verification:
+
+- Final `cargo clippy` should complete with no warnings.
+- `cargo fmt`
+- `cargo check`
+- `cargo check --features metal`
+- Re-read the edited `AGENTS.md` section and verify it addresses warnings when
+  they are originally surfaced.
+
+Completion criteria:
+
+- The workspace produces no clippy warnings.
+- Any non-mechanical clippy fix has explicit approval before implementation.
+- Agent instructions prevent newly surfaced clippy warnings from being deferred
+  silently in future sessions.

@@ -4,7 +4,7 @@
 
 Please read:
 
-service/data-store/BENCHMARKS-PLAN.md
+PLAN-ENDPOINT-UPDATES.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 

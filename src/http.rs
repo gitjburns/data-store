@@ -63,26 +63,16 @@ const OPERATION_STREAM_CLOSED_MESSAGE: &str =
     "operation response stream closed before event delivery";
 static NEXT_SERVER_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Build the Axum router for the versioned HTTP API and protected admin controls.
+/// Build the Axum router for supported health, operation, and operation-control routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let max_request_body_bytes = state.config.server.max_request_body_bytes;
 
     Router::new()
         .route("/v1/health", get(get_health))
-        .route("/v1/limits", get(get_limits))
-        .route("/v1/sources", get(get_sources))
-        .route("/v1/ingest", post(post_ingest))
-        .route("/v1/search", post(post_search))
         .route("/v1/operations", post(post_operation))
         .route(
             "/v1/operations/{operation_id}/control",
             post(post_operation_control),
-        )
-        .route("/admin/shutdown", post(post_admin_shutdown))
-        .route("/admin/document-versions", get(get_admin_document_versions))
-        .route(
-            "/admin/document-versions/rollback",
-            post(post_admin_document_version_rollback),
         )
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
@@ -106,27 +96,6 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(response)
 }
 
-/// Return public request and retrieval limits for caller-side request construction.
-async fn get_limits(State(state): State<Arc<AppState>>) -> Json<LimitsResponse> {
-    let started = log_route_started("/v1/limits", "limits_reading");
-    let response = build_limits_response(&state);
-    info!(
-        event = "http.route.result_ready",
-        route = "/v1/limits",
-        stage = "limits_reading",
-        status = 200_u16,
-        max_request_body_bytes = response.request.max_request_body_bytes,
-        max_ingest_source_chars = response.request.max_ingest_source_chars,
-        max_search_query_chars = response.request.max_search_query_chars,
-        default_top_k = response.retrieval.default_top_k,
-        max_top_k = response.retrieval.max_top_k,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Json(response)
-}
-
 /// Build the public limits response from validated runtime config.
 fn build_limits_response(state: &AppState) -> LimitsResponse {
     LimitsResponse {
@@ -140,31 +109,6 @@ fn build_limits_response(state: &AppState) -> LimitsResponse {
             max_top_k: state.config.retrieval.max_top_k,
         },
     }
-}
-
-/// Return active ingested source documents without admin-only retained-version diagnostics.
-async fn get_sources(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<crate::storage::IngestedSourceListing>, ApiError> {
-    let started = log_route_started("/v1/sources", "sources_listing");
-    let response = match execute_ingested_sources(&state) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed("/v1/sources", "sources_listing", &error, &started);
-            return Err(error);
-        }
-    };
-    info!(
-        event = "http.route.result_ready",
-        route = "/v1/sources",
-        stage = "result_ready",
-        status = 200_u16,
-        sources = response.sources.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
 }
 
 /// Log the accepted boundary for one route-specific HTTP request.
@@ -264,55 +208,7 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
     }
 }
 
-/// Run one synchronous ingest request while keeping file bytes inside the service-owned corpus.
-async fn post_ingest(
-    State(state): State<Arc<AppState>>,
-    payload: Result<Json<IngestRequest>, JsonRejection>,
-) -> Result<Json<IngestResponse>, ApiError> {
-    let started = log_route_started("/v1/ingest", "request_decoding");
-    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
-        Ok(request) => request,
-        Err(error) => {
-            log_route_failed("/v1/ingest", "request_decoding", &error, &started);
-            return Err(error);
-        }
-    };
-    let requested_source = request.source.clone();
-    let force_requested = request.force_enabled();
-    info!(
-        event = "http.route.request_decoded",
-        route = "/v1/ingest",
-        stage = "request_decoded",
-        requested_source = %requested_source,
-        force = force_requested,
-        source_chars = requested_source.chars().count(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route request decoded"
-    );
-    let response = match execute_ingest(&state, request, None) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed("/v1/ingest", "ingest_executing", &error, &started);
-            return Err(error);
-        }
-    };
-    info!(
-        event = "http.route.result_ready",
-        route = "/v1/ingest",
-        stage = "result_ready",
-        status = 200_u16,
-        requested_source = %requested_source,
-        document_id = %response.document_id,
-        version_label = %response.version_label,
-        units_ingested = response.units_ingested,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
-}
-
-/// Execute the ingest pipeline shared by the route-specific and operation-stream APIs.
+/// Execute the ingest pipeline behind the canonical operation-stream API.
 fn execute_ingest(
     state: &AppState,
     request: IngestRequest,
@@ -910,54 +806,7 @@ fn execute_ingest(
     })
 }
 
-/// Run dense, BM25, RRF, bounded ColBERT reranking, and final ModernBERT reranking for one search request.
-async fn post_search(
-    State(state): State<Arc<AppState>>,
-    payload: Result<Json<SearchRequest>, JsonRejection>,
-) -> Result<Json<SearchResponse>, ApiError> {
-    let started = log_route_started("/v1/search", "request_decoding");
-    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
-        Ok(request) => request,
-        Err(error) => {
-            log_route_failed("/v1/search", "request_decoding", &error, &started);
-            return Err(error);
-        }
-    };
-    let query_chars = request.query.chars().count();
-    let requested_top_k = request.top_k;
-    info!(
-        event = "http.route.request_decoded",
-        route = "/v1/search",
-        stage = "request_decoded",
-        query_chars,
-        top_k = ?requested_top_k,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route request decoded"
-    );
-    let response = match execute_search(&state, request, None) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed("/v1/search", "search_executing", &error, &started);
-            return Err(error);
-        }
-    };
-    info!(
-        event = "http.route.result_ready",
-        route = "/v1/search",
-        stage = "result_ready",
-        status = 200_u16,
-        query_chars,
-        requested_top_k = ?requested_top_k,
-        results = response.results.len(),
-        search_latency_ms = response.latency_ms,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
-}
-
-/// Execute the retrieval pipeline shared by the route-specific and operation-stream APIs.
+/// Execute the retrieval pipeline behind the canonical operation-stream API.
 fn execute_search(
     state: &AppState,
     request: SearchRequest,
@@ -2838,60 +2687,6 @@ fn build_reranker_results(
     Ok((results, raw))
 }
 
-/// Authorize and request graceful service shutdown.
-async fn post_admin_shutdown(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<ShutdownResponse>, ApiError> {
-    let started = log_route_started("/admin/shutdown", "authorization_checking");
-    let token = match bearer_token_from_headers(&headers) {
-        Ok(token) => token,
-        Err(error) => {
-            log_route_failed(
-                "/admin/shutdown",
-                "authorization_checking",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    if let Err(error) = state.authorize_admin_token(token) {
-        log_route_failed(
-            "/admin/shutdown",
-            "authorization_checking",
-            &error,
-            &started,
-        );
-        return Err(error);
-    }
-    info!(
-        event = "http.route.authorization_completed",
-        route = "/admin/shutdown",
-        stage = "authorization_completed",
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route authorization completed"
-    );
-    let response = match execute_shutdown(&state) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed("/admin/shutdown", "shutdown_requesting", &error, &started);
-            return Err(error);
-        }
-    };
-    info!(
-        event = "http.route.result_ready",
-        route = "/admin/shutdown",
-        stage = "result_ready",
-        status = 200_u16,
-        shutdown_status = %response.status,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
-}
-
 /// Request graceful shutdown after the caller has passed admin authorization.
 fn execute_shutdown(state: &AppState) -> Result<ShutdownResponse, ApiError> {
     state.request_shutdown()?;
@@ -2951,71 +2746,6 @@ fn execute_ingested_sources(
     Ok(listing)
 }
 
-/// Authorize and return retained source-document version diagnostics.
-async fn get_admin_document_versions(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<crate::storage::DocumentVersionListing>, ApiError> {
-    let started = log_route_started("/admin/document-versions", "authorization_checking");
-    let token = match bearer_token_from_headers(&headers) {
-        Ok(token) => token,
-        Err(error) => {
-            log_route_failed(
-                "/admin/document-versions",
-                "authorization_checking",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    if let Err(error) = state.authorize_admin_token(token) {
-        log_route_failed(
-            "/admin/document-versions",
-            "authorization_checking",
-            &error,
-            &started,
-        );
-        return Err(error);
-    }
-    info!(
-        event = "http.route.authorization_completed",
-        route = "/admin/document-versions",
-        stage = "authorization_completed",
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route authorization completed"
-    );
-    let response = match execute_document_versions(&state) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed(
-                "/admin/document-versions",
-                "versions_listing",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    let version_count = response
-        .sources
-        .iter()
-        .map(|source| source.versions.len())
-        .sum::<usize>();
-    info!(
-        event = "http.route.result_ready",
-        route = "/admin/document-versions",
-        stage = "result_ready",
-        status = 200_u16,
-        sources = response.sources.len(),
-        versions = version_count,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
-}
-
 /// Return retained source-document versions after the caller has passed admin authorization.
 fn execute_document_versions(
     state: &AppState,
@@ -3065,98 +2795,6 @@ fn execute_document_versions(
     );
 
     Ok(listing)
-}
-
-/// Authorize and repoint one source document to an already-retained version.
-async fn post_admin_document_version_rollback(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    payload: Result<Json<DocumentVersionRollbackRequest>, JsonRejection>,
-) -> Result<Json<DocumentVersionRollbackResponse>, ApiError> {
-    let started = log_route_started(
-        "/admin/document-versions/rollback",
-        "authorization_checking",
-    );
-    let token = match bearer_token_from_headers(&headers) {
-        Ok(token) => token,
-        Err(error) => {
-            log_route_failed(
-                "/admin/document-versions/rollback",
-                "authorization_checking",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    if let Err(error) = state.authorize_admin_token(token) {
-        log_route_failed(
-            "/admin/document-versions/rollback",
-            "authorization_checking",
-            &error,
-            &started,
-        );
-        return Err(error);
-    }
-    info!(
-        event = "http.route.authorization_completed",
-        route = "/admin/document-versions/rollback",
-        stage = "authorization_completed",
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route authorization completed"
-    );
-    let Json(request) = match payload.map_err(json_rejection_to_api_error) {
-        Ok(request) => request,
-        Err(error) => {
-            log_route_failed(
-                "/admin/document-versions/rollback",
-                "request_decoding",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    let requested_source = request.source.clone();
-    let requested_version_label = request.version_label.clone();
-    info!(
-        event = "http.route.request_decoded",
-        route = "/admin/document-versions/rollback",
-        stage = "request_decoded",
-        requested_source = %requested_source,
-        version_label = %requested_version_label,
-        source_chars = requested_source.chars().count(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route request decoded"
-    );
-    let response = match execute_document_version_rollback(&state, request) {
-        Ok(response) => response,
-        Err(error) => {
-            log_route_failed(
-                "/admin/document-versions/rollback",
-                "rollback_publishing",
-                &error,
-                &started,
-            );
-            return Err(error);
-        }
-    };
-    info!(
-        event = "http.route.result_ready",
-        route = "/admin/document-versions/rollback",
-        stage = "result_ready",
-        status = 200_u16,
-        requested_source = %requested_source,
-        requested_version_label = %requested_version_label,
-        source_path = %response.source_path,
-        active_version_label = %response.active_version_label,
-        published_at_ms = response.published_at_ms,
-        vector_count = response.vector_count,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "HTTP route result ready"
-    );
-
-    Ok(Json(response))
 }
 
 /// Publish an already-retained document version after the caller has passed admin authorization.
