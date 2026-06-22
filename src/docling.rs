@@ -650,22 +650,22 @@ fn emit_post_100_docling_feedback(
     );
     let message = format_docling_activity_message(&report, started.elapsed(), timeout_remaining);
 
-    if let Some(progress_sender) = progress_sender {
-        if let Err(error) = progress_sender.send(DoclingProgressUpdate {
+    if let Some(progress_sender) = progress_sender
+        && let Err(error) = progress_sender.send(DoclingProgressUpdate {
             message,
             percentage: None,
-        }) {
-            error!(
-                event = "docling.post_100_feedback.delivery_failed",
-                source_requested = %source.requested,
-                relative_source = %source.relative_path.display(),
-                output_dir = %output_dir.display(),
-                process_id,
-                error = %error,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Docling post-100 feedback delivery failed"
-            );
-        }
+        })
+    {
+        error!(
+            event = "docling.post_100_feedback.delivery_failed",
+            source_requested = %source.requested,
+            relative_source = %source.relative_path.display(),
+            output_dir = %output_dir.display(),
+            process_id,
+            error = %error,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Docling post-100 feedback delivery failed"
+        );
     }
 }
 
@@ -839,29 +839,29 @@ where
 
         let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
         output = append_bounded_diagnostic_text(&output, &chunk);
-        if progress_sender.is_some() || progress_state.is_some() {
-            if let Err(error) = emit_docling_progress_from_chunk(
+        if (progress_sender.is_some() || progress_state.is_some())
+            && let Err(error) = emit_docling_progress_from_chunk(
                 progress_sender.as_ref(),
                 progress_state.as_ref(),
                 &chunk,
-            ) {
-                error!(
-                    event = "docling.child_output_reader.failed",
-                    task_purpose = "read_docling_child_output",
-                    pipe = label,
-                    process_id,
-                    source_requested = %source_requested,
-                    relative_source = %relative_source,
-                    output_dir = %output_dir,
-                    stage = "progress_delivery",
-                    output_chars = output.chars().count(),
-                    error_kind = error.error_kind(),
-                    error = %error,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "Docling child output reader failed"
-                );
-                return Err(error);
-            }
+            )
+        {
+            error!(
+                event = "docling.child_output_reader.failed",
+                task_purpose = "read_docling_child_output",
+                pipe = label,
+                process_id,
+                source_requested = %source_requested,
+                relative_source = %relative_source,
+                output_dir = %output_dir,
+                stage = "progress_delivery",
+                output_chars = output.chars().count(),
+                error_kind = error.error_kind(),
+                error = %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Docling child output reader failed"
+            );
+            return Err(error);
         }
     }
 }

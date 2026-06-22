@@ -706,7 +706,7 @@ fn execute_ingest(
         colbert_vectors,
         &state.config.models.dense,
         &state.config.models.colbert,
-        emitter.as_deref_mut().map(|emitter| {
+        emitter.map(|emitter| {
             move |message: &'static str, current: u64, total: u64| {
                 emitter.progress("storage_publishing", message, current, total)
             }
@@ -1933,7 +1933,7 @@ fn emit_operation_progress(
 
 /// Return whether a counted progress update is useful enough to write to the durable service log.
 fn should_log_progress_checkpoint(current: u64, total: u64) -> bool {
-    current == 1 || current == total || current % 10 == 0
+    current == 1 || current == total || current.is_multiple_of(10)
 }
 
 /// Return a stable log correlation value for route-specific and operation-stream calls.

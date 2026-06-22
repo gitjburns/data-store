@@ -369,9 +369,7 @@ impl Qwen3Attention {
             .matmul(&k.t().map_err(|source| {
                 inference_error(format!("{label} key transpose failed: {source}"))
             })?)
-            .and_then(|tensor| {
-                (tensor / (self.head_dim as f64).sqrt()).map_err(candle_core::Error::from)
-            })
+            .and_then(|tensor| tensor / (self.head_dim as f64).sqrt())
             .and_then(|tensor| apply_causal_mask(&tensor, seq_len))
             .map_err(|source| {
                 inference_error(format!("{label} attention scores failed: {source}"))
@@ -505,7 +503,10 @@ fn validate_qwen3_config(label: &str, config: &Qwen3Config) -> Result<(), ApiErr
             config.hidden_act
         )));
     }
-    if config.num_attention_heads % config.num_key_value_heads != 0 {
+    if !config
+        .num_attention_heads
+        .is_multiple_of(config.num_key_value_heads)
+    {
         return Err(inference_error(format!(
             "{label} num_attention_heads must be divisible by num_key_value_heads"
         )));

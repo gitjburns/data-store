@@ -45,8 +45,10 @@ fn main() -> Result<(), ApiError> {
         min_token_norm(&embedding.vector, embedding.dimension),
         max_token_norm(&embedding.vector, embedding.dimension)
     );
-    let scores =
-        colbert.score_persisted_candidates("clear writing style rules", &[embedding.clone()])?;
+    let scores = colbert.score_persisted_candidates(
+        "clear writing style rules",
+        std::slice::from_ref(&embedding),
+    )?;
     let score = scores.first().ok_or_else(|| ApiError::InferenceInit {
         message: "ColBERT diagnostic produced no candidate scores".to_string(),
     })?;

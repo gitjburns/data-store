@@ -265,12 +265,12 @@ impl SearchRequest {
             });
         }
 
-        if let Some(top_k) = self.top_k {
-            if top_k == 0 || top_k > max_top_k {
-                return Err(ApiError::BadRequest {
-                    message: format!("topK must be between 1 and {max_top_k}"),
-                });
-            }
+        if let Some(top_k) = self.top_k
+            && (top_k == 0 || top_k > max_top_k)
+        {
+            return Err(ApiError::BadRequest {
+                message: format!("topK must be between 1 and {max_top_k}"),
+            });
         }
 
         Ok(())

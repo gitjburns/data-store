@@ -375,17 +375,17 @@ async fn run_http_service(
     );
 
     reporter.report("data-store startup inference=initializing")?;
-    let mut report_inference_progress = |message: &str| {
-        let startup_message = format!("data-store startup inference={message}");
-        if uses_count_progress(message) {
-            reporter.report_progress(startup_message)
-        } else {
-            reporter.report(startup_message)
-        }
+    let inference_result = {
+        let mut report_inference_progress = |message: &str| {
+            let startup_message = format!("data-store startup inference={message}");
+            if uses_count_progress(message) {
+                reporter.report_progress(startup_message)
+            } else {
+                reporter.report(startup_message)
+            }
+        };
+        InferenceRuntime::initialize_with_progress(&config, &mut report_inference_progress)
     };
-    let inference_result =
-        InferenceRuntime::initialize_with_progress(&config, &mut report_inference_progress);
-    drop(report_inference_progress);
     let inference = match inference_result {
         Ok(runtime) => {
             reporter.report(format!(

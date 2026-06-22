@@ -1733,11 +1733,7 @@ impl StreamRenderer {
         }
         let line = match (current, total) {
             (Some(current), Some(total)) => {
-                let percent = if total > 0 {
-                    (current.saturating_mul(100)) / total
-                } else {
-                    0
-                };
+                let percent = current.saturating_mul(100).checked_div(total).unwrap_or(0);
                 format!(
                     "[{operation_id} #{sequence}] {stage}: {message} {current}/{total} ({percent}%)"
                 )

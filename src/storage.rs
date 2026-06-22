@@ -4476,7 +4476,7 @@ where
 
 /// Return whether a unit persistence count should be written as a durable service-log checkpoint.
 fn should_log_storage_checkpoint(current: usize, total: usize) -> bool {
-    current == 1 || current == total || current % 10 == 0
+    current == 1 || current == total || current.is_multiple_of(10)
 }
 
 /// Insert one retrieval unit and its external-content FTS row.

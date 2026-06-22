@@ -331,7 +331,7 @@ fn split_oversized_block(
 
         match builder.take() {
             Some(mut current)
-                if can_append_sentence(&tokenizer, &current, &sentence_block, max_tokens)? =>
+                if can_append_sentence(tokenizer, &current, &sentence_block, max_tokens)? =>
             {
                 let candidate = format!("{} {}", current.content, sentence_block.content);
                 current.token_count = count_tokens(tokenizer, &candidate)?;

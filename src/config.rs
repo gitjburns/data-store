@@ -604,7 +604,7 @@ fn validate_reranker_backend_fields(reranker: &RerankerModelConfig) -> Result<()
 }
 
 /// Ensure a path field uses an absolute path.
-fn require_absolute_path(label: &str, path: &PathBuf) -> Result<(), ApiError> {
+fn require_absolute_path(label: &str, path: &Path) -> Result<(), ApiError> {
     if path.is_absolute() {
         return Ok(());
     }
@@ -615,7 +615,7 @@ fn require_absolute_path(label: &str, path: &PathBuf) -> Result<(), ApiError> {
 }
 
 /// Ensure a path field is not the empty path.
-fn require_non_empty_path(label: &str, path: &PathBuf) -> Result<(), ApiError> {
+fn require_non_empty_path(label: &str, path: &Path) -> Result<(), ApiError> {
     if !path.as_os_str().is_empty() {
         return Ok(());
     }

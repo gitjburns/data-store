@@ -1077,9 +1077,7 @@ impl ModernBertAttentionPrimitive {
                         "reranker {label} key transpose failed for head {head_index}: {source}"
                     ))
                 })?)
-                .and_then(|tensor| {
-                    (tensor / (self.head_dim as f64).sqrt()).map_err(candle_core::Error::from)
-                })
+                .and_then(|tensor| tensor / (self.head_dim as f64).sqrt())
                 .map_err(|source| {
                     inference_error(format!(
                         "reranker {label} attention scores failed for head {head_index}: {source}"
@@ -1352,7 +1350,7 @@ impl ModernBertClassifierHead {
 impl ModernBertAttentionKind {
     /// Resolve ModernBERT's layer policy so global and local attention stay explicit.
     fn for_layer(layer_index: usize, config: &ModernBertConfig) -> Self {
-        if layer_index % config.global_attn_every_n_layers == 0 {
+        if layer_index.is_multiple_of(config.global_attn_every_n_layers) {
             Self::Global
         } else {
             Self::Local
@@ -1510,7 +1508,10 @@ fn validate_modernbert_config(
             model_config.hidden_size
         )));
     }
-    if model_config.hidden_size % model_config.num_attention_heads != 0 {
+    if !model_config
+        .hidden_size
+        .is_multiple_of(model_config.num_attention_heads)
+    {
         return Err(inference_error(
             "reranker hidden_size must divide evenly by num_attention_heads".to_string(),
         ));
