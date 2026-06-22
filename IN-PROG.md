@@ -4,7 +4,7 @@
 
 Please read:
 
-PLAN-ENDPOINT-UPDATES.md
+PLAN-CLIPPY-WARNINGS.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 
