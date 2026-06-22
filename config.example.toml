@@ -3,9 +3,9 @@
 bind_address = "127.0.0.1:8091"
 # Maximum accepted HTTP request body size before Axum returns 413.
 max_request_body_bytes = 16384
-# Maximum corpus-relative source reference length accepted by /v1/ingest.
+# Maximum corpus-relative source reference length accepted by ingest operations.
 max_ingest_source_chars = 2048
-# Maximum query text length accepted by /v1/search.
+# Maximum query text length accepted by search operations.
 max_search_query_chars = 4096
 # Maximum number of synchronous ingest operations allowed to run at once.
 max_in_flight_ingest = 1
@@ -162,7 +162,7 @@ max_tokens = 32768
 #api_key_file_path = ".data-store-rerank-api-key"
 
 [retrieval]
-# Default result count when /v1/search omits topK.
+# Default result count when a search operation omits topK.
 default_top_k = 10
 # Maximum result count callers may request.
 max_top_k = 100

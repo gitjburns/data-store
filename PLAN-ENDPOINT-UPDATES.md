@@ -98,7 +98,7 @@ sessions should not need another codebase exploration pass.
 - [x] Phase 1: Remove public legacy routes
 - [x] Phase 2: Remove admin legacy routes
 - [x] Phase 3: Update operator and architecture docs
-- [ ] Phase 4: Update config comments
+- [x] Phase 4: Update config comments
 - [ ] Phase 5: Reference sweep and plan status update
 - [ ] Phase 6: Run clippy cleanup and update agent instructions
 
@@ -355,7 +355,17 @@ Completion criteria:
 
 ## Phase 4: Update Config Comments
 
-Status: Not started.
+Status: Completed.
+
+Completed summary:
+
+- Updated stale route-specific comments in `config.example.toml` and
+  `config.toml` so they refer to ingest/search operations instead of removed
+  `/v1/ingest` and `/v1/search` endpoints.
+- Kept all config values, config shape, parsing, defaults, and runtime behavior
+  unchanged.
+- Verified with the planned `rg` checks that the stale route strings are gone
+  from the two config files and the replacement comments are present.
 
 Estimated effort: 4k-6k tokens.
 
