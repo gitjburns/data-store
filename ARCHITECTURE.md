@@ -11,10 +11,6 @@ conversion, unit splitting, model inference, durable storage, search indexes,
 active document versioning, retrieval ranking, service config, readiness,
 logging, and protected admin controls.
 
-The service is an independent Rust application under `service/data-store/`.
-It is not a library facade over another process, and its storage, corpus,
-model runtime, and operational lifecycle are service-local concerns.
-
 ## Runtime Stack
 
 - HTTP transport shell: Axum on Tokio, confined to `main.rs` and the transport
@@ -124,9 +120,10 @@ are terminal.
 
 Supported operations are `health`, `limits`, `ingest`, `search`, `versions`,
 `rollback`, `sources`, and `shutdown`. `versions`, `rollback`, and `shutdown`
-require the startup-scoped bearer token. Operations are exposed through
-`POST /v1/operations`, with `GET /v1/health` retained as the supported
-readiness route.
+require the startup-scoped bearer token. `sources` lists source documents that
+currently have an active version, distinct from `versions`, which lists the full
+retained version history. Operations are exposed through `POST /v1/operations`,
+with `GET /v1/health` retained as the supported readiness route.
 
 ## Storage Model
 
@@ -395,7 +392,7 @@ API itself.
 - Public API strings and persisted metadata values are contracts; change them
   deliberately.
 - Every operation writes meaningful lifecycle facts to the service log at
-  `service/data-store/logs/data-store.log`.
+  `logs/data-store.log`.
 - Storage transactions log begin, each persistence phase, commit attempt,
   commit success or failure, rollback or abort when visible, and publish
   success or failure.

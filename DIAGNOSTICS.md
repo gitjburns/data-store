@@ -1,16 +1,5 @@
 # Data Store Diagnostics Standard
 
-## Scope
-
-This document applies only to the standalone Rust service in
-`service/data-store/`.
-
-The authoritative service log for this service is:
-
-```text
-service/data-store/logs/data-store.log
-```
-
 This document is intentionally standalone. It is a coding standard and an
 evaluation protocol, not an implementation plan.
 
@@ -47,8 +36,7 @@ transition, durable state boundary, client-delivery boundary, or failure with
 local diagnostic facts.
 
 **Durable evidence** means evidence written to
-`service/data-store/logs/data-store.log`. Terminal-only output is not durable
-evidence.
+`logs/data-store.log`. Terminal-only output is not durable evidence.
 
 **Terminal outcome** means a result or error that completes an operation or
 startup path.
@@ -65,8 +53,8 @@ secrets, document contents, vector values, token dumps, or large raw payloads.
 
 ## Core Standard
 
-Every meaningful lifecycle boundary and every error path in `service/data-store`
-must leave durable, useful evidence in `service/data-store/logs/data-store.log`.
+Every meaningful lifecycle boundary and every error path must leave durable,
+useful evidence in `logs/data-store.log`.
 
 If a fact is important enough to print to an operator after file logging is
 initialized, it is important enough to log durably.
@@ -100,7 +88,7 @@ cannot help diagnose a real failure.
 ### R1. Startup Progress Must Be Durable
 
 Every startup status or progress line emitted after file logging is initialized
-must also be written to `service/data-store/logs/data-store.log`.
+must also be written to `logs/data-store.log`.
 
 This includes progress sent to a background parent process. Parent-terminal
 handoff output is not a substitute for service-log evidence.
@@ -256,8 +244,8 @@ After file logging is initialized, diagnostic facts must not exist only in:
 - SQLite rows;
 - inferred state.
 
-Those surfaces may repeat or render facts, but
-`service/data-store/logs/data-store.log` must contain the durable evidence.
+Those surfaces may repeat or render facts, but `logs/data-store.log` must
+contain the durable evidence.
 
 ### R10. Generic Failure Logs Are Forbidden
 
@@ -452,7 +440,7 @@ Use this template when evaluating the current codebase:
 Diagnostics Evaluation: PASS|FAIL
 
 Log file:
-service/data-store/logs/data-store.log
+logs/data-store.log
 
 Inventory counts:
 - startup phases:

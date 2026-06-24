@@ -1,20 +1,5 @@
 # Data Store Diagnostics Coding Standard
 
-## Scope
-
-This document is onboarding guidance for writing and reviewing code in the
-standalone Rust service under `service/data-store/`.
-
-The detailed diagnostics audit and refactoring protocol remains in
-`DIAGNOSTICS.md`. Use that file for focused diagnostics evaluation sessions.
-Use this file as the day-to-day coding standard.
-
-The authoritative service log is:
-
-```text
-service/data-store/logs/data-store.log
-```
-
 ## Core Rule
 
 Every meaningful lifecycle boundary and every error path must leave durable,

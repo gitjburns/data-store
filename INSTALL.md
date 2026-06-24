@@ -10,9 +10,6 @@ For what the service does and how to operate it once running, see `README.md`.
 Backend/frontend integration is later scope. Do not expect this service to be
 started or managed by the Node app yet.
 
-Run commands in this document from `service/data-store/` unless stated
-otherwise.
-
 ## Prerequisites
 
 Create a local `config.toml` from `config.example.toml`. The local config is
@@ -119,8 +116,7 @@ Relative admin token-file paths resolve from the Rust service root.
 
 Operational events after file logging initialization are written to the
 configured `[logging].file_path`. Relative log paths resolve from the Rust
-service root, so `logs/data-store.log` resolves to `logs/data-store.log` inside
-this directory.
+service root, e.g. `logs/data-store.log`
 
 ## Verify
 

@@ -200,8 +200,7 @@ config, or protocol error with a generic message.
 ## Diagnostic Hygiene
 
 - Follow `DIAGNOSTICS-ONBOARDING.md` for day-to-day diagnostics policy and
-  implementation standards; use `DIAGNOSTICS.md` for focused diagnostics audits
-  and evaluation sessions.
+  implementation standards.
 - Before relying on diagnostics for a feature, identify the authoritative log or
   audit path from the applicable configuration, documentation, or
   implementation. If no authoritative path is documented or discoverable, treat

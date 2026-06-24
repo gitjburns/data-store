@@ -163,7 +163,7 @@ History behavior:
 - The history file path is fixed at:
 
 ```text
-service/data-store/.data-store.history
+./.data-store.history
 ```
 
 - The history file is not configured in the service config.

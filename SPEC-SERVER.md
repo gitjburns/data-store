@@ -568,10 +568,10 @@ Service-owned config includes:
   - chunk sizing
 
 `logging.file_path` is required. Absolute paths are used as-is; relative paths
-resolve against the Rust service root (`service/data-store/`). The service
-creates missing log parent directories before long-lived work starts and fails
-before binding if the log file cannot be opened. `logging.level` is required and
-controls the minimum operational event level written to the log file.
+resolve against the repo root. The service creates missing log parent directories
+before long-lived work starts and fails before binding if the log file cannot be
+opened. `logging.level` is required and controls the minimum operational event
+level written to the log file.
 
 `admin.token_file_path` is required. Absolute paths are used as-is; relative
 paths resolve against the Rust service root. The example config must include the

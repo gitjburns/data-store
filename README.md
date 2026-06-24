@@ -562,6 +562,32 @@ If the configured ingest/search admission gate is saturated, the endpoint
 emits a terminal `error` event with status `503 Service Unavailable`. The
 service does not hide work in an unbounded queue.
 
+## List Ingested Sources
+
+`sources` is a public operation that lists source documents with an active
+version.
+
+```bash
+curl -N -X POST \
+  -H "Accept: application/x-ndjson" \
+  -H "Content-Type: application/json" \
+  -d '{"operation":"sources","payload":{}}' \
+  http://127.0.0.1:8091/v1/operations
+```
+
+The terminal `result` payload contains a `sources` array, one entry per source
+document that currently has an active version, ordered by source path ascending.
+Each entry reports `sourcePath` (corpus-relative reference), `activeVersionLabel`
+(the active version), `documentId` (the active version's document identifier),
+`unitsIngested` (retrieval units stored for the active version), `status`
+(stored ingest status), and `createdAtMs`/`updatedAtMs` (millisecond timestamps
+for the active-version row).
+
+`sources` lists only active documents; it does not list retained non-active
+versions — use `versions` for full version history. It consumes no ingest/search
+admission permits and emits a single `sources_listing` status stage before the
+terminal result.
+
 ## Version Administration
 
 Protected operations require the startup-scoped bearer token printed as
