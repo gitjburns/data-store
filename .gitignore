@@ -1,8 +1,11 @@
 target/
 models/
 sources
+sources.old
 index/
 logs/
 config.toml
 .data-store-admin-token
 .data-store.history
+.annotator-api-key
+.data-store-dense-api-key

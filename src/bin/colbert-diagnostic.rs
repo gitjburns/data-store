@@ -8,6 +8,10 @@ mod config;
 mod error;
 #[path = "../inference/mod.rs"]
 mod inference;
+// Required by the included inference sources: device.rs renders panic
+// payloads through crate::util, which this bin crate must therefore declare.
+#[path = "../util.rs"]
+mod util;
 
 use config::ServiceConfig;
 use error::ApiError;

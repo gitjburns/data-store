@@ -16,6 +16,8 @@ use crate::{
     },
 };
 
+// Retained inference API (pinned contract); consumed at C7c.
+#[allow(dead_code)]
 const LOCAL_RERANKER_MODE: &str = "modernbert_sequence_classifier";
 const HTTP_RERANKER_MODE: &str = "http_rerank";
 const SMOKE_QUERY: &str = "clear writing style rules";
@@ -88,9 +90,10 @@ impl RerankerBackend {
     /// Build the HTTP reranker backend and run the startup smoke check through the configured endpoint.
     pub fn load_http_with_progress(
         config: &RerankerModelConfig,
+        config_root: &Path,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        HttpRerankerClient::load_with_progress(config, progress).map(Self::Http)
+        HttpRerankerClient::load_with_progress(config, config_root, progress).map(Self::Http)
     }
 
     /// Return the stable backend-kind label used in health and log output.
@@ -102,6 +105,8 @@ impl RerankerBackend {
     }
 
     /// Return the raw-diagnostics reranker mode label for this backend.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     pub fn mode(&self) -> &'static str {
         match self {
             RerankerBackend::Local(_) => LOCAL_RERANKER_MODE,
@@ -110,6 +115,8 @@ impl RerankerBackend {
     }
 
     /// Return whether scoring uses the local accelerator model-call gate.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     pub fn uses_local_model_gate(&self) -> bool {
         match self {
             RerankerBackend::Local(_) => true,
@@ -128,6 +135,8 @@ impl RerankerBackend {
     }
 
     /// Score candidate documents without per-candidate progress reporting.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     pub fn score_candidates(
         &self,
         query: &str,
@@ -140,6 +149,8 @@ impl RerankerBackend {
     }
 
     /// Score candidate documents while reporting completed reranker candidates.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     pub fn score_candidates_with_progress<F>(
         &self,
         query: &str,
@@ -164,12 +175,13 @@ impl HttpRerankerClient {
     /// Build the blocking HTTP client, load optional credentials, and verify the endpoint with a smoke request.
     fn load_with_progress(
         config: &RerankerModelConfig,
+        config_root: &Path,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         let endpoint = config.http_endpoint()?.to_string();
         let model = config.http_model()?.to_string();
         let timeout_seconds = config.http_timeout_seconds()?;
-        let api_key_file_path = config.resolved_http_api_key_file_path();
+        let api_key_file_path = config.resolved_http_api_key_file_path(config_root);
         let api_key = match api_key_file_path.as_ref() {
             Some(path) => Some(read_api_key(path)?),
             None => None,
@@ -251,6 +263,8 @@ impl HttpRerankerClient {
     }
 
     /// Score candidate documents without per-candidate progress reporting.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     fn score_candidates(
         &self,
         query: &str,
@@ -260,6 +274,8 @@ impl HttpRerankerClient {
     }
 
     /// Score candidate documents and report one completion step after the remote batch returns.
+    // Retained inference API (pinned contract); consumed at C7c.
+    #[allow(dead_code)]
     fn score_candidates_with_progress<F>(
         &self,
         query: &str,

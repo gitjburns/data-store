@@ -16,8 +16,43 @@ use crate::{
 
 const QUERY_INSTRUCTION_PREFIX: &str =
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
-const SMOKE_TEXT: &str = "dense embedding readiness smoke check";
+/// Smoke text embedded once per backend at startup. `pub(crate)` so the HTTP
+/// backend's startup smoke round-trips the SAME text the local runtime does,
+/// keeping the readiness check identical across backends.
+pub(crate) const DENSE_SMOKE_TEXT: &str = "dense embedding readiness smoke check";
+const SMOKE_TEXT: &str = DENSE_SMOKE_TEXT;
 const DENSE_POOLING_LAST_TOKEN: &str = "last_token";
+
+/// Format a retrieval query into the exact text the dense model tokenizes: the
+/// Qwen3 instruction prefix followed by the raw query. This is the SINGLE source
+/// of truth for the query prompt shape — both the local runtime (`embed_query`)
+/// and the HTTP backend build the final query text through this function, so a
+/// backend switch can never fork the embedded semantics. The prefix string is
+/// defined once here (`QUERY_INSTRUCTION_PREFIX`) and never duplicated.
+pub(crate) fn format_dense_query_text(text: &str) -> String {
+    format!("{QUERY_INSTRUCTION_PREFIX} {text}")
+}
+
+/// Format a retrieval passage into the exact text the dense model tokenizes.
+/// Qwen3 passages carry no instruction prefix, so this is the identity; it
+/// exists as the passage-side twin of `format_dense_query_text` so both the
+/// local runtime and the HTTP backend route passage text through one named
+/// boundary and a future prefix change lands in exactly one place per kind.
+pub(crate) fn format_dense_passage_text(text: &str) -> &str {
+    text
+}
+
+/// On-device compute dtype for the dense model: safetensors weights are
+/// converted to this at load and the whole forward runs in it. BF16 matches
+/// the shipped checkpoint and is a deliberate, validated choice: F16 was
+/// benchmarked ~17-25% faster on the dominant Metal matmuls but REJECTED
+/// 2026-07-18 (user-ruled) — the real-model cross-dtype validation
+/// (`dense-batch-diagnostic --validate-dense-dtypes`) produced non-finite
+/// activations under F16 (Qwen-family outlier activations overflow F16's
+/// exponent range, e.g. in the RmsNorm square). BF16 keeps F32's exponent
+/// range and has no such cliff. Re-run that validation before ever changing
+/// this constant.
+const DENSE_COMPUTE_DTYPE: DType = DType::BF16;
 
 #[derive(Debug, Clone)]
 pub struct DenseEmbeddingRuntime {
@@ -36,14 +71,46 @@ struct DenseEmbeddingOutput {
 }
 
 impl DenseEmbeddingRuntime {
-    /// Load the dense runtime while reporting tokenizer, model, and smoke-check progress.
+    /// Load the dense runtime while reporting tokenizer, model, and smoke-check
+    /// progress. The service path always computes in `DENSE_COMPUTE_DTYPE`.
     pub fn load_with_progress(
         artifacts: &ModelArtifacts,
         config: &DenseModelConfig,
         device: &Device,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
+        Self::load_with_dtype(artifacts, config, device, DENSE_COMPUTE_DTYPE, progress)
+    }
+
+    /// Validation-only load at an explicit compute dtype, consumed by the
+    /// dense-batch-diagnostic cross-dtype check (which embeds the same passages
+    /// under two dtypes sequentially and compares cosines). The service startup
+    /// path never calls this.
+    #[allow(dead_code)]
+    pub fn load_with_dtype_for_validation(
+        artifacts: &ModelArtifacts,
+        config: &DenseModelConfig,
+        device: &Device,
+        compute_dtype: DType,
+        progress: InferenceProgress<'_>,
+    ) -> Result<Self, ApiError> {
+        Self::load_with_dtype(artifacts, config, device, compute_dtype, progress)
+    }
+
+    /// Shared load body behind the public entry points; `compute_dtype` is
+    /// threaded to the Qwen3 weight load and governs the whole forward.
+    fn load_with_dtype(
+        artifacts: &ModelArtifacts,
+        config: &DenseModelConfig,
+        device: &Device,
+        compute_dtype: DType,
+        progress: InferenceProgress<'_>,
+    ) -> Result<Self, ApiError> {
         validate_dense_config(config)?;
+        // This runtime is the LOCAL backend; `local_max_tokens()` returns the
+        // config-guaranteed local token cap and fails clearly if config selected
+        // the HTTP backend (which has no local runtime to load).
+        let max_tokens = config.local_max_tokens()? as usize;
 
         progress("dense_tokenizer_loading")?;
         let tokenizer = Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|source| {
@@ -64,6 +131,7 @@ impl DenseEmbeddingRuntime {
             &qwen_config,
             artifacts,
             device,
+            compute_dtype,
             None,
             progress,
         )?;
@@ -72,7 +140,7 @@ impl DenseEmbeddingRuntime {
             tokenizer,
             model,
             device: device.clone(),
-            max_tokens: config.max_tokens as usize,
+            max_tokens,
             dimension: config.dimension as usize,
             smoke_norm: 0.0,
         };
@@ -97,6 +165,8 @@ impl DenseEmbeddingRuntime {
     }
 
     /// Embed a retrieval unit as a passage and return its dense vector.
+    // Consumed by the dense builder's Local arm (projections/dense.rs
+    // build_all_chunks) and the dense-batch-diagnostic bin's dtype validation.
     pub fn embed_passage_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
         let started_at = Instant::now();
         let text_chars = text.chars().count();
@@ -158,6 +228,8 @@ impl DenseEmbeddingRuntime {
     }
 
     /// Embed a retrieval query with the configured instruction prefix and return its dense vector.
+    // Consumed by the query path (query/execute.rs dense query embedding, via
+    // DenseEmbeddingBackend::embed_query_vector's Local arm).
     pub fn embed_query_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
         let started_at = Instant::now();
         let text_chars = text.chars().count();
@@ -218,14 +290,18 @@ impl DenseEmbeddingRuntime {
         result.map(|output| output.vector)
     }
 
-    /// Embed a retrieval query with the Qwen3 instruction prefix.
+    /// Embed a retrieval query with the Qwen3 instruction prefix. The prompt
+    /// text is built through the shared `format_dense_query_text` boundary so
+    /// the local and HTTP backends tokenize/send byte-identical query text.
     fn embed_query(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
-        self.embed_text(&format!("{QUERY_INSTRUCTION_PREFIX} {text}"))
+        self.embed_text(&format_dense_query_text(text))
     }
 
-    /// Embed a retrieval passage without an instruction prefix.
+    /// Embed a retrieval passage without an instruction prefix, routed through
+    /// the shared `format_dense_passage_text` boundary (the identity for
+    /// passages) so passage text has one formatting source of truth too.
     fn embed_passage(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
-        self.embed_text(text)
+        self.embed_text(format_dense_passage_text(text))
     }
 
     /// Run one startup smoke embedding and log the model-call boundary without exposing smoke text.
@@ -296,9 +372,9 @@ impl DenseEmbeddingRuntime {
         result
     }
 
-    /// Tokenize, truncate, run the model, last-token pool, and L2-normalize one text.
-    ///
-    /// This is the single boundary that applies embedding truncation, pooling, and normalization.
+    /// Tokenize, truncate, run the model, last-token pool, and L2-normalize one
+    /// text. This is the single boundary applying embedding truncation, pooling,
+    /// and normalization for every dense entry point.
     fn embed_text(&self, text: &str) -> Result<DenseEmbeddingOutput, ApiError> {
         let ids = tokenize_truncated(&self.tokenizer, text, self.max_tokens)?;
         let token_count = ids.len();

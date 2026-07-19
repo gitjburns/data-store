@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -19,7 +19,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct LoggingRuntime {
-    /// Absolute path actually used for the file sink after service-root resolution.
+    /// Absolute path actually used for the file sink after config-relative resolution.
     pub resolved_file_path: PathBuf,
 }
 
@@ -36,8 +36,11 @@ struct SharedLogGuard {
 }
 
 /// Initialize the service log file and install the global tracing subscriber.
-pub fn init_file_logging(config: &LoggingConfig) -> Result<LoggingRuntime, ApiError> {
-    let resolved_file_path = config.resolved_file_path();
+pub fn init_file_logging(
+    config: &LoggingConfig,
+    config_root: &Path,
+) -> Result<LoggingRuntime, ApiError> {
+    let resolved_file_path = config.resolved_file_path(config_root);
     // The service is intended to run unattended, so a missing first-run log
     // directory is created before any long-lived work starts.
     if let Some(parent) = resolved_file_path.parent() {

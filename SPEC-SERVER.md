@@ -1,630 +1,1178 @@
-# Data Store Service Specification
-
-## 1. Purpose And Scope
-
-A standalone Rust microservice that owns document ingestion, durable document
-version storage, retrieval indexes, inference runtimes, and search.
-
-The service exposes a data-store-specific operation protocol over HTTP. Source
-document bytes do not cross the API; callers send corpus-relative source
-references and search queries.
-
-**In scope**
-
-- Rust service process with `axum` and `tokio` confined to the HTTP transport
-  shell.
-- Operation-scoped streamed HTTP protocol.
-- Document ingestion from service-owned corpus files.
-- Docling conversion, unit splitting, dense embeddings, persisted ColBERT
-  document vectors, SQLite storage, FTS, active-version cache, ColBERT scoring,
-  and config-selected final reranking.
-- Immutable source-document versioning, active-version publish, retained-version
-  listing, rollback, health, limits, and graceful shutdown.
-- Runtime admin token-file handoff for local operators.
-
-**Out of scope**
-
-- Migrating indexes or corpora from another system.
-- File listing, markdown inspection, delete, automatic rollback, inactive
-  version cleanup, or corpus management operations.
-- Deferred retrieval features: trigram/fuzzy retrieval, Contextual Retrieval,
-  small-to-big parent retrieval, and ANN indexing.
-
-## 2. Architecture
-
-- **Process:** independent service binary, `data-store-service`.
-- **HTTP transport:** `axum` plus `tokio`, confined to request routing,
-  response streaming, body limits, and graceful-shutdown bridging.
-- **Domain execution:** synchronous operation pipelines for ingestion,
-  retrieval, storage, model calls, Docling process handling, admission, and
-  shutdown state.
-- **Inference:** `candle` and `tokenizers` for local dense, ColBERT, and
-  optional local reranker work, with CUDA or Apple Silicon Metal acceleration.
-  CPU fallback is not supported for local models.
-- **Storage:** SQLite owns durable documents, versions, units, metadata, vector
-  blobs, ColBERT document vectors, and FTS.
-- **Retrieval cache:** dense retrieval uses an explicit in-memory flat vector
-  cache with exact cosine similarity over active document versions.
-- **Late interaction:** ColBERT scoring runs over a bounded candidate pool and
-  loads persisted document token vectors from SQLite.
-- **Final ranking:** a config-selected reranker backend produces the public
-  result order. Supported backends are local Candle ModernBERT and HTTP
-  Cohere-compatible rerank.
-- **Ownership:** the service owns corpus resolution, conversion, chunking,
-  embeddings, durable storage, retrieval cache, indexes, config, and lifecycle
-  controls.
-
-## 3. Models
-
-Local models load from `.safetensors` into accelerator memory during startup.
-Startup and readiness diagnostics must make model and configured reranker
-backend failures explicit. The HTTP process may still bind so health and
-operation errors can report why inference is unavailable.
-
-| Slot | Model | Key params | Formatting | Output |
-|---|---|---|---|---|
-| Dense | Qwen/Qwen3-Embedding-8B | 4096-d Matryoshka, 32k ctx | Query: instruct prefix; passage: raw | 1-D vector with last-token pooling |
-| Late-interaction | lightonai/ColBERT-Zero | 128-d/token, about 512 ctx | `search_query:` / `search_document:` | 2-D `[num_tokens,128]` tensor, no pooling |
-| Reranker | Config-selected local ModernBERT or HTTP Cohere-compatible endpoint | Backend-specific | Local sequence pair or HTTP `{model, query, documents, top_n}` | Public relevance score plus backend-dependent diagnostics |
-
-## 4. Storage Schema
-
-SQLite is the durable source of truth for ingested units and their
-source-document-scoped versions.
-
-Required durable tables:
-
-- `document_versions`: corpus-relative source path, timestamp `versionLabel`,
-  document id, conversion metadata, ingest timestamps, status, and diagnostics.
-  `(sourcePath, versionLabel)` identifies one immutable version of one source
-  document.
-- `active_document_versions`: the active `versionLabel` for each source path.
-  This is the search-visible corpus map and is updated only after a new version
-  is fully durable and cache-ready.
-- `units`: `unitId`, `sourcePath`, `versionLabel`, `documentId`,
-  `headingPath[]`, `pageNumbers[]`, sequence, token count, and `content`.
-- `dense_vectors`: `unitId`, `sourcePath`, `versionLabel`, dimension, vector
-  blob, vector norm, and embedding metadata.
-- `colbert_document_vectors`: `unitId`, `sourcePath`, `versionLabel`, token
-  count, dimension, vector blob, and embedding metadata for persisted document
-  token matrices used by MaxSim.
-- SQLite FTS5 table over unit `content` with enough version metadata or joins to
-  restrict BM25 retrieval to a request's captured active versions.
-
-Version rules:
-
-- Every successful ingest creates a new immutable source-document version.
-- `versionLabel` is a self-documenting timestamp scoped to the source document,
-  such as `2026-06-01T21:37:22.184Z`.
-- Ingesting an already-active source without `force: true` fails with
-  `409 Conflict`.
-- Force re-ingesting a source document never overwrites or deletes older
-  versions.
-- First-time ingests remain invisible to search until publish completes.
-- Force re-ingests keep the previously active version searchable until the new
-  version publishes.
-- Failed ingest attempts must not create an active version, must not become
-  search-visible, and must not require `force: true` on retry. `force: true` is
-  required only when the source already has an active searchable version from a
-  prior successful ingest.
-
-Dense search cache:
-
-- Store one contiguous `Vec<f32>` in row-major `[unit_count, dimension]` order.
-- Store parallel arrays for `unitId`, `sourcePath`, `versionLabel`, stored
-  vector norm, and deterministic sort keys.
-- Cache load/update paths log duration, vector count, dimension, and memory
-  footprint.
-- Cache publish happens only after the new document version is fully durable and
-  ready.
-- Search captures the active cache/snapshot at request admission, before query
-  embedding or later inference work, and uses that same snapshot for the
-  lifetime of the request. A version published after that capture must not enter
-  the already-admitted search scope.
-
-## 5. Pipelines
-
-### Ingestion
-
-Ingestion blocks until the new document version is durable and, after publish,
-searchable. Ingestion is atomic at the service contract boundary: it either
-fully succeeds and publishes the new active version, or it fails without leaving
-new successful ingested state.
-
-1. Resolve the referenced source file internally.
-2. Allocate a source-document-scoped timestamp `versionLabel`.
-3. Convert PDF to markdown with Docling using service-configured PDF backend,
-   OCR mode, and page-batch-size options.
-4. Split markdown into retrieval units with `headingPath`, `pageNumbers`, and
-   content.
-5. Embed Qwen3 dense vectors and ColBERT document token vectors for each
-   searchable unit.
-6. Write the immutable document version, units, dense vectors, ColBERT document
-   vectors, vector norms, and FTS rows to SQLite in an explicit transaction.
-7. Build the search cache state for the new active-version map offline.
-8. Publish by atomically updating the active version for the source document and
-   swapping the active search snapshot.
-9. If any step fails before the terminal ingest result is ready, roll back or
-   remove staged durable rows and active-cache changes for that attempted
-   version. A failed attempt must not leave a success-labeled retained
-   `document_versions` row, units, vector rows, FTS rows, or active-version row
-   that affects future duplicate checks, rollback choices, or search scope.
-   Temporary conversion artifacts may be retained only as diagnostics when they
-   are not treated as ingested state.
-10. Surface conversion failures with diagnostics. No silent fallback across
-   backends or OCR modes is allowed.
-
-### Retrieval
-
-1. Capture the current active source-document version map and active search
-   cache snapshot at request admission, before query embedding. This captured
-   snapshot is authoritative for the lifetime of the request.
-2. Embed the query with Qwen3 dense.
-3. Validate query vector values are finite and compute query norm. Invalid or
-   zero-norm vectors fail explicitly.
-4. Dense retrieval performs exact cosine similarity over the captured vector
-   cache, with deterministic tie-breaking by `unitId`.
-5. BM25 retrieval uses SQLite FTS5 filtered to the captured active versions.
-6. RRF fuses dense and BM25 candidate lists.
-7. ColBERT embeds the query, loads persisted candidate document token vectors
-   for the captured versions from SQLite, and MaxSim reranks only the fused
-   candidate pool.
-8. The selected reranker backend rescores the configured final candidate pool.
-9. Return top-K in final reranker order.
-
-## 6. Operation Protocol
-
-The documented consumer protocol is:
-
-```http
-POST /v1/operations
-Accept: application/x-ndjson
-Content-Type: application/json
-```
-
-Each request starts one operation. The response body is an operation-scoped
-NDJSON stream. Each line is one operation event. The stream ends after a
-terminal `result` or `error` event.
-
-Request envelope:
-
-```json
-{
-  "operationId": "optional-client-id",
-  "operation": "search",
-  "payload": {
-    "query": "clear writing style rules",
-    "topK": 3
-  }
-}
-```
-
-Event types:
-
-- `status`: newline-worthy operation stage.
-- `progress`: counted repeated work, with optional `current` and `total`.
-- `result`: terminal success event with operation-specific payload.
-- `error`: terminal failure event with structured error details.
-
-All operation events include `operationId` and a monotonic per-operation
-`sequence`.
-
-The service reserves:
-
-```http
-POST /v1/operations/{operationId}/control
-```
-
-for cancellation or future mid-operation client-to-server control messages. The
-first implementation may reject unsupported control messages explicitly.
-
-## 7. Operations
-
-### `limits`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Result payload contains request-construction and retrieval limits:
-
-```json
-{
-  "request": {
-    "maxRequestBodyBytes": 16384,
-    "maxIngestSourceChars": 2048,
-    "maxSearchQueryChars": 4096
-  },
-  "retrieval": {
-    "defaultTopK": 10,
-    "maxTopK": 100
-  }
-}
-```
-
-### `health`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Result payload reports service readiness and component diagnostics.
-
-### `sources`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Result payload lists active ingested source documents:
-
-```json
-{
-  "sources": [
-    {
-      "sourcePath": "The_Elements_of_Style.pdf",
-      "activeVersionLabel": "2026-06-01T21:37:22.184Z",
-      "documentId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z",
-      "unitsIngested": 43,
-      "status": "ingested",
-      "createdAtMs": 1780135249223,
-      "updatedAtMs": 1780135249223
-    }
-  ]
-}
-```
-
-The operation must not expose retained inactive versions, absolute markdown
-paths, checksums, vector metadata, or conversion diagnostics. Those remain in
-the protected `versions` operation.
-
-### `ingest`
-
-Authentication: none.
-
-Payload:
-
-```json
-{
-  "source": "The_Elements_of_Style.pdf",
-  "force": true
-}
-```
-
-If `force` is absent or `false` and the resolved source already has an active
-version, the operation must abort before conversion with terminal error
-`status: 409`, `kind: "source_already_ingested"`, and message
-`Source <source> is already ingested. Use --force to override.`
-
-The operation must emit real server-side status/progress events for source
-resolution, existing-source checking, conversion, unit splitting, dense
-embedding, ColBERT embedding, and storage publish.
-
-Result payload:
-
-```json
-{
-  "documentId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z",
-  "versionLabel": "2026-06-01T21:37:22.184Z",
-  "unitsIngested": 43,
-  "status": "ingested"
-}
-```
-
-### `search`
-
-Authentication: none.
-
-Payload:
-
-```json
-{
-  "query": "clear writing style rules",
-  "topK": 3
-}
-```
-
-The operation must emit real server-side status/progress events for query
-embedding, candidate retrieval, ColBERT scoring, reranking, and result assembly.
-
-Result payload:
-
-```json
-{
-  "results": [
-    {
-      "unitId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z:unit:000000",
-      "score": 0.725617,
-      "content": "Matched unit text...",
-      "headingPath": ["Chapter", "Section"],
-      "sourcePath": "The_Elements_of_Style.pdf",
-      "pageNumbers": []
-    }
-  ],
-  "latencyMs": 103500,
-  "raw": {
-    "storage": {
-      "retrieval": {
-        "mode": "dense_bm25_rrf_candidate_pool",
-        "latencyMs": 4711,
-        "queryVectorValidationLatencyMs": 0,
-        "denseLatencyMs": 123,
-        "bm25LatencyMs": 4201,
-        "rrfFusionLatencyMs": 0,
-        "candidateMaterializationLatencyMs": 365,
-        "rawDiagnosticsLatencyMs": 22
-      }
-    },
-    "reranker": {
-      "mode": "modernbert_sequence_classifier",
-      "scores": [
-        {
-          "unitId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z:unit:000000",
-          "score": 0.725617,
-          "rank": 1,
-          "logit": 0.961434,
-          "tokenCount": 512
-        }
-      ],
-      "finalResults": [
-        {
-          "unitId": "the-elements-of-style-pdf__2026-06-01T21-37-22-184Z:unit:000000",
-          "rerankerScore": 0.725617,
-          "rerankerRank": 1,
-          "rerankerLogit": 0.961434,
-          "rerankerTokenCount": 512
-        }
-      ]
-    }
-  }
-}
-```
-
-The `raw.storage.retrieval` object must expose timing fields that break down
-the `retrieving_candidates` stage into query-vector validation, dense scan,
-BM25, RRF fusion, candidate materialization, and raw-diagnostics assembly.
-These fields are diagnostic timing data; public search result ranking is still
-the final reranker order.
-
-The `modernbert_sequence_classifier` raw example includes local-only diagnostic
-fields. For `mode: "http_rerank"`, `scores[]` omits `logit` and `tokenCount`,
-and `finalResults[]` omits `rerankerLogit` and `rerankerTokenCount`. HTTP
-reranker scores are the provider `relevance_score`; the service must not
-synthesize logits or token counts.
-
-### `versions`
-
-Authentication: bearer token required.
-
-Payload:
-
-```json
-{}
-```
-
-Result payload lists retained source-document versions, active-version state,
-checksums, model metadata, ingest status, timestamps, and conversion
-diagnostics.
-
-### `rollback`
-
-Authentication: bearer token required.
-
-Payload:
-
-```json
-{
-  "source": "The_Elements_of_Style.pdf",
-  "versionLabel": "2026-06-01T21:37:22.184Z"
-}
-```
-
-Rollback validates the retained version and publishes it as the active source
-document version without deleting versions, rebuilding embeddings, or changing
-immutable version rows.
-
-Result payload:
-
-```json
-{
-  "sourcePath": "The_Elements_of_Style.pdf",
-  "activeVersionLabel": "2026-06-01T21:37:22.184Z",
-  "publishedAtMs": 1780135300000,
-  "vectorCount": 43,
-  "status": "rolled_back"
-}
-```
-
-### `shutdown`
-
-Authentication: bearer token required.
-
-Payload:
-
-```json
-{}
-```
-
-Result payload:
-
-```json
-{
-  "status": "shutdown_complete",
-  "message": "shutdown complete; service process is terminating"
-}
-```
-
-Accepted shutdown requests drain through the HTTP server graceful-shutdown path.
-
-## 8. Errors
-
-Operation failures after the stream opens must be reported as terminal `error`
-events:
-
-```json
-{
-  "type": "error",
-  "operationId": "op-1",
-  "sequence": 5,
-  "stage": "docling_converting",
-  "error": {
-    "status": 422,
-    "kind": "docling_conversion",
-    "message": "failed to convert source document"
-  }
-}
-```
-
-Errors before the stream opens return structured HTTP error bodies with the
-same `status`, `kind`, and `message` fields.
-
-Required behavior:
-
-- Oversized request bodies fail with `413 Payload Too Large`.
-- Unknown request fields and invalid request fields fail with `400 Bad Request`.
-- Missing or invalid bearer auth for protected operations fails with `401
-  Unauthorized`.
-- Duplicate ingest without `force: true` fails with `409 Conflict`.
-- Conversion failures fail with useful diagnostics and no silent fallback.
-- Inference, storage, and internal failures include enough context for an
-  operator to identify the failing subsystem.
-- Error responses and logs must not include bearer tokens, document contents,
-  vector values, or oversized retrieval internals.
-
-## 9. Service Lifecycle And Admin Token
-
-- On each startup, the service generates one cryptographically random
-  process-scoped admin token.
-- The service keeps the token in memory and prints it once as
-  `admin_shutdown_token=<token>`.
-- The service config requires `[admin].token_file_path`.
-- The service writes the startup token to the configured token file with
-  owner-only permissions.
-- Token-file creation is startup-critical.
-- The service replaces stale token files from earlier runs.
-- On graceful shutdown, the service removes the token file only if it still
-  contains the current token.
-- The token must not be stored in config, environment variables, SQLite, or the
-  service log.
-- Protected operations require `Authorization: Bearer <startup-token>`.
-- Missing or invalid authorization fails explicitly and must not trigger
-  shutdown or version changes.
-
-Startup emits operator-visible bootstrap and startup progress to stdout before
-the process is ready. Startup progress with `x/y` counters may overwrite the
-current terminal line; all other startup status lines must end with a newline.
-
-After file logging is initialized, operational service events are written to the
-configured service log file for unattended/background operation.
-
-## 10. Configuration
-
-Service-owned config includes:
-
-- Server bind address.
-- Required request limits:
-  - `server.max_request_body_bytes`
-  - `server.max_ingest_source_chars`
-  - `server.max_search_query_chars`
-- Ingest/search admission limits.
-- Logging:
-  - `logging.file_path`
-  - `logging.level`
-- Admin token file:
-  - `admin.token_file_path`
-- Model paths for local dense and ColBERT runtimes.
-- Reranker backend configuration:
-  - `models.reranker.backend`: `local` or `http`.
-  - `models.reranker.path` and `models.reranker.max_tokens`, required only for
-    the local ModernBERT backend.
-  - `models.reranker.endpoint`, `models.reranker.model`, and
-    `models.reranker.timeout_seconds`, required only for the HTTP backend.
-  - `models.reranker.api_key_file_path`, optional for the HTTP backend.
-- Inference device and device index.
-- Docling paths and PDF defaults.
-- Corpus path.
-- SQLite database path.
-- Cache loading policy.
-- Retrieval parameters:
-  - `defaultTopK`
-  - `maxTopK`
-  - `rrfK`
-  - candidate over-fetch multiplier
-  - `colbert_candidate_pool_size`
-  - `reranker_candidate_pool_size`
-  - `minSearchUnitChars`
-  - chunk sizing
-
-`logging.file_path` is required. Absolute paths are used as-is; relative paths
-resolve against the repo root. The service creates missing log parent directories
-before long-lived work starts and fails before binding if the log file cannot be
-opened. `logging.level` is required and controls the minimum operational event
-level written to the log file.
-
-`admin.token_file_path` is required. Absolute paths are used as-is; relative
-paths resolve against the Rust service root. The example config must include the
-recommended explicit relative value `.data-store-admin-token`.
-
-ColBERT reranking uses `retrieval.colbert_candidate_pool_size`, with a
-recommended default of `100`. This pool is produced by dense/BM25/RRF before
-ColBERT MaxSim reranking. ColBERT document token embeddings are persisted during
-ingestion and loaded from SQLite during search. Search-time document-vector
-recomputation is not a normal fallback path.
-
-Final reranking uses `retrieval.reranker_candidate_pool_size`. The effective
-pool is `max(reranker_candidate_pool_size, requested topK)`, clamped to the
-available ColBERT-ranked candidates. Final public results remain limited to
-`topK`.
-
-Service logs are human-readable structured lines with stable event fields. They
-must not contain the admin token, document contents, vector values, or other
-oversized retrieval internals.
-
-## 11. Concurrency
-
-Ingest and search each have a separate configured maximum in-flight count. When
-the limit is saturated, the service emits a terminal operation `error` event
-with status `503`.
-
-Separate ingest/search admission is a functional requirement, not only a
-counter layout. A search admitted while an ingest is in progress must search the
-already-active corpus snapshot captured at its own admission. In-progress ingest
-output remains out of search scope until that ingest commits durable storage and
-publishes the new active snapshot. An admitted search must not fail with `503`
-solely because an ingest operation is running.
-
-Shared accelerator and local model runtimes must be made safe for overlapping
-admitted operations. The implementation may serialize individual local model
-calls or small local model-call batches when required by the accelerator/runtime,
-but it must not serialize whole ingest and search operations as the concurrency
-mechanism. HTTP reranker network scoring must not hold the shared local
-model-call gate.
-For example, an ingest may yield between per-unit dense or ColBERT document
-embedding calls so a search can run query embedding, ColBERT scoring, and
-reranking against the captured active corpus.
-
-Model outputs are validated at the inference boundary before storage or ranking
-code consumes them. Dense vectors, ColBERT token vectors, reranker scores, and
-any backend-provided reranker logits must be finite and dimensionally valid.
-Non-finite model output is an inference failure with model-call diagnostics, not
-a downstream storage failure.
-
-The first operation-stream implementation does not need to guarantee
-cancellation support, queue position, or resumable streams.
-
-## 12. Open Validation Items
-
-1. Dense scan performance target: benchmark around 10k, 50k, and 100k units
-   before considering ANN/indexing.
+# SPEC-SERVER — Data Store Service Specification
+
+This is the authoritative specification of the Data Store **server**: an
+autonomous canonical-content-graph and retrieval-fabric service. It describes
+server responsibilities, configuration, storage contracts, startup and
+lifecycle, the administrative async-operation model, health (§1–§7), the
+domain contracts of the autonomous subsystems — acquisition, sync, parsing,
+activation, projections, annotations, query, forensics, events, errors
+(§8–§17) — and commissioning and recorded deviations (§18–§19). It specifies
+rules and invariants; wire detail defers to PROTOCOL.md.
+
+Scope and companion documents:
+
+- **PROTOCOL.md** — the exhaustive HTTP wire contract (request/response shapes,
+  status codes, error bodies). This spec points there for wire detail and does
+  not restate it.
+- **SPEC-CLIENT.md** — the bundled `data-store` CLI client.
+- **INSTALL.md** — installation, model/artifact placement, and `--setup-storage`.
+
+Precision note: **the service code is authoritative.** Where any narrative below
+would conflict with the code, the code wins. The service is designed to be
+commissioned and first run deliberately (see §18); statements here describe the
+service as built, not observed production behavior.
+
+---
+
+## 1. Server responsibilities
+
+The service is a single standalone process that owns four responsibilities.
+
+### 1.1 The autonomous acquisition→activation pipeline
+
+An in-process **acquisition scheduler** thread runs continuously, on its own OS
+thread (not the async runtime), and drives the full content lifecycle without
+operator prompting:
+
+1. **Detect** — a filesystem connector enumerates the corpus root and stages new
+   or changed source bundles. Complete enumeration also evidences deletions
+   (locations that no longer exist).
+2. **Acquire** — staged bundles are imported, recording genuine acquisition
+   provenance (a `SourceLocation` stamped with the connector's governance
+   domain).
+3. **Parse** — the drain dispatches a parse chain per queued item (Docling PDF
+   conversion where applicable, then canonical unit/relationship construction).
+   **A source has at most one active parse**; a fresh parse is built and gated
+   against the current active parse.
+4. **Build projections** — content-derived retrieval projections (chunk,
+   lexical/FTS5, dense, ColBERT/multivector matrices, derived view) are built
+   for the candidate parse. The summary and graph projections are **not** built
+   here — they derive from semantic annotations and build post-activation
+   (§12.1).
+5. **Gate / activate** — `activation::gate_and_activate` evaluates the candidate
+   against the active predecessor. The outcome is one of: **activate** (pointer
+   swap to the new parse), **hold** (retain the candidate as a held parse with a
+   `held_reason` for operator disposition), or a recorded parse failure. Cutover
+   is serialized per source through a process-global `CutoverRegistry` barrier
+   so activation and query-side rejection cannot interleave.
+
+The scheduler runs on an **adaptive cadence**: the effective detection interval
+(`cadence_ms`) is established after the first scan and adjusted per cycle. Each
+cycle publishes health counters (§7).
+
+### 1.2 Post-activation annotation worker
+
+A separate **annotation worker** thread runs beside the scheduler. It is
+discovery-based: each cycle it examines active sources and builds the MVP
+semantic annotation types (entity, relation, summary) for units that lack them,
+reusing memoized producer output (`annotation_memo`) on a memo-key hit and
+retrying previously failed rows. Annotation producers call an external
+OpenAI-compatible chat-completions endpoint (`[models.annotator]`).
+
+The annotation worker is **deliberately not readiness-critical.** A bad key or
+config file **parks** the worker (annotations disabled for the run) while the
+process keeps serving; an unreachable endpoint degrades annotations visibly
+through freshness rows, worker logs, and the diagnostic-only annotation health
+slot. Neither gates service readiness.
+
+### 1.3 HTTP transport shell
+
+An Axum HTTP server (async, Tokio multi-thread runtime) is the **only** async
+surface. It is a thin transport shell: the query pipeline and all admin work run
+on blocking threads. The route surface is summarized in §6; PROTOCOL.md is the
+exhaustive contract.
+
+### 1.4 Snapshot / restore / deletion lifecycle
+
+The service mints forensic snapshots at lifecycle boundaries (pre-activation,
+post-activation, pre-deactivation) and on operator request, restores archived
+parses, and propagates deletions/reappearances. The operator-facing surfaces are
+the admin routes (§6); the autonomous callers are the scheduler and deletion
+paths. Both the HTTP rollback-as-restore route and the autonomous reappearance
+path drive the **same** shared completion function
+(`deletion::restore_and_reactivate_source`), leaving one durable end state.
+
+### 1.5 Health and admission
+
+The service publishes readiness and per-component diagnostics (§7) and admits
+searches through a fail-fast in-flight gate.
+
+---
+
+## 2. Configuration
+
+Configuration is one TOML file, loaded and validated once at startup
+(`ServiceConfig::load`). Relative paths resolve against the **config file's
+parent directory** (canonicalized), never a compile-time or working-directory
+base.
+
+**Every config struct sets `#[serde(deny_unknown_fields)]`.** An unknown or
+misspelled key anywhere in the file is a fatal startup error — stray
+configuration is never silently ignored. Cross-field invariants that TOML cannot
+express (positivity, absolute-path requirements, per-backend required/forbidden
+field sets) are checked in `ServiceConfig::validate` and fail startup with an
+`InvalidConfig` message naming the offending key.
+
+**Config holds external facts only** (spec §35). Retrieval and chunker tunables
+that were once configuration (top-k, RRF constants, candidate-pool sizes,
+chunker limits) have moved to **versioned, hashed policy documents** (the
+RetrievalProfile and chunker configuration folded into their config hashes), not
+this file. Config may hold the path to an active policy document, not its
+values.
+
+The sections below document each `[section]` and its keys as external facts. See
+`config.example.toml` for a complete annotated example.
+
+### 2.1 `[server]`
+
+| Key | Meaning |
+| --- | --- |
+| `bind_address` | Socket address where the HTTP service binds (e.g. `127.0.0.1:8091`). |
+| `max_request_body_bytes` | HTTP body limit applied before request JSON is accepted (over-limit → 413). Must be > 0. |
+| `max_ingest_source_chars` | Maximum length of an ingest source reference after JSON parsing. Must be > 0. |
+| `max_search_query_chars` | Maximum length of a search query after JSON parsing. Must be > 0. |
+
+The three limits are deliberate, operator-visible request-shape protections, not
+internal capacity guesses.
+
+### 2.2 `[logging]`
+
+| Key | Meaning |
+| --- | --- |
+| `file_path` | Service log file; relative resolves against the config directory. Non-empty. |
+| `level` | Minimum event level: `trace`, `debug`, `info`, `warn`, or `error`. |
+
+Bootstrap diagnostics print to stdout before file logging initializes;
+operational logs switch to the configured file thereafter. Config and CLI
+failures before that switch still surface on stdout/stderr.
+
+**Forbidden log data.** API keys, bearer/admin tokens, prompt text, model
+outputs, document contents, and vector values never enter the service log.
+Logs carry bounded diagnostics only — compact boundary facts such as character
+counts, elapsed times, statuses, and truncated error excerpts. Enforcement
+sites include the annotator client (prompt content and model output are
+external-language payloads, logged only as char counts), the HTTP reranker
+(API key read and `Debug` output never expose the key), and the bearer-auth
+guard (a failed token is never in the error or the log). The startup handoff
+line carrying the admin token (§4.6) goes to the operator channel only; the
+durable log records `token_present` without the value.
+
+### 2.3 `[admin]`
+
+| Key | Meaning |
+| --- | --- |
+| `token_file_path` | Runtime file where the service writes the current startup-scoped admin bearer token. Relative resolves against the config directory. Non-empty. |
+
+### 2.4 `[client]`
+
+The bundled CLI shares this single config file. The server **parses and
+validates** this section (so `deny_unknown_fields` accepts the shared file) but
+**never reads it at runtime** — it is client-owned.
+
+| Key | Meaning |
+| --- | --- |
+| `operation_timeout_seconds` | The CLI's per-request / total-poll timeout the client applies to one operation. Must be > 0. |
+
+This is a **CLI request/poll timeout, not a stream timeout**: the fabric has no
+streaming transport.
+
+### 2.5 `[inference]`
+
+| Key | Meaning |
+| --- | --- |
+| `device` | Accelerator backend: `cuda` or `metal`. **CPU fallback is intentionally unsupported.** |
+| `device_index` | Device index passed to the selected backend. |
+
+### 2.6 `[storage]`
+
+| Key | Meaning |
+| --- | --- |
+| `corpus_root` | Root directory for corpus-relative source references. Must be absolute. |
+| `index_root` | Service-owned root for SQLite storage and generated conversion artifacts. Must be absolute. The fabric plane and artifact store derive from this (§3). |
+
+### 2.7 `[connectors.filesystem]`
+
+| Key | Meaning |
+| --- | --- |
+| `governance_domain` | Governance domain stamped on every `SourceLocation` the connector acquires (spec §6 reservation 3): an external governance fact assigned at acquisition, retaggable without re-parse or re-index. Non-empty. |
+
+### 2.8 `[docling]`
+
+| Key | Meaning |
+| --- | --- |
+| `python_path` | Python executable recorded for the configured Docling environment (diagnostic; the service launches `docling_path` directly). Absolute. |
+| `docling_path` | Docling executable launched for PDF→markdown conversion. Absolute. |
+| `document_timeout_seconds` | Per-document conversion timeout. Must be > 0. |
+| `pdf_backend` | One of `pypdfium2`, `docling_parse`, `dlparse_v1`, `dlparse_v2`, `dlparse_v4`. |
+| `ocr_mode` | One of `auto`, `on`, `off`. |
+| `device` | Docling's Python-side device: one of `auto`, `cpu`, `cuda`, `mps`, `xpu` (separate from `[inference].device`). |
+| `num_threads` | Docling worker thread count. Must be > 0. |
+| `page_batch_size` | Docling page batch size. Must be > 0. |
+
+Note: `document_timeout_seconds`, `pdf_backend`, `ocr_mode`, `num_threads`, and
+`page_batch_size` are parser-identity-bearing — they fold into `parserConfigHash`
+and can trigger dominance gating on change.
+
+### 2.9 `[models.dense]`, `[models.colbert]`, `[models.reranker]`, `[models.annotator]`
+
+`[models.dense]` — backend-exclusive; **no fallback between backends.**
+`backend` is `local` or `http`. Validation requires each backend's fields and
+**forbids** the other backend's fields (misconfiguration fails at startup):
+
+| Key | Required when | Meaning |
+| --- | --- | --- |
+| `backend` | always | `local` (in-process Candle Qwen3 embedding runtime) or `http` (OpenAI-compatible `/v1/embeddings` remote). |
+| `dimension` | always | Expected dense vector width. > 0. HTTP responses are validated against it per call. |
+| `pooling` | always | Pooling contract (e.g. `last_token`); validated by the local adapter, recorded as the served model's stated fact for `http`. Non-empty. |
+| `path` | `local` | Local Qwen3 dense embedding model directory. Absolute. Forbidden for `http`. |
+| `max_tokens` | `local` | Dense input token cap. > 0. Forbidden for `http`. |
+| `endpoint` | `http` | OpenAI-compatible embeddings URL; must start `http://` or `https://`. Forbidden for `local`. |
+| `model` | `http` | Model name sent in embeddings requests. Forbidden for `local`. |
+| `timeout_seconds` | `http` | External embeddings request timeout. > 0. Forbidden for `local`. |
+| `api_key_file_path` | optional (`http` only) | Owner-only file holding the bearer API key (e.g. `.data-store-dense-api-key`). Relative resolves against the config directory. |
+
+`[models.colbert]`:
+
+| Key | Meaning |
+| --- | --- |
+| `path` | Local ColBERT-Zero model directory. Absolute. |
+| `dimension` | Expected ColBERT token-vector width. > 0. |
+| `query_max_tokens` | ColBERT query input token cap. > 0. |
+| `document_max_tokens` | ColBERT document/unit input token cap. > 0. |
+
+`[models.reranker]` — backend-exclusive; **no fallback between backends.**
+`backend` is `local` or `http`. Validation requires each backend's fields and
+**forbids** the other backend's fields (misconfiguration fails at startup):
+
+| Key | Required when | Meaning |
+| --- | --- | --- |
+| `backend` | always | `local` (in-process Candle ModernBERT) or `http` (Cohere-compatible remote). |
+| `path` | `local` | Local reranker model directory. Absolute. Forbidden for `http`. |
+| `max_tokens` | `local` | Local reranker token cap. > 0. Forbidden for `http`. |
+| `endpoint` | `http` | Cohere-compatible rerank URL; must start `http://` or `https://`. Forbidden for `local`. |
+| `model` | `http` | Model name sent in rerank requests. Forbidden for `local`. |
+| `timeout_seconds` | `http` | External rerank request timeout. > 0. Forbidden for `local`. |
+| `api_key_file_path` | optional (`http` only) | Owner-only file holding the rerank API key. |
+
+`[models.annotator]` — the external OpenAI-compatible chat-completions endpoint
+for the annotation producers. **Exclusive**: producer failures park annotations
+as failed for later retry; there is no fallback model or endpoint.
+
+| Key | Meaning |
+| --- | --- |
+| `endpoint` | Full chat-completions route URL (not a base URL). Non-empty. |
+| `model` | Model name sent in request bodies. Non-empty. |
+| `timeout_seconds` | Whole-request timeout for one producer call. > 0. |
+| `api_key_file_path` | Optional owner-only file holding the bearer API key. |
+| `max_input_chars` | Producer input budget in characters; larger section groups split deterministically before invocation. Sized from the endpoint model's context window. > 0. |
+
+---
+
+## 3. Storage and schema contract
+
+Physical layout derives from `[storage].index_root`:
+
+- **Fabric hot plane** — one SQLite database at
+  `{index_root}/fabric/fabric.sqlite3`, with its DDL under `sql/fabric/`. It is
+  the only durable store; there is no legacy plane in the end state.
+- **Artifact store** — a content-addressed filesystem tree at
+  `{index_root}/fabric/artifacts/sha256/<first-2-hex>/<full-hash>` (write-once,
+  temp-file + atomic rename).
+- **Event log** — the `system_events` table in the hot plane, written inside the
+  owning operation's transaction.
+
+**Connection and deadline policy** (all code constants, never config, per spec §35):
+
+- `journal_mode = WAL` — set at setup and **validated fatally at startup**; never
+  repaired at runtime.
+- `synchronous = FULL` on write-capable connections (durability guarantee: a
+  lost-but-served record is a breach).
+- `busy_timeout` and per-statement deadlines are code constants (both 5000 ms).
+- Read paths open `SQLITE_OPEN_READ_ONLY`; `foreign_keys = ON` per connection; a
+  fresh connection per operation.
+- The database carries its own `PRAGMA user_version` sequence **starting at 1**
+  (current expected version: **1**). Startup validates the version and the table
+  contract (a Rust-side mirror compared against `PRAGMA table_info`).
+
+**Runtime never creates or migrates schema** (spec §1.3). Schema arrives only via
+the explicit operator-run `--setup-storage` path (§4). A missing or invalid
+fabric plane at startup is **not fatal** — the service serves with `ready=false`
+and health explains why (§4, §7).
+
+Fabric tables (from `sql/fabric/schema.sql`):
+
+`source_objects`, `source_locations`, `acquisition_records`, `sync_queue`,
+`parse_runs`, `content_units`, `unit_relationships`, `retrieval_projections`,
+`query_execution_records`, `forensic_snapshots`, `operations`,
+`semantic_annotations`, `annotation_memo`, `system_events`, `chunk_projections`,
+`chunk_dense_vectors`, `unit_multivector_projections`, `graph_entity_mentions`,
+`graph_entity_edges`, plus the `chunk_text_index` FTS5 virtual table (the
+lexical index over chunk text). (`query_execution_records` exists as a reserved
+seam; the QER audit tier that writes it is deferred — see §19.)
+
+---
+
+## 4. Startup and lifecycle
+
+### 4.1 CLI options
+
+| Flag | Effect |
+| --- | --- |
+| `--config <path>` | Config file path (defaults to `config.toml`). |
+| `--setup-storage` | Create/validate the **fabric hot plane** schema, then exit. A single deliberate operator action; the only path that creates or validates schema. |
+| `--foreground` | Keep the service attached to the terminal instead of daemonizing. |
+| `--smoke-dense` | Run inference readiness smoke checks without binding HTTP, then exit. |
+
+An unknown argument is a fatal CLI error.
+
+`--setup-storage` sets up the fabric plane only (the legacy plane was retired);
+on success it prints the database path and exits. It builds at a temp path and
+atomic-renames, so a crashed setup is recoverable.
+
+### 4.2 Bind-before-init
+
+On a normal start the service **binds HTTP before lengthy dependency
+initialization**, so a launcher observes the listener early. Ordering:
+
+1. Bootstrap: load config, initialize file logging (bootstrap diagnostics to
+   stdout).
+2. Generate the admin token; enter the service process role (daemonize unless
+   `--foreground`).
+3. Bind the TCP listener. A bind failure is fatal.
+4. **Publish the admin token file** (§4.3). Failure is fatal.
+5. Initialize inference. Failure is fatal (and cleans up the token file).
+6. Fabric hot-plane **pre-check** (reporting only): a synchronous read-only open
+   + schema validation predicts sync readiness for the startup handoff. It is
+   **not** the health source of truth — `/v1/health` reads the
+   scheduler-published sync slot, which starts pending. A missing/invalid fabric
+   plane here is **not fatal**: the service serves with `ready=false`.
+7. Capture the §30.2 application identity once (fatal on failure — a service that
+   cannot pin the identity its snapshots stamp has nothing valid to record).
+8. Construct shared state and spawn the scheduler (fatal on spawn failure, since
+   sync gates readiness) and the annotation worker (not readiness-critical).
+9. Serve until shutdown.
+
+### 4.3 Admin token handoff
+
+The service generates a fresh **startup-scoped** admin bearer token each run and
+publishes it to the configured `[admin].token_file_path` with **owner-only
+(0600)** permissions. The token authorizes the protected routes (§6). The token
+file is cleaned up when the current process's serve loop ends.
+
+### 4.4 Readiness
+
+Top-level readiness is the conjunction of exactly two components:
+**`inference` AND `sync`**. Inference is true by construction once startup passes
+its init step. `sync` is the scheduler's fabric-plane readiness, published into a
+shared slot and starting `pending`. The diagnostic-only components (fabric,
+annotation, search_admission — §7) are **excluded** from this conjunction; a
+degraded diagnostic never makes a running service report unavailable.
+
+### 4.5 Graceful shutdown
+
+Shutdown is driven **only** by `POST /shutdown` → `AppState::request_shutdown`,
+which signals a cross-thread latch. **There is no OS-signal handling.** On the
+signal (or on a transport error in the serve loop) the service requests shutdown,
+then joins the scheduler and annotation worker (bounded by one wakeup), cleans up
+the token file, and stops.
+
+### 4.6 Daemonization handoff
+
+Unless `--foreground` is given, the service daemonizes: the launcher-facing
+parent process re-executes its own binary as a detached child (its own session
+via `setsid`) and waits on a **startup handoff channel** — one half of a Unix
+socket pair the child inherits (its fd published through
+`DATA_STORE_BACKGROUND_STARTUP_FD`, with `FD_CLOEXEC` cleared so it survives
+the exec). With `--foreground` the same protocol runs over stdout instead. The
+child reports startup over that channel as:
+
+- **Status lines** — one line per startup stage, echoed by the parent so the
+  operator sees bind/init progress.
+- **Transient progress lines** — prefixed `__data_store_progress__` so the
+  parent can render them as overwritable terminal progress rather than
+  permanent output.
+- **The token line** — exactly one `admin_shutdown_token=<token>` line hands
+  the startup-scoped admin token to the operator channel. The parent redacts
+  this line when echoing anywhere durable; the service log records only
+  `token_present`, never the value.
+
+When startup completes, the child **closes the handoff channel**; the parent
+observes EOF and exits, leaving the detached child serving. Startup failures
+surface on the same channel before it closes, so the parent can exit non-zero
+with the failure visible.
+
+---
+
+## 5. Async-operation administrative model
+
+Every **mutating** admin route executes as an asynchronous **Operation**. The
+route inserts a durable `operations` row, returns an Operation id immediately,
+and runs the work either **queue-coupled** (via the scheduler drain) or on a
+**detached `spawn_blocking`** task. The task transitions the Operation to
+`succeeded` on `Ok` or `failed` on `Err`/panic. Clients poll with
+`GET /operations/{operationId}`.
+
+The Operation `status` set is closed: **`pending`** (on insert) →
+**`running`** (once the worker starts it) → terminal **`succeeded`** or
+**`failed`**. The `operationType` set is the spec §34.6 closed enumeration plus
+one recorded additive extension: **`parse_discard`**, the held-parse discard
+disposition's async-operation handle (§16).
+
+**No NDJSON anywhere** (D2 ruling): there is no streamed progress on
+administrative operations, and no streamed query transport. Administration is
+Operation records + polling only.
+
+**Operation-succeeded ≠ parse-outcome.** An Operation's `succeeded` status means
+the **pipeline lifecycle completed** — the async work ran to a clean terminal
+state. It does **not** encode the domain verdict of a parse. The domain outcome
+(activated, held with a reason, or a recorded parse failure) lives in the
+**parse run** (`parse_runs` / the held-parse surface). A polling client that
+needs the domain verdict must read the parse run, not just the Operation status.
+
+---
+
+## 6. HTTP route surface
+
+The full wire contract is in **PROTOCOL.md**. Routes split into public
+(no bearer) and protected (admin bearer required, spec §34 protection split).
+
+**Public:**
+
+- `GET /v1/health` — readiness and diagnostics (§7).
+- `POST /query` — the spec §34.1 spec-literal query path; JSON `QueryRequest` in, one
+  JSON response carrying the EvidencePack. The synchronous retrieval + assembly
+  pipeline runs on a blocking thread.
+- `GET /units/{unitId}`, `GET /units/{unitId}/relationships` — unit reads, gated
+  so a non-active parse's units are never served.
+- `GET /sources/{sourceId}` — source inspection.
+- `GET /sync/status` — sync status.
+
+**Protected (admin bearer):**
+
+- `POST /sources` — register a source (async Operation).
+- `POST /sources/{sourceId}/parses` — request a parse (async Operation).
+- `POST /sources/{sourceId}/parses/{parseId}/activate` — activate a parse (async).
+- `POST /parses/{parseId}/accept`, `POST /parses/{parseId}/discard` — held-parse
+  disposition (async).
+- `POST /snapshots` — mint a forensic snapshot (async).
+- `POST /restore` — restore + reactivate a source (async; shares the autonomous
+  completion path).
+- `POST /shutdown` — immediate confirmation, then signals shutdown. **Not** an
+  Operation row (not async work).
+- `GET /parses?status=held` — held-parse listing (spec §13.4 disposition surface).
+- `GET /operations/{operationId}` — Operation polling.
+
+---
+
+## 7. Health
+
+`GET /v1/health` returns a `HealthResponse { service, ready, components[] }`.
+Each `HealthComponent` carries `name`, `ready`, `details[]`, and a typed
+`counts[]` array of `HealthCount { label, source_system?, value, as_of }`. Counts
+are typed numbers (not strings parsed out of `details`), and **every count
+carries its own `as_of` marker** — a count without its measurement time is a
+guess presented as fact.
+
+Health is assembled from **in-memory slots** published into by the owning
+threads; the health read opens no database connection. Slot reads are
+poison-recovered (a panicked publisher's last snapshot is still reported so
+health keeps answering).
+
+Components:
+
+- **`inference`** (readiness-critical) — runtime readiness details.
+- **`sync`** (readiness-critical) — the scheduler's per-cycle slot:
+  `fabric_ready`, backlog depths (`pending`/`in_flight`/`failed`),
+  `coalesced_total`, last-cycle counters, effective `cadence_ms`, and
+  `last_success_at` (achieved freshness as measured truth, never a target).
+  Starts not-ready ("validation pending") until the scheduler's first cycle.
+- **`logging`** (diagnostic-only) — file path and level.
+- **`fabric`** (diagnostic-only) — per-`source_system` fabric backlog/fault
+  counts published each scheduler cycle: **`held`**, **`serving_stale`**,
+  **`access_lost`**, **`stuck_building`**, **`unparseable_mime`**,
+  **`verification_halted`**. Keyed per `source_system` (exactly one at MVP, but
+  the shape is a per-system map, not a single global bucket), each with the
+  cycle's `as_of`.
+- **`annotation`** (diagnostic-only) — the annotation worker's own slot:
+  `parked` (+ detail) and last-cycle freshness counts, corpus-aggregate (not
+  source-system keyed), with an `as_of`.
+- **`search_admission`** (diagnostic-only) — the search admission gate window
+  (`max_in_flight` / `in_flight`) via `AdmissionGate::snapshot`.
+
+**Only `inference` and `sync` gate the top-level `ready` flag.** The other
+components are diagnostic-only by construction.
+
+Admission itself: the `/query` handler acquires a permit from a fail-fast
+in-flight search gate before running the pipeline. Saturation surfaces the
+existing `ServiceUnavailable` (503) path; the gate's capacity is a code constant,
+not operator-tunable.
+
+---
+
+## 8. Acquisition contract
+
+### 8.1 Connectors are untrusted producers
+
+Connectors stage acquisition bundles; the **importer** owns every canonical
+acquisition write. Every manifest field is a claim. Content identity is only
+ever the SHA-256 the importer **recomputes over the staged bytes**: a manifest
+whose claimed source hash (or claimed byte size) disagrees with the staged
+bytes is rejected at the trust boundary.
+
+A malformed or mismatching bundle is a **recorded acquisition outcome**, never
+an importer error: the importer writes a failed `AcquisitionRecord` plus an
+`acquisition.failed` event in one transaction, and the staged bundle directory
+is **deliberately kept** so the operator can inspect the malformed input.
+Importer `Err` is reserved for faults of the canonical side itself (SQL,
+artifact store, staging filesystem). When the manifest was readable, its claims
+are preserved verbatim on the failure record; when it was not, identity fields
+carry an explicit unknown-claim literal — the record never fabricates claims.
+
+### 8.2 AcquisitionRecords for failures and successes alike
+
+Every acquisition attempt — success or failure — leaves a durable
+`AcquisitionRecord`. Failure records carry a `failure_class` from the closed
+set `unreachable`, `access_denied`, `not_found`, `timeout`, `malformed`,
+`resource_limit`, `other`, plus a bounded `failure_detail`.
+
+### 8.3 Content identity and dedup
+
+**One SourceObject exists per `source_hash`.** Re-import of identical content
+is idempotent: dedup by content hash refreshes the existing rows rather than
+duplicating them, so a crash mid-chain can safely replay against a
+still-staged bundle. The artifact-store blob write happens *before* (outside)
+the import transaction — the store is content-addressed and write-once
+idempotent, so a crash between blob write and commit leaves only an orphan
+blob a later import reuses, never a committed row whose `storage_uri` dangles.
+
+### 8.4 Locations, renames, and rebinds
+
+`(source_system, native_uri)` is the unique presence key of a
+`SourceLocation`. Three transitions exist:
+
+- **Refresh** — the location re-observed with the *same* content: presence is
+  re-confirmed (`last_seen_at` advances, status returns to `current`) and any
+  stale deletion evidence on the row is cleared; the durable evidence survives
+  in the event log, the row reflects current state only.
+- **Rebind** — the location re-observed with *different* content: the row is
+  repointed at the new SourceObject and **`first_seen_at` is reset** to the
+  rebind time. A content change is one location binding ending and another
+  beginning; the reused row models the *new* binding, and the old binding's
+  history survives in `acquisition_records` and `system_events`.
+- **Rename** — content appearing at a new `native_uri` is a new location of
+  the same SourceObject (dedup by hash); the vacated location is evidenced as
+  deleted by the same enumeration that saw the move.
+
+### 8.5 Deletion evidence — qualifying signals only
+
+A location is marked `deleted` only with qualifying `DeletionEvidence`. The
+signal vocabulary is closed: `explicit_delete_event`,
+`absent_from_complete_enumeration`, `source_reported_gone`. The MVP filesystem
+connector mints only `absent_from_complete_enumeration`, and only from a
+**complete** enumeration of the scope. Deletion is **never inferred from
+absence counting**, and a failed or partial enumeration asserts *nothing*
+about absent items. The complete current-location set is read uncapped by
+design: a capped read would treat rows beyond the cap as absent and fabricate
+deletion evidence.
+
+### 8.6 Access-lost lifecycle
+
+When a scope enumeration fails **source-side**, the scope's `current`
+locations transition to `access_lost` (with a `source.access_lost` event
+each). Access-lost is a reachability statement, not a deletion: the document
+presumably still exists; observation was lost. **Serving continues** — no
+deactivation, no barrier — and the freshness clock stops simply because
+`last_seen_at` stops advancing. Access-lost never feeds §15.8 deactivation. A
+location coming back from `access_lost` completes the audit pair: the refresh
+mints `source.access_restored` on the same transaction.
+
+---
+
+## 9. Sync queue and backpressure contract
+
+### 9.1 Durable coalescing queue
+
+Detected changes flow through the durable `sync_queue` with **latest-state
+coalescing**: at most one row exists per `source_key`
+(`source_system:native_uri`). A new detection for an existing row — in *any*
+state — is absorbed into it (advancing `detected_at`, re-pending the row,
+incrementing `coalesced_count`) instead of inserting a second row.
+
+**Coalescing never drops an attached Operation.** A queue-coupled
+(HTTP-enqueued) row carries the `operation_id` of its §5 Operation; the
+coalesce write keeps whichever of the new-or-existing link is non-null,
+because the drain still owes that Operation a terminal transition.
+
+Entry states are `pending`, `in_flight`, `failed`. Completed entries are
+**deleted** — the audit trail is the acquisition records the drain produced,
+never queue residue. A `failed` entry is terminal until a new detection
+re-pends it. `in_flight` rows observed at claim time are reclaimed: the single
+scheduler thread drains synchronously, so any observed `in_flight` row is
+stale wreckage from a crash, never live work.
+
+### 9.2 Knob-free adaptive cadence
+
+The detection cadence is **knob-free** (spec §35): no cadence, interval, or
+backlog configuration key exists anywhere in the config surface. Growth
+factors and smoothing weights are code constants; quiet cycles grow the
+interval multiplicatively (deliberately no ceiling — that would be a policy
+knob), observed changes pull it back down toward the measured inter-change
+rate (floored at the scan's own duration), and undrained backlog at cycle end
+throttles detection further. The effective `cadence_ms` is published per cycle
+into sync health (§7) as measured truth.
+
+### 9.3 Backpressure events
+
+`sync.backpressure_entered` / `sync.backpressure_exited` are **durable,
+edge-triggered SystemEvents** recording a real load-shedding regime: entered
+when a cycle ends with undrained backlog throttling the cadence, exited when
+the backlog clears. They record regime transitions, not per-cycle noise.
+
+### 9.4 Staging lifecycle
+
+Startup sweeps orphaned parser temp workspaces (`bundle-*` `.tmp` directories)
+before the first cycle. A consumed acquisition bundle directory is deleted
+**only after the entry's whole unit of work completes** (import → parse → gate
+→ activate → queue completion), so a crash mid-chain replays against the
+still-present bundle idempotently. Failure bundles — rejected acquisition
+bundles and failed parser output bundles — are **retained** for diagnostics.
+
+---
+
+## 10. Parsing contract
+
+### 10.1 Parser workers are untrusted producers
+
+Parser workers write **staged output bundles only** — never canonical storage
+or hot indexes. Nothing in a bundle is canonical until the importer validates
+and imports it. The bundle reader independently **recomputes every file
+digest** listed in the bundle manifest before the importer trusts any content;
+the manifest itself (which cannot contain its own hash) is validated
+structurally — parse, schema version, and full digest coverage of every other
+file. Staged bundles are plain JSON claims, not canonical state:
+canonicalization happens exactly once, at import, when the core builds the
+canonical parse bundle.
+
+### 10.2 The importer is the sole canonical writer
+
+Candidate records in a bundle carry parser-local string IDs only. **All
+canonical parse-scoped IDs are assigned by the importer, never by workers**;
+even the bundle directory name is a worker-chosen unique name with no
+canonical meaning. The importer owns every canonical parse-state write
+(`parse_runs`, `content_units`, `unit_relationships`, and their events).
+
+### 10.3 Hard gates (spec §13.1)
+
+The importer enforces the §13.1 hard gates over the digest-verified bundle:
+definitional structural truths, no thresholds. **Each gate fails with a
+distinct error** naming the gate and the offending record: `resource_limits`
+(unit/relationship/warning counts, per-unit body size), `id_assignment`
+(sequence-index claims), `local_ref_integrity` (duplicate or dangling local
+ids), `body_type_mapping` (body shape vs declared content type), and
+`capability_profile` (undeclared content or relationship types).
+
+### 10.4 Rejected vs fault
+
+The split mirrors acquisition:
+
+- A bundle that breaks the staged contract, reports a failed parser execution,
+  or fails a hard gate is a **recorded parse outcome**: the `parse_runs` row
+  moves to `failed` with a bounded error and a `parse.failed` event. Every
+  failed attempt writes a durable failure record (spec §13.5 rule 2).
+- An infrastructure fault of the canonical side (SQL, artifact store, clock)
+  surfaces as an error and **deliberately leaves the run row `building`** —
+  marking it `failed` would blame the parse for the service's own fault.
+  Stuck-`building` rows surface in health (the fabric component's
+  `stuck_building` count, §7), and dispatch proceeds past stale `building`
+  wreckage so one crash cannot permanently block a source.
+- One recorded boundary: a bundle whose manifest is unreadable or whose
+  claimed source does not exist cannot leave *any* durable run row
+  (`parse_runs` identity columns are NOT NULL); those unattributable bundles
+  surface as explicit errors logged with the bundle path.
+
+### 10.5 Conformance is measured, never gating
+
+Conformance measurement is **pure** — no IO, no clock, no storage — and is
+**always measured, never a gate**: no absolute threshold exists. It produces
+the `ConformanceReport` whose `dimensions` map the §11.2 dominance rule later
+compares. Dimension keys are a stable persisted contract
+(`locator_coverage`, `caption_pairing_rate`, `table_decomposition_rate`,
+`relationship_coverage`), every dimension oriented so higher is better.
+
+### 10.6 No blind retry (spec §13.5)
+
+Before dispatching a worker, the scheduler evaluates every prior run keyed on
+the tuple **(source, parser name, parser version, parser config hash)**.
+Because a source id is 1:1 with its `source_hash`, a match means identical
+bytes through an identical parser — which fails (or succeeds) identically, so
+re-parsing is pointless or forbidden. Outcomes: dispatch (no prior run),
+dispatch over stale `building` wreckage (surfaced, so a crash cannot block the
+source), gate an existing un-held `ready` run (crash-recovery idempotence), or
+skip. Only new content or a new parser identity licenses a re-parse; Docling's
+identity-bearing config keys (§2.8) fold into `parserConfigHash` and change
+the tuple.
+
+### 10.7 Pre-worker content-identity check
+
+Immediately before worker execution the scheduler hashes the **live** corpus
+file and compares it against the run's bound `source_hash` (computed over the
+*staged* bytes at acquisition). On mismatch the parse is **skipped**: binding
+old-hash identity to new-byte content would corrupt content identity, and the
+skip is self-healing — the changed bytes are re-detected, re-staged, and
+re-parsed under their own new SourceObject by the next scan. The residual
+instant between this check and the worker's own read is a recorded residual.
+
+---
+
+## 11. Activation contract
+
+### 11.1 Changed content activates
+
+A source has at most one active parse (`source_objects.active_parse_id`).
+**Changed content — a new `sourceHash`, hence a source with no active
+predecessor — activates automatically** once its canonical state is complete,
+the binary invariants (§10.3) passed, and its required content-derived
+projections are fresh (chunk, lexical, dense, multivector, derived view; the
+graph projection is deliberately not required — it is annotation-derived and
+post-activation, §12.1). The §21.4 required-annotation-set policy is consulted
+at the same seam; its MVP content is "nothing blocks activation."
+
+### 11.2 Unchanged content is dominance-gated
+
+A re-parse of **unchanged content** is gated by relative dominance over the
+`ConformanceReport.dimensions` maps of candidate and active parse: a **union
+comparison, absence-conservative** —
+
+- a dimension present in the active report but absent from the candidate
+  compares as **worse** (hold);
+- a dimension present only in the candidate never blocks;
+- absent from both is equal;
+- present in both compares with plain `>=` (all dimensions higher-is-better).
+
+**No absolute quality threshold exists anywhere in the activation path**
+(spec §13, §35): every gate is a definitional status/identity check or this
+relative comparison between two measured reports.
+
+### 11.3 Held parses
+
+A dominance regression holds the candidate: `heldReason =
+conformance_regression` (the only held reason), and the run stays `ready` and
+non-queryable pending **explicit asynchronous operator disposition** — the
+accept and discard Operations (§6). **At most one held candidate exists per
+source**: a newer candidate reaching a disposition (activate *or* hold)
+supersedes any older held candidate (`parse.hold_superseded`, moved to
+`archiving` and cleaned through §15.7). Accept force-activates the held run
+(clearing the hold atomically with activation); discard removes it from the
+disposition queue — its canonical parse bundle stays in the artifact store,
+because discard removes a candidate, not the audit record.
+
+### 11.4 Per-source cutover barrier
+
+Cutover is serialized per source through a process-global barrier registry.
+The pointer swap (`active_parse_id`), the candidate's `ready → active`
+transition, the predecessor's `active → archiving` transition, and their
+events commit in one transaction **under the held barrier**; the dense-plane
+publish/evict happens under the same hold. Query-side, any query whose
+captured active set touches a source mid-cutover is rejected with the
+**retryable 503 `cutover_barrier_active`** — raised immediately after scope
+capture and **before any retrieval stage runs**, so a query is never partially
+executed. Barrier holds last milliseconds (spec §31.1); client retry is
+sufficient. Snapshots are never minted under a held barrier (§15.2).
+
+---
+
+## 12. Projections contract
+
+### 12.1 The built set and its timing
+
+Projections are rebuildable retrieval-targeting and ranking artifacts over a
+parse — **never canonical evidence**. The MVP set:
+
+- **Content-derived, built pre-activation** for the candidate parse: chunk,
+  lexical (the `chunk_text_index` FTS5 index over chunk text), dense
+  (per-chunk vectors), multivector (per-unit ColBERT matrices), derived view.
+  These are the activation-required set (§11.1).
+- **Annotation-derived, built post-activation** by the annotation worker:
+  summary (materializing summary annotations) and graph (entity mentions and
+  entity edges derived from entity/relation annotations).
+
+### 12.2 Parse-scoped, active-only
+
+Every projection is parse-scoped and **queryable only for the source's active
+parse**; a held or superseded parse's projections are never served.
+
+### 12.3 Freshness lifecycle
+
+Projection freshness is the closed five-value lifecycle **`building` →
+`fresh`**, with `failed` (build failed), `stale` (inputs moved on), and
+`superseded` (the owning parse superseded at cutover). All envelope rows live
+on the shared `retrieval_projections` table through a single persistence path;
+lifecycle transitions are status-guarded and append their `projection.*`
+events atomically.
+
+### 12.4 Rebuild determinism split
+
+- **Chunk, lexical, and graph** rebuild **deterministically** from durable
+  rows: restore re-imports the archived chunk rows and rebuilds the FTS5 index
+  and graph tables from re-imported canonical/annotation state, which is why
+  the FTS5 and graph planes are never archived.
+- **Dense and multivector** are model-dependent — not deterministically
+  reproducible from scratch — but **byte-reproducible from their archived
+  blobs** via the little-endian f32 codec. Restore and verification
+  **re-import the stored bytes and never re-embed**.
+
+The chunker's identity (name, version, and its boundary-affecting limits) is a
+hashed code document folded into `chunkerConfigHash`, not configuration.
+
+### 12.5 Chunks are targeting artifacts
+
+Chunks exist to be found — lexical and dense targets that resolve back to
+canonical units. **A chunk is never served as evidence**; evidence is always
+canonical ContentUnits (§14.3 step 7).
+
+---
+
+## 13. Annotations contract
+
+The annotation worker (§1.2) builds the MVP semantic annotation types
+(entity, relation, summary) **after activation**; annotations never block
+activation or the sync pipeline (the §21.4 policy's MVP blocking set is
+empty).
+
+- **Freshness state machine.** `building` → `fresh`, with `failed` (producer
+  failure, retried by later worker passes) and `stale`. Transitions are
+  status-guarded and append `annotation.*` events atomically.
+- **Parse-scoped readability.** Annotations are parse-scoped and readable only
+  for the source's **current active parse**, enforced in the read SQL itself.
+- **Eligibility: pure function of target content.** A producer's model input
+  is *exactly* the ordered text of its target units — no corpus context, no
+  neighbors, no metadata, no synthesized headings. This input purity is what
+  makes every producer memoization-eligible.
+- **The §21.2 memo key.** The memo cache is keyed by a canonical SHA-256 over
+  the **ordered per-target content hashes** (each target's `textHash`, falling
+  back to `bodyHash`), the **annotation type**, and the **producer identity
+  hash**. A producer identity or configuration change changes the key and
+  invalidates reuse. One cache row caches one full producer invocation output;
+  memo rows deliberately survive parse archival and hot cleanup — cross-parse
+  reuse is the cache's purpose (§15.10).
+- **Memoization honesty.** Reuse is recorded through the Provenance
+  memoization fields: a re-minted annotation carries `memoized` and a
+  per-item `memoizedFrom` naming the originating annotation. An auditor can
+  always tell whether the model actually ran.
+- **Exclusive external endpoint.** Producer calls go to the single configured
+  OpenAI-compatible endpoint (§2.9); a failure parks the annotation `failed`
+  for a later retry pass — no fallback model or endpoint.
+
+---
+
+## 14. Query pipeline contract
+
+### 14.1 DP1 — one read snapshot per query
+
+**Every query executes all of its hot-plane reads inside ONE read-only
+transaction on one connection — one WAL snapshot — opened as the pipeline's
+first act.** The scope-filtered active `(source → parse)` capture is read
+inside that transaction, so capture and every later read (lexical, chunk→unit
+resolution, multivector matrices, unit content, assembly) share one snapshot.
+Nothing in the pipeline opens a second connection or transaction. The dense
+planes are in-memory immutable clones captured at the same point. Recorded
+tradeoff: the pinned snapshot blocks WAL checkpointing for the query's
+duration (bounded by admission), and the snapshot-held duration is logged.
+
+### 14.2 Admission
+
+The `/query` handler acquires a permit from the fail-fast in-flight gate
+before the pipeline runs and holds it across the whole blocking pipeline.
+Capacity is a code constant — **one in-flight search** at MVP; saturation is
+an immediate 503. (§7.)
+
+### 14.3 Stage order
+
+1. **Scope capture** inside the read transaction; **scope is enforced at
+   candidate generation, never post-filtered** — out-of-scope sources are
+   never captured, so no later stage sees them.
+2. **Cutover-barrier probe** over the captured sources, before any retrieval
+   stage (§11.4).
+3. **Dense + lexical candidate generation**, then **RRF fusion** — fusion is
+   **rank-only**: the fused score is a reciprocal-rank signal, never a
+   semantic similarity.
+4. **Graph channel appended** to the fused pool: lexical entity-name entry,
+   semantic-only one-hop traversal over annotation-derived mentions/edges, no
+   LLM in the query path.
+5. **ColBERT MaxSim over the fused pool** — **retained at MVP.** The deferred
+   `multi_vector` *retrieval channel* (§19) is candidate generation; this
+   stage is late-interaction re-scoring of the already-fused pool and is
+   built and live. Document matrices are the persisted ones (recomputing
+   document vectors at search time is forbidden); only the query is embedded
+   live.
+6. **Final reranker** over the MaxSim top-N via the config-selected backend —
+   exclusive local ModernBERT or HTTP Cohere-compatible, **no cross-backend
+   fallback** (§2.9).
+7. **Deterministic assembly**: the EvidencePack is built from the reranked
+   anchors under the sealed AssemblyPolicy, inside the same read transaction,
+   with its auditable assembly trace.
+
+### 14.4 Model-call gate discipline
+
+A process-global exclusive gate serializes live **local** accelerator calls.
+The discipline is caller-side: acquire immediately before a live local model
+call (dense query embed, ColBERT scoring, local reranker), release immediately
+after — never held across SQL reads, and **never held across HTTP backends**
+(network I/O must not starve the accelerator gate).
+
+### 14.5 Sealed policy documents
+
+Three first-class policy contracts govern the pipeline, all **versioned,
+self-hashed code documents** — deliberately *not* configuration (spec §35),
+because their identity (`id` + `version` + hash over their canonical
+serialization) must be stable and auditable across processes:
+
+- **RetrievalProfile** (spec §24.2) — channels, candidate pool sizes, RRF
+  constant, overfetch, hop budget, final-evidence caps.
+- **AssemblyPolicy** (spec §25) — how reranked hits expand into an
+  EvidencePack.
+- **Required-annotation-set policy** (spec §21.4) — which annotation types
+  gate activation (MVP: none).
+
+Config may later hold a *path* to an external policy document, never its
+values; consumers read the active document, never a config field.
+
+---
+
+## 15. Forensics contract
+
+### 15.1 Snapshot triggers
+
+`ForensicSnapshot` minting is a closed trigger set. Built at MVP:
+**`pre_activation`** (before gating a candidate), **`post_activation`** (after
+a cutover), **`pre_deactivation`** (before deactivating a source), and the
+operator-requested **`manual`** / **`incident`** entry (subject columns NULL).
+**`scheduled`** and **`pre_deployment`** are inert recorded deferrals — the
+types exist, no trigger constructs them.
+
+### 15.2 Minting: manifest first, row last
+
+Minting is two-phase: every heavy artifact is written to the write-once
+content-addressed artifact store first (idempotent, outside any SQL
+transaction), the **self-hashed §30.4 manifest** is archived last, and only
+then does the `forensic_snapshots` metadata row plus its `snapshot.completed`
+event commit in one transaction. A crash mid-mint leaves orphaned-but-valid
+blobs and no row — never a row pointing at absent bytes. The
+archived-vs-referenced boundary: planes existing only in the hot plane are
+archived
+(dense/multivector blobs as raw bytes, so restore re-imports rather than
+re-embeds); artifacts already durable in the store (the canonical parse
+bundle, the raw source bytes) are referenced by existing uri+hash, never
+re-copied; the FTS5 and graph planes are not archived (deterministic rebuild
+covers them, §12.4). **Snapshot creation never runs under a held cutover
+barrier**: the scheduler snapshots around the activation gate, and the
+deactivation path snapshots *before* acquiring the barrier.
+
+### 15.3 Application identity
+
+Every snapshot stamps the §30.2 **ApplicationIdentity**, captured once at
+startup and threaded explicitly (never a global): the system version
+(`CARGO_PKG_VERSION`), the spec version constant (**"0.3"**), the compiled
+build features (via `cfg!`, sorted), and an aggregate configuration hash over
+a canonical projection of the audit-relevant config. The configuration hash
+covers **secret file paths only, never secret values** — it changes when a
+credential file is repointed but never encodes a secret.
+
+### 15.4 Replay profile
+
+Every snapshot stamps a ReplayProfile: **evidence replay `bit_exact`**,
+**retrieval and generation replay `not_supported`** (§19). The optional
+`channelReplayModes` / `declaredTolerances` fields are omitted at MVP — they
+are the Guarantee-3 verified-recompute seam (§19).
+
+### 15.5 Verification tiers
+
+- **Mechanical** — run on **every** snapshot: confirm the archived manifest is
+  complete and self-hash-valid, and re-hash every blob-backed artifact
+  reference against its recorded hash.
+- **Deletion gate** — mechanical **plus** deterministic-rebuild comparison:
+  each archived plane is compared against the live hot plane by re-importing
+  archived bytes and re-deriving from archived rows. **No model call exists
+  anywhere in verification or restore** (hard invariant): vectors are decoded
+  from stored blobs and compared, never regenerated.
+
+### 15.6 The deletion gate blocks deletion
+
+Superseded hot state is removed only through **archive → verify → delete**,
+and the deletion gate runs *before* any delete write. A gate failure **halts
+the affected source's lifecycle before any write**: superseded state is
+retained, nothing is deleted, there is no auto-retry past a failed gate, and
+the halt surfaces in health (the fabric component's `verification_halted`
+count, §7).
+
+### 15.7 The three exits into `archiving`
+
+Three lifecycle exits move a parse to `archiving`, and all three complete
+`archiving → archived` **only** through archive-verify-delete:
+
+1. **Activation predecessor** — the outgoing active parse at cutover; its
+   deletion gate verifies over the `post_activation` snapshot of the newly
+   activated candidate, and the cleanup completes the predecessor's
+   `archiving → archived` transition atomically with the delete sweep.
+2. **Superseded held candidate** — an older held candidate displaced by a
+   newer disposition (§11.3); gate over the candidate's **own**
+   `pre_activation` snapshot (which archived its vector planes). Terminal.
+3. **Discarded held candidate** — operator discard (§11.3); same gating as 2.
+   Terminal.
+
+The **deactivation cleanup arm is different by design**: after a source
+deactivation it deletes the hot data planes only and **leaves the parse status
+untouched** (still `active`) — deactivation is reversible (§15.9), the hot
+delete is not, so reversibility lives in the flag, not the parse status.
+
+### 15.8 Deletion propagation
+
+When a source's **last** `current` location is gone (qualifying evidence only,
+§8.5), the source leaves the queryable plane:
+
+1. Mint the `pre_deactivation` snapshot — **outside the barrier** (snapshots
+   are I/O-heavy; barrier holds must last milliseconds).
+2. Acquire the per-source cutover barrier.
+3. One transaction: set `source_objects.deactivated_at` and append the
+   `source.deactivated` event atomically.
+4. Still barriered: evict the source's dense plane.
+5. Release; the scheduler then drives the trailing archive-verify-delete hot
+   cleanup outside the barrier.
+
+It is `deactivated_at` — not location status — that removes a source from
+All-scope search; `active_parse_id` is deliberately left intact so
+deactivation is a reversible flag-set. A source stays searchable while *any*
+`current` location survives.
+
+### 15.9 Reappearance
+
+When a deactivated source regains a `current` location with the **same
+content** (guaranteed structurally: acquisition refreshes a location to
+`current` only for the same source; different content rebinds to a new
+SourceObject), the source is **restored from its ForensicSnapshot's archived
+artifacts preserving all IDs — no re-parse, no re-embedding** — the
+non-archived planes are rebuilt deterministically, and `deactivated_at` is
+cleared. The HTTP restore route and the autonomous reappearance path drive the
+same completion function (§1.4).
+
+### 15.10 What survives cleanup
+
+`annotation_memo` rows deliberately survive parse archival, hot cleanup, and
+every deletion path — cross-parse reuse is the cache's entire purpose (§13).
+
+---
+
+## 16. System events
+
+The `system_events` log is the audit surface of the autonomous pipeline. The
+`eventType` vocabulary is a **closed set of 36 types**, by family:
+
+- `acquisition.*` — `succeeded`, `failed`.
+- `source.*` — `ingested`, `location_added`, `location_deleted`,
+  `access_lost`, `access_restored`, `deactivated`, `reactivated`.
+- `parse.*` — `started`, `ready`, `held`, `hold_superseded`, `accepted`,
+  `discarded`, `activated`, `failed`, `archived`.
+- `sync.*` — `backpressure_entered`, `backpressure_exited`.
+- `annotation.*` — `requested`, `completed`, `failed`, `stale`.
+- `projection.*` — `requested`, `completed`, `failed`, `stale`, `superseded`.
+- `assembly_policy.changed` — exists but is reserved: the sealed MVP policy
+  documents never change at runtime, so it is never minted at MVP.
+- `snapshot.*` — `started`, `completed`, `failed`.
+- `drill.*` — `completed`, `failed`.
+- `query.executed`.
+
+**Append invariant:** events append on the **caller's connection**, so an
+event commits (or rolls back) atomically with the state change it records —
+the audit trail can never claim an event for a state change that did not
+durably happen, or vice versa. Append failures surface as explicit errors with
+operation context and are **never swallowed** by callers.
+
+Recorded **additive extensions** to the spec's §33 closed enumeration: the
+`annotation.*` family (the spec defines semantic annotations but omits their
+lifecycle events), `projection.superseded` (the spec defines the transition
+but omits its event), and — in spec §34.6 — the `parse_discard` operationType (§5).
+
+---
+
+## 17. Error model overview
+
+The wire contract (bodies, exact shapes) is PROTOCOL.md; this is the
+server-side domain map. Every error carries a stable kind label and a fixed
+HTTP status:
+
+- **Client boundary** — 400 (`bad_request`), 401 (`unauthorized`), 404
+  (`not_found`: an absent resource and a non-active parse's units are
+  indistinguishable by design), 413 (`payload_too_large`), 422
+  (`docling_conversion`).
+- **Availability, retryable** — 503: `service_unavailable` (admission
+  saturation, not-ready) and `cutover_barrier_active` (query rejected
+  mid-cutover **before any retrieval stage**; barrier holds last milliseconds,
+  client retry is sufficient).
+- **Internal faults** — 500: storage, IO, inference-init, and
+  annotation-producer faults, plus the lifecycle-integrity failures
+  **`snapshot_verification_failed`** and **`restore_failed`**. These two are
+  500-class faults, not retryable conditions: a failed verification gate halts
+  the affected source's lifecycle with no auto-retry (§15.6).
+
+Operation status semantics are §5; the parse-outcome split (Operation
+`succeeded` ≠ domain verdict) also lives there.
+
+---
+
+## 18. Commissioning
+
+The service is developed end-state-only: nothing depended on it being startable
+or serving during the build programme, and it had **not been run before
+commissioning**. First runtime execution is a deliberate, individually approved
+step. Statements in this spec describe the service **as built** — its wire and
+storage contracts and its validated startup behavior — not observed production
+behavior.
+
+---
+
+## 19. Recorded deviations and residuals
+
+These are deliberate, recorded deviations, not defects:
+
+- **QER audit tier deferred.** There are no §24/§28 QER model types in the code.
+  `queryExecutionRecordId` is omitted from the query response; per-query
+  `QueryPlan` / `planHash` and durable retrieval/ranking trace persistence are
+  deferred. `query_execution_records` exists only as a reserved schema seam. The
+  delivered system answers evidence questions at serve time only; retrospective
+  per-query reconstruction is not available until this tier lands.
+- **`multi_vector` retrieval channel deferred.** ColBERT multivector matrices are
+  still built and **persisted** (`unit_multivector_projections`, archived as raw
+  bytes so a restore re-imports them), but the `multi_vector` retrieval channel
+  is deferred post-MVP (an exhaustive MaxSim candidate scan measured infeasible
+  at the actual corpus/hardware). **This deferral is candidate generation only —
+  it does not mean "no late interaction": the ColBERT MaxSim rerank stage over
+  the already-fused candidate pool is retained and live at MVP (§14.3).**
+- **Guarantee-4 gap (external calls before the audit tier).** The annotation
+  producers (and any HTTP reranker) make external model calls **before** the
+  audit tier exists to record them under Guarantee 4. This gap is accepted as
+  recorded at the 2026-07-11 rescope; external calls are covered operationally
+  by onboarding/diagnostics documentation, not by a durable per-call audit
+  record.
+- **Replay claims at MVP.** Every snapshot stamps a replay profile in which
+  **evidence replay is `bit_exact`** (recorded evidence replays byte-for-byte)
+  while **retrieval and generation replay are `not_supported`** — the service
+  does not claim a replay mode it cannot demonstrate. `record_replay` is never
+  emitted at MVP (it belongs to the deferred QER tier).
+- **Guarantee-3 verified recompute deferred.** Probe query sets, measured
+  per-channel tolerances, and numeric-environment capture are not built. The
+  code seam exists and is deliberately empty: the optional
+  `ReplayProfile.channelReplayModes` / `declaredTolerances` manifest fields are
+  omitted from every MVP snapshot (§15.4) and are reserved for this tier.
+- **Entitlement layer deferred.** Nothing resolves callers to allowed source
+  sets. The code seams exist: the opaque `callerContext` query field is
+  accepted and passed through unread, sources carry their acquisition-stamped
+  `governance_domain` (§2.7), and scope is already enforced at candidate
+  generation (§14.3) — the layer, when built, intersects entitlements into the
+  resolved scope at that same point.
+- **Compliance-driven erasure deferred.** A designed, audited purge operation
+  over the immutable stores (spec §11.5) is a named deferral. It **must not be
+  improvised**: no existing deletion path (§15.8) erases artifact-store
+  content, and ad-hoc removal from the write-once stores is outside every
+  contract in this spec.
+
+No guarantees beyond those the code implements are claimed here.

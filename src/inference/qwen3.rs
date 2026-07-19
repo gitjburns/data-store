@@ -74,11 +74,17 @@ struct MetalSafeRmsNorm {
 
 impl Qwen3Model {
     /// Load a Qwen3 graph while reporting long model-load substeps to startup.
+    ///
+    /// `compute_dtype` is the on-device weight/activation dtype the whole
+    /// forward runs in (the caller owns the choice — see the dense runtime's
+    /// `DENSE_COMPUTE_DTYPE` rationale); safetensors weights are converted to
+    /// it at memory-map time.
     pub fn load_with_progress(
         label: &str,
         config: &Qwen3Config,
         artifacts: &ModelArtifacts,
         device: &Device,
+        compute_dtype: DType,
         tensor_prefix: Option<&str>,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
@@ -101,7 +107,7 @@ impl Qwen3Model {
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     &artifacts.safetensor_paths,
-                    DType::BF16,
+                    compute_dtype,
                     device,
                 )
             }
@@ -541,7 +547,17 @@ fn repeat_kv_heads(
         }
     }
     let head_refs = heads.iter().collect::<Vec<_>>();
+    // The cat over narrowed head views returns a stride-PERMUTED view (buffer
+    // ordered [heads, batch, seq, dim]), and candle 0.10.2's Metal matmul
+    // silently miscomputes that layout for batch rows >= 1 (the CPU backend
+    // rejects the same layout as MatMulUnexpectedStriding; verified by the
+    // dense-batch-diagnostic reproducer, 2026-07-18). At batch 1 the layout is
+    // degenerate-equivalent to contiguous, which is why singular embedding was
+    // always correct. Materialize to standard layout so both attention matmuls
+    // (q @ k^T and probs @ v) consume safe inputs; a no-op copy if a future
+    // candle returns contiguous cats.
     Tensor::cat(&head_refs, 1)
+        .and_then(|repeated| repeated.contiguous())
         .map_err(|source| inference_error(format!("{label} kv head repeat failed: {source}")))
 }
 

@@ -42,7 +42,9 @@ pub struct ArtifactMetrics {
     pub file_count: u64,
     pub markdown_count: u64,
     pub total_bytes: u64,
-    pub expected_markdown_exists: bool,
+    /// Whether the conversion's expected output artifact (format-dependent:
+    /// `.md` or `.json`) exists yet in the output directory.
+    pub expected_artifact_exists: bool,
     pub largest_file_name: Option<String>,
     pub largest_file_bytes: Option<u64>,
     pub error: Option<String>,
@@ -52,12 +54,12 @@ pub struct ArtifactMetrics {
 pub fn inspect_docling_activity(
     process_id: u32,
     output_dir: &Path,
-    expected_markdown_path: &Path,
+    expected_artifact_path: &Path,
     sample_duration: Duration,
 ) -> DoclingActivityReport {
     let process = inspect_process_metrics(process_id);
     let sample = sample_process_activity(process_id, sample_duration);
-    let artifacts = inspect_artifacts(output_dir, expected_markdown_path);
+    let artifacts = inspect_artifacts(output_dir, expected_artifact_path);
     let activity_label = classify_activity(&process, &sample);
 
     DoclingActivityReport {
@@ -324,9 +326,9 @@ fn count_any(value: &str, markers: &[&str]) -> usize {
 }
 
 /// Inspect output artifacts without reading produced file contents.
-fn inspect_artifacts(output_dir: &Path, expected_markdown_path: &Path) -> ArtifactMetrics {
+fn inspect_artifacts(output_dir: &Path, expected_artifact_path: &Path) -> ArtifactMetrics {
     let mut metrics = ArtifactMetrics {
-        expected_markdown_exists: expected_markdown_path.is_file(),
+        expected_artifact_exists: expected_artifact_path.is_file(),
         ..ArtifactMetrics::default()
     };
     if let Err(error) = visit_artifact_dir(output_dir, &mut metrics) {

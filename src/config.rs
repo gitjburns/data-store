@@ -9,23 +9,33 @@ use serde::Deserialize;
 use crate::error::ApiError;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
-    /// HTTP bind address, request limits, and synchronous admission limits.
+    /// HTTP bind address and request-shape limits.
     pub server: ServerConfig,
     /// File-backed service logging settings used after bootstrap stdout output.
     pub logging: LoggingConfig,
     /// Startup-scoped admin credential handoff settings.
     pub admin: AdminConfig,
+    /// CLI client settings sharing this config file. The server parses and
+    /// validates this section so `deny_unknown_fields` accepts the shared
+    /// file, but never reads it at runtime; it is client-owned.
+    pub client: ClientConfig,
     /// Accelerator selection for all model runtimes.
     pub inference: InferenceConfig,
     /// Corpus and durable index/artifact paths owned by the service.
     pub storage: StorageConfig,
+    /// Acquisition connector settings; external facts per spec §35, never
+    /// internal capacity guesses.
+    pub connectors: ConnectorsConfig,
     /// Explicit Docling executable and PDF conversion controls.
     pub docling: DoclingConfig,
     /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,
-    /// Retrieval ranking, candidate-pool, and unit-sizing parameters.
-    pub retrieval: RetrievalConfig,
+    /// Directory of the loaded config file; the base every relative config
+    /// path resolves against. Set by `load`, never deserialized.
+    #[serde(skip)]
+    config_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -34,13 +44,15 @@ pub struct CliOptions {
     pub config_path: PathBuf,
     /// Run inference readiness smoke checks without binding HTTP.
     pub smoke_dense: bool,
-    /// Create or validate the development SQLite schema through the explicit setup path.
+    /// Create or validate the fabric hot-plane SQLite schema through the
+    /// explicit setup path.
     pub setup_storage: bool,
     /// Keep the HTTP service attached to the current terminal instead of daemonizing.
     pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Socket address where Axum binds the standalone service.
     pub bind_address: SocketAddr,
@@ -50,24 +62,33 @@ pub struct ServerConfig {
     pub max_ingest_source_chars: u32,
     /// Maximum length of a search query after JSON parsing.
     pub max_search_query_chars: u32,
-    /// Non-queueing limit for concurrent synchronous ingest operations.
-    pub max_in_flight_ingest: u32,
-    /// Non-queueing limit for concurrent synchronous search operations.
-    pub max_in_flight_search: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Service log file path; relative paths are resolved against the Rust service root.
+    /// Service log file path; relative paths resolve against the config file's directory.
     pub file_path: PathBuf,
     /// Minimum event level written to the service log file.
     pub level: LoggingLevel,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Runtime file where the service writes the current startup-scoped admin bearer token.
+    /// Relative paths resolve against the config file's directory.
     pub token_file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// Timeout in seconds the CLI client applies to each individual HTTP request
+    /// (including each Operation poll). It does NOT bound the total poll-loop
+    /// duration, which runs until the Operation reaches a terminal status.
+    /// Server-validated, client-consumed.
+    pub operation_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -86,6 +107,7 @@ pub enum LoggingLevel {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InferenceConfig {
     /// Explicit accelerator backend. CPU fallback is intentionally unsupported.
     pub device: InferenceDeviceKind,
@@ -103,6 +125,7 @@ pub enum InferenceDeviceKind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Root directory for corpus-relative source references.
     pub corpus_root: PathBuf,
@@ -111,6 +134,23 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorsConfig {
+    /// Filesystem connector acquiring source files from the corpus root.
+    pub filesystem: FilesystemConnectorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemConnectorConfig {
+    /// Governance domain stamped on every SourceLocation this connector
+    /// acquires (spec §6 reservation 3): an external governance fact
+    /// assigned at acquisition, retaggable without re-parse or re-index.
+    pub governance_domain: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DoclingConfig {
     /// Python executable recorded for the configured Docling environment.
     pub python_path: PathBuf,
@@ -131,6 +171,7 @@ pub struct DoclingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Dense embedding model configuration.
     pub dense: DenseModelConfig,
@@ -138,21 +179,123 @@ pub struct ModelConfig {
     pub colbert: ColbertModelConfig,
     /// ModernBERT sequence-classification reranker model configuration.
     pub reranker: RerankerModelConfig,
+    /// External OpenAI-compatible annotation-producer endpoint configuration.
+    pub annotator: AnnotatorModelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DenseModelConfig {
-    /// Local model artifact directory for Qwen3 dense embeddings.
-    pub path: PathBuf,
-    /// Expected dense vector width.
+    /// Explicit dense-embedding backend selection. There is no fallback
+    /// between backends.
+    pub backend: DenseBackendKind,
+    /// Expected dense vector width. Common to both backends; HTTP responses
+    /// are validated against it per call.
     pub dimension: u32,
-    /// Runtime token cap for dense embedding inputs.
-    pub max_tokens: u32,
-    /// Pooling contract validated by the service-local dense adapter.
+    /// Dense pooling contract of the model. The local adapter validates it;
+    /// for the HTTP backend it records the served model's pooling as an
+    /// operator-stated external fact (the server owns pooling).
     pub pooling: String,
+    /// Local model artifact directory for Qwen3 dense embeddings. Required
+    /// when backend = "local"; forbidden otherwise.
+    pub path: Option<PathBuf>,
+    /// Runtime token cap for dense embedding inputs. Required when
+    /// backend = "local"; forbidden otherwise.
+    pub max_tokens: Option<u32>,
+    /// OpenAI-compatible embeddings endpoint URL. Required when
+    /// backend = "http"; forbidden otherwise.
+    pub endpoint: Option<String>,
+    /// Model name sent in HTTP embeddings requests. Required when
+    /// backend = "http"; forbidden otherwise.
+    pub model: Option<String>,
+    /// HTTP embeddings request timeout in seconds. Required when
+    /// backend = "http"; forbidden otherwise.
+    pub timeout_seconds: Option<u64>,
+    /// Optional owner-only file holding the HTTP embeddings API key. Allowed
+    /// only when backend = "http".
+    pub api_key_file_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenseBackendKind {
+    /// In-process Candle Qwen3 embedding runtime.
+    Local,
+    /// HTTP client speaking the OpenAI-compatible embeddings contract.
+    Http,
+}
+
+impl DenseModelConfig {
+    /// Return the local model artifact directory. Config validation guarantees
+    /// presence for the local backend; the http backend has no local path.
+    pub fn local_path(&self) -> Result<&Path, ApiError> {
+        match (self.backend, self.path.as_deref()) {
+            (DenseBackendKind::Local, Some(path)) => Ok(path),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.dense has no local model path unless backend = \"local\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Return the local runtime token cap. Config validation guarantees
+    /// presence for the local backend; the http backend has no local token cap.
+    pub fn local_max_tokens(&self) -> Result<u32, ApiError> {
+        match (self.backend, self.max_tokens) {
+            (DenseBackendKind::Local, Some(max_tokens)) => Ok(max_tokens),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.dense has no local max_tokens unless backend = \"local\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Return the HTTP embeddings endpoint. Config validation guarantees
+    /// presence for the HTTP backend; the local backend has no endpoint.
+    pub fn http_endpoint(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.endpoint.as_deref()) {
+            (DenseBackendKind::Http, Some(endpoint)) => Ok(endpoint.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.dense has no endpoint unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Return the HTTP embeddings model name sent in provider requests.
+    pub fn http_model(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.model.as_deref()) {
+            (DenseBackendKind::Http, Some(model)) => Ok(model.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.dense has no model unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Return the configured HTTP embeddings timeout in seconds.
+    pub fn http_timeout_seconds(&self) -> Result<u64, ApiError> {
+        match (self.backend, self.timeout_seconds) {
+            (DenseBackendKind::Http, Some(timeout_seconds)) => Ok(timeout_seconds),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.dense has no timeout_seconds unless backend = \"http\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Resolve the optional HTTP API-key file path against the config file's
+    /// directory when it is relative.
+    pub fn resolved_http_api_key_file_path(&self, config_root: &Path) -> Option<PathBuf> {
+        let path = self.api_key_file_path.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+
+        Some(config_root.join(path))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColbertModelConfig {
     /// Local model artifact directory for ColBERT-Zero.
     pub path: PathBuf,
@@ -165,6 +308,7 @@ pub struct ColbertModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RerankerModelConfig {
     /// Explicit reranker backend selection. There is no fallback between backends.
     pub backend: RerankerBackendKind,
@@ -254,39 +398,50 @@ impl RerankerModelConfig {
         }
     }
 
-    /// Resolve the optional HTTP API-key file path against the Rust service root.
-    pub fn resolved_http_api_key_file_path(&self) -> Option<PathBuf> {
+    /// Resolve the optional HTTP API-key file path against the config file's
+    /// directory when it is relative.
+    pub fn resolved_http_api_key_file_path(&self, config_root: &Path) -> Option<PathBuf> {
         let path = self.api_key_file_path.as_ref()?;
         if path.is_absolute() {
             return Some(path.clone());
         }
 
-        Some(service_root().join(path))
+        Some(config_root.join(path))
     }
 }
 
+/// External OpenAI-compatible chat-completions endpoint used by the
+/// annotation producers (entity, relation, summary). The endpoint is
+/// exclusive: producer failures park annotations as failed for later retry
+/// by the annotation worker; there is no fallback model or endpoint.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RetrievalConfig {
-    /// Default public result count when callers omit topK.
-    pub default_top_k: u32,
-    /// Maximum public result count allowed for one search request.
-    pub max_top_k: u32,
-    /// Reciprocal Rank Fusion constant for dense and BM25 candidate lists.
-    pub rrf_k: u32,
-    /// First-stage dense/BM25 over-fetch multiplier before RRF and reranking.
-    pub candidate_overfetch_multiplier: u32,
-    #[serde(default = "default_colbert_candidate_pool_size")]
-    /// Bounded RRF candidate pool size sent into ColBERT MaxSim.
-    pub colbert_candidate_pool_size: u32,
-    #[serde(default = "default_reranker_candidate_pool_size")]
-    /// Bounded ColBERT-ranked candidate pool size sent into the reranker; the
-    /// effective pool is max(this value, requested topK), clamped to available
-    /// ColBERT-ranked candidates.
-    pub reranker_candidate_pool_size: u32,
-    /// Minimum unit text length retained as searchable content.
-    pub min_search_unit_chars: u32,
-    /// Unit tokenizer cap aligned to ColBERT document capacity.
-    pub max_unit_tokens: u32,
+#[serde(deny_unknown_fields)]
+pub struct AnnotatorModelConfig {
+    /// Full chat-completions route URL (external fact, spec §35).
+    pub endpoint: String,
+    /// Model name sent in request bodies.
+    pub model: String,
+    /// Whole-request timeout for one producer call, in seconds.
+    pub timeout_seconds: u64,
+    /// Optional owner-only file holding the bearer API key.
+    pub api_key_file_path: Option<PathBuf>,
+    /// Producer input budget in characters: section groups larger than this
+    /// are split deterministically before invocation. External fact sized
+    /// from the endpoint model's context window (spec §35).
+    pub max_input_chars: usize,
+}
+
+impl AnnotatorModelConfig {
+    /// Resolve the optional API-key file path against the config file's
+    /// directory when it is relative.
+    pub fn resolved_api_key_file_path(&self, config_root: &Path) -> Option<PathBuf> {
+        let path = self.api_key_file_path.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+
+        Some(config_root.join(path))
+    }
 }
 
 impl ServiceConfig {
@@ -296,13 +451,20 @@ impl ServiceConfig {
             path: path.clone(),
             source,
         })?;
-        let config: Self = toml::from_str(&raw).map_err(|source| ApiError::ConfigParse {
+        let mut config: Self = toml::from_str(&raw).map_err(|source| ApiError::ConfigParse {
             path: path.clone(),
             source,
         })?;
+        config.config_root = config_root_for(&path)?;
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Return the directory relative config paths resolve against: the loaded
+    /// config file's parent directory.
+    pub fn config_root(&self) -> &Path {
+        &self.config_root
     }
 
     /// Return the configured socket address for the HTTP server.
@@ -324,25 +486,26 @@ impl ServiceConfig {
             "server.max_search_query_chars",
             self.server.max_search_query_chars,
         )?;
-        require_positive(
-            "server.max_in_flight_ingest",
-            self.server.max_in_flight_ingest,
-        )?;
-        require_positive(
-            "server.max_in_flight_search",
-            self.server.max_in_flight_search,
-        )?;
         require_non_empty_path("logging.file_path", &self.logging.file_path)?;
         require_non_empty_path("admin.token_file_path", &self.admin.token_file_path)?;
+        require_positive_u64(
+            "client.operation_timeout_seconds",
+            self.client.operation_timeout_seconds,
+        )?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
+        require_non_empty(
+            "connectors.filesystem.governance_domain",
+            &self.connectors.filesystem.governance_domain,
+        )?;
         require_absolute_path("docling.python_path", &self.docling.python_path)?;
         require_absolute_path("docling.docling_path", &self.docling.docling_path)?;
         require_positive_u64(
             "docling.document_timeout_seconds",
             self.docling.document_timeout_seconds,
         )?;
-        require_absolute_path("models.dense.path", &self.models.dense.path)?;
+        // models.dense.path is backend-conditional; validate_dense_backend_fields
+        // owns its absolute-path check in the Local arm.
         require_absolute_path("models.colbert.path", &self.models.colbert.path)?;
 
         require_non_empty("docling.pdf_backend", &self.docling.pdf_backend)?;
@@ -375,7 +538,7 @@ impl ServiceConfig {
         require_positive("docling.page_batch_size", self.docling.page_batch_size)?;
         require_non_empty("models.dense.pooling", &self.models.dense.pooling)?;
         require_positive("models.dense.dimension", self.models.dense.dimension)?;
-        require_positive("models.dense.max_tokens", self.models.dense.max_tokens)?;
+        validate_dense_backend_fields(&self.models.dense)?;
         require_positive("models.colbert.dimension", self.models.colbert.dimension)?;
         require_positive(
             "models.colbert.query_max_tokens",
@@ -386,40 +549,20 @@ impl ServiceConfig {
             self.models.colbert.document_max_tokens,
         )?;
         validate_reranker_backend_fields(&self.models.reranker)?;
-        require_positive("retrieval.default_top_k", self.retrieval.default_top_k)?;
-        require_positive("retrieval.max_top_k", self.retrieval.max_top_k)?;
-        require_positive("retrieval.rrf_k", self.retrieval.rrf_k)?;
-        require_positive(
-            "retrieval.candidate_overfetch_multiplier",
-            self.retrieval.candidate_overfetch_multiplier,
+        require_non_empty("models.annotator.endpoint", &self.models.annotator.endpoint)?;
+        require_non_empty("models.annotator.model", &self.models.annotator.model)?;
+        require_positive_u64(
+            "models.annotator.timeout_seconds",
+            self.models.annotator.timeout_seconds,
         )?;
-        require_positive(
-            "retrieval.colbert_candidate_pool_size",
-            self.retrieval.colbert_candidate_pool_size,
+        require_positive_usize(
+            "models.annotator.max_input_chars",
+            self.models.annotator.max_input_chars,
         )?;
-        require_positive(
-            "retrieval.reranker_candidate_pool_size",
-            self.retrieval.reranker_candidate_pool_size,
-        )?;
-        acknowledge_non_negative(
-            "retrieval.min_search_unit_chars",
-            self.retrieval.min_search_unit_chars,
-        )?;
-        require_positive("retrieval.max_unit_tokens", self.retrieval.max_unit_tokens)?;
-
-        if self.retrieval.default_top_k > self.retrieval.max_top_k {
-            return Err(ApiError::InvalidConfig {
-                message:
-                    "retrieval.default_top_k must be less than or equal to retrieval.max_top_k"
-                        .to_string(),
-            });
-        }
-        if self.retrieval.colbert_candidate_pool_size < self.retrieval.max_top_k {
-            return Err(ApiError::InvalidConfig {
-                message:
-                    "retrieval.colbert_candidate_pool_size must be greater than or equal to retrieval.max_top_k"
-                        .to_string(),
-            });
+        // Optional, but an explicit empty path would resolve to the config
+        // directory itself; fail at startup like the reranker's key path.
+        if let Some(api_key_file_path) = self.models.annotator.api_key_file_path.as_ref() {
+            require_non_empty_path("models.annotator.api_key_file_path", api_key_file_path)?;
         }
 
         Ok(())
@@ -427,24 +570,24 @@ impl ServiceConfig {
 }
 
 impl LoggingConfig {
-    /// Resolve the configured log path against the Rust service root when it is relative.
-    pub fn resolved_file_path(&self) -> PathBuf {
+    /// Resolve the configured log path against the config file's directory when it is relative.
+    pub fn resolved_file_path(&self, config_root: &Path) -> PathBuf {
         if self.file_path.is_absolute() {
             return self.file_path.clone();
         }
 
-        service_root().join(&self.file_path)
+        config_root.join(&self.file_path)
     }
 }
 
 impl AdminConfig {
-    /// Resolve the configured token file path against the Rust service root when it is relative.
-    pub fn resolved_token_file_path(&self) -> PathBuf {
+    /// Resolve the configured token file path against the config file's directory when it is relative.
+    pub fn resolved_token_file_path(&self, config_root: &Path) -> PathBuf {
         if self.token_file_path.is_absolute() {
             return self.token_file_path.clone();
         }
 
-        service_root().join(&self.token_file_path)
+        config_root.join(&self.token_file_path)
     }
 }
 
@@ -461,20 +604,24 @@ impl LoggingLevel {
     }
 }
 
-/// Return the Rust crate root used as the base for service-relative paths.
-fn service_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Return the Phase 11F default bounded ColBERT reranking pool size.
-fn default_colbert_candidate_pool_size() -> u32 {
-    100
-}
-
-/// Return the default reranker candidate pool size, preserving the previous
-/// hard topK cap for configs that omit the value.
-fn default_reranker_candidate_pool_size() -> u32 {
-    10
+/// Resolve the base directory for relative config paths: the canonicalized
+/// parent directory of the loaded config file. Canonicalization makes the
+/// base stable regardless of the process working directory or how the
+/// `--config` argument was spelled.
+fn config_root_for(config_path: &Path) -> Result<PathBuf, ApiError> {
+    let canonical = fs::canonicalize(config_path).map_err(|source| ApiError::ConfigRead {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    match canonical.parent() {
+        Some(parent) => Ok(parent.to_path_buf()),
+        None => Err(ApiError::InvalidConfig {
+            message: format!(
+                "config path {} has no parent directory to resolve relative paths against",
+                canonical.display()
+            ),
+        }),
+    }
 }
 
 /// Resolve supported CLI options, falling back to `config.toml`.
@@ -522,6 +669,82 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
         setup_storage,
         foreground,
     })
+}
+
+/// Validate per-backend required and forbidden [models.dense] fields. Each
+/// backend's required fields must be present and valid, and the other
+/// backend's fields must be absent so misconfiguration fails at startup
+/// instead of being silently ignored.
+fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiError> {
+    match dense.backend {
+        DenseBackendKind::Local => {
+            let Some(path) = dense.path.as_ref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.path is required when backend = \"local\"".to_string(),
+                });
+            };
+            require_absolute_path("models.dense.path", path)?;
+            let Some(max_tokens) = dense.max_tokens else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.max_tokens is required when backend = \"local\""
+                        .to_string(),
+                });
+            };
+            require_positive("models.dense.max_tokens", max_tokens)?;
+            if dense.endpoint.is_some()
+                || dense.model.is_some()
+                || dense.timeout_seconds.is_some()
+                || dense.api_key_file_path.is_some()
+            {
+                return Err(ApiError::InvalidConfig {
+                    message:
+                        "models.dense with backend = \"local\" must not set endpoint, model, timeout_seconds, or api_key_file_path"
+                            .to_string(),
+                });
+            }
+        }
+        DenseBackendKind::Http => {
+            if dense.path.is_some() || dense.max_tokens.is_some() {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense with backend = \"http\" must not set path or max_tokens"
+                        .to_string(),
+                });
+            }
+            let Some(endpoint) = dense.endpoint.as_deref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.endpoint is required when backend = \"http\""
+                        .to_string(),
+                });
+            };
+            require_non_empty("models.dense.endpoint", endpoint)?;
+            let trimmed_endpoint = endpoint.trim();
+            if !trimmed_endpoint.starts_with("http://") && !trimmed_endpoint.starts_with("https://")
+            {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.endpoint must start with http:// or https://"
+                        .to_string(),
+                });
+            }
+            let Some(model) = dense.model.as_deref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.model is required when backend = \"http\"".to_string(),
+                });
+            };
+            require_non_empty("models.dense.model", model)?;
+            let Some(timeout_seconds) = dense.timeout_seconds else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.dense.timeout_seconds is required when backend = \"http\""
+                        .to_string(),
+                });
+            };
+            require_positive_u64("models.dense.timeout_seconds", timeout_seconds)?;
+            if let Some(api_key_file_path) = dense.api_key_file_path.as_ref() {
+                require_non_empty_path("models.dense.api_key_file_path", api_key_file_path)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate per-backend required and forbidden [models.reranker] fields. Each
@@ -667,9 +890,4 @@ fn require_positive_u64(label: &str, value: u64) -> Result<(), ApiError> {
     Err(ApiError::InvalidConfig {
         message: format!("{label} must be greater than zero"),
     })
-}
-
-/// Make intentionally non-negative u32 fields part of validation and readiness.
-fn acknowledge_non_negative(_label: &str, _value: u32) -> Result<(), ApiError> {
-    Ok(())
 }

@@ -4,7 +4,7 @@
 
 Please read:
 
-PLAN-CLIPPY-WARNINGS.md
+PLAN-CANONICAL-FABRIC.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 

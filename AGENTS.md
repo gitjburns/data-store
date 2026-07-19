@@ -174,9 +174,6 @@ explain the intended change before editing.
   material. Never filter, narrow, reconstruct, rename, or omit observability
   fields except for explicit secret redaction. Derived views are additions, not
   replacements.
-- **SQLite access**: Database access must remain read-only, synchronous, bounded,
-  and explicit. Do not add write-capable connections, hidden fallback data
-  sources, or async wrappers.
 - **Configuration**: Config is strict and operationally significant. Missing
   files, missing keys, unknown keys, and missing required secrets are fatal
   errors.
@@ -223,6 +220,11 @@ All work must stay inside the project root. Do not inspect parent directories,
 home directories, system directories, `/tmp`, or unrelated projects. Do not use
 external paths for scratch files, temporary files, backups, exports, diagnostics,
 or any other purpose.
+
+Single recorded exception (user-ruled 2026-07-14): subagents may additionally
+read (never write) files under this session's own Claude harness directory when
+the orchestrator passes an explicit path — these are artifacts our own agents
+produced this session. All other out-of-repo access remains prohibited.
 
 The `specs/` directory is also off-limits unless the user explicitly asks for it.
 Do not read from or write to `specs/`; it contains archived material that must

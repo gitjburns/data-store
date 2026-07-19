@@ -94,22 +94,8 @@ where
         Err(payload) => Err(ApiError::InferenceInit {
             message: format!(
                 "failed to initialize {label}: Candle backend panicked: {}",
-                panic_payload_message(payload)
+                crate::util::panic_payload_message(payload.as_ref())
             ),
         }),
     }
-}
-
-/// Render a panic payload without assuming the upstream panic type.
-#[cfg(any(feature = "cuda", feature = "metal"))]
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-
-    "non-string panic payload".to_string()
 }

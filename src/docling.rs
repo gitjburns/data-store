@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     fs,
     io::Read,
     os::unix::process::ExitStatusExt,
@@ -8,10 +7,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::SyncSender,
+        mpsc::{SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use tracing::{error, info};
@@ -23,16 +22,20 @@ use crate::{
     },
     error::ApiError,
     source::ResolvedSource,
+    util::{MAX_DIAGNOSTIC_CHARS, panic_payload_message, truncate_diagnostic_text},
 };
 
 static CONVERSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const MAX_DIAGNOSTIC_CHARS: usize = 16_000;
 const CHILD_OUTPUT_READ_CHUNK_BYTES: usize = 8_192;
 const DOCLING_WAIT_POLL_MILLIS: u64 = 250;
 const POST_100_FIRST_FEEDBACK_SECONDS: u64 = 1;
 const POST_100_FEEDBACK_CADENCE_SECONDS: u64 = 1;
 const POST_100_SAMPLE_SECONDS: u64 = 0;
 
+/// Effective Docling CLI options for one conversion, resolved from
+/// `[docling]` config. These are identity-bearing parser configuration
+/// (D3): they are folded into `parserConfigHash`, so changing any value
+/// yields a new parse identity.
 #[derive(Debug, Clone)]
 pub struct ResolvedDoclingOptions {
     pub pdf_backend: String,
@@ -43,18 +46,31 @@ pub struct ResolvedDoclingOptions {
     pub document_timeout_seconds: u64,
 }
 
+/// Result of one Docling `--to json` conversion (decision D6): the raw
+/// DoclingDocument JSON artifact plus bounded process diagnostics (args,
+/// stdout, stderr) for operator-visible failure context.
+// The PDF parser worker reads only the artifact and stream fields today, so
+// the identity/context fields (source, options, output_dir, args) are allowed
+// until a consumer (C5 dispatch diagnostics) reads them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct DoclingConversionResult {
+pub struct DoclingJsonConversionResult {
     pub source: ResolvedSource,
     pub options: ResolvedDoclingOptions,
     pub output_dir: PathBuf,
-    pub markdown_path: PathBuf,
-    pub markdown: String,
+    pub json_path: PathBuf,
+    /// Artifact text byte-for-byte as Docling wrote it. NO line normalization
+    /// is applied: JSON is a structured payload where a line rewrite could
+    /// silently alter string values.
+    pub json_text: String,
     pub args: Vec<String>,
     pub stdout: String,
     pub stderr: String,
 }
 
+/// One progress line parsed from Docling stderr, forwarded to the
+/// operation's progress channel; `percentage` is present only when the line
+/// carried a parseable percent figure.
 #[derive(Debug, Clone)]
 pub struct DoclingProgressUpdate {
     pub message: String,
@@ -84,12 +100,28 @@ struct DoclingProgressSnapshot {
     completed_reported_for: Option<Duration>,
 }
 
+// Identity facts for one Docling launch, grouped so `run_docling` takes one
+// coherent context instead of a long parameter list; all fields are borrows,
+// so the struct is `Copy` and the body binds them like locals.
+#[derive(Clone, Copy)]
+struct DoclingLaunch<'a> {
+    config: &'a DoclingConfig,
+    args: &'a [String],
+    index_root: &'a Path,
+    output_dir: &'a Path,
+    source: &'a ResolvedSource,
+    output_format: &'a str,
+}
+
 // Keep stable Docling process facts together so wait-time logs and feedback use
 // the same lifecycle identity without changing operation handles.
 struct DoclingProcessContext<'a> {
     config: &'a DoclingConfig,
     output_dir: &'a Path,
     source: &'a ResolvedSource,
+    /// `--to` output format of this conversion (`json`); process lifecycle
+    /// logs carry it so the format is explicit per process.
+    output_format: &'a str,
     process_id: u32,
     started: Instant,
 }
@@ -104,25 +136,88 @@ struct DoclingChildOutputContext {
     output_dir: String,
 }
 
-/// Convert one resolved PDF source to markdown using only service-configured Docling options.
+/// Convert one resolved PDF source to DoclingDocument JSON (`--to json`,
+/// decision D6) using only service-configured Docling options; the typed
+/// candidate-unit source for the PDF parser worker.
 ///
-/// Diagnostics are bounded but preserved so conversion failures remain explicit and inspectable.
-pub fn convert_source_to_markdown(
+/// `output_dir_override` lets the worker place Docling output inside its
+/// bundle workspace (`parser_raw/`, spec §12.2 diagnostics); `None` keeps
+/// the default service-owned conversion directory.
+pub fn convert_source_to_document_json(
     config: &DoclingConfig,
     index_root: &Path,
     source: ResolvedSource,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
-) -> Result<DoclingConversionResult, ApiError> {
+    output_dir_override: Option<&Path>,
+) -> Result<DoclingJsonConversionResult, ApiError> {
     let options = resolve_docling_options(config)?;
-    let output_dir = create_conversion_output_dir(index_root)?;
-    let args = build_docling_args(&output_dir, &source.absolute_path, &options);
-    let output = run_docling(
+    let output_dir = match output_dir_override {
+        Some(dir) => {
+            // The caller owns the override directory; create-if-missing
+            // keeps the contract explicit instead of failing on a fresh
+            // workspace directory.
+            fs::create_dir_all(dir).map_err(|create_error| ApiError::InternalIo {
+                message: format!(
+                    "failed to create Docling output directory at {}: {create_error}",
+                    dir.display()
+                ),
+            })?;
+            dir.to_path_buf()
+        }
+        None => create_conversion_output_dir(index_root)?,
+    };
+    let (args, stdout, stderr) = execute_docling_conversion(
         config,
-        &args,
         index_root,
-        &output_dir,
         &source,
         progress_sender,
+        &output_dir,
+        &options,
+        "json",
+    )?;
+    let json_path = find_conversion_artifact(&output_dir, &source.absolute_path, "json")?;
+    let json_text = read_raw_artifact(&json_path)?;
+
+    Ok(DoclingJsonConversionResult {
+        source,
+        options,
+        output_dir,
+        json_path,
+        json_text,
+        args,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run one Docling conversion attempt for the configured output format,
+/// mapping timeouts and non-zero exits to explicit conversion errors.
+/// `output_format` is both the `--to` value and the artifact extension —
+/// Docling names its artifact `{source_stem}.{format}` (this service uses
+/// `json`).
+fn execute_docling_conversion(
+    config: &DoclingConfig,
+    index_root: &Path,
+    source: &ResolvedSource,
+    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
+    output_dir: &Path,
+    options: &ResolvedDoclingOptions,
+    output_format: &str,
+) -> Result<(Vec<String>, String, String), ApiError> {
+    let args = build_docling_args(output_dir, &source.absolute_path, options, output_format);
+    let expected_artifact =
+        expected_artifact_path(output_dir, &source.absolute_path, output_format);
+    let output = run_docling(
+        &DoclingLaunch {
+            config,
+            args: &args,
+            index_root,
+            output_dir,
+            source,
+            output_format,
+        },
+        progress_sender,
+        expected_artifact,
     )?;
     let stdout = truncate_diagnostic_text(&output.stdout);
     let stderr = truncate_diagnostic_text(&output.stderr);
@@ -146,23 +241,15 @@ pub fn convert_source_to_markdown(
         });
     }
 
-    let markdown_path = find_markdown_artifact(&output_dir, &source.absolute_path)?;
-    let markdown = read_and_normalize_markdown(&markdown_path)?;
-
-    Ok(DoclingConversionResult {
-        source,
-        options,
-        output_dir,
-        markdown_path,
-        markdown,
-        args,
-        stdout,
-        stderr,
-    })
+    Ok((args, stdout, stderr))
 }
 
 /// Resolve service-configured Docling options for one conversion attempt.
-fn resolve_docling_options(config: &DoclingConfig) -> Result<ResolvedDoclingOptions, ApiError> {
+/// `pub(crate)` so the PDF parser worker can hash the exact effective
+/// options into its `parserConfigHash` before starting a conversion.
+pub(crate) fn resolve_docling_options(
+    config: &DoclingConfig,
+) -> Result<ResolvedDoclingOptions, ApiError> {
     let pdf_backend = config.pdf_backend.trim().to_string();
     let ocr_mode = config.ocr_mode.trim().to_string();
     let device = config.device.trim().to_string();
@@ -196,12 +283,7 @@ fn create_conversion_output_dir(index_root: &Path) -> Result<PathBuf, ApiError> 
         ),
     })?;
 
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| ApiError::InternalIo {
-            message: format!("system clock is before UNIX epoch: {source}"),
-        })?
-        .as_millis();
+    let timestamp_ms = crate::primitives::current_time_ms()?;
     let sequence = CONVERSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let output_dir = root.join(format!("conversion-{timestamp_ms}-{sequence}"));
 
@@ -215,15 +297,18 @@ fn create_conversion_output_dir(index_root: &Path) -> Result<PathBuf, ApiError> 
     Ok(output_dir)
 }
 
-/// Build Docling CLI arguments without shell interpolation.
+/// Build Docling CLI arguments without shell interpolation. `output_format`
+/// supplies the `--to` value; every other flag (including placeholder image
+/// export) is fixed for this service's conversions.
 fn build_docling_args(
     output_dir: &Path,
     source_path: &Path,
     options: &ResolvedDoclingOptions,
+    output_format: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "--to".to_string(),
-        "md".to_string(),
+        output_format.to_string(),
         "--output".to_string(),
         output_dir.display().to_string(),
         "--image-export-mode".to_string(),
@@ -255,13 +340,18 @@ fn build_docling_args(
 ///
 /// The caller owns diagnostic truncation so success and failure paths preserve the same output shape.
 fn run_docling(
-    config: &DoclingConfig,
-    args: &[String],
-    index_root: &Path,
-    output_dir: &Path,
-    source: &ResolvedSource,
+    launch: &DoclingLaunch<'_>,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
+    expected_artifact_path: PathBuf,
 ) -> Result<DoclingRunOutput, ApiError> {
+    let DoclingLaunch {
+        config,
+        args,
+        index_root,
+        output_dir,
+        source,
+        output_format,
+    } = *launch;
     let started = Instant::now();
     info!(
         event = "docling.process.starting",
@@ -271,6 +361,7 @@ fn run_docling(
         relative_source = %source.relative_path.display(),
         absolute_source = %source.absolute_path.display(),
         output_dir = %output_dir.display(),
+        output_format,
         working_dir = %index_root.display(),
         timeout_seconds = config.document_timeout_seconds,
         args_count = args.len(),
@@ -295,6 +386,7 @@ fn run_docling(
                 relative_source = %source.relative_path.display(),
                 absolute_source = %source.absolute_path.display(),
                 output_dir = %output_dir.display(),
+                output_format,
                 working_dir = %index_root.display(),
                 timeout_seconds = config.document_timeout_seconds,
                 args_count = args.len(),
@@ -318,6 +410,7 @@ fn run_docling(
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
+        output_format,
         process_id,
         timeout_seconds = config.document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -411,11 +504,11 @@ fn run_docling(
             Some(stderr_progress_state),
         )
     });
-    let expected_markdown_path = expected_markdown_artifact_path(output_dir, &source.absolute_path);
     let process_context = DoclingProcessContext {
         config,
         output_dir,
         source,
+        output_format,
         process_id,
         started,
     };
@@ -424,7 +517,7 @@ fn run_docling(
         &process_context,
         progress_state,
         progress_sender,
-        expected_markdown_path,
+        expected_artifact_path,
     )?;
     info!(
         event = "docling.process.wait_completed",
@@ -432,6 +525,7 @@ fn run_docling(
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
+        output_format,
         process_id,
         timed_out,
         exit_code = ?status.code(),
@@ -453,6 +547,7 @@ fn run_docling(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
+            output_format,
             process_id,
             timed_out,
             exit_code = ?status.code(),
@@ -472,6 +567,7 @@ fn run_docling(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
+            output_format,
             process_id,
             timed_out,
             exit_code = ?status.code(),
@@ -497,12 +593,13 @@ fn wait_for_docling_process(
     child: &mut Child,
     context: &DoclingProcessContext<'_>,
     progress_state: Arc<Mutex<DoclingProgressState>>,
-    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
-    expected_markdown_path: PathBuf,
+    mut progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
+    expected_artifact_path: PathBuf,
 ) -> Result<(ExitStatus, bool), ApiError> {
     let config = context.config;
     let output_dir = context.output_dir;
     let source = context.source;
+    let output_format = context.output_format;
     let process_id = context.process_id;
     let started = context.started;
     let timeout_duration = Duration::from_secs(config.document_timeout_seconds);
@@ -519,6 +616,7 @@ fn wait_for_docling_process(
                     source_requested = %source.requested,
                     relative_source = %source.relative_path.display(),
                     output_dir = %output_dir.display(),
+                    output_format,
                     process_id,
                     timeout_seconds = config.document_timeout_seconds,
                     error = %wait_error,
@@ -539,13 +637,19 @@ fn wait_for_docling_process(
         let snapshot = snapshot_docling_progress(&progress_state, now);
         if should_emit_post_100_feedback(&snapshot, last_feedback_at, now) {
             last_feedback_at = Some(now);
-            emit_post_100_docling_feedback(
+            let consumer_disconnected = emit_post_100_docling_feedback(
                 context,
                 timeout_duration,
                 &snapshot,
                 progress_sender.as_ref(),
-                &expected_markdown_path,
+                &expected_artifact_path,
             );
+            // A dead progress consumer never affects the conversion: stop
+            // attempting delivery (feedback stays log-only) and keep
+            // waiting for the process.
+            if consumer_disconnected {
+                progress_sender = None;
+            }
         }
 
         let poll_duration = Duration::from_millis(DOCLING_WAIT_POLL_MILLIS)
@@ -562,6 +666,7 @@ fn timeout_docling_process(
     let config = context.config;
     let output_dir = context.output_dir;
     let source = context.source;
+    let output_format = context.output_format;
     let process_id = context.process_id;
     let started = context.started;
     error!(
@@ -570,6 +675,7 @@ fn timeout_docling_process(
         source_requested = %source.requested,
         relative_source = %source.relative_path.display(),
         output_dir = %output_dir.display(),
+        output_format,
         process_id,
         timeout_seconds = config.document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -585,6 +691,7 @@ fn timeout_docling_process(
                 source_requested = %source.requested,
                 relative_source = %source.relative_path.display(),
                 output_dir = %output_dir.display(),
+                output_format,
                 process_id,
                 timeout_seconds = config.document_timeout_seconds,
                 kill_requested = kill_result.is_ok(),
@@ -604,6 +711,7 @@ fn timeout_docling_process(
             source_requested = %source.requested,
             relative_source = %source.relative_path.display(),
             output_dir = %output_dir.display(),
+            output_format,
             process_id,
             exit_code = ?status.code(),
             signal = ?status.signal(),
@@ -620,14 +728,17 @@ fn timeout_docling_process(
     Ok((status, true))
 }
 
-/// Emit one synthetic post-100% progress update with process and artifact metrics.
+/// Emit one synthetic post-100% progress update with process and artifact
+/// metrics. Returns whether the progress consumer is gone so the wait loop
+/// can stop attempting delivery; delivery is best-effort and never blocks
+/// or fails the conversion.
 fn emit_post_100_docling_feedback(
     context: &DoclingProcessContext<'_>,
     timeout_duration: Duration,
     progress_snapshot: &DoclingProgressSnapshot,
     progress_sender: Option<&SyncSender<DoclingProgressUpdate>>,
-    expected_markdown_path: &Path,
-) {
+    expected_artifact_path: &Path,
+) -> bool {
     let output_dir = context.output_dir;
     let source = context.source;
     let process_id = context.process_id;
@@ -657,29 +768,39 @@ fn emit_post_100_docling_feedback(
     let report = inspect_docling_activity(
         process_id,
         output_dir,
-        expected_markdown_path,
+        expected_artifact_path,
         sample_duration,
     );
     log_post_100_report(&report, context, timeout_remaining);
     let message = format_docling_activity_message(&report, started.elapsed(), timeout_remaining);
 
-    if let Some(progress_sender) = progress_sender
-        && let Err(error) = progress_sender.send(DoclingProgressUpdate {
+    // try_send keeps feedback delivery decoupled from the conversion: a
+    // full channel means the consumer is behind, and this synthetic update
+    // is droppable (the same facts were just written to the service log
+    // above); a disconnected consumer is reported to the wait loop so it
+    // stops sending. Neither case blocks nor fails the parse.
+    if let Some(progress_sender) = progress_sender {
+        match progress_sender.try_send(DoclingProgressUpdate {
             message,
             percentage: None,
-        })
-    {
-        error!(
-            event = "docling.post_100_feedback.delivery_failed",
-            source_requested = %source.requested,
-            relative_source = %source.relative_path.display(),
-            output_dir = %output_dir.display(),
-            process_id,
-            error = %error,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Docling post-100 feedback delivery failed"
-        );
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                info!(
+                    event = "docling.post_100_feedback.consumer_disconnected",
+                    source_requested = %source.requested,
+                    relative_source = %source.relative_path.display(),
+                    output_dir = %output_dir.display(),
+                    process_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling progress consumer disconnected; feedback continues log-only"
+                );
+                return true;
+            }
+        }
     }
+    false
 }
 
 /// Log the compact inspection report without storing raw stack samples.
@@ -715,7 +836,7 @@ fn log_post_100_report(
         artifact_files = report.artifacts.file_count,
         artifact_markdown_files = report.artifacts.markdown_count,
         artifact_total_bytes = report.artifacts.total_bytes,
-        expected_markdown_exists = report.artifacts.expected_markdown_exists,
+        expected_artifact_exists = report.artifacts.expected_artifact_exists,
         largest_file_name = ?report.artifacts.largest_file_name,
         largest_file_bytes = ?report.artifacts.largest_file_bytes,
         artifact_error = ?report.artifacts.error,
@@ -788,7 +909,7 @@ fn truncate_progress_message_for_log(value: &str) -> String {
 fn read_child_output<R>(
     mut reader: R,
     context: DoclingChildOutputContext,
-    progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
+    mut progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     progress_state: Option<Arc<Mutex<DoclingProgressState>>>,
 ) -> Result<String, ApiError>
 where
@@ -856,29 +977,30 @@ where
 
         let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
         output = append_bounded_diagnostic_text(&output, &chunk);
-        if (progress_sender.is_some() || progress_state.is_some())
-            && let Err(error) = emit_docling_progress_from_chunk(
+        if progress_sender.is_some() || progress_state.is_some() {
+            let consumer_disconnected = emit_docling_progress_from_chunk(
                 progress_sender.as_ref(),
                 progress_state.as_ref(),
                 &chunk,
-            )
-        {
-            error!(
-                event = "docling.child_output_reader.failed",
-                task_purpose = "read_docling_child_output",
-                pipe = label,
-                process_id,
-                source_requested = %source_requested,
-                relative_source = %relative_source,
-                output_dir = %output_dir,
-                stage = "progress_delivery",
-                output_chars = output.chars().count(),
-                error_kind = error.error_kind(),
-                error = %error,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Docling child output reader failed"
             );
-            return Err(error);
+            // Progress delivery is decoupled from the conversion: a
+            // disconnected consumer stops further delivery attempts but
+            // never fails the reader or the parse. Logged once here, not
+            // per chunk; progress state recording continues regardless.
+            if consumer_disconnected {
+                progress_sender = None;
+                info!(
+                    event = "docling.child_output_reader.progress_consumer_disconnected",
+                    task_purpose = "read_docling_child_output",
+                    pipe = label,
+                    process_id,
+                    source_requested = %source_requested,
+                    relative_source = %relative_source,
+                    output_dir = %output_dir,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Docling progress consumer disconnected; conversion continues without progress delivery"
+                );
+            }
         }
     }
 }
@@ -925,43 +1047,37 @@ fn join_child_output(
     }
 }
 
-/// Extract a bounded, readable message from a joined thread's panic payload.
+/// Emit and record parsed Docling progress from one stderr chunk. Returns
+/// whether the progress consumer has disconnected.
 ///
-/// Shared with thread-join boundaries outside this module so panic diagnostics
-/// stay consistent across spawned-work owners.
-pub(crate) fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
-    let message = if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
-    };
-
-    truncate_diagnostic_text(&message)
-}
-
-/// Emit and record parsed Docling progress from one stderr chunk.
+/// Delivery is strictly best-effort so a dead or slow consumer can never
+/// block the pipe reader or kill an otherwise healthy conversion:
+/// `try_send` drops an update when the channel is full (progress is
+/// monotone feedback; a missed update is superseded by the next one), and
+/// a disconnected receiver is reported to the caller so it stops sending.
 fn emit_docling_progress_from_chunk(
     sender: Option<&SyncSender<DoclingProgressUpdate>>,
     progress_state: Option<&Arc<Mutex<DoclingProgressState>>>,
     chunk: &str,
-) -> Result<(), ApiError> {
+) -> bool {
+    let mut consumer_disconnected = false;
     for line in chunk.split(['\r', '\n']) {
         if let Some(progress) = parse_docling_progress_line(line) {
             if let Some(progress_state) = progress_state {
                 record_docling_progress(progress_state, &progress);
             }
-            if let Some(sender) = sender {
-                sender.send(progress).map_err(|_| ApiError::InternalIo {
-                    message: "operation response stream closed before Docling progress delivery"
-                        .to_string(),
-                })?;
+            if let Some(sender) = sender
+                && !consumer_disconnected
+            {
+                match sender.try_send(progress) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => consumer_disconnected = true,
+                }
             }
         }
     }
 
-    Ok(())
+    consumer_disconnected
 }
 
 /// Record parsed progress for the process wait loop without blocking pipe reads.
@@ -1051,14 +1167,20 @@ fn strip_ansi_sequences(value: &str) -> String {
     stripped
 }
 
-/// Locate the markdown artifact Docling produced for one source file.
-fn find_markdown_artifact(output_dir: &Path, source_path: &Path) -> Result<PathBuf, ApiError> {
-    let expected_path = expected_markdown_artifact_path(output_dir, source_path);
+/// Locate the artifact with one extension that Docling produced for one
+/// source file: the expected `{source_stem}.{extension}` name first, then a
+/// recursive single-match fallback for layouts where Docling nests output.
+fn find_conversion_artifact(
+    output_dir: &Path,
+    source_path: &Path,
+    extension: &str,
+) -> Result<PathBuf, ApiError> {
+    let expected_path = expected_artifact_path(output_dir, source_path, extension);
     if expected_path.is_file() {
         return Ok(expected_path);
     }
 
-    let discovered = discover_markdown_files(output_dir)?;
+    let discovered = discover_artifact_files(output_dir, extension)?;
     if discovered.len() == 1 {
         return Ok(discovered[0].clone());
     }
@@ -1075,17 +1197,17 @@ fn find_markdown_artifact(output_dir: &Path, source_path: &Path) -> Result<PathB
 
     Err(ApiError::DoclingConversion {
         message: format!(
-            "Docling completed but no unique markdown artifact was found; expected={}; discovered={}",
+            "Docling completed but no unique .{extension} artifact was found; expected={}; discovered={}",
             expected_path.display(),
             discovered_text
         ),
     })
 }
 
-/// Build Docling's expected markdown artifact path for one source path.
-fn expected_markdown_artifact_path(output_dir: &Path, source_path: &Path) -> PathBuf {
+/// Build Docling's expected artifact path for one source path and extension.
+fn expected_artifact_path(output_dir: &Path, source_path: &Path, extension: &str) -> PathBuf {
     output_dir.join(format!(
-        "{}.md",
+        "{}.{extension}",
         source_path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1093,16 +1215,22 @@ fn expected_markdown_artifact_path(output_dir: &Path, source_path: &Path) -> Pat
     ))
 }
 
-/// Recursively discover markdown files under the Docling output directory.
-fn discover_markdown_files(output_dir: &Path) -> Result<Vec<PathBuf>, ApiError> {
+/// Recursively discover files with one extension under the Docling output
+/// directory.
+fn discover_artifact_files(output_dir: &Path, extension: &str) -> Result<Vec<PathBuf>, ApiError> {
     let mut results = Vec::new();
-    collect_markdown_files(output_dir, &mut results)?;
+    collect_artifact_files(output_dir, extension, &mut results)?;
     results.sort();
     Ok(results)
 }
 
-/// Add markdown files from one directory subtree to the accumulator.
-fn collect_markdown_files(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), ApiError> {
+/// Add files with one extension from one directory subtree to the
+/// accumulator.
+fn collect_artifact_files(
+    dir: &Path,
+    extension: &str,
+    results: &mut Vec<PathBuf>,
+) -> Result<(), ApiError> {
     let entries = fs::read_dir(dir).map_err(|source| ApiError::InternalIo {
         message: format!(
             "failed to read Docling output directory {}: {source}",
@@ -1126,14 +1254,14 @@ fn collect_markdown_files(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), 
         })?;
 
         if file_type.is_dir() {
-            collect_markdown_files(&path, results)?;
+            collect_artifact_files(&path, extension, results)?;
             continue;
         }
         if file_type.is_file()
             && path
                 .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
         {
             results.push(path);
         }
@@ -1142,52 +1270,17 @@ fn collect_markdown_files(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-/// Read and normalize markdown text for later unit splitting.
-fn read_and_normalize_markdown(markdown_path: &Path) -> Result<String, ApiError> {
-    let raw = fs::read_to_string(markdown_path).map_err(|source| ApiError::InternalIo {
+/// Read one Docling artifact verbatim. No normalization by design:
+/// DoclingDocument JSON is a structured payload that must stay byte-for-byte
+/// as written (a line rewrite could alter string values), and the raw file
+/// doubles as preserved diagnostic evidence in the parser bundle.
+fn read_raw_artifact(path: &Path) -> Result<String, ApiError> {
+    fs::read_to_string(path).map_err(|source| ApiError::InternalIo {
         message: format!(
-            "failed to read Docling markdown artifact at {}: {source}",
-            markdown_path.display()
+            "failed to read Docling artifact at {}: {source}",
+            path.display()
         ),
-    })?;
-
-    Ok(normalize_markdown(&raw))
-}
-
-/// Normalize Docling markdown line endings and excessive blank space.
-fn normalize_markdown(markdown: &str) -> String {
-    let normalized = markdown.replace("\r\n", "\n").replace('\r', "\n");
-    let mut collapsed = String::new();
-    let mut blank_count = 0;
-
-    for line in normalized.lines() {
-        if line.trim().is_empty() {
-            blank_count += 1;
-            if blank_count <= 2 {
-                collapsed.push('\n');
-            }
-            continue;
-        }
-
-        blank_count = 0;
-        collapsed.push_str(line.trim_end());
-        collapsed.push('\n');
-    }
-
-    collapsed.trim().to_string()
-}
-
-/// Truncate diagnostic text so API errors remain readable.
-fn truncate_diagnostic_text(value: &str) -> String {
-    let mut truncated = value
-        .trim()
-        .chars()
-        .take(MAX_DIAGNOSTIC_CHARS)
-        .collect::<String>();
-    if value.chars().count() > MAX_DIAGNOSTIC_CHARS {
-        truncated.push_str("...");
-    }
-    truncated
+    })
 }
 
 /// Append one diagnostic chunk while keeping the most recent bounded text.

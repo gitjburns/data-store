@@ -6,7 +6,7 @@ use std::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    config::{ModelConfig, RerankerBackendKind},
+    config::{DenseBackendKind, ModelConfig, RerankerBackendKind},
     error::ApiError,
 };
 
@@ -16,7 +16,10 @@ pub const SAFETENSORS_EXTENSION: &str = "safetensors";
 
 #[derive(Debug, Clone)]
 pub struct ModelArtifactSet {
-    pub dense: ModelArtifacts,
+    /// Dense local artifacts, present only for the local dense backend. The HTTP
+    /// backend has no local model to validate, so this is `None` there (mirror
+    /// of the reranker's optional artifacts).
+    pub dense: Option<ModelArtifacts>,
     pub colbert: ModelArtifacts,
     pub reranker: Option<ModelArtifacts>,
 }
@@ -31,10 +34,17 @@ pub struct ModelArtifacts {
 }
 
 impl ModelArtifactSet {
-    /// Validate all configured model directories and tokenizer files.
+    /// Validate all configured model directories and tokenizer files. Dense and
+    /// reranker local artifacts are validated only when their backend is local;
+    /// an HTTP backend has no local model directory to check.
     pub fn load(config: &ModelConfig) -> Result<Self, ApiError> {
         Ok(Self {
-            dense: ModelArtifacts::load("dense", &config.dense.path)?,
+            dense: match config.dense.backend {
+                DenseBackendKind::Local => {
+                    Some(ModelArtifacts::load("dense", config.dense.local_path()?)?)
+                }
+                DenseBackendKind::Http => None,
+            },
             colbert: ModelArtifacts::load("colbert", &config.colbert.path)?,
             reranker: match config.reranker.backend {
                 RerankerBackendKind::Local => Some(ModelArtifacts::load(
@@ -48,7 +58,12 @@ impl ModelArtifactSet {
 
     /// Return readiness details for all configured model artifact groups.
     pub fn health_details(&self) -> Vec<String> {
-        let mut details = vec![self.dense.health_detail(), self.colbert.health_detail()];
+        let mut details = Vec::new();
+        match &self.dense {
+            Some(dense) => details.push(dense.health_detail()),
+            None => details.push("dense artifacts ready: remote HTTP backend".to_string()),
+        }
+        details.push(self.colbert.health_detail());
         match &self.reranker {
             Some(reranker) => details.push(reranker.health_detail()),
             None => details.push("reranker artifacts ready: remote HTTP backend".to_string()),

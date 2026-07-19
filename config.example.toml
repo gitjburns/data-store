@@ -1,3 +1,5 @@
+# Unknown keys anywhere in this file are fatal startup errors: the service
+# rejects misspelled or stray configuration instead of silently ignoring it.
 [server]
 # Socket address where the standalone HTTP service binds.
 bind_address = "127.0.0.1:8091"
@@ -7,23 +9,23 @@ max_request_body_bytes = 16384
 max_ingest_source_chars = 2048
 # Maximum query text length accepted by search operations.
 max_search_query_chars = 4096
-# Maximum number of synchronous ingest operations allowed to run at once.
-max_in_flight_ingest = 1
-# Maximum number of synchronous search operations allowed to run at once.
-max_in_flight_search = 1
 
 [logging]
-# Service log file. Relative paths resolve from the Rust service root.
+# Service log file. Relative paths resolve from this config file's directory.
 file_path = "logs/data-store.log"
 # Minimum service log level: trace, debug, info, warn, or error.
 level = "info"
 
 [admin]
-# Runtime admin bearer token file. Relative paths resolve from the Rust service root.
+# Runtime admin bearer token file. Relative paths resolve from this config
+# file's directory.
 token_file_path = ".data-store-admin-token"
 
 [client]
-# Maximum time the interactive CLI waits for one streamed operation.
+# Timeout for each single HTTP request the CLI client sends (including each
+# poll of GET /operations/{operationId}); it does not cap total polling time.
+# The server validates this section but never reads it at runtime; it is
+# owned by the bundled data-store CLI client sharing this file.
 operation_timeout_seconds = 3600
 
 [inference]
@@ -37,6 +39,11 @@ device_index = 0
 corpus_root = "/absolute/path/to/corpus"
 # Service-owned index root for SQLite storage and Docling conversion artifacts.
 index_root = "/absolute/path/to/indexes"
+
+[connectors.filesystem]
+# Governance domain stamped on every SourceLocation acquired by the
+# filesystem connector (spec §6 reservation 3; an external fact).
+governance_domain = "local-corpus"
 
 [docling]
 # Python executable for the environment where Docling is installed. The service
@@ -112,14 +119,46 @@ num_threads = 10
 page_batch_size = 10
 
 [models.dense]
-# Local Qwen3 dense embedding model directory.
-path = "/absolute/path/to/qwen3-embedding-8b"
-# Expected dense embedding vector dimension.
+# Dense embedding backend selection. There is no fallback between backends;
+# the configured backend is exclusive and misconfiguration is a startup error.
+#
+# Valid values:
+# - local: In-process Candle Qwen3 embedding runtime on the [inference]
+#   accelerator. Requires path and max_tokens. The http-only fields
+#   (endpoint, model, timeout_seconds, api_key_file_path) must not be set.
+# - http: Remote endpoint speaking the OpenAI-compatible embeddings contract
+#   (vLLM, TEI, llama.cpp). Requires endpoint, model, and timeout_seconds;
+#   api_key_file_path is optional. The local-only fields (path, max_tokens)
+#   must not be set. The service sends the same instruction-prefixed text the
+#   local runtime would embed and L2-normalizes returned vectors, so query and
+#   passage semantics do not fork by backend. Vectors from different backends
+#   are not interchangeable within one corpus; switch backends only alongside
+#   a fresh ingest.
+backend = "local"
+# Expected dense embedding vector dimension. Common to both backends; HTTP
+# responses are validated against it per call.
 dimension = 4096
-# Maximum token count accepted by the dense runtime.
-max_tokens = 8192
-# Dense pooling contract; this service currently expects last-token pooling.
+# Dense pooling contract of the model. The local runtime validates it
+# (last-token pooling); for the http backend it records the served model's
+# pooling as an operator-stated fact.
 pooling = "last_token"
+# Local Qwen3 dense embedding model directory. Required when backend = "local".
+path = "/absolute/path/to/qwen3-embedding-8b"
+# Maximum token count accepted by the local dense runtime. Required when
+# backend = "local".
+max_tokens = 8192
+# HTTP backend example: replace the local fields above with these.
+#
+# OpenAI-compatible embeddings endpoint URL; must start with http:// or
+# https://. Full route URL, not a base URL.
+#endpoint = "http://embedding-host:8001/v1/embeddings"
+# Model name sent in HTTP embeddings requests.
+#model = "qwen3-embedding-8b"
+# HTTP embeddings request timeout in seconds.
+#timeout_seconds = 60
+# Optional owner-only file containing the API key sent as a bearer token.
+# Relative paths resolve from this config file's directory.
+#api_key_file_path = ".data-store-dense-api-key"
 
 [models.colbert]
 # Local ColBERT-Zero model directory.
@@ -158,24 +197,23 @@ max_tokens = 32768
 # HTTP rerank request timeout in seconds.
 #timeout_seconds = 60
 # Optional owner-only file containing the API key sent as a bearer token.
-# Relative paths resolve from the Rust service root.
+# Relative paths resolve from this config file's directory.
 #api_key_file_path = ".data-store-rerank-api-key"
 
-[retrieval]
-# Default result count when a search operation omits topK.
-default_top_k = 10
-# Maximum result count callers may request.
-max_top_k = 100
-# Reciprocal Rank Fusion constant used to combine dense and BM25 candidates.
-rrf_k = 60
-# Dense/BM25 first-stage over-fetch multiplier before RRF and reranking.
-candidate_overfetch_multiplier = 3
-# Maximum RRF candidate pool sent into ColBERT MaxSim reranking.
-colbert_candidate_pool_size = 100
-# ColBERT-ranked candidate pool sent into the final reranker. The effective
-# pool is max(this value, requested topK), clamped to available candidates.
-reranker_candidate_pool_size = 10
-# Minimum unit content length retained as searchable text.
-min_search_unit_chars = 400
-# Maximum retrieval-unit size, aligned to ColBERT document token capacity.
-max_unit_tokens = 512
+[models.annotator]
+# External OpenAI-compatible chat-completions endpoint used by the annotation
+# producers (entity, relation, summary). Exclusive: producer failures park
+# annotations as failed for later retry; there is no fallback model or
+# endpoint. Full route URL, not a base URL.
+endpoint = "http://127.0.0.1:8000/v1/chat/completions"
+# Model name sent in request bodies.
+model = "annotator-model-name"
+# Whole-request timeout for one producer call, in seconds.
+timeout_seconds = 120
+# Optional owner-only file containing the API key sent as a bearer token.
+# Relative paths resolve from this config file's directory.
+#api_key_file_path = ".annotator-api-key"
+# Producer input budget in characters: section groups larger than this are
+# split deterministically before invocation. External fact: size from the
+# endpoint model's context window.
+max_input_chars = 24000

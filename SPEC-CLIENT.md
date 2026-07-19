@@ -1,514 +1,366 @@
-# Data Store CLI Client Specification
+# SPEC-CLIENT — the bundled `data-store` CLI
 
-## Purpose
+Operator reference for the `data-store` command-line client built into
+`src/bin/data-store.rs`. It documents the client exactly as built: the
+transport model, every command, the polling model for async admin
+mutations, and how each response is rendered.
 
-Build a simple command-line client for operating the standalone Data Store
-service. The client supports both interactive REPL use and non-interactive
-one-shot operation invocation. Both modes are operator/developer interfaces over
-the same documented operation protocol used by all consumers.
+Cross-references:
 
-The client must not introduce a second authentication path, service-side
-backdoor, hidden client state, or alternate domain behavior. The service remains
-the source of truth for validation, persistence, retrieval, version management,
-progress reporting, and shutdown behavior.
+- `PROTOCOL.md` — the wire routes each command targets.
+- `INTERACTIVE.md` — the interactive REPL (line editor, history, prompt).
+- `INSTALL.md` — config file and admin-token file setup.
 
-## Binary
+Verification status: this client surface is first runtime-exercised at
+the C10f commissioning package; until then it is compile-checked only
+(recorded residual, `PLAN-CANONICAL-FABRIC.md`, 2026-07-17 entry).
 
-The client binary name is:
+---
 
-```bash
-data-store
+## 1. Client model
+
+The client is a **`reqwest` blocking** HTTP client. There is no async
+runtime and **no streaming**: every request is a single blocking
+request/response, and async server work is followed by polling (§4).
+
+### 1.1 Shared configuration
+
+The client reads the **same config file as the server**. The transport
+is **HTTP-only**: the base URL is always plain `http://` derived from
+`[server].bind_address` (bind-all addresses are rewritten to loopback
+so the client can dial them) — the client cannot dial TLS. The
+admin-token file path comes from `[admin].token_file_path`, and the
+request timeout from the `[client]` section:
+
+- `[client].operation_timeout_seconds` — the timeout on the underlying
+  `reqwest` HTTP client. It bounds **each individual HTTP request** the
+  client makes, including **each individual poll** of the operation
+  loop (§4) — and nothing more: the poll loop as a whole is
+  **unbounded** and runs until a terminal status is observed (§4), so a
+  never-terminal operation polls forever. It is **not** a stream
+  timeout — the client does no streaming. Default `3600`; must be
+  greater than zero.
+
+Relative paths in the config (e.g. the token file) resolve against the
+config file's directory, matching the server's resolution rule.
+
+Select the config with `--config <path>`; it defaults to `config.toml`.
+
+### 1.2 Two modes
+
+- **One-shot** — invoke a single command via its `--flag` and exit.
+  Example: `data-store --config config.toml --health`.
+- **Interactive REPL** — invoke `data-store` with no command flag to
+  enter the read-eval-print loop. See `INTERACTIVE.md`. The prompt is
+  `data-store> `; type `help` for the command list, `exit` (or `quit`)
+  to leave. History is stored in `.data-store.history`.
+
+Both modes dispatch through the same command table and the same
+renderers; the only difference is how the command is entered.
+
+### 1.3 One-shot argv grammar
+
+- Exactly **one operation flag** per invocation: a second operation
+  flag is rejected (*"only one operation flag may be provided"*).
+- `--help` cannot be combined with an operation flag.
+- Unknown arguments are rejected with a pointer to `--help`.
+- Positional-argument collection for an operation flag stops at the
+  **next recognized flag** (`--config` or any operation flag/alias):
+  everything between the flag and the next recognized flag is taken as
+  its positional arguments.
+- `--config` requires a value; a missing value — or a recognized flag
+  in the value position — is rejected.
+
+### 1.4 One-shot exit-code contract (scripting)
+
+A one-shot invocation exits **`0`** on success. Any error — config
+load, transport/send failure, HTTP error status, response decode
+failure — propagates out of `main` and terminates the process with a
+**nonzero** exit code, printing the anyhow error report (message plus
+cause chain) on stderr.
+
+**Terminal `failed` is not an error exit.** An async admin operation
+that reaches terminal status `failed` is still rendered normally and
+the process exits `0` — the client succeeded at driving the operation
+to a terminal state. Scripts must inspect the **rendered `status`**
+(and, for parse-producing types, the parse run row — §5.2), not the
+exit code, for the domain outcome.
+
+### 1.5 Admin token (protected commands)
+
+Protected commands (§3, marked **protected**) send the admin token as an
+HTTP bearer credential. The token is **read fresh from the token file on
+every protected request** — it is never cached. Each poll of a running
+operation re-reads it as well. The file is read, trimmed, and validated
+non-empty; a missing or empty token file fails the command with a clear
+error. Public commands send no credential.
+
+---
+
+## 2. Command dispatch
+
+Every command has a REPL name (with optional aliases), an equivalent
+one-shot `--flag`, positional arguments, a target route, a
+public/protected classification, and a rendering. `help` prints the REPL
+usage lines; `data-store --help` (alias `-h`) prints the one-shot usage
+lines without reading the config.
+
+Bracketed arguments (`[...]`) are optional; angle-bracketed arguments
+(`<...>`) are required. `<requestJson>` arguments are raw JSON strings
+passed straight to the request body; invalid JSON is rejected locally
+before any request is sent.
+
+REPL lines are tokenized by a minimal splitter (`split_shell_like`) —
+no shell is involved:
+
+- Double quotes group a token (a quoted region may open and close
+  mid-token).
+- **Inside quotes only**, backslash escapes `"` and `\`; before any
+  other character the backslash is kept literally.
+- **Outside quotes**, backslash is an ordinary literal character.
+- An unterminated quote is an error.
+- There is **no** variable, tilde, or glob expansion of any kind.
+
+---
+
+## 3. Command table
+
+The list below is the complete `COMMAND_SPECS` table as built. Routes
+are cross-checked against the router in `src/http.rs`.
+
+| REPL name (aliases) | One-shot flag | Arguments | Route | Access | Async? |
+|---|---|---|---|---|---|
+| `health` | `--health` | — | `GET /v1/health` | public | no |
+| `query` | `--query` | `<requestJson>` | `POST /query` | public | no |
+| `ingest` | `--ingest` | `<sourceSystem> <nativeUri>` | `POST /sources` | protected | yes (operation) |
+| `reparse` | `--reparse` | `<sourceId> <sourceSystem> <nativeUri>` | `POST /sources/{sourceId}/parses` | protected | yes (operation) |
+| `activate` | `--activate` | `<sourceId> <parseId>` | `POST /sources/{sourceId}/parses/{parseId}/activate` | protected | yes (operation) |
+| `accept` | `--accept` | `<parseId>` | `POST /parses/{parseId}/accept` | protected | yes (operation) |
+| `discard` | `--discard` | `<parseId>` | `POST /parses/{parseId}/discard` | protected | yes (operation) |
+| `snapshot` | `--snapshot` | `[requestJson]` | `POST /snapshots` | protected | yes (operation) |
+| `restore` | `--restore` | `<sourceId> <parseId>` | `POST /restore` | protected | yes (operation) |
+| `shutdown` | `--shutdown` | — | `POST /shutdown` | protected | no (control action) |
+| `held-parses` (`held`) | `--held-parses` | — | `GET /parses?status=held` | protected | no |
+| `operation` | `--operation` | `<operationId>` | `GET /operations/{operationId}` | protected | no (single read) |
+| `unit` | `--unit` | `<unitId>` | `GET /units/{unitId}` | public | no |
+| `relationships` | `--relationships` | `<unitId> [direction] [relationshipType]` | `GET /units/{unitId}/relationships` | public | no |
+| `source` | `--source` | `<sourceId>` | `GET /sources/{sourceId}` | public | no |
+| `sync-status` (`sync`) | `--sync-status` | — | `GET /sync/status` | public | no |
+| `help` | `--help` (`-h`) | — | — (local) | — | no |
+| `exit` (`quit`) | — | — | — (REPL only) | — | no |
+
+Notes on individual commands:
+
+- **`ingest <sourceSystem> <nativeUri>`** — POSTs an ingest request
+  (`{sourceSystem, nativeUri}`) to `/sources`.
+- **`reparse <sourceId> <sourceSystem> <nativeUri>`** — POSTs the same
+  ingest request shape to that source's `/parses` sub-route.
+- **`activate` / `accept` / `discard`** — POST with no body to the
+  respective parse-lifecycle routes.
+- **`snapshot [requestJson]`** — the JSON body is optional; when
+  omitted, the empty JSON object body `{}` is sent.
+- **`restore <sourceId> <parseId>`** — POSTs `{sourceId, parseId}` to
+  `/restore`.
+- **`operation <operationId>`** — a **single** protected read of the
+  operation record; it does **not** poll. (The async admin commands poll
+  internally; this command is the standalone snapshot read.)
+- **`relationships`** — `direction` and `relationshipType` are optional
+  positional filters, encoded as `direction=` / `relationshipType=`
+  query parameters only when supplied.
+- **`exit` / `quit`** — REPL-only; no one-shot flag.
+
+---
+
+## 4. Polling model for async admin mutations
+
+The seven async admin commands (`ingest`, `reparse`, `activate`,
+`accept`, `discard`, `snapshot`, `restore`) drive server-side work that
+runs asynchronously. The client:
+
+1. Prints a **progress line** `<METHOD> <url>` to stdout (visible as
+   `POST http://…/sources` in the example below), then POSTs to the
+   target route with the bearer token (and optional JSON body).
+2. Receives `202` with an acceptance body `{operationId}` and prints
+   `Accepted: operationId=<id>`.
+3. Polls `GET /operations/{operationId}` every
+   **`OPERATION_POLL_INTERVAL` = 1 second** (a code constant) until the
+   operation reaches a terminal status (`succeeded` or `failed`).
+4. Renders the terminal operation record (§5.2).
+
+Each poll re-reads the admin token and is itself bounded by
+`[client].operation_timeout_seconds` (the per-request timeout). The poll
+loop otherwise runs until a terminal status is observed. There is **no
+NDJSON, no streaming, and no stream-timeout** anywhere in the client.
+
+**`shutdown` is not an operation.** It prints the same
+`POST <url>` progress line, POSTs to `/shutdown`, receives a `202` with
+**no body**, prints `Shutdown signalled (HTTP 202)`, and is **never
+polled**.
+
+The progress line is printed **only** by the async admin POSTs and
+`shutdown`: read commands and `query` print no progress line.
+
+Example (interactive):
+
+```
+data-store> ingest confluence https://wiki/pages/123
+POST http://127.0.0.1:8080/sources
+Accepted: operationId=op-7f3c…
+Operation: op-7f3c…
+  type: source_ingest
+  status: succeeded
+  target: source src-91a…
+  createdAt: 2026-07-17T12:00:00Z
+  note: the operation lifecycle completed, but this does NOT confirm the
+        domain outcome. Check the parse run row for the domain verdict;
+        for a held result run `held-parses`.
 ```
 
-The service binary remains:
-
-```bash
-data-store-service
-```
-
-The client is a separate binary target from the service so launching the client
-cannot accidentally start, fork, initialize, smoke-test, or set up the service.
-
-Expected development run command:
-
-```bash
-cargo run --bin data-store -- --config config.toml
-```
-
-Expected non-interactive development command:
-
-```bash
-cargo run --bin data-store -- --config config.toml --health
-```
-
-## Startup Configuration
-
-The client starts from the same service config file used by the service:
-
-```bash
-data-store --config config.toml
-```
-
-If `--config` is omitted, the client uses `config.toml` in the Rust service
-working directory.
-
-The client reads:
-
-- `server.bind_address` to construct the base HTTP URL.
-- `admin.token_file_path` to locate the current startup-scoped admin bearer
-  token for protected operations.
-- `client.operation_timeout_seconds` to bound one operation-stream request.
-
-The client must not require operators to manually provide the admin token during
-normal use.
-
-The local usage command does not require config or a running service:
-
-```bash
-data-store --help
-```
-
-## Admin Token File
-
-The service config must contain a required admin section:
-
-```toml
-[admin]
-# Runtime admin bearer token file. Relative paths resolve from the Rust service root.
-token_file_path = ".data-store-admin-token"
-```
-
-`admin.token_file_path` is required. Missing or empty values are fatal service
-configuration errors.
-
-Relative token file paths resolve from the Rust service root. The example config
-must include the recommended explicit relative value shown above so new
-installers can use the example as-is while still seeing and controlling the
-credential handoff path.
-
-The token remains the only admin authentication mechanism. The token file is
-only a local credential handoff mechanism for the client.
-
-Service token-file lifecycle:
-
-- On startup, the service generates its startup-scoped admin token.
-- The service writes that token to the configured token file.
-- The service replaces any stale token file from an earlier run.
-- The token file must be created with owner-only permissions.
-- Token-file creation is startup-critical; if the service cannot write the file
-  securely, startup fails clearly.
-- The service still prints `admin_shutdown_token=<token>` to stdout.
-- On graceful shutdown, the service removes the token file if it still contains
-  the current token.
-- If the service crashes, a stale token file may remain. That stale token is not
-  accepted by any later service process and is replaced on the next startup.
-
-The recommended token file must be gitignored.
-
-## Service Protocol
-
-The client uses the same operation protocol documented in `PROTOCOL.md`:
-
-```http
-POST /v1/operations
-Accept: application/x-ndjson
-Content-Type: application/json
-```
-
-Every client command sends one operation request and reads the streamed NDJSON
-operation events until the service emits a terminal `result` or `error` event.
-
-Protected operations use:
-
-```http
-Authorization: Bearer <token>
-```
-
-The token is read from the configured token file immediately before each
-protected operation. The client must not cache the token for the whole REPL
-session.
-
-The control endpoint is reserved for cancellation or future client-to-server
-operation messages:
-
-```http
-POST /v1/operations/{operationId}/control
-```
-
-The first client version does not need an interactive cancel command unless the
-service implementation supports cancellation.
-
-## Interaction Model
-
-The client supports two interaction modes:
-
-- With no operation flag, it starts a REPL-style interactive CLI.
-- With exactly one operation flag, it sends that operation once and exits after
-  the terminal result or error.
-
-It is not a menu-driven TUI.
-
-The prompt should be concise and stable:
-
-```text
-data-store>
-```
-
-The REPL supports readline-like editing and history through `rustyline`.
-
-History behavior:
-
-- Command history should persist across client runs if supported directly by
-  `rustyline` with low implementation effort.
-- The history file path is fixed at:
-
-```text
-./.data-store.history
-```
-
-- The history file is not configured in the service config.
-- The history file must be gitignored.
-
-## Non-Interactive Invocation
-
-Non-interactive invocation uses the same command semantics and renderers as the
-REPL commands, but receives arguments from process argv instead of the REPL
-line parser.
-
-Supported operation flags:
-
-```bash
-data-store [--config <path>] --health
-data-store [--config <path>] --limits
-data-store [--config <path>] --sources
-data-store [--config <path>] --ingest <source> [--force]
-data-store [--config <path>] --search <query> [topK]
-data-store [--config <path>] --search-full <query> [topK]
-data-store [--config <path>] --versions
-data-store [--config <path>] --rollback <source> <versionLabel>
-data-store [--config <path>] --shutdown
-```
-
-Only one operation flag may be provided per process invocation. Public flags
-send unauthenticated operations. Protected flags read the configured token file
-immediately before the request, exactly like their REPL equivalents.
-
-Shells perform argument splitting before the client receives argv, so
-multi-word queries and paths containing spaces must be quoted by the operator:
-
-```bash
-data-store --config config.toml --search "clear writing style rules" 3
-```
-
-## Input Parsing
-
-The REPL uses simple shell-like parsing:
-
-- Arguments are separated by whitespace.
-- Double quotes allow spaces inside one argument.
-- Backslash escapes are supported inside quoted strings for at least `\"` and
-  `\\`.
-- No shell execution, variables, redirects, pipes, globbing, command
-  substitution, or multiline input.
-
-Examples:
-
-```text
-search "clear writing style rules" 3
-ingest The_Elements_of_Style.pdf
-ingest The_Elements_of_Style.pdf --force
-rollback The_Elements_of_Style.pdf 2026-06-01T21:37:22.184Z
-```
-
-Invalid parsing must produce a clear client-side error without sending an HTTP
-request.
-
-## Commands
-
-The client exposes the service operations plus basic REPL controls. Each service
-operation has both a REPL command and a matching non-interactive flag.
-
-### `health` / `--health`
-
-Operation: `health`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Output: human-readable readiness summary and component details.
-
-### `limits` / `--limits`
-
-Operation: `limits`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Output: labeled request and retrieval limits.
-
-### `sources` / `--sources`
-
-Operation: `sources`
-
-Authentication: none.
-
-Payload:
-
-```json
-{}
-```
-
-Output: active ingested source listing. Include source path, active version
-label, document ID, status, units ingested, and timestamps.
-
-### `ingest <source> [--force]` / `--ingest <source> [--force]`
-
-Operation: `ingest`
-
-Authentication: none.
-
-Payload:
-
-```json
-{
-  "source": "<source>",
-  "force": true
-}
-```
-
-Output: streamed operation status and progress, followed by document ID,
-version label, units ingested, and status.
-
-The client sends `force: true` only when `--force` is provided.
-When `--force` is omitted and the service returns
-`kind: "source_already_ingested"`, output the service message:
-`Source <source> is already ingested. Use --force to override.`
-
-### `search <query> [topK]` / `--search <query> [topK]`
-
-Operation: `search`
-
-Authentication: none.
-
-Payload:
-
-```json
-{
-  "query": "<query>",
-  "topK": 3
-}
-```
-
-Output: streamed operation status and progress, followed by ranked results with
-score, source path, unit ID, page numbers, heading path when present, and a
-bounded excerpt of matched content.
-
-After search results, the client prints a `Benchmarks:` summary. The
-`retrieving_candidates` row is the client-observed duration for that streamed
-operation stage. When the response includes `raw.storage.retrieval` timing
-fields, the client must print indented child rows beneath
-`retrieving_candidates` for:
-
-- `retrieving_candidates.query_vector_validation`
-- `retrieving_candidates.dense_scan`
-- `retrieving_candidates.bm25`
-- `retrieving_candidates.rrf_fusion`
-- `retrieving_candidates.candidate_materialization`
-- `retrieving_candidates.raw_diagnostics`
-
-The child rows are server-reported diagnostic timings, not independent stream
-stages.
-
-The client rendering is excerpted only; service search behavior is unchanged.
-
-### `search-full <query> [topK]` / `--search-full <query> [topK]`
-
-Operation: `search`
-
-Authentication: none.
-
-Payload is the same as `search`.
-
-Output: same metadata as `search`, but prints the full matched unit content for
-each result.
-
-The client rendering is full-content only; service search behavior is
-unchanged.
-
-### `versions` / `--versions`
-
-Operation: `versions`
-
-Authentication: bearer token read from `admin.token_file_path`.
-
-Payload:
-
-```json
-{}
-```
-
-Output: grouped source-document version listing. Active versions must be clearly
-marked. Include version label, document ID, status, units ingested, timestamps,
-and vector metadata counts/dimensions.
-
-### `rollback <source> <versionLabel>` / `--rollback <source> <versionLabel>`
-
-Operation: `rollback`
-
-Authentication: bearer token read from `admin.token_file_path`.
-
-Payload:
-
-```json
-{
-  "source": "<source>",
-  "versionLabel": "<versionLabel>"
-}
-```
-
-Output: streamed operation status, followed by source path, active version
-label, publish timestamp, vector count, and status.
-
-### `shutdown` / `--shutdown`
-
-Operation: `shutdown`
-
-Authentication: bearer token read from `admin.token_file_path`.
-
-Payload:
-
-```json
-{}
-```
-
-Output: streamed operation status followed by the server-authored
-`shutdown_complete` terminal result.
-
-### `help`
-
-Prints the available REPL commands and syntax.
-
-### `--help`
-
-Prints executable-level usage without reading config or contacting the service.
-
-### `exit`
-
-Exits the REPL cleanly.
-
-Aliases such as `quit` may be accepted if they do not complicate the parser.
-
-## Output Requirements
-
-Output is human-readable only. The client must not include a JSON output mode in
-the first version.
-
-Client output should be concise but complete enough for operation:
-
-- Show operation start, status, progress, terminal result, and elapsed time.
-- Render status and counted progress events compactly, including `current` and
-  `total` when the service provides them.
-- Finalize any overwritten progress line before printing the next status,
-  result, or error.
-- Show HTTP method and URL for transport failures.
-- Show operation, stage, server error kind, status, and message for operation
-  errors.
-- Print the full client-side cause chain for transport, response parsing, and
-  stream parsing failures.
-- Do not print the bearer token.
-- Do not log the bearer token.
-- Do not print raw JSON responses as the normal interface.
-- Use raw search diagnostics only to render documented human-readable summaries,
-  such as retrieval benchmark child rows.
-
-Search result excerpts should be long enough to be useful in a terminal while
-preventing accidental output floods. The exact excerpt length is an
-implementation detail, but it should be a fixed constant in the client.
-
-## HTTP Behavior
-
-The client uses the operation protocol as documented in `PROTOCOL.md`.
-
-Base URL construction:
-
-- Use `server.bind_address` from config.
-- Construct `http://<bind_address>`.
-- If the configured bind host is an unspecified address such as `0.0.0.0` or
-  `::`, connect to the equivalent loopback address on the same port.
-- HTTPS support is not required for the first version.
-
-The client should use a real HTTP client dependency rather than hand-rolled
-`TcpStream` HTTP.
-
-Approved dependency:
-
-- `reqwest`
-
-## Error Handling
-
-Client-side errors must be clear and must not look like successful service
-responses.
-
-Examples:
-
-- Config file missing or invalid.
-- Missing required config fields.
-- Token file missing for a protected operation.
-- Token file unreadable.
-- Invalid command syntax.
-- HTTP connection failure.
-- Operation stream line is not valid JSON.
-- Operation stream ends before a terminal event.
-- Terminal operation error event.
-
-For terminal operation errors, print:
-
-- Operation name.
-- Stage when available.
-- Error kind.
-- Error status.
-- Error message.
-
-For transport and stream errors, print:
-
-- HTTP method.
-- URL.
-- Top-level error.
-- Cause chain.
-
-## Documentation Updates
-
-Implementation should update the operator documentation to describe:
-
-- The `data-store` client binary.
-- How to run it with `--config config.toml`.
-- How to invoke one-shot commands such as `--health`, `--ingest`, `--search`,
-  and `--shutdown`.
-- The required `[admin] token_file_path` config.
-- Token-file lifecycle and security behavior.
-- The operation-stream protocol at a user-facing level.
-- The REPL commands.
-- The `.data-store.history` and `.data-store-admin-token` gitignored local
-  files.
-
-## Non-Goals
-
-The first version must not include:
-
-- Menu-driven TUI.
-- JSON output mode.
-- Persistent client config.
-- Client-side saved base URLs or saved tokens.
-- Alternate admin authentication.
-- Unix socket admin channel.
-- External consumer integration.
+---
+
+## 5. Output rendering
+
+All response mirrors deserialize **leniently**: additive server fields
+are tolerated (no `deny_unknown_fields`), so an unexpected new field does
+not break decoding. Rich/nested shapes (a unit `body`, the assembly
+trace, the conformance report, the fused candidate pool, relationship
+provenance, deletion evidence, location metadata) are kept as raw JSON
+and printed **in full** rather than narrowed. As a consequence,
+**structural drift in those passthrough fields surfaces as raw JSON,
+not as a decode failure.** The claim holds **only** for the
+`serde_json::Value` passthroughs: drift in a typed **required** field
+(e.g. the evidence pack's `queryId`) IS a decode failure, rendered as
+an "unexpected response body" error (§5.9). Errors of every kind
+render per §5.9.
+
+### 5.1 `health`
+
+Prints the service name, readiness (`yes`/`no`), and each component with
+its readiness and detail lines. Components carry typed **`counts`**: each
+count is printed as `count <label> [<sourceSystem>]: <value> (as of
+<timestamp>)` — a count is never shown as current without its as-of
+marker, and the optional `sourceSystem` scopes fabric counts to their
+owner.
+
+### 5.2 Operation records (`operation`, and every async admin command)
+
+Prints the operation `id`, `type`, `status`, `target` (object type +
+id), timestamps, and `createdAt`. On `failed`, the server's specific
+error detail is printed (`error: …`).
+
+**Operation-succeeded ≠ parse-outcome rule (implemented in the CLI).**
+When an operation is **parse-producing** — `is_parse_producing_operation`
+matches the operation types **`source_ingest`**, **`parser_execution`**,
+and **`parse_activation`** — a `succeeded` status means only that the
+pipeline **lifecycle** completed. It does **not** confirm the domain
+outcome: a recorded parse failure, or a held disposition awaiting
+operator action, lives in the **parse run row**, not in
+`Operation.status`. So on `succeeded` for those types the renderer prints
+an explicit `note:` directing the operator to check the parse run row
+for the domain verdict, and to run **`held-parses`** for a held result.
+For non-parse-producing operation types, `succeeded` prints without the
+note.
+
+### 5.3 `query`
+
+Renders the evidence pack: `queryId`, `queryText`, `assembledAt`, the
+evidence-unit count, then each unit with its `unitId`, `contentType`,
+`sourceId`/`parseId`, optional `score`, optional `reasons`, an
+**excerpted `textProjection`** (up to **`TEXT_EXCERPT_CHARS` = 800**
+characters, ellipsized when clipped), a `locators` count, and the full
+`body` as pretty JSON. Pack-level `relationships`/`annotations` are
+counted; the full **`assemblyTrace`** is printed as pretty JSON. The
+excerpt is a summary only — the unit `body` is always rendered in full
+alongside it, so nothing is hidden.
+
+When the request set `debug`, a `diagnostics:` block follows: a
+per-stage **latency table** (openTransaction, capture, queryEmbed,
+denseLexicalFusion, graph, maxsim, rerank, assembly, snapshotHeld, in
+ms), the **`fusedPool`** count **and** the full fused pool dumped as
+pretty JSON, the `maxsim` ranked lines (`#rank unit … score …`), and the
+`reranked` lines (same, plus `logit` and `tokens` when present).
+
+### 5.4 `held-parses` (`held`)
+
+Lists held parses (or `Held parses: none`). Per parse: `id`, `status`,
+`sourceId`, parser name/version, optional `heldReason`, timestamps,
+optional `error`, a `warnings` count, and `metrics` as pretty JSON. The
+**conformance report has no single verdict field** — the renderer prints
+the report's **`dimensions`** map (each dimension name → value) as the
+regression cause, then keeps the full `conformanceReport` reachable as
+pretty JSON.
+
+### 5.5 `unit`
+
+Renders one content unit: `id`, `sourceId`/`parseId`, `contentType`,
+`bodyHash`, optional `textHash`/`structureHash`/`primaryParentId`/
+`sequenceIndex`, a `locators` count with full locator detail, timestamps,
+and the arbitrary `body` in full as pretty JSON.
+
+A **`404`** on `unit` or `relationships` is annotated: *"a 404 means the
+unit is absent OR belongs to a non-active parse — the service makes these
+two cases indistinguishable by design"* (§14). Non-404 errors pass
+through unchanged.
+
+### 5.6 `relationships`
+
+Lists relationships for a unit (or `Relationships: none`). Per
+relationship: `relationshipType`, `from`→`to` unit ids, `id`,
+`sourceId`/`parseId`, optional `role`/`sequenceIndex`/`confidence`,
+`provenance` as pretty JSON, and timestamps. Same §14 404 annotation as
+`unit`.
+
+### 5.7 `source`
+
+Renders one source: `id`, `activeParseId` (or `none (no active parse)`),
+`mimeType`, optional `sizeBytes`, `sourceHash`, `storageUri`, optional
+`eventTime`, `ingestTime`, `createdAt`, optional `deactivatedAt`, then
+each **location** with its `sourceSystem:nativeUri [status]`, `id`,
+optional `nativeId`, `governanceDomain`, `firstSeenAt`, and
+**`lastSeenAt`** prominently. `deletionEvidence` and `metadata` are kept
+as pretty JSON.
+
+### 5.8 `sync-status` (`sync`)
+
+Renders the sync scheduler snapshot: `fabricReady` (`yes`/`no`), optional
+`detail`, and the `pending` / `inFlight` / `failed` / `coalescedTotal`
+counters, plus optional `cadenceMs` and `lastSuccessAt`.
+
+### 5.9 Error rendering (both modes)
+
+Every failure renders as one of the following operator-facing errors:
+
+- **Non-2xx, structured body.** A body that decodes as
+  `{"error":{status,kind,message}}` renders
+  `<METHOD> <url> HTTP <n>: status=<s> kind=<k> message=<m>`. In the
+  decode, `status` and `kind` are **optional** — a degraded body that
+  carries only `message` still renders its message (with the absent
+  parts omitted) rather than being replaced with a generic error.
+- **Non-2xx, empty body.** Renders
+  `<METHOD> <url> HTTP <n> with empty response body`.
+- **Non-2xx, non-JSON body.** Renders the trimmed body text:
+  `<METHOD> <url> HTTP <n>: <trimmed body>`.
+- **Transport/send failure.** Renders
+  `<METHOD> <url> failed to send HTTP request`, with the underlying
+  cause preserved in the error chain.
+- **2xx body that fails the typed decode.** Renders an
+  *"returned an unexpected response body"* error. At the dispatch
+  decode seam (`decode_value`, used by `query` and `held-parses`) the
+  error carries the route **plus the full payload**; at the transport
+  decode (`decode_success`) it carries the method and URL only.
+
+**Mode asymmetry.** In the REPL, an error prints as `error: <msg>`
+followed by an indented `caused by: <cause>` line per link in the
+chain, and the loop **continues**. In one-shot mode the same failure
+terminates the process with a nonzero exit code (§1.4).
+
+---
+
+## 6. Recorded deviations the operator meets via the CLI
+
+- **`POST /query` omits `queryExecutionRecordId`.** The query response
+  carries no query-execution-record id; the CLI has no field for it and
+  renders none.
+- **Active retrieval channels are lexical, dense, and graph.** The
+  `multi_vector` channel is deferred post-MVP, so debug diagnostics
+  reflect only the lexical/dense/graph pipeline.

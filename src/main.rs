@@ -1,15 +1,35 @@
+mod acquisition;
+mod activation;
+mod annotations;
+mod artifact_store;
+mod assembly;
+mod canonical;
 mod config;
+mod connectors;
+mod deletion;
 mod docling;
 mod docling_activity;
 mod error;
+mod events;
+mod hot_plane;
 mod http;
+mod identity;
+mod ids;
 mod inference;
 mod logging;
+mod model;
+mod operations;
+mod parse;
+mod primitives;
+mod projections;
+mod query;
+mod restore;
+mod scheduler;
+mod snapshot;
 mod source;
 mod state;
-mod storage;
 mod types;
-mod units;
+mod util;
 
 use std::{
     env,
@@ -23,7 +43,7 @@ use std::{
     },
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -35,11 +55,11 @@ use tracing::{error, info, warn};
 use crate::{
     config::{CliOptions, ServiceConfig, resolve_cli_options_from_args},
     error::ApiError,
+    hot_plane::setup_fabric_storage,
     http::build_router,
     inference::InferenceRuntime,
     logging::init_file_logging,
-    state::{AppState, ShutdownSignal},
-    storage::{StorageRuntime, setup_storage},
+    state::{AnnotationHealth, AppState, FabricHealth, ShutdownSignal, SyncHealth},
 };
 
 enum ServiceProcessRole {
@@ -75,6 +95,9 @@ const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const FD_CLOEXEC: i32 = 1;
 
+// Direct POSIX declarations instead of a libc dependency: setsid detaches the
+// daemonized child from its controlling terminal; fcntl clears FD_CLOEXEC on
+// the inherited startup-status fd so it survives exec into the child.
 unsafe extern "C" {
     fn setsid() -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
@@ -230,7 +253,7 @@ fn main() -> anyhow::Result<()> {
         cli_options.config_path.display()
     );
     let config = ServiceConfig::load(cli_options.config_path.clone())?;
-    let resolved_log_path = config.logging.resolved_file_path();
+    let resolved_log_path = config.logging.resolved_file_path(config.config_root());
     println!(
         "data-store bootstrap logging.file_path={} logging.resolved_file_path={} logging.level={}",
         config.logging.file_path.display(),
@@ -239,7 +262,7 @@ fn main() -> anyhow::Result<()> {
     );
     // Operational logs switch to the configured file here. Config/CLI failures
     // before this point still surface through stdout/stderr.
-    let logging = init_file_logging(&config.logging)?;
+    let logging = init_file_logging(&config.logging, config.config_root())?;
     println!(
         "data-store bootstrap file_logging=initialized path={}",
         logging.resolved_file_path.display()
@@ -252,21 +275,24 @@ fn main() -> anyhow::Result<()> {
         "service bootstrap completed"
     );
     if cli_options.setup_storage {
-        match setup_storage(&config.storage) {
+        // One deliberate operator action sets up the fabric hot plane. The
+        // legacy schema plane was retired at cluster CR; the fabric plane is
+        // the only durable store.
+        match setup_fabric_storage(&config.storage.index_root) {
             Ok(db_path) => {
-                println!("storage schema ready at {}", db_path.display());
+                println!("fabric storage schema ready at {}", db_path.display());
                 info!(
-                    event = "storage.setup.completed",
+                    event = "fabric_storage.setup.completed",
                     db_path = %db_path.display(),
-                    "storage setup completed"
+                    "fabric storage setup completed"
                 );
                 return Ok(());
             }
             Err(source) => {
                 error!(
-                    event = "storage.setup.failed",
+                    event = "fabric_storage.setup.failed",
                     error = %source,
-                    "storage setup failed"
+                    "fabric storage setup failed"
                 );
                 return Err(source.into());
             }
@@ -371,7 +397,7 @@ async fn run_http_service(
     info!(
         event = "service.initializing",
         %bind_address,
-        "initializing inference and storage"
+        "initializing inference"
     );
 
     reporter.report("data-store startup inference=initializing")?;
@@ -423,56 +449,162 @@ async fn run_http_service(
         }
     };
 
-    reporter.report("data-store startup storage_cache=initializing")?;
-    let storage_result = StorageRuntime::open(
-        &config.storage,
-        &config.models.dense,
-        &config.models.colbert,
-    );
-    let storage = match storage_result {
-        Ok(runtime) => {
-            reporter.report(format!(
-                "data-store startup storage_cache=ready details=\"{}\"",
-                runtime.health_details().join(" | ")
-            ))?;
-            info!(
-                event = "storage.initialized",
-                "storage initialized successfully"
-            );
-            runtime
+    // Fabric hot-plane pre-check, reporting only: the scheduler thread owns
+    // the runtime validation gate and re-validates before its first cycle;
+    // this synchronous check gives the startup handoff a truthful prediction
+    // of the sync component's readiness. It is a prediction, not the health
+    // source of truth: /v1/health reads the scheduler-published sync slot,
+    // which starts pending, so a probe in the brief window before the
+    // scheduler's first publish reports ready=false even after this line
+    // printed ready=true. A missing or invalid fabric plane is not fatal —
+    // the service serves with ready=false and health explains why.
+    reporter.report("data-store startup sync=validating")?;
+    let fabric_ready_at_startup = match crate::hot_plane::open_read(&config.storage.index_root)
+        .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
+    {
+        Ok(()) => {
+            reporter.report("data-store startup sync=ready")?;
+            true
         }
         Err(source) => {
             reporter.report(format!(
-                "data-store startup storage_cache=not_ready error=\"{source}\""
+                "data-store startup sync=not_ready error=\"{source}\""
             ))?;
-            error!(
-                event = "storage.initialization_failed",
-                %bind_address,
+            warn!(
+                event = "startup.fabric_not_ready",
                 error = %source,
-                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-                "storage initialization failed"
+                "fabric hot plane is not ready; acquisition scheduler will report unready sync health (run --setup-storage)"
             );
+            false
+        }
+    };
+    // The scheduler owns clones of its inputs because `config` moves into
+    // AppState next; the shared health slot is the only channel between the
+    // scheduler thread and health reporting.
+    let scheduler_corpus_root = config.storage.corpus_root.clone();
+    let scheduler_index_root = config.storage.index_root.clone();
+    let scheduler_governance_domain = config.connectors.filesystem.governance_domain.clone();
+    let scheduler_docling = config.docling.clone();
+    let annotation_index_root = config.storage.index_root.clone();
+    let annotation_annotator = config.models.annotator.clone();
+    let annotation_config_root = config.config_root().to_path_buf();
+    // §30.2 application identity captured ONCE here, right after config load and
+    // validation, then threaded explicitly into the scheduler (and from there to
+    // every snapshot-minting site) per the 2026-07-16 ruling — no global, no
+    // OnceLock. Computed before `config` moves into AppState below. Capture
+    // failure is fatal: a service that cannot pin the identity its forensic
+    // snapshots stamp has nothing valid to record, so it exits with the same
+    // startup.fatal reporting as a failed scheduler spawn.
+    let application_identity = match identity::ApplicationIdentity::capture(&config) {
+        Ok(identity) => identity,
+        Err(source) => {
             error!(
                 event = "startup.fatal",
-                stage = "storage_cache_initialization",
+                stage = "application_identity_capture",
                 %bind_address,
                 error = %source,
                 elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-                "startup failed during storage/cache initialization"
+                "startup failed capturing the application identity"
             );
             reporter.report(format!("data-store startup fatal=\"{source}\""))?;
             admin_token_file.cleanup_if_current();
             return Err(source.into());
         }
     };
+    let sync_health = Arc::new(Mutex::new(SyncHealth::startup_pending()));
+    // C10b diagnostic-only health slots: the scheduler publishes fabric counts,
+    // the annotation worker its own state. Separate from `sync_health` so
+    // neither slot gates readiness (the set stays {inference, sync}).
+    let fabric_health = Arc::new(Mutex::new(FabricHealth::default()));
+    let annotation_health = Arc::new(Mutex::new(AnnotationHealth::startup_pending()));
     let shutdown_signal = Arc::new(ShutdownSignal::default());
+    // One cutover-barrier registry per process (§31.1): activation via the
+    // scheduler and the future C10a accept disposition must serialize on the
+    // SAME per-source barriers (discard deliberately takes none — no pointer
+    // swap), so the registry is constructed here and cloned outward. The
+    // C7/C8 query-side consumers reach it the same way.
+    let cutover_registry = Arc::new(state::CutoverRegistry::new());
+    // C6 projection-runtime inputs read BEFORE `config`/`inference` move into
+    // AppState below. The dense/colbert runtimes are cheap Clone handles; the
+    // expected vector widths come from config.models.{dense,colbert}.dimension.
+    let scheduler_dense_runtime = inference.dense.clone();
+    let scheduler_colbert_runtime = inference.colbert.clone();
+    let scheduler_dense_dimension = config.models.dense.dimension as usize;
+    let scheduler_colbert_dimension = config.models.colbert.dimension as usize;
+    // The shared active dense cache (§1.6 successor). Phase 1 hands the scheduler
+    // this clone; the second clone below rides AppState so the C7 dense
+    // retrieval channel scores against the same swapped planes (C8d-1 seam).
+    let dense_cache = Arc::new(projections::dense_cache::DenseCache::new());
     let state = Arc::new(AppState::new(
         config,
         Ok(inference),
-        Ok(storage),
         admin_shutdown_token.clone(),
         Arc::clone(&shutdown_signal),
+        Arc::clone(&sync_health),
+        Arc::clone(&fabric_health),
+        Arc::clone(&annotation_health),
+        Arc::clone(&dense_cache),
+        Arc::clone(&cutover_registry),
+        // Cloned onto AppState so HTTP snapshot/restore handlers stamp the same
+        // identity the scheduler stamps; the original moves into scheduler::start
+        // below (C10 resolution 7).
+        application_identity.clone(),
     ));
+    // The projection runtime's model-call gate is the SAME process-global gate
+    // AppState holds (`model_call_gate_handle`), so scheduler-thread model calls
+    // and HTTP-path model calls serialize on one instance (§1.5). Constructed
+    // here after AppState::new because the gate is created inside AppState.
+    let scheduler_projection_runtime = scheduler::ProjectionRuntime {
+        dense: scheduler_dense_runtime,
+        colbert: scheduler_colbert_runtime,
+        dense_dimension: scheduler_dense_dimension,
+        colbert_dimension: scheduler_colbert_dimension,
+        gate: state.model_call_gate_handle(),
+        dense_cache: Arc::clone(&dense_cache),
+    };
+    // Spawn the acquisition scheduler once shared state exists. Spawn failure
+    // is fatal: the sync component gates readiness, so a service whose
+    // scheduler can never run would sit permanently unready with no operator
+    // signal beyond this boundary.
+    let scheduler_handle = match scheduler::start(
+        scheduler_corpus_root,
+        scheduler_index_root,
+        scheduler_governance_domain,
+        scheduler_docling,
+        Arc::clone(&cutover_registry),
+        scheduler_projection_runtime,
+        application_identity,
+        Arc::clone(&shutdown_signal),
+        sync_health,
+        fabric_health,
+    ) {
+        Ok(handle) => handle,
+        Err(source) => {
+            error!(
+                event = "startup.fatal",
+                stage = "scheduler_spawn",
+                %bind_address,
+                error = %source,
+                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+                "startup failed spawning the sync scheduler thread"
+            );
+            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+            admin_token_file.cleanup_if_current();
+            return Err(source.into());
+        }
+    };
+    // Spawn the annotation worker (CA) beside the scheduler: discovery-based
+    // post-activation annotation builds. Deliberately NOT readiness-critical —
+    // an unreachable annotator endpoint or a parked worker degrades
+    // annotations visibly (freshness rows, worker logs, and the diagnostic-only
+    // annotation health slot) without gating service readiness.
+    let annotation_worker_handle = annotations::worker::start(
+        annotation_index_root,
+        annotation_annotator,
+        annotation_config_root,
+        Arc::clone(&shutdown_signal),
+        annotation_health,
+    );
     let app = build_router(state).layer(TraceLayer::new_for_http());
     reporter.report(format!(
         "data-store startup http=listening bind_address={bind_address}"
@@ -484,15 +616,19 @@ async fn run_http_service(
         "startup HTTP listener is ready"
     );
     let health_url = format!("http://{bind_address}/v1/health");
+    // Top-level readiness is inference plus the sync component: inference is
+    // true by construction here (its failure returns above), so the
+    // pre-checked fabric state decides the reported flag.
     reporter.report(format!(
-        "data-store startup ready=true inference=true storage_cache=true health_url={health_url}"
+        "data-store startup ready={fabric_ready_at_startup} inference=true sync={fabric_ready_at_startup} health_url={health_url}"
     ))?;
     info!(
         event = "startup.ready",
         %bind_address,
         health_url = %health_url,
+        ready = fabric_ready_at_startup,
         inference_ready = true,
-        storage_ready = true,
+        sync_ready = fabric_ready_at_startup,
         elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
         "startup readiness completed"
     );
@@ -500,15 +636,39 @@ async fn run_http_service(
     info!(
         event = "service.listening",
         %bind_address,
-        ready = true,
+        ready = fabric_ready_at_startup,
         inference_ready = true,
-        storage_ready = true,
+        sync_ready = fabric_ready_at_startup,
         "data store service listening"
     );
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_signal))
+        .with_graceful_shutdown(wait_for_shutdown_signal(Arc::clone(&shutdown_signal)))
         .await;
     admin_token_file.cleanup_if_current();
+    // Serve has returned — gracefully or with a transport error. On the
+    // error path nothing has tripped the shutdown signal yet, and the
+    // scheduler and annotation worker may be mid-sleep; request shutdown
+    // explicitly so the joins below are bounded by one wait_timeout wakeup
+    // instead of a full idle sleep.
+    if let Err(reason) = shutdown_signal.request() {
+        error!(
+            event = "scheduler.shutdown_request_failed",
+            error = %reason,
+            "failed to signal scheduler shutdown before join"
+        );
+    }
+    if scheduler_handle.join().is_err() {
+        error!(
+            event = "scheduler.join_panicked",
+            "sync scheduler thread panicked before shutdown"
+        );
+    }
+    if annotation_worker_handle.join().is_err() {
+        error!(
+            event = "annotation_worker.join_panicked",
+            "annotation worker thread panicked before shutdown"
+        );
+    }
     serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
@@ -519,7 +679,7 @@ impl AdminTokenFile {
     /// Publish the current startup-scoped admin token to the configured owner-only runtime file.
     fn write_current(config: &ServiceConfig, token: &str) -> Result<Self, ApiError> {
         let started_at = Instant::now();
-        let path = config.admin.resolved_token_file_path();
+        let path = config.admin.resolved_token_file_path(config.config_root());
         info!(
             event = "admin_token_file.publish_started",
             path = %path.display(),
@@ -1090,6 +1250,9 @@ fn clear_close_on_exec(fd: i32) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Detect count-style progress fields (`key=current/total` with numeric
+/// parts) in a startup status message, so the reporter treats the line as an
+/// overwritable progress update rather than a discrete status line.
 fn uses_count_progress(message: &str) -> bool {
     message.split_whitespace().any(|field| {
         let Some((_, value)) = field.split_once('=') else {

@@ -1,48 +1,101 @@
-# Onboarding Guide for AI Assistants
+# Using the interactive Data Store client (REPL)
 
-If you are reading this file for the first time (fresh context), immediately follow the instructions below. Do not just summarize this file.
+The `data-store` binary runs an interactive read-eval-print loop (REPL) when
+invoked with **no operation flag**. It is the CLI client binary, separate from
+the `data-store-service` binary that runs the service; running it without a
+one-shot command (such as `--health` or `--query`) starts the REPL instead.
 
-This guide helps new AI assistant instances quickly get the context needed to resume development on this project.
+This guide covers the REPL. For install and first-run setup, see `INSTALL.md`.
+For the full request/response shapes and rendering detail see `SPEC-CLIENT.md`,
+and for the HTTP wire contract see `PROTOCOL.md`.
 
-**Read only files explicitly named by the user or explicitly required by those files. Ask before reading anything else.**
-**During onboarding, do not infer extra context files. Follow the explicit read list only.**
+## Launching
 
-## Action Required
+```sh
+data-store                            # uses ./config.toml
+data-store --config /path/to/config.toml
+```
 
-### Read files
+The REPL shares the same `config.toml` as the service. From it, the client
+resolves:
 
-Please read the following files one at a time, in the given order:
+- the service base URL from `[server].bind_address` (a bind-all address is
+  dialed as loopback),
+- the admin token file from `[admin].token_file_path`, and
+- the request/poll timeout from `[client].operation_timeout_seconds`, which
+  bounds each individual HTTP request (including each poll); the poll loop
+  itself has no total-time cap.
 
-AGENTS.md
-PRINCIPLES.md
-README.md
-INSTALL.md
-ARCHITECTURE.md
-DIAGNOSTICS-ONBOARDING.md
+On launch it prints the connected base URL and a hint to type `help`. Line
+editing and history are provided by rustyline; command history persists to
+`.data-store.history` (resolved against the config file's directory) across
+sessions.
 
-These following reference documents are also available, but should only be read when needed:
+Type `exit` (or `quit`), or send EOF (Ctrl-D), to leave. Ctrl-C interrupts the
+current line and prints a reminder to use `exit`.
 
-SPEC-SERVER.md - Comprehensive server spec
-SPEC-CLIENT.md - Comprehensive client spec
-PROTOCOL.md - Comprehensive client/server API contract
+## Command set
 
-Files these documents explicitly instruct you to read. If any of the above files contain explicit instructions to read a specific file (e.g., "Read the spec: filename"), follow that instruction. Do not follow casual mentions or "where to look" pointers.
+Commands and their usage strings (from the client's command table):
 
-### Flag errors and inconsistencies
+| Command | Usage | Notes |
+| --- | --- | --- |
+| `health` | `health` | Service health and per-component readiness. |
+| `query` | `query <requestJson>` | Search; request body is raw JSON. |
+| `ingest` | `ingest <sourceSystem> <nativeUri>` | Admin; async operation. |
+| `reparse` | `reparse <sourceId> <sourceSystem> <nativeUri>` | Admin; async operation. |
+| `activate` | `activate <sourceId> <parseId>` | Admin; async operation. |
+| `accept` | `accept <parseId>` | Admin; async operation. |
+| `discard` | `discard <parseId>` | Admin; async operation. |
+| `snapshot` | `snapshot [requestJson]` | Admin; async operation. Optional JSON request body. |
+| `restore` | `restore <sourceId> <parseId>` | Admin; async operation. |
+| `shutdown` | `shutdown` | Admin; control action (not polled). |
+| `held-parses` (alias `held`) | `held-parses` | List held parses awaiting disposition. |
+| `operation` | `operation <operationId>` | Read one operation record (single snapshot). |
+| `unit` | `unit <unitId>` | Read a unit. |
+| `relationships` | `relationships <unitId> [direction] [relationshipType]` | Optional filters. |
+| `source` | `source <sourceId>` | Read a source. |
+| `sync-status` (alias `sync`) | `sync-status` | Acquisition/sync status. |
+| `help` | `help` | List commands. |
+| `exit` (alias `quit`) | `exit` | Leave the REPL. |
 
-If any of the files you've read contain errors or inconsistencies, let the user know.
+Arguments are split with minimal shell-like quoting: double quotes group
+tokens; inside quotes a backslash escapes only `"` and `\` (any other escaped
+character keeps its backslash); outside quotes a backslash is literal; an
+unterminated quote is an error. There is no shell expansion of any kind. JSON
+arguments (`query`, and the optional `snapshot` body) are parsed and validated
+before any request is sent.
 
-### Summarize
+## Polling model
 
-Do this now before responding to the user: After reading all files above, briefly summarize the project based on what you've read in these files.
-Once you've done this, the user will describe the scope of work for this session.
+There is **no streaming**. Mutating admin commands (`ingest`, `reparse`,
+`activate`, `accept`, `discard`, `snapshot`, `restore`) resolve to an
+asynchronous operation: the client receives
+an operation id (HTTP 202) and then **polls `GET /operations/{operationId}` on a
+fixed one-second interval** until the operation reaches a terminal state
+(`succeeded` or `failed`), rendering the terminal record. Each poll — like every
+protected request — reads the admin token from the token file **fresh, per
+request**; the token is never cached. `[client].operation_timeout_seconds`
+bounds each individual poll request only; the loop itself runs until a
+terminal status with no total-time cap.
 
-## Session feature implementation process
+`operation <operationId>` performs a single snapshot read of an operation record
+without polling. `shutdown` is the one control action that returns 202 with no
+body and is never polled.
 
-Features are applied one-by-one with user approval:
-1. **Show current status**: Describe what has been done and what is scheduled to develop next
-2. **Propose where to resume**: Propose next steps based on development plan. The user may request some other feature be worked on or bug addressed at this point. This does not remove the requirement to show your plan and receive explicit approval before making code changes. This approval is required regardless of what you are working on.
-3. **Show plan and discuss**: Ask any questions you may have on the development task. The user may also have questions or request changes. Iterate until all questions have been answered.
-4. **Display final plan including estimated development effort (in tokens) and confidence level the plan will work on the first try (in percentage) to the user for review and final approval**: Wait for final approval before beginning development. Approval must be explicit.
-5. **Pause development when agreed scope is complete or you run into problems**: Do not continue if things go off-track. Instead, pause and discuss. When unsure, pause.
-6. **End session procedure**: Once scoped-development is complete, summarize what has been done. The user will ask a series of questions and/or ask for changes before providing approval to log current status, which means update current status in the detailed plan.
+### Operation succeeded is not the parse outcome
+
+For a parse-producing operation (`source_ingest`, `parser_execution`,
+`parse_activation`), an operation reaching `succeeded` means the pipeline
+**lifecycle** completed — it does **not** confirm a favorable domain outcome. The
+domain verdict (a recorded parse failure, or a held disposition awaiting your
+action) lives in the parse run row, not in the operation status. When the client
+renders such a `succeeded` operation, it prints a note directing you to the
+domain verdict: run `held-parses` for a held result, or inspect the parse run
+itself.
+
+## Reference
+
+- `SPEC-CLIENT.md` — full command surface, request/response shapes, and
+  rendering detail.
+- `PROTOCOL.md` — the HTTP wire contract.

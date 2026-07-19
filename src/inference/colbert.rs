@@ -38,6 +38,20 @@ const PROJECTION_MODEL_FILE_NAME: &str = "model.safetensors";
 const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
 const SENTENCE_BERT_CONFIG_FILE_NAME: &str = "sentence_bert_config.json";
 const TOKEN_VECTOR_NORM_EPS: f64 = 1e-12;
+/// Fixed different-length smoke texts (distinct token lengths) embedded both
+/// batched and singly to prove the CPd batched DOCUMENT path is numerically
+/// equivalent to the retained singular path. The longest is sized against the
+/// runtime-loaded `local_attention` so it crosses a local-window boundary and
+/// forces a masked padded region relative to the shorter two.
+const SMOKE_BATCH_SHORT: &str = "Clear rules.";
+const SMOKE_BATCH_MEDIUM: &str =
+    "Prefer specific words and direct sentences when explaining technical changes to a reader.";
+/// Per-token-vector cosine floor between the batched and singular embeddings of
+/// the SAME text. The two paths differ only in F32 accumulation order (batched
+/// rank-3 matmuls vs. singular per-head 2D matmuls), so agreement must be near
+/// exact; anything below this indicates a real formulation defect (a mask leak,
+/// a stride miscompute) rather than floating-point noise.
+const SMOKE_BATCH_COSINE_FLOOR: f32 = 0.9999;
 
 #[derive(Debug, Clone)]
 pub struct ColbertRuntime {
@@ -65,7 +79,11 @@ pub struct ColbertCandidateScore {
     pub unit_id: String,
     pub score: f32,
     pub rank: usize,
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     pub query_tokens: usize,
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     pub document_tokens: usize,
 }
 
@@ -410,6 +428,48 @@ impl ColbertRuntime {
                 encoder.document_capacity_smoke(&capacity_document_hidden, &projection)
             },
         )?;
+        // CPd batch-consistency smoke (additive): prove the batched DOCUMENT path
+        // matches the singular reference path per token vector on fixed
+        // different-length texts BEFORE readiness. Reuses the shared smoke
+        // logging boundary with its own `call_purpose`; `document_capacity_tokens`
+        // is not a meaningful field here, so it is left at its default.
+        progress("colbert_smoke_batch_consistency")?;
+        let (batch_consistency_texts, crosses_local_boundary) =
+            build_batch_consistency_smoke_texts(
+                &tokenizer,
+                model_config.local_attention,
+                config.document_max_tokens as usize,
+            )?;
+        run_colbert_startup_call(
+            ColbertStartupCallDiagnostics {
+                call_purpose: "startup_smoke_batch_consistency",
+                ..smoke_tokens
+            },
+            || {
+                run_colbert_batch_consistency_smoke(
+                    &tokenizer,
+                    &input_path,
+                    &encoder,
+                    &projection,
+                    config.document_max_tokens as usize,
+                    device,
+                    &batch_consistency_texts,
+                )
+            },
+        )?;
+        info!(
+            event = "colbert_smoke_batch_consistency_ready",
+            model_role = "colbert",
+            text_count = batch_consistency_texts.len(),
+            local_attention = model_config.local_attention,
+            configured_document_max_tokens = config.document_max_tokens as usize,
+            // When false, the loaded config's local window spans the document
+            // token cap, so no smoke text can cross a local-window boundary; the
+            // masked-padding case is still exercised, the boundary-crossing case
+            // is not.
+            crosses_local_boundary,
+            "ColBERT batched/singular batch-consistency smoke passed"
+        );
         progress("colbert_smoke_ready")?;
 
         Ok(Self {
@@ -492,7 +552,24 @@ impl ColbertRuntime {
         ]
     }
 
-    /// Encode and flatten one unit's ColBERT document token matrix for durable storage.
+    /// Borrow the ColBERT tokenizer the runtime encodes with. The C6b chunk
+    /// builder measures its per-chunk token cap against THIS tokenizer (§C6b
+    /// contract) so a chunk's token count is the same measurement the
+    /// multivector channel embeds under; the integration wiring passes this
+    /// borrow into `chunk::build_chunks`. Read-only: the tokenizer is not
+    /// mutated, and the borrow lives no longer than the runtime handle.
+    pub(crate) fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Encode and flatten one unit's ColBERT document token matrix. Production
+    /// path for LONG units under the CPd length-threshold hybrid (2026-07-18):
+    /// the C6e builder routes units above `COLBERT_BATCH_ROUTE_MAX_TOKENS`
+    /// (multivector.rs) here — padded quadratic attention makes the batched
+    /// path slower past the ~130-token crossover — and packs the rest through
+    /// `embed_documents`. Also consumed by the colbert-diagnostic bin, and
+    /// remains the pinned byte-compatibility reference the batched path is
+    /// defined against.
     pub fn embed_document(
         &self,
         unit_id: &str,
@@ -557,7 +634,141 @@ impl ColbertRuntime {
         result
     }
 
+    /// Embed a window of documents in ONE batched forward pass, returning one
+    /// entry per input in input order, each already truncated to its own true
+    /// token length so its matrix is byte-identical to the singular
+    /// `embed_document` path.
+    ///
+    /// CPd batched DOCUMENT path (additive; the singular `embed_document` above
+    /// stays intact for the colbert-diagnostic bin and as the byte-compatibility
+    /// reference this batched path is defined against — the smoke's reference side
+    /// reuses the same singular primitives directly, and the query path uses
+    /// `encode_projected_query`). Documents are tokenized, padded to the window's
+    /// longest true length, and run through the FLATTENED batched encoder
+    /// (`encode_batched`): rank-2 linears over `(B·S, 768)`, rank-3 attention
+    /// over `(B·heads, S, head_dim)`. A true key-padding mask composed with the
+    /// existing local-window mask keeps padded keys from leaking into real
+    /// tokens; each document's output rows `0..L_b` are extracted so padding
+    /// never reaches storage.
+    ///
+    /// Gate: this method acquires NOTHING; the caller (the multi-vector builder)
+    /// holds one `ModelCallPermit` across the whole per-parse batch (D-fact 9).
+    /// One `model_call.*` pair is emitted per batch with batch-level fields.
+    pub fn embed_documents(
+        &self,
+        units: &[(&str, &str)],
+    ) -> Result<Vec<ColbertDocumentEmbedding>, ApiError> {
+        let started_at = Instant::now();
+        let text_count = units.len();
+        let document_chars: usize = units.iter().map(|(_, text)| text.chars().count()).sum();
+        info!(
+            event = "model_call.started",
+            model_role = "colbert",
+            call_purpose = "document_embedding_batched",
+            input_kind = "document",
+            // Batch-level fields replace the singular path's per-unit `unit_id`:
+            // `text_count` = batch size, `document_chars` = summed chars. The
+            // per-unit `unit_id` is intentionally absent here.
+            text_count,
+            document_chars,
+            configured_max_tokens = self.document_max_tokens,
+            expected_dimension = self.projection_dimension,
+            "ColBERT batched document embedding started"
+        );
+
+        let result = self.embed_documents_inner(units);
+        match &result {
+            Ok(embeddings) => {
+                // `token_count` is the summed TRUE token count across the batch
+                // (a safe aggregate), never per-unit and never vector values.
+                let token_count: usize = embeddings
+                    .iter()
+                    .map(|embedding| embedding.token_count)
+                    .sum();
+                info!(
+                    event = "model_call.completed",
+                    model_role = "colbert",
+                    call_purpose = "document_embedding_batched",
+                    input_kind = "document",
+                    text_count,
+                    document_chars,
+                    token_count,
+                    configured_max_tokens = self.document_max_tokens,
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "ColBERT batched document embedding completed"
+                );
+            }
+            Err(source) => {
+                error!(
+                    event = "model_call.failed",
+                    model_role = "colbert",
+                    call_purpose = "document_embedding_batched",
+                    input_kind = "document",
+                    text_count,
+                    document_chars,
+                    configured_max_tokens = self.document_max_tokens,
+                    expected_dimension = self.projection_dimension,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %source,
+                    "ColBERT batched document embedding failed"
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Tokenize, pad, run the flattened batched encoder, extract each document's
+    /// true-length projected matrix, and materialize it to a `ColbertDocumentEmbedding`
+    /// in input order. Split from `embed_documents` so the batch-level logging
+    /// boundary wraps exactly this fallible work.
+    fn embed_documents_inner(
+        &self,
+        units: &[(&str, &str)],
+    ) -> Result<Vec<ColbertDocumentEmbedding>, ApiError> {
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let texts: Vec<&str> = units.iter().map(|(_, text)| *text).collect();
+        // Shared flattened batched pipeline; returns each document's true-length
+        // projected matrix indexed by original input position.
+        let matrices = batched_document_matrices(
+            &self.tokenizer,
+            &self.input_path,
+            &self.encoder,
+            &self.projection,
+            self.document_max_tokens,
+            &self.device,
+            &texts,
+        )?;
+
+        // Materialize in input order. Padded rows were already dropped at
+        // true-length extraction, so `tensor_to_document_embedding`'s non-finite
+        // check only ever sees real-token values.
+        let mut results: Vec<Option<ColbertDocumentEmbedding>> =
+            (0..units.len()).map(|_| None).collect();
+        for (input_index, matrix) in matrices {
+            let unit_id = units[input_index].0;
+            results[input_index] = Some(tensor_to_document_embedding(unit_id, matrix)?);
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(input_index, entry)| {
+                entry.ok_or_else(|| {
+                    inference_error(format!(
+                        "ColBERT batched document embedding lost input index {input_index}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     /// Score persisted ColBERT document token vectors without per-candidate progress reporting.
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     pub fn score_persisted_candidates(
         &self,
         query: &str,
@@ -567,6 +778,8 @@ impl ColbertRuntime {
     }
 
     /// Score persisted ColBERT document token vectors while reporting completed candidates.
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     pub fn score_persisted_candidates_with_progress<F>(
         &self,
         query: &str,
@@ -690,6 +903,8 @@ impl ColbertRuntime {
     }
 
     /// Encode and project one search query using the ColBERT prompt contract.
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     fn encode_projected_query(&self, query: &str) -> Result<Tensor, ApiError> {
         let token_ids = tokenize_formatted(
             &self.tokenizer,
@@ -701,6 +916,8 @@ impl ColbertRuntime {
     }
 
     /// Encode and project one candidate unit as a ColBERT document.
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     fn encode_projected_document(&self, document: &str) -> Result<Tensor, ApiError> {
         let token_ids = tokenize_formatted(
             &self.tokenizer,
@@ -712,6 +929,8 @@ impl ColbertRuntime {
     }
 
     /// Run token IDs through input embeddings, the full encoder, and PyLate projection.
+    // Retained inference API (pinned contract); consumed at C6e/C7c.
+    #[allow(dead_code)]
     fn encode_projected_tokens(&self, token_ids: &[u32], label: &str) -> Result<Tensor, ApiError> {
         let hidden = self.input_path.forward(token_ids, &self.device, label)?;
         let encoded = self.encoder.encode(&hidden, label)?;
@@ -799,6 +1018,43 @@ impl ColbertInputPath {
             .map_err(|source| {
                 inference_error(format!(
                     "failed to flatten ColBERT {label} hidden states for projection: {source}"
+                ))
+            })
+    }
+
+    /// Batched twin of `forward`: turn a padded `(batch_size, padded_len)`
+    /// token-id matrix into FLATTENED `(batch_size * padded_len, 768)` normalized
+    /// hidden states. LayerNorm reduces only within a token (`D::Minus1`), so
+    /// padded rows never contaminate real rows here; the key-padding mask in
+    /// attention is what keeps padded KEYS out of real tokens downstream.
+    fn forward_batched(
+        &self,
+        padded_ids: &[u32],
+        batch_size: usize,
+        padded_len: usize,
+        device: &Device,
+    ) -> Result<Tensor, ApiError> {
+        let input = Tensor::from_vec(padded_ids.to_vec(), (batch_size, padded_len), device)
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to build ColBERT batched document input tensor: {source}"
+                ))
+            })?;
+        let hidden = self.embeddings.forward(&input).map_err(|source| {
+            inference_error(format!(
+                "ColBERT batched document token embedding lookup failed: {source}"
+            ))
+        })?;
+        let normalized = self.norm.forward(&hidden).map_err(|source| {
+            inference_error(format!(
+                "ColBERT batched document embedding norm failed: {source}"
+            ))
+        })?;
+        normalized
+            .reshape((batch_size * padded_len, self.hidden_size))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to flatten ColBERT batched document hidden states for encoder: {source}"
                 ))
             })
     }
@@ -1086,6 +1342,307 @@ impl ColbertAttentionPrimitive {
                 ))
             })
     }
+
+    /// FLATTENED batched twin of `forward`: run ModernBERT attention over a whole
+    /// padded window. Input/output are flattened `(batch_size * seq_len, hidden)`;
+    /// `pad_mask` is the shared additive `(batch_size, seq_len)` key-padding mask
+    /// (`0.0` for real keys, `-inf` for padded keys `j >= L_b`), computed once per
+    /// encode and reused for every layer. RoPE, QKV split, per-head scores, mask
+    /// composition, softmax, and `probs·V` all run rank-3 over `(B·heads, S, D)`.
+    fn forward_batched(
+        &self,
+        hidden_states: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+        pad_mask: &Tensor,
+        label: &str,
+    ) -> Result<Tensor, ApiError> {
+        let (rows, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size || rows != batch_size * seq_len {
+            return Err(inference_error(format!(
+                "ColBERT {label} batched attention shape [{rows}, {hidden_size}], expected [{}, {}]",
+                batch_size * seq_len,
+                self.hidden_size
+            )));
+        }
+        if seq_len > self.max_position_embeddings {
+            return Err(inference_error(format!(
+                "ColBERT {label} batched attention sequence length {seq_len} exceeds max_position_embeddings {}",
+                self.max_position_embeddings
+            )));
+        }
+
+        // Attention pre-norm (skipped for layer 0, mirroring the singular path).
+        // LayerNorm reduces within a token, so it is padding-safe on flattened
+        // rows.
+        let attention_input = match &self.attn_norm {
+            Some(norm) => norm.forward(hidden_states).map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} batched attention norm failed for layer {}: {source}",
+                    self.layer_index
+                ))
+            })?,
+            None => hidden_states.clone(),
+        };
+        let qkv = self.qkv_proj.forward(&attention_input).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched fused QKV projection failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        // Re-batch the fused projection to `(batch_size, seq_len, 3*hidden)` so
+        // each projection can be split per head with a known batch axis.
+        let qkv = qkv
+            .reshape((batch_size, seq_len, hidden_size * 3))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to batch ColBERT {label} fused QKV projection for layer {}: {source}",
+                    self.layer_index
+                ))
+            })?;
+        let q =
+            self.split_attention_projection_batched(&qkv, 0, batch_size, seq_len, label, "query")?;
+        let k = self.split_attention_projection_batched(
+            &qkv,
+            hidden_size,
+            batch_size,
+            seq_len,
+            label,
+            "key",
+        )?;
+        let v = self.split_attention_projection_batched(
+            &qkv,
+            hidden_size * 2,
+            batch_size,
+            seq_len,
+            label,
+            "value",
+        )?;
+        let q = apply_rope(&q, self.rope_theta).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched query rope failed: {source}"
+            ))
+        })?;
+        let k = apply_rope(&k, self.rope_theta).map_err(|source| {
+            inference_error(format!("ColBERT {label} batched key rope failed: {source}"))
+        })?;
+        let attention_output =
+            self.attention_output_by_head_batched(&q, &k, &v, pad_mask, label)?;
+        // Flatten `(batch_size, seq_len, hidden)` back to `(B·S, hidden)` for the
+        // output projection, which reduces within a token.
+        let attention_output = attention_output
+            .reshape((batch_size * seq_len, hidden_size))
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to flatten ColBERT {label} batched attention output before projection: {source}"
+                ))
+            })?;
+        self.out_proj.forward(&attention_output).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention output projection failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })
+    }
+
+    /// Rank-3 batched attention over `(batch_size * heads, seq_len, head_dim)`.
+    ///
+    /// q/k/v arrive as `(batch_size, heads, seq_len, head_dim)`. They are
+    /// reshaped to `(B·heads, S, D)` (`.contiguous()` after every stride-permuting
+    /// reshape/transpose — the candle-Metal defect below). Scores are
+    /// `q·kᵀ / sqrt(D)` giving `(B·heads, S, S)`; the additive local-window mask
+    /// (Local layers only) and the key-padding mask are composed onto them; a
+    /// single softmax and `probs·V` finish the head.
+    ///
+    /// candle-Metal defect (cited per CPd contract): `Tensor::cat`/`narrow` over
+    /// strided views returns a stride-permuted view CPU matmul rejects
+    /// (MatMulUnexpectedStriding) but Metal silently miscomputes past batch row 0,
+    /// so every reshape that permutes strides is forced contiguous.
+    fn attention_output_by_head_batched(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        pad_mask: &Tensor,
+        label: &str,
+    ) -> Result<Tensor, ApiError> {
+        // q/k/v arrive as `(batch_size, heads, seq_len, head_dim)`; derive the
+        // batch and sequence axes here rather than threading them as parameters.
+        let (batch_size, _, seq_len, _) = q.dims4().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention query must be rank-4: {source}"
+            ))
+        })?;
+        let flat = batch_size * self.num_attention_heads;
+        let q = self.flatten_heads(q, flat, seq_len, label, "query")?;
+        let k = self.flatten_heads(k, flat, seq_len, label, "key")?;
+        let v = self.flatten_heads(v, flat, seq_len, label, "value")?;
+
+        let scores = q
+            .matmul(
+                &k.transpose(1, 2)
+                    .and_then(|tensor| tensor.contiguous())
+                    .map_err(|source| {
+                        inference_error(format!(
+                            "ColBERT {label} batched key transpose failed: {source}"
+                        ))
+                    })?,
+            )
+            .and_then(|tensor| tensor / (self.head_dim as f64).sqrt())
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} batched attention scores failed: {source}"
+                ))
+            })?;
+
+        // Compose masks additively onto `(B·heads, S, S)`. The local-window mask
+        // (Global layers have none) is positional and identical across batch
+        // rows, so it broadcasts over the flat leading axis. The key-padding mask
+        // is `(batch_size, 1, seq_len)` and must be expanded per head so key
+        // column `j` is masked in the SAME document's rows only; padded keys are
+        // masked even when the local window covers the whole sequence (the
+        // `local_attention >= seq_len` early return does NOT skip padding).
+        // Additive `-inf` is idempotent, so composition order is irrelevant.
+        let scores = match self.attention_kind {
+            ColbertAttentionKind::Global => scores,
+            ColbertAttentionKind::Local => {
+                let window = local_attention_mask(seq_len, self.local_attention, scores.device())
+                    .map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT {label} batched local attention mask failed: {source}"
+                    ))
+                })?;
+                match window {
+                    Some(window) => scores.broadcast_add(&window).map_err(|source| {
+                        inference_error(format!(
+                            "ColBERT {label} batched local mask add failed: {source}"
+                        ))
+                    })?,
+                    None => scores,
+                }
+            }
+        };
+        let scores = self
+            .add_key_padding_mask(&scores, pad_mask, batch_size, seq_len)
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} batched key-padding mask failed: {source}"
+                ))
+            })?;
+
+        // NaN / fully-masked-row hazard: a padded QUERY row (row index
+        // `i >= L_b`) can be masked against EVERY key (when its position falls
+        // outside every real key's local window), so its softmax is NaN. That NaN
+        // stays inside this layer's padded row here, but it IS a cross-LAYER
+        // contamination hazard: at the next layer the NaN row feeds `qkv_proj`,
+        // its K/V rows go NaN, and `finite · NaN = NaN` would poison the score
+        // COLUMN of that key for every real query row of the same document,
+        // defeating both additive masks (`NaN + -inf = NaN`). It is confined per
+        // layer by the post-layer row-validity multiply in `encode_batched`,
+        // which zeros padded rows at each layer exit so the next layer's qkv sees
+        // a finite (zero-input) padded row. REAL query rows always keep their own
+        // diagonal key unmasked (a token attends to itself within its window and
+        // is never a padded key), so no real row goes fully `-inf`.
+        let probs = softmax_last_dim_metal_safe(&scores).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention softmax failed: {source}"
+            ))
+        })?;
+        let context = probs.matmul(&v).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention output failed: {source}"
+            ))
+        })?;
+
+        // `(B·heads, S, D)` -> `(batch_size, heads, S, D)` -> `(batch_size, S,
+        // heads, D)` -> `(batch_size, S, hidden)`. `.contiguous()` after the
+        // head/seq transpose (stride-permuting) before the final merge reshape.
+        context
+            .reshape((batch_size, self.num_attention_heads, seq_len, self.head_dim))
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .and_then(|tensor| tensor.contiguous())
+            .and_then(|tensor| tensor.reshape((batch_size, seq_len, self.hidden_size)))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} batched attention head merge failed: {source}"
+                ))
+            })
+    }
+
+    /// Reshape `(batch_size, heads, seq_len, head_dim)` into the rank-3
+    /// `(batch_size * heads, seq_len, head_dim)` matmul shape, forcing contiguity
+    /// (the head/batch axes were produced by a stride-permuting transpose) (the
+    /// candle-Metal strided-view defect).
+    fn flatten_heads(
+        &self,
+        states: &Tensor,
+        flat: usize,
+        seq_len: usize,
+        label: &str,
+        projection_label: &str,
+    ) -> Result<Tensor, ApiError> {
+        states
+            .contiguous()
+            .and_then(|tensor| tensor.reshape((flat, seq_len, self.head_dim)))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} {projection_label} head flatten failed: {source}"
+                ))
+            })
+    }
+
+    /// Expand the shared `(batch_size, seq_len)` additive key-padding mask to
+    /// `(batch_size * heads, 1, seq_len)` and add it to `(B·heads, S, S)` scores,
+    /// masking padded KEY columns across every query row of the same document.
+    fn add_key_padding_mask(
+        &self,
+        scores: &Tensor,
+        pad_mask: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> candle_core::Result<Tensor> {
+        // `(batch_size, seq_len)` -> `(batch_size, 1, 1, seq_len)` -> repeat over
+        // heads -> `(batch_size * heads, 1, seq_len)`. The middle `1` broadcasts
+        // over the query axis so every query row of a document sees the same
+        // masked key columns. `broadcast_as` yields a stride-0 view; force
+        // contiguity before the flatten reshape (the candle-Metal strided-view
+        // defect — see attention_output_by_head_batched).
+        let expanded = pad_mask
+            .reshape((batch_size, 1, 1, seq_len))?
+            .broadcast_as((batch_size, self.num_attention_heads, 1, seq_len))?
+            .contiguous()?
+            .reshape((batch_size * self.num_attention_heads, 1, seq_len))?;
+        scores.broadcast_add(&expanded)
+    }
+
+    /// FLATTENED-batched fused-QKV split into `(batch_size, heads, seq_len,
+    /// head_dim)`. `.contiguous()` after the head/seq transpose so the downstream
+    /// flatten sees a packed buffer (the candle-Metal strided-view defect).
+    fn split_attention_projection_batched(
+        &self,
+        qkv: &Tensor,
+        offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+        label: &str,
+        projection_label: &str,
+    ) -> Result<Tensor, ApiError> {
+        qkv.narrow(2, offset, self.hidden_size)
+            .and_then(|tensor| {
+                tensor.reshape((batch_size, seq_len, self.num_attention_heads, self.head_dim))
+            })
+            .and_then(|tensor| tensor.transpose(1, 2))
+            .and_then(|tensor| tensor.contiguous())
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT {label} {projection_label} batched split failed: {source}"
+                ))
+            })
+    }
 }
 
 impl ColbertLayerPrimitive {
@@ -1182,6 +1739,56 @@ impl ColbertLayerPrimitive {
         (mlp_output + hidden_states).map_err(|source| {
             inference_error(format!(
                 "ColBERT {label} MLP residual failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })
+    }
+
+    /// FLATTENED batched twin of `forward`: one ModernBERT layer over a padded
+    /// window. Hidden states are flattened `(batch_size * seq_len, hidden)`; the
+    /// shared `pad_mask` threads into batched attention. Residuals and the
+    /// GELU-gated MLP are elementwise / within-token, so they operate unchanged on
+    /// the flattened rows — padded rows never leak into real rows.
+    fn forward_batched(
+        &self,
+        hidden_states: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+        pad_mask: &Tensor,
+        label: &str,
+    ) -> Result<Tensor, ApiError> {
+        let (rows, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched single-layer input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size || rows != batch_size * seq_len {
+            return Err(inference_error(format!(
+                "ColBERT {label} batched single-layer shape [{rows}, {hidden_size}], expected [{}, {}]",
+                batch_size * seq_len,
+                self.hidden_size
+            )));
+        }
+
+        let attention_output =
+            self.attention
+                .forward_batched(hidden_states, batch_size, seq_len, pad_mask, label)?;
+        let hidden_states = (attention_output + hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched attention residual failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        let mlp_input = self.mlp_norm.forward(&hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched MLP norm failed for layer {}: {source}",
+                self.layer_index
+            ))
+        })?;
+        let mlp_output = self.mlp.forward(&mlp_input, label, self.layer_index)?;
+        (mlp_output + hidden_states).map_err(|source| {
+            inference_error(format!(
+                "ColBERT {label} batched MLP residual failed for layer {}: {source}",
                 self.layer_index
             ))
         })
@@ -1357,6 +1964,111 @@ impl ColbertEncoderRuntime {
         }
         self.final_norm.forward(&current).map_err(|source| {
             inference_error(format!("ColBERT {label} final norm failed: {source}"))
+        })
+    }
+
+    /// FLATTENED batched twin of `encode`: run the full ModernBERT stack over one
+    /// padded window of `batch_size` documents. Input/output are flattened
+    /// `(batch_size * seq_len, hidden)`. The key-padding mask is built ONCE from
+    /// `true_lengths` and reused for every layer; final LayerNorm reduces within a
+    /// token, so it is padding-safe on the flattened rows.
+    fn encode_batched(
+        &self,
+        hidden_states: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+        true_lengths: &[usize],
+    ) -> Result<Tensor, ApiError> {
+        let (rows, hidden_size) = hidden_states.dims2().map_err(|source| {
+            inference_error(format!(
+                "ColBERT batched full-encoder input must be rank-2 hidden states: {source}"
+            ))
+        })?;
+        if hidden_size != self.hidden_size || rows != batch_size * seq_len {
+            return Err(inference_error(format!(
+                "ColBERT batched full-encoder shape [{rows}, {hidden_size}], expected [{}, {}]",
+                batch_size * seq_len,
+                self.hidden_size
+            )));
+        }
+        if true_lengths.len() != batch_size {
+            return Err(inference_error(format!(
+                "ColBERT batched full-encoder received {} true lengths, expected {batch_size}",
+                true_lengths.len()
+            )));
+        }
+
+        let pad_mask =
+            key_padding_mask(true_lengths, seq_len, hidden_states.device()).map_err(|source| {
+                inference_error(format!(
+                    "ColBERT batched key-padding mask build failed: {source}"
+                ))
+            })?;
+
+        // Row-validity mask over the SAME packed row order as the flattened hidden
+        // states: 1.0 for real rows (`0..L_b`), 0.0 for padded rows. Scrubbing each
+        // layer's padded-row OUTPUT confines a fully-masked-softmax NaN (born when
+        // a padded query row falls outside every real key's local window, so all
+        // its scores are `-inf`) to the layer that produced it: the next layer's
+        // row-wise qkv projection then sees a zero-input padded row and emits
+        // exactly-zero K/V (the projections are bias-free), whose score COLUMNS
+        // the key-padding mask still pins to `-inf`, so every REAL row's output is
+        // governed bit-for-bit by real tokens alone and batched-vs-singular
+        // agreement holds.
+        //
+        // The scrub MUST be a `where_cond` SELECT, never multiplication: IEEE 754
+        // makes `NaN * 0.0 = NaN`, so a zero-mask multiply preserves exactly the
+        // NaN it exists to remove, and one layer later that NaN spreads through
+        // the shared key columns into every real row of the same document
+        // (probe-verified on both backends 2026-07-18: dense-batch-diagnostic
+        // `--probe-batched-sanitize`). The select copies real rows bit-exactly and
+        // forces padded rows to literal zeros regardless of their contents;
+        // zeroed rows stay finite through LayerNorm/RmsNorm (zero mean,
+        // eps-floored variance) and the final norm, and are discarded at
+        // true-length extraction.
+        let row_validity = row_validity_mask(true_lengths, seq_len, hidden_states.device())
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT batched row-validity mask build failed: {source}"
+                ))
+            })?;
+        // The U8 condition is materialized `.contiguous()` once before the loop:
+        // `broadcast_as` yields a stride-0 view, the candle-Metal strided-view
+        // defect class (see attention_output_by_head_batched).
+        let validity_condition = row_validity
+            .broadcast_as((rows, hidden_size))
+            .and_then(|mask| mask.contiguous())
+            .and_then(|mask| mask.to_dtype(DType::U8))
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT batched row-validity condition build failed: {source}"
+                ))
+            })?;
+        let zero_rows = Tensor::zeros((rows, hidden_size), DType::F32, hidden_states.device())
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT batched zero-row template build failed: {source}"
+                ))
+            })?;
+
+        let mut current = hidden_states.clone();
+        for layer in &self.layers {
+            current =
+                layer.forward_batched(&current, batch_size, seq_len, &pad_mask, "document")?;
+            // Sanitize every layer exit uniformly so no padded-row NaN ever
+            // reaches the next layer's qkv projection or the final norm.
+            current = validity_condition
+                .where_cond(&current, &zero_rows)
+                .map_err(|source| {
+                    inference_error(format!(
+                        "ColBERT batched row-validity sanitize failed: {source}"
+                    ))
+                })?;
+        }
+        self.final_norm.forward(&current).map_err(|source| {
+            inference_error(format!(
+                "ColBERT batched document final norm failed: {source}"
+            ))
         })
     }
 }
@@ -2034,11 +2746,28 @@ fn apply_local_attention_mask(
     seq_len: usize,
     local_attention: usize,
 ) -> candle_core::Result<Tensor> {
+    match local_attention_mask(seq_len, local_attention, scores.device())? {
+        Some(mask) => scores.broadcast_add(&mask.to_dtype(scores.dtype())?),
+        None => Ok(scores.clone()),
+    }
+}
+
+/// Build ModernBERT's additive local bidirectional window mask as an
+/// `(seq_len, seq_len)` F32 tensor (`0.0` inside the window, `-inf` outside), or
+/// `None` when the window covers the whole sequence (nothing to mask). Shared by
+/// the singular and the flattened batched paths; the mask is positional only, so
+/// the batched path broadcasts one copy across every `(batch·heads)` row. The
+/// window is purely a QUERY-KEY DISTANCE mask — it never masks padded keys, which
+/// is the separate key-padding concern the batched path composes on top.
+fn local_attention_mask(
+    seq_len: usize,
+    local_attention: usize,
+    device: &Device,
+) -> candle_core::Result<Option<Tensor>> {
     if local_attention >= seq_len {
-        return Ok(scores.clone());
+        return Ok(None);
     }
 
-    let device = scores.device();
     let radius = local_attention / 2;
     let mut values = Vec::with_capacity(seq_len * seq_len);
     for row in 0..seq_len {
@@ -2052,8 +2781,53 @@ fn apply_local_attention_mask(
             });
         }
     }
-    let mask = Tensor::from_vec(values, (seq_len, seq_len), device)?.to_dtype(scores.dtype())?;
-    scores.broadcast_add(&mask)
+    Ok(Some(Tensor::from_vec(values, (seq_len, seq_len), device)?))
+}
+
+/// Build the shared additive key-padding mask for one padded window:
+/// `(batch_size, seq_len)` F32 with `0.0` at real key positions `j < L_b` and
+/// `-inf` at padded positions `j >= L_b`. Computed ONCE per encode and reused for
+/// every layer; the batched attention expands it per head. A padded KEY column is
+/// forced to zero attention weight after softmax regardless of the local window,
+/// which is what makes padding safe under ModernBERT's bidirectional attention.
+fn key_padding_mask(
+    true_lengths: &[usize],
+    seq_len: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let batch_size = true_lengths.len();
+    let mut values = Vec::with_capacity(batch_size * seq_len);
+    for &true_len in true_lengths {
+        for col in 0..seq_len {
+            values.push(if col < true_len {
+                0.0f32
+            } else {
+                f32::NEG_INFINITY
+            });
+        }
+    }
+    Tensor::from_vec(values, (batch_size, seq_len), device)
+}
+
+/// Build the `(batch_size * seq_len, 1)` row-validity mask in packed row order:
+/// 1.0 for rows whose within-document position is below that document's true
+/// length, 0.0 for padded rows. `encode_batched` broadcasts this into a
+/// `where_cond` SELECT condition that zeroes padded rows at every layer exit —
+/// a select, never a multiply, because `NaN * 0.0 = NaN` (see the sanitize
+/// comment in `encode_batched`).
+fn row_validity_mask(
+    true_lengths: &[usize],
+    seq_len: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let batch_size = true_lengths.len();
+    let mut values = Vec::with_capacity(batch_size * seq_len);
+    for &true_len in true_lengths {
+        for pos in 0..seq_len {
+            values.push(if pos < true_len { 1.0f32 } else { 0.0f32 });
+        }
+    }
+    Tensor::from_vec(values, (batch_size * seq_len, 1), device)
 }
 
 /// Verify that one smoke tensor is finite and return compact magnitude diagnostics.
@@ -2144,6 +2918,114 @@ fn tensor_to_document_embedding(
     })
 }
 
+/// Run the FLATTENED batched DOCUMENT pipeline over a window of texts and return
+/// each document's true-length projected `(true_len, dimension)` matrix paired
+/// with its original input index.
+///
+/// The batched formulation (per the CPd contract): tokenize each text (same
+/// formatter and cap as the singular path, so a one-text window is byte-identical
+/// to `embed_document`), length-sort locally to bound padding waste, pad to the
+/// window's longest true length, run `forward_batched` → `encode_batched` →
+/// `project` over flattened rows, then extract each document's rows `0..L_b`.
+/// Padded rows are dropped here BEFORE any non-finite check. This is a free
+/// function so the startup batch-consistency smoke can call it on the same loaded
+/// components before the `ColbertRuntime` handle exists.
+fn batched_document_matrices(
+    tokenizer: &Tokenizer,
+    input_path: &ColbertInputPath,
+    encoder: &ColbertEncoderRuntime,
+    projection: &ColbertProjection,
+    document_max_tokens: usize,
+    device: &Device,
+    texts: &[&str],
+) -> Result<Vec<(usize, Tensor)>, ApiError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Tokenize up front so true lengths are known before padding. Attribute a
+    // failure to its window-local input index (the identifier available at this
+    // seam — the smoke calls this with texts only, no unit ids; callers map index
+    // -> unit id), mirroring the extraction-error convention below.
+    let mut tokenized: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+    for (input_index, text) in texts.iter().enumerate() {
+        tokenized.push(
+            tokenize_formatted(
+                tokenizer,
+                &format_document(text),
+                document_max_tokens,
+                "search document",
+            )
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT batched document tokenization failed for input {input_index}: {source}"
+                ))
+            })?,
+        );
+    }
+
+    // Length-sort input positions (longest first, id tiebreak) ONLY to minimize
+    // padding waste inside this packed forward; each result carries its original
+    // input index so the caller restores input order.
+    let mut order: Vec<usize> = (0..tokenized.len()).collect();
+    order.sort_by(|&left, &right| {
+        tokenized[right]
+            .len()
+            .cmp(&tokenized[left].len())
+            .then_with(|| left.cmp(&right))
+    });
+
+    let batch_size = order.len();
+    let padded_len = order
+        .iter()
+        .map(|&slot| tokenized[slot].len())
+        .max()
+        .unwrap_or(0);
+    if padded_len == 0 {
+        return Err(inference_error(
+            "ColBERT batched document embedding produced no tokens".to_string(),
+        ));
+    }
+
+    // True lengths in packed row order drive the key-padding mask and the
+    // per-document true-length extraction below.
+    let true_lengths: Vec<usize> = order.iter().map(|&slot| tokenized[slot].len()).collect();
+
+    // Padded `(batch_size, padded_len)` token-id matrix. Pad id 0 never
+    // contributes: its key columns are masked to -inf before softmax and its
+    // query rows are discarded at extraction.
+    let mut padded_ids: Vec<u32> = vec![0; batch_size * padded_len];
+    for (row, &slot) in order.iter().enumerate() {
+        let ids = &tokenized[slot];
+        padded_ids[row * padded_len..row * padded_len + ids.len()].copy_from_slice(ids);
+    }
+
+    let hidden = input_path.forward_batched(&padded_ids, batch_size, padded_len, device)?;
+    let encoded = encoder.encode_batched(&hidden, batch_size, padded_len, &true_lengths)?;
+    let projected = projection.project(&encoded)?;
+
+    // Extract each document's rows `0..L_b` from the packed projection, restoring
+    // input order via the packed-slot -> input-index map.
+    let mut matrices: Vec<(usize, Tensor)> = Vec::with_capacity(batch_size);
+    for (row, &input_index) in order.iter().enumerate() {
+        let true_len = true_lengths[row];
+        // `narrow` returns a strided view of the packed projection; force
+        // contiguity so downstream consumers never see it (the candle-Metal
+        // strided-view defect — see attention_output_by_head_batched).
+        let document_rows = projected
+            .narrow(0, row * padded_len, true_len)
+            .and_then(|tensor| tensor.contiguous())
+            .map_err(|source| {
+                inference_error(format!(
+                    "failed to extract ColBERT batched document rows for input {input_index}: {source}"
+                ))
+            })?;
+        matrices.push((input_index, document_rows));
+    }
+
+    Ok(matrices)
+}
+
 /// Compute ColBERT MaxSim by summing each query token's best document-token dot product.
 fn maxsim_score(query_vectors: &Tensor, document_vectors: &Tensor) -> Result<f32, ApiError> {
     let (query_tokens, _) = query_vectors.dims2().map_err(|source| {
@@ -2184,6 +3066,179 @@ fn maxsim_score(query_vectors: &Tensor, document_vectors: &Tensor) -> Result<f32
     }
 
     Ok(total)
+}
+
+/// Build the three fixed different-length smoke texts, sizing the longest
+/// against the runtime-loaded `local_attention` so its token count exceeds the
+/// local window (forcing at least one length crossing a window boundary and a
+/// masked padded region relative to the shorter texts) while staying under
+/// `document_max_tokens`. Returns the texts plus whether the local-boundary case
+/// is actually exercised. When the loaded `local_attention >= document_max_tokens`
+/// makes a boundary crossing impossible, the longest text targets
+/// `document_max_tokens` and `false` is returned so the caller can note it.
+fn build_batch_consistency_smoke_texts(
+    tokenizer: &Tokenizer,
+    local_attention: usize,
+    document_max_tokens: usize,
+) -> Result<(Vec<String>, bool), ApiError> {
+    // A repeated sentence whose length we grow until its true (post-truncation)
+    // token count clears the target, so the longest text reliably spans a padded
+    // region relative to the two shorter fixed texts.
+    let unit = "Prefer specific direct sentences when explaining technical changes to a reader. ";
+    let crosses_boundary = local_attention < document_max_tokens;
+    let target_tokens = if crosses_boundary {
+        // One token past the window guarantees a crossing while staying bounded.
+        (local_attention + 1).min(document_max_tokens)
+    } else {
+        document_max_tokens
+    };
+
+    let mut long_text = String::new();
+    // Grow until the tokenized-and-truncated length reaches the target or the
+    // text is already at capacity (repeats add at least one token each round).
+    loop {
+        long_text.push_str(unit);
+        let token_len = tokenize_formatted(
+            tokenizer,
+            &format_document(&long_text),
+            document_max_tokens,
+            "batch-consistency smoke",
+        )?
+        .len();
+        if token_len >= target_tokens || token_len >= document_max_tokens {
+            break;
+        }
+    }
+
+    Ok((
+        vec![
+            SMOKE_BATCH_SHORT.to_string(),
+            SMOKE_BATCH_MEDIUM.to_string(),
+            long_text,
+        ],
+        crosses_boundary,
+    ))
+}
+
+/// Batch-consistency startup smoke: embed fixed different-length texts BOTH
+/// batched (the CPd path) AND singly (the retained singular reference path), then
+/// gate each text's every token vector on per-token cosine similarity between the
+/// two. A failure raises `ApiError::InferenceInit` (same class as every other
+/// smoke) because a divergence means the batched formulation — mask composition,
+/// padding, or a stride miscompute — is wrong and must block readiness.
+fn run_colbert_batch_consistency_smoke(
+    tokenizer: &Tokenizer,
+    input_path: &ColbertInputPath,
+    encoder: &ColbertEncoderRuntime,
+    projection: &ColbertProjection,
+    document_max_tokens: usize,
+    device: &Device,
+    texts: &[String],
+) -> Result<(), ApiError> {
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+    // Batched side (CPd path), returned in input order.
+    let mut batched: Vec<Option<Tensor>> = (0..text_refs.len()).map(|_| None).collect();
+    for (input_index, matrix) in batched_document_matrices(
+        tokenizer,
+        input_path,
+        encoder,
+        projection,
+        document_max_tokens,
+        device,
+        &text_refs,
+    )? {
+        batched[input_index] = Some(matrix);
+    }
+
+    for (index, text) in text_refs.iter().enumerate() {
+        // Singular reference side: the exact retained per-doc path. Every failure
+        // carries the text index so a divergence names its input; `project` takes
+        // no label, so its error is wrapped to carry the same index.
+        let reference_label = format!("batch-consistency smoke text {index}");
+        let token_ids = tokenize_formatted(
+            tokenizer,
+            &format_document(text),
+            document_max_tokens,
+            &reference_label,
+        )?;
+        let reference_hidden = input_path.forward(&token_ids, device, &reference_label)?;
+        let reference_encoded = encoder.encode(&reference_hidden, &reference_label)?;
+        let reference = projection.project(&reference_encoded).map_err(|source| {
+            inference_error(format!(
+                "ColBERT batch-consistency smoke text {index} reference projection failed: {source}"
+            ))
+        })?;
+
+        let batched_matrix = batched[index].as_ref().ok_or_else(|| {
+            inference_error(format!(
+                "ColBERT batch-consistency smoke lost batched text index {index}"
+            ))
+        })?;
+        assert_token_matrices_agree(batched_matrix, &reference, index)?;
+    }
+
+    Ok(())
+}
+
+/// Gate every token vector of two `(tokens, dimension)` matrices on cosine
+/// similarity >= `SMOKE_BATCH_COSINE_FLOOR`. Both matrices are already
+/// L2-normalized by `project`, so the per-token dot product IS the cosine; the
+/// floor allows only F32 accumulation-order drift, not a formulation defect.
+fn assert_token_matrices_agree(
+    batched: &Tensor,
+    reference: &Tensor,
+    text_index: usize,
+) -> Result<(), ApiError> {
+    let batched_rows = batched
+        .to_device(&Device::Cpu)
+        .and_then(|tensor| tensor.to_vec2::<f32>())
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT batch-consistency smoke could not read batched matrix for text {text_index}: {source}"
+            ))
+        })?;
+    let reference_rows = reference
+        .to_device(&Device::Cpu)
+        .and_then(|tensor| tensor.to_vec2::<f32>())
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT batch-consistency smoke could not read reference matrix for text {text_index}: {source}"
+            ))
+        })?;
+    if batched_rows.len() != reference_rows.len() {
+        return Err(inference_error(format!(
+            "ColBERT batch-consistency smoke text {text_index} token counts differ: batched {}, singular {}",
+            batched_rows.len(),
+            reference_rows.len()
+        )));
+    }
+
+    for (token_index, (batched_row, reference_row)) in
+        batched_rows.iter().zip(reference_rows.iter()).enumerate()
+    {
+        if batched_row.len() != reference_row.len() {
+            return Err(inference_error(format!(
+                "ColBERT batch-consistency smoke text {text_index} token {token_index} dimensions differ: batched {}, singular {}",
+                batched_row.len(),
+                reference_row.len()
+            )));
+        }
+        // Both rows are unit-norm from `project`, so their dot product is the
+        // cosine similarity directly.
+        let cosine: f32 = batched_row
+            .iter()
+            .zip(reference_row.iter())
+            .map(|(left, right)| left * right)
+            .sum();
+        if !cosine.is_finite() || cosine < SMOKE_BATCH_COSINE_FLOOR {
+            return Err(inference_error(format!(
+                "ColBERT batch-consistency smoke text {text_index} token {token_index} cosine {cosine:.6} below floor {SMOKE_BATCH_COSINE_FLOOR}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Run one ColBERT startup smoke boundary with durable R5-shaped lifecycle logs.
