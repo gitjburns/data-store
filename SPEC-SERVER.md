@@ -1010,11 +1010,11 @@ an immediate 503. (§7.)
    a leading prefix of the correspondingly positioned stored-name token). Fuzzy
    candidates are capped at `max_fuzzy_candidates`. Graph hits order by tier,
    then match class (`exact` > `acronym` > `token_prefix`), then matched-name
-   length descending, then unitId then parseId ascending — a rank-only
-   deterministic order. **With both fuzzy classes disabled (the shipped
-   default) the path is byte-identical to the prior exact-only behavior:** no
-   per-parse name enumeration runs at all, so every match is `exact` and the
-   class component of the order is constant.
+   character length descending, then name ascending, then unitId then parseId
+   ascending — a rank-only deterministic order. **With both fuzzy classes
+   disabled (the shipped default) the path is byte-identical to the prior
+   exact-only behavior:** no per-parse name enumeration runs at all, so every
+   match is `exact` and the class component of the order is constant.
 5. **ColBERT MaxSim over the fused pool** — **retained at MVP.** The deferred
    `multi_vector` *retrieval channel* (§19) is candidate generation; this
    stage is late-interaction re-scoring of the already-fused pool and is

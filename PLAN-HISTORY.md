@@ -25,6 +25,106 @@ and the completed CPc/CPd2 package texts plus cluster CA2 moved into a
 third-stage "Retired planning sections" part at the end of this file.
 Same rule: verbatim, nothing summarized or edited in the move.
 
+Fourth-stage relocation (2026-07-19, user-approved): the plan file's
+"One-line ledger" moved verbatim into its own section below. From this
+stage on, the plan file no longer accumulates history of any kind —
+sessions append their records directly to this file and amend the
+plan's current-state sections in place (amended §1.4 step 6).
+
+## Relocated one-line ledger (2026-07-05 – 2026-07-19)
+
+- C1 (2026-07-07): seam cuts — execute pipelines out of `http.rs`, pure
+  primitives extracted, util unification.
+- C2 (2026-07-07): substrate — canonical serialization/hashing, ids,
+  artifact store, model types, fabric schema + hot plane, events; D1/D3
+  resolved; C2f config rework.
+- C3 (2026-07-10): acquisition — filesystem connector, importer,
+  coalescing sync queue + knob-free adaptive scheduler; D6 resolved.
+- C4 (2026-07-10, two sessions): parsing — §12.2 bundle contract, §13.1
+  import gates, conformance, PDF/text workers, Docling JSON path.
+- Restructures (2026-07-10/11): end-state-only offline development; MVP
+  rescope (QER audit tier deferred; annotations/multi-vector/graph pulled
+  into MVP; cluster CR added; 2026-07-15 amendment re-deferred the
+  multi_vector CHANNEL).
+- CR (2026-07-11): legacy retirement — `src/operations/`, `storage.rs`,
+  legacy schema and config keys deleted; retained substrate allow-swept.
+- C5 (2026-07-11): activation lifecycle — dominance gating per the union
+  ruling, cutover barriers, drain-loop parse dispatch chain.
+- CA (2026-07-13): semantic annotations + memoization — store, producers,
+  LLM client, memo cache, §21.4 policy, worker thread; D8 resolved.
+- C6 (2026-07-14): retrieval projections — chunk/lexical/dense/
+  multivector/derived-view builders, dense cache, graph projection; D9
+  resolved.
+- C7 (2026-07-15): retrieval fabric — sealed RetrievalProfile, dense/
+  lexical/graph channels, MaxSim + reranker stages, `execute_query` DP1
+  snapshot discipline.
+- C8 (2026-07-15): assembly + EvidencePack — sealed AssemblyPolicy, §25
+  operators, evidence builder, query envelope, `POST /query`; D2 (query
+  side) resolved.
+- C9 (2026-07-16): lifecycle forensics — snapshots, verification tiers,
+  archive-verify-delete, restore, deletion lifecycle, application
+  identity.
+- C10s/C10r/C10a (2026-07-16): Operation substrate, HeldSupersession
+  cleanup + queue-coupled completion, full §34 HTTP surface with live
+  bearer auth.
+- C10b/C10c (2026-07-17): health count slots; CLI full rework (polling
+  model, typed renderers).
+- C10d (2026-07-17): documentation re-baseline — all seven operator docs
+  fully replaced from live code reads.
+- C10e (2026-07-17): final legacy sweep (NDJSON emitter, markdown path,
+  `units.rs`) + the cluster-remainder verification pass; both C10f
+  pre-planning rulings implemented.
+- C10f (2026-07-17, IN PROGRESS): commissioning — R0–R3 + graceful
+  shutdown complete (first cycle 14/14 activated, zero failures); R4–R9
+  pending after CPc.
+- CP (2026-07-17/18, interim): CPa dense batching reverted (measured
+  regression; the candle-Metal `.contiguous()` fix kept permanently);
+  F16 rejected (non-finite activations); CPb thinking opt-out VERIFIED
+  live; CPd ColBERT batched document embedding complete incl. the
+  NaN-sanitize `where_cond` fix and the length-threshold hybrid; CPc
+  full re-ingest still pending.
+- CPd hybrid (2026-07-18): length-threshold ColBERT routing —
+  `COLBERT_BATCH_ROUTE_MAX_TOKENS = 128`, short units batched, long
+  units singular; recorded routing-boundary token-count bias.
+- Lock-starvation ruling B (2026-07-18): annotation worker defers
+  quietly on Busy at pre-paid boundaries, shutdown-bounded wait at
+  post-paid; Option A (embed outside the write tx) banked structural.
+- HTTP dense backend (2026-07-19): exclusive Local/Http
+  `DenseEmbeddingBackend`, OpenAI-compatible client, startup smoke,
+  backend-aware gating; CPc attempt 3 killed for this pivot (observed
+  ruling-B working live both categories).
+- Re-benchmark + invalidation (2026-07-19): 69.8-min cycle, 14/14
+  (3.3×; dense ~100×) — then INVALIDATED by the latent serial-
+  annotation design ceiling.
+- Concurrency package (2026-07-19): dense HTTP windows (8 concurrent)
+  + annotator waves (32), scoped-thread fan-out, all SQLite writes
+  serial; writer-lock-across-fan-out caveat accepted (Option A banked).
+- OpenRouter switch + commercial run (2026-07-19): both models
+  commercial (qwen/qwen3-embedding-8b @ 4096, gpt-5-nano); 429-only
+  bounded dense retry; annotator timeout 120 → 300 s validated live;
+  run later aborted under the empty-marker ruling.
+- Docling/CPe design (2026-07-19): streaming parse pool ruled and
+  APPROVED — staging half fans out, canonical half serial, dynamic
+  two-axis admission (memory + CPU EMAs), no knobs; supersedes
+  discussion B.
+- Documentation-currency rule (2026-07-19): doc updates ride the
+  package that changes operator-visible surfaces; four drifted docs
+  rewritten and review-verified same session.
+- Empty-marker ruling (2026-07-19): worker's by-design `[]` marker
+  rows poison the annotation-derived builders; commercial test
+  INVALIDATED and aborted; consumer-side skip ruled first scope.
+- CPd2 (2026-07-19): empty-marker consumer fix — all three
+  annotation-derived consumers (graph entity/relation, summary) skip
+  `[]` markers with visible counts; compile-verified only.
+- CA2 (2026-07-19, designed + implemented same day): annotation
+  identity + policy governance — content-scoped satisfaction
+  (`content_key_hash`), `[policies]` operator documents with
+  system-assigned `policy_versions` registry, D9 fuzzy graph entry
+  (shipped disabled), vocabulary inspection route + CLI verb,
+  `--annotation-dry-run` mode; COMPLETE, compile-verified only;
+  integration-dimension verification gap recorded (finder stopped
+  mid-run).
+
 ## Completed Current Status entries
 
 - 2026-07-05: Plan approved in structure and written (serial P0–P7 phase
@@ -2983,6 +3083,81 @@ Same rule: verbatim, nothing summarized or edited in the move.
     --setup-storage → --annotation-dry-run → inspect/author → normal
     start). RELEASE REBUILD required (binaries predate CPd2 + CA2).
     Integration-dimension verification gap recorded above.
+- 2026-07-19 (CA2 integration-verification session): the recorded CA2
+  integration-dimension gap RETIRED by a dedicated pass — four Opus
+  finder agents over all six CA2 packages (28 seam checks; P0 policy
+  substrate and P1/P3 annotation identity + prompt composition fully
+  clean), three findings adversarially confirmed (refute-by-default)
+  and fixed same session:
+  - F1 (HIGH, fixed): `GET /annotations/vocabulary` `sourceCount`
+    counted distinct annotation ids, not source ids — both SELECT
+    constants selected `id, body_json, provenance_json` while
+    `read_rows_with_source` read column 0 as the source id, so
+    `sourceCount` always equaled `totalCount` (both types, both
+    scopes), destroying the cross-source-spread signal the
+    ruleset-authoring surface exists for. Fix: column 0 of both
+    SELECT constants swapped to `source_id`
+    (`src/annotations/vocabulary.rs`); reader indices, aggregation,
+    DTO, and wire mapping unchanged; `ORDER BY id` frontier kept.
+  - F2 (LOW, fixed): SPEC-SERVER.md §14.3 and ARCHITECTURE.md §6
+    stated the graph-hit ordering chain as exhaustive while omitting
+    the code's and D9 ruling's `name ASC` component; both sentences
+    amended, also qualifying length as CHARACTER length (the code
+    uses `chars().count()`).
+  - F3 (LOW, fixed): dry-run health served the mode message behind
+    an `inference initialization failed:` prefix (the mode reused
+    `ApiError::InferenceInit`), asserting a failure for a
+    deliberately skipped initialization, vs the bare string
+    SPEC-SERVER §4.7 and INSTALL promise. Fix: the AppState
+    inference slot's `Result` replaced by the three-arm
+    `InferenceSlot` enum (Ready / Failed / NotInitialized;
+    `src/state.rs`, `src/main.rs`); health renders NotInitialized as
+    exactly `annotation dry-run mode: inference not initialized`;
+    the accessor still fails loudly (`InferenceInit` with the mode
+    message) on any accidental inference use; the Failed arm renders
+    byte-identically to the old Err path but is currently
+    unconstructed (genuine init failure is fatal at startup) —
+    retained with a rationale-carrying allow(dead_code).
+  - All fixes by Opus subagents per the §1.4 model rule; full cargo
+    battery after each Rust fix (fmt, check, check --features metal,
+    clippy) at zero warnings. Everything remains compile-verified
+    only; first live exercise rides the re-run, whose binaries now
+    also require these fixes (rebuild note amended in the Handoff).
+  - Same session (user-ruled): the plan file stopped being a ledger.
+    §1.4 step 6 amended to in-place currency plus history appended
+    directly to this file (periodic relocation retired); the
+    one-line ledger relocated here (fourth stage, above); ONBOARD.md
+    end-session wording updated to match.
+- 2026-07-19 (same session, plan-file slim-down): the Current Status
+  writing rule applied retroactively to the whole plan file —
+  historical commentary removed from the Handoff, §1, §3, §4 heading,
+  and §5; Handoff item 2 collapsed to a §1.4 pointer (its unique
+  integration dimension folded into §1.4 step 5); the §1.5–1.6 stub,
+  the completed CA2/CPc/CPd2 §3 entries, and the CP motivation
+  narrative deleted; the documentation-currency rule moved to §1.3 as
+  its single source; the CPe estimate/confidence removed as
+  planning-review metadata. Excised specifics preserved here in case
+  no earlier entry carries them: the aborted commercial run started
+  20:45:41Z, restarted 21:03:21Z for the 300 s annotator timeout,
+  aborted ≈21:25Z (clean SIGTERM, no orphans; ingest interrupted with
+  4 sources remaining); stale release binaries carry the 2026-07-19
+  morning set (CPd hybrid, ruling-B, HTTP dense backend, concurrency
+  waves/windows, 429 retry, lock-hold comment fix); graceful-shutdown
+  latency ~2 h 20 m observed at R3, SIGTERM needed at both CPc
+  attempts; relation-producer near-empty calls measured ~16 output
+  chars in ~220 ms; first commissioning cycle detail: dense 5,120
+  calls avg 1,753 ms batch 1 (65%), ColBERT 34,092 calls avg 53 ms
+  (13%); the user's local vLLM endpoints (10.1.0.10:8000/:8001) are
+  decommissioned (Little Snitch/egress notes historical); the 27B-era
+  annotator crash was external misconfiguration (user-confirmed,
+  fixed, one-time); the commissioning corpus symlink was replaced by
+  the in-repo `sources/` dir; the legacy service process was killed
+  (user-approved); the SIGPIPE/start.sh kill was observed
+  2026-07-19T06:06Z; CPa was reverted (no dense batching win on this
+  GPU), CPb verified live, CPd completed with the length-threshold
+  hybrid, CPc's three attempts aborted/killed (Metal stride defect,
+  batching-regression kill, HTTP-dense pivot) with the 69.8-min /
+  3.3× re-benchmark invalidated by the serial-annotation ceiling.
 
 ## Retired planning sections (relocated verbatim 2026-07-18, second stage)
 

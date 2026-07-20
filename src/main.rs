@@ -619,7 +619,7 @@ async fn run_http_service(
     let dense_cache = Arc::new(projections::dense_cache::DenseCache::new());
     let state = Arc::new(AppState::new(
         config,
-        Ok(inference),
+        state::InferenceSlot::Ready(inference),
         admin_shutdown_token.clone(),
         Arc::clone(&shutdown_signal),
         Arc::clone(&sync_health),
@@ -930,11 +930,12 @@ async fn run_annotation_dry_run_mode(
     let shutdown_signal = Arc::new(ShutdownSignal::default());
     let state = Arc::new(AppState::new(
         config,
-        // No inference in this mode — an explicit error so any accidental
-        // inference-touching path fails loudly, and health reports the mode.
-        Err(ApiError::InferenceInit {
-            message: "annotation dry-run mode: inference not initialized".to_string(),
-        }),
+        // No inference in this mode: deliberately not initialized, NOT a
+        // failure. Any accidental inference-touching path still fails loudly
+        // (the accessor turns this into an InferenceInit error), while health
+        // reports the bare mode message instead of asserting an init failure
+        // that never happened.
+        state::InferenceSlot::NotInitialized,
         admin_shutdown_token.clone(),
         Arc::clone(&shutdown_signal),
         Arc::new(Mutex::new(SyncHealth::startup_pending())),

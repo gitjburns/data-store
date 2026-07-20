@@ -80,7 +80,7 @@ pub(crate) enum VocabularyScope {
 /// truncation frontier when the row cap is hit. The `LIMIT` is `MAX_ROWS_READ + 1`
 /// so reading one extra row proves truncation without a second COUNT query.
 const SELECT_ACTIVE_SQL: &str = "
-SELECT id, body_json, provenance_json
+SELECT source_id, body_json, provenance_json
 FROM semantic_annotations sa
 WHERE sa.annotation_type = ?1
   AND sa.freshness_status = 'fresh'
@@ -96,7 +96,7 @@ LIMIT ?2";
 /// never-activated parses is inspectable. Same three columns, same deterministic
 /// id ordering, same `MAX_ROWS_READ + 1` limit as the active variant.
 const SELECT_ALL_SQL: &str = "
-SELECT id, body_json, provenance_json
+SELECT source_id, body_json, provenance_json
 FROM semantic_annotations
 WHERE annotation_type = ?1
   AND freshness_status = 'fresh'
@@ -188,11 +188,13 @@ pub(crate) struct ModelCount {
     pub(crate) count: usize,
 }
 
-/// One `semantic_annotations` row as read for aggregation: only the columns the
-/// aggregators need. `id` disambiguates the deterministic scan/truncation
-/// frontier; `body_json` is NEVER NULL on a fresh row (the §21 envelope, enforced
-/// by `store::annotation_from_row`), but is modeled as read-optional so a corrupt
-/// NULL is counted as malformed rather than panicking.
+/// One `semantic_annotations` row as read for aggregation: only the body and
+/// provenance the aggregators fold. The row's `source_id` rides a parallel vector
+/// (see `read_rows_with_source`), and the deterministic scan/truncation frontier
+/// is fixed by the SQL `ORDER BY id`, not by any field here. `body_json` is NEVER
+/// NULL on a fresh row (the §21 envelope, enforced by `store::annotation_from_row`),
+/// but is modeled as read-optional so a corrupt NULL is counted as malformed
+/// rather than panicking.
 struct VocabularyRow {
     body_json: Option<String>,
     provenance_json: String,

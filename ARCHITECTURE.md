@@ -575,8 +575,8 @@ open read-only tx  ─▶  capture scope-filtered active set (+ dense Arc clones
   `min_token_len` chars is a leading prefix of the correspondingly positioned
   stored-name token) classes, capped at `max_fuzzy_candidates`. Candidate order
   is rank-only and deterministic: tier, then match class (`Exact` < `Acronym` <
-  `TokenPrefix`), then matched-name length descending, then unitId then parseId
-  ascending. **When both fuzzy classes are disabled (the shipped default) the
+  `TokenPrefix`), then matched-name character length descending, then name
+  ascending, then unitId then parseId ascending. **When both fuzzy classes are disabled (the shipped default) the
   path is byte-identical to the prior exact-only behavior:**
   `entity_names_for_parse` (`src/projections/graph.rs`, the per-parse name
   enumeration) is **never called**, so the class order component is constant.

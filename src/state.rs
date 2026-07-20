@@ -20,10 +20,50 @@ use crate::{
     types::{HealthComponent, HealthCount, HealthResponse},
 };
 
+/// The exact detail line `/v1/health` serves for the inference component when
+/// the process runs with inference deliberately skipped (annotation dry-run
+/// mode). Defined once here and rendered verbatim by `health()`; SPEC-SERVER.md
+/// §health and INSTALL.md document this precise string, so it must not gain the
+/// `ApiError::InferenceInit` "inference initialization failed: " prefix.
+const DRY_RUN_INFERENCE_NOT_INITIALIZED: &str =
+    "annotation dry-run mode: inference not initialized";
+
+/// The inference runtime slot AppState holds. Distinguishes three states that
+/// the readiness-critical `inference` health component and the `inference()`
+/// accessor must treat differently:
+///
+/// - `Ready`: the runtime initialized; the component is ready.
+/// - `Failed`: initialization was attempted and genuinely failed; health
+///   renders the carried `ApiError` verbatim (with its "inference
+///   initialization failed: " prefix) and the accessor propagates it.
+/// - `NotInitialized`: inference was deliberately skipped (annotation dry-run
+///   mode). This is NOT a failure — health must not claim an initialization
+///   failure that never happened, and the docs promise the bare mode message —
+///   so it is kept distinct from `Failed`. Any accidental inference-touching
+///   path in this mode STILL fails loudly: the accessor turns this arm into an
+///   `InferenceInit` error carrying the mode message.
+// The `Ready` arm dominates the enum size, but AppState stored the runtime
+// inline before this change too (the slot was `Result<InferenceRuntime,
+// ApiError>`, whose `Ok` carries the same value). Boxing would add indirection
+// the prior code never had and change the accessor's borrow shape, so the size
+// disparity is accepted rather than "fixed".
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(crate) enum InferenceSlot {
+    Ready(InferenceRuntime),
+    // Genuine init-failure arm: no current call site constructs it (both live
+    // startup paths are `Ready` or `NotInitialized`), but it preserves the
+    // failure-rendering contract the previous `Err(ApiError)` slot guaranteed —
+    // health renders the carried error verbatim, accessor propagates it.
+    #[allow(dead_code)]
+    Failed(ApiError),
+    NotInitialized,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub config: ServiceConfig,
-    inference: Result<InferenceRuntime, ApiError>,
+    inference: InferenceSlot,
     model_call_gate: Arc<ExclusiveGate>,
     admin_shutdown_token: String,
     shutdown_signal: Arc<ShutdownSignal>,
@@ -394,7 +434,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ServiceConfig,
-        inference: Result<InferenceRuntime, ApiError>,
+        inference: InferenceSlot,
         admin_shutdown_token: String,
         shutdown_signal: Arc<ShutdownSignal>,
         sync_health: Arc<Mutex<SyncHealth>>,
@@ -490,12 +530,21 @@ impl AppState {
     }
 
     /// Return the initialized inference runtime or an explicit readiness error.
+    /// A genuine init failure propagates its message; the deliberate dry-run
+    /// not-initialized state fails loudly here too (any accidental
+    /// inference-touching path in dry-run mode gets a meaningful error carrying
+    /// the mode message) — it is only rendered without the failure prefix by
+    /// `health()`, never here.
     pub fn inference(&self) -> Result<&InferenceRuntime, ApiError> {
-        self.inference
-            .as_ref()
-            .map_err(|source| ApiError::InferenceInit {
+        match &self.inference {
+            InferenceSlot::Ready(runtime) => Ok(runtime),
+            InferenceSlot::Failed(source) => Err(ApiError::InferenceInit {
                 message: source.to_string(),
-            })
+            }),
+            InferenceSlot::NotInitialized => Err(ApiError::InferenceInit {
+                message: DRY_RUN_INFERENCE_NOT_INITIALIZED.to_string(),
+            }),
+        }
     }
 
     /// Wait for exclusive access to the shared accelerator-backed model runtimes.
@@ -601,17 +650,31 @@ impl AppState {
 
     /// Return current service health and readiness diagnostics.
     pub fn health(&self) -> HealthResponse {
+        // Not-ready arms both carry a single detail line. `Failed` renders the
+        // `ApiError` verbatim (its "inference initialization failed: " prefix is
+        // part of the documented failure detail); `NotInitialized` renders the
+        // bare mode message, because dry-run mode skipped init deliberately and
+        // health must not assert a failure that never happened.
         let inference_component = match &self.inference {
-            Ok(runtime) => HealthComponent {
+            InferenceSlot::Ready(runtime) => HealthComponent {
                 name: "inference".to_string(),
                 ready: true,
                 details: readiness_details("readiness-critical", runtime.health_details()),
                 counts: Vec::new(),
             },
-            Err(error) => HealthComponent {
+            InferenceSlot::Failed(error) => HealthComponent {
                 name: "inference".to_string(),
                 ready: false,
                 details: readiness_details("readiness-critical", vec![error.to_string()]),
+                counts: Vec::new(),
+            },
+            InferenceSlot::NotInitialized => HealthComponent {
+                name: "inference".to_string(),
+                ready: false,
+                details: readiness_details(
+                    "readiness-critical",
+                    vec![DRY_RUN_INFERENCE_NOT_INITIALIZED.to_string()],
+                ),
                 counts: Vec::new(),
             },
         };

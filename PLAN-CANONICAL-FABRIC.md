@@ -5,118 +5,26 @@ Reference specification: `canonical_content_graph_retrieval_fabric_v_0_3.md`
 
 ## Current Status
 
-Completed work — the full session-by-session record (2026-07-05 through
-the 2026-07-19 CA2 implementation session) was relocated verbatim to
-`PLAN-HISTORY.md` (three user-approved stages: 2026-07-18 first and
-second, 2026-07-19 third); date-cited entry references resolve there.
-The second and third stages also retired the completed planning corpus —
-§1.5–1.6, §2, the §3 spine and completed cluster texts C1–C10e with all
-fact bases, CPa/CPb/CPd, the acceptance table, the §4 full decision
-texts, then CPc/CPd2/CA2 —
-verbatim to the same file's "Retired planning sections" parts; §4
-carries condensed rulings indexes pointing there by grep anchor.
-One-line ledger:
+Completed work is recorded in `PLAN-HISTORY.md`: the session-by-session
+record ("Completed Current Status entries"), the retired planning
+sections (grep-anchor cited from §4), and the relocated one-line
+ledger. Date-cited entry references resolve there. This file records
+current state (the Handoff below) and pending work (§3, §5) only;
+history never accumulates here (§1.4 step 6).
 
-- C1 (2026-07-07): seam cuts — execute pipelines out of `http.rs`, pure
-  primitives extracted, util unification.
-- C2 (2026-07-07): substrate — canonical serialization/hashing, ids,
-  artifact store, model types, fabric schema + hot plane, events; D1/D3
-  resolved; C2f config rework.
-- C3 (2026-07-10): acquisition — filesystem connector, importer,
-  coalescing sync queue + knob-free adaptive scheduler; D6 resolved.
-- C4 (2026-07-10, two sessions): parsing — §12.2 bundle contract, §13.1
-  import gates, conformance, PDF/text workers, Docling JSON path.
-- Restructures (2026-07-10/11): end-state-only offline development; MVP
-  rescope (QER audit tier deferred; annotations/multi-vector/graph pulled
-  into MVP; cluster CR added; 2026-07-15 amendment re-deferred the
-  multi_vector CHANNEL).
-- CR (2026-07-11): legacy retirement — `src/operations/`, `storage.rs`,
-  legacy schema and config keys deleted; retained substrate allow-swept.
-- C5 (2026-07-11): activation lifecycle — dominance gating per the union
-  ruling, cutover barriers, drain-loop parse dispatch chain.
-- CA (2026-07-13): semantic annotations + memoization — store, producers,
-  LLM client, memo cache, §21.4 policy, worker thread; D8 resolved.
-- C6 (2026-07-14): retrieval projections — chunk/lexical/dense/
-  multivector/derived-view builders, dense cache, graph projection; D9
-  resolved.
-- C7 (2026-07-15): retrieval fabric — sealed RetrievalProfile, dense/
-  lexical/graph channels, MaxSim + reranker stages, `execute_query` DP1
-  snapshot discipline.
-- C8 (2026-07-15): assembly + EvidencePack — sealed AssemblyPolicy, §25
-  operators, evidence builder, query envelope, `POST /query`; D2 (query
-  side) resolved.
-- C9 (2026-07-16): lifecycle forensics — snapshots, verification tiers,
-  archive-verify-delete, restore, deletion lifecycle, application
-  identity.
-- C10s/C10r/C10a (2026-07-16): Operation substrate, HeldSupersession
-  cleanup + queue-coupled completion, full §34 HTTP surface with live
-  bearer auth.
-- C10b/C10c (2026-07-17): health count slots; CLI full rework (polling
-  model, typed renderers).
-- C10d (2026-07-17): documentation re-baseline — all seven operator docs
-  fully replaced from live code reads.
-- C10e (2026-07-17): final legacy sweep (NDJSON emitter, markdown path,
-  `units.rs`) + the cluster-remainder verification pass; both C10f
-  pre-planning rulings implemented.
-- C10f (2026-07-17, IN PROGRESS): commissioning — R0–R3 + graceful
-  shutdown complete (first cycle 14/14 activated, zero failures); R4–R9
-  pending after CPc.
-- CP (2026-07-17/18, interim): CPa dense batching reverted (measured
-  regression; the candle-Metal `.contiguous()` fix kept permanently);
-  F16 rejected (non-finite activations); CPb thinking opt-out VERIFIED
-  live; CPd ColBERT batched document embedding complete incl. the
-  NaN-sanitize `where_cond` fix and the length-threshold hybrid; CPc
-  full re-ingest still pending.
-- CPd hybrid (2026-07-18): length-threshold ColBERT routing —
-  `COLBERT_BATCH_ROUTE_MAX_TOKENS = 128`, short units batched, long
-  units singular; recorded routing-boundary token-count bias.
-- Lock-starvation ruling B (2026-07-18): annotation worker defers
-  quietly on Busy at pre-paid boundaries, shutdown-bounded wait at
-  post-paid; Option A (embed outside the write tx) banked structural.
-- HTTP dense backend (2026-07-19): exclusive Local/Http
-  `DenseEmbeddingBackend`, OpenAI-compatible client, startup smoke,
-  backend-aware gating; CPc attempt 3 killed for this pivot (observed
-  ruling-B working live both categories).
-- Re-benchmark + invalidation (2026-07-19): 69.8-min cycle, 14/14
-  (3.3×; dense ~100×) — then INVALIDATED by the latent serial-
-  annotation design ceiling.
-- Concurrency package (2026-07-19): dense HTTP windows (8 concurrent)
-  + annotator waves (32), scoped-thread fan-out, all SQLite writes
-  serial; writer-lock-across-fan-out caveat accepted (Option A banked).
-- OpenRouter switch + commercial run (2026-07-19): both models
-  commercial (qwen/qwen3-embedding-8b @ 4096, gpt-5-nano); 429-only
-  bounded dense retry; annotator timeout 120 → 300 s validated live;
-  run later aborted under the empty-marker ruling.
-- Docling/CPe design (2026-07-19): streaming parse pool ruled and
-  APPROVED — staging half fans out, canonical half serial, dynamic
-  two-axis admission (memory + CPU EMAs), no knobs; supersedes
-  discussion B.
-- Documentation-currency rule (2026-07-19): doc updates ride the
-  package that changes operator-visible surfaces; four drifted docs
-  rewritten and review-verified same session.
-- Empty-marker ruling (2026-07-19): worker's by-design `[]` marker
-  rows poison the annotation-derived builders; commercial test
-  INVALIDATED and aborted; consumer-side skip ruled first scope.
-- CPd2 (2026-07-19): empty-marker consumer fix — all three
-  annotation-derived consumers (graph entity/relation, summary) skip
-  `[]` markers with visible counts; compile-verified only.
-- CA2 (2026-07-19, designed + implemented same day): annotation
-  identity + policy governance — content-scoped satisfaction
-  (`content_key_hash`), `[policies]` operator documents with
-  system-assigned `policy_versions` registry, D9 fuzzy graph entry
-  (shipped disabled), vocabulary inspection route + CLI verb,
-  `--annotation-dry-run` mode; COMPLETE, compile-verified only;
-  integration-dimension verification gap recorded (finder stopped
-  mid-run).
+Writing rule: state facts in present tense, as if they were always
+true. No dates, no event narration, no change rationale, no
+"amended/retired/superseded/was" notes — when a fact goes stale,
+replace it and delete the old one; PLAN-HISTORY.md records the
+transition. Sole exception: §4 ruling anchors may cite dates as
+PLAN-HISTORY grep keys.
 
-## Handoff (authoritative current-state digest; written 2026-07-10,
-amended per session through 2026-07-19 under the §1.4 Handoff-currency
-rule — the amendment history is the relocated session-entry record in
-PLAN-HISTORY.md)
+## Handoff (authoritative current-state digest, amended per session in
+place — §1.4 Handoff-currency rule)
 
 State for the next session picking this up:
 
-1. **Operating premise (user-ruled 2026-07-10)**: end-state-only
+1. **Operating premise (user-ruled)**: end-state-only
    development. The app does not need to start, serve, or be functional
    at any point until the programme completes (§1.2). No between-phase
    operability, no legacy behavior preservation, no per-cluster runtime
@@ -124,64 +32,36 @@ State for the next session picking this up:
    commissioning. The cargo battery (zero warnings) and the
    adversarially-confirmed verification workflows remain mandatory per
    package.
-1a. **Next work (ruled order, current as of 2026-07-19)**: every
-   implementation cluster and package through C10e, the CP set (CPa
-   reverted, CPb verified live, CPd + length-threshold hybrid), CPd2,
-   and CA2 is COMPLETE — the ledger above is the digest; full session
-   records are in PLAN-HISTORY.md. C10f commissioning is UNDERWAY:
-   R0–R3 plus a graceful shutdown are COMPLETE (first cycle 14/14
-   sources activated, zero failures); no open rulings block the
+1a. **Next work (ruled order)**: all implementation clusters and
+   packages through C10e, CP, CPd2, and CA2 are COMPLETE (records in
+   PLAN-HISTORY.md). C10f commissioning is UNDERWAY: R0–R3 and a
+   graceful shutdown are COMPLETE; no open rulings block the
    remaining runs. The sequence from here:
    (1) the commercial-endpoint clean-corpus test RE-RUN (NEXT; fresh
    plane — the `index/fabric/` deletion needs its named approval
-   then; RELEASE REBUILD required first — current binaries predate
-   CPd2 + CA2; AMENDED procedure: `--setup-storage` →
-   `--annotation-dry-run` → vocabulary inspection / ruleset
-   authoring → normal start; benchmark of record + first complete
-   annotation chain; also the first live exercise of CPd2 and all
-   of CA2 — the CA2 integration-dimension verification gap is a
-   recorded residual this run retires or surfaces);
+   then; RELEASE REBUILD required first — current binaries are
+   stale; procedure: `--setup-storage` → `--annotation-dry-run` →
+   vocabulary inspection / ruleset authoring → normal start;
+   benchmark of record + first complete annotation chain; also the
+   first live exercise of CPd2 and CA2);
    (2) R4 query testing (user-sequenced: queries proven before
    Docling implementation); (3) CPe Docling parse pool (APPROVED —
-   see §3; supersedes the parse/embed-overlap discussion B). C10f
-   runs R4–R9 resume within/after (2) and still include the C9
-   runtime verification set (mint/verify/cleanup/deactivate/restore
-   cycles), a held-candidate cleanup cycle (ruling 1), the
-   async-Operation admin surface incl. the Option A force-stage
-   path, the CLI poll-loop and renderer surface (never executed),
-   the C10b health counts under real cycles, and the multi-vector
-   overlap diagnostic (2026-07-15). Sequence after C10: the
-   programme's MVP completes; the QER audit tier and other §5 tiers
-   follow post-MVP. D5 deferred. (Per the 2026-07-16 ruling, the
-   §1.4 ~150k per-agent coherence cap is a guideline; the C10c
-   two-stage decomposition under it is precedent for pre-splitting
-   full-file rewrites.)
-2. **Process in force** (user-approved; model-assignment rule added
-   2026-07-13): each cluster =
-   in-session decision resolution → cluster plan approval (explicit;
-   config diffs and deletions named separately) → implementation
-   workflow (parallel agents on disjoint owned files; `config.rs`
-   main-loop-owned; `main.rs`/`error.rs` serialized through one exclusive
-   non-parallel agent; mod skeletons and shared contract types
-   pre-created before dispatch by a serial substrate agent; Fable is
-   orchestration only per §1.4, ruled 2026-07-14) → full cargo battery
-   → adversarially-confirmed verification workflow (5 dimensions: spec,
-   principles, comments, diagnostics, integration; findings confirmed by
-   refute-by-default agents) → fix confirmed findings → log status here
-   with approval, re-verifying this Handoff against the new entry in the
-   same approval (Handoff-currency rule, §1.4 step 6, added 2026-07-18).
-   Three further §1.4 rules in force since 2026-07-15:
-   the end-state-only prompt constraint (§1.2 premise in every agent
-   prompt), the spec-decides-it auto-ruling rule, and the honest-option
-   rule (no false choices; filter applied at both the agent and
-   main-loop layers). Agent constraints per §1.4: repo root only, never
-   `specs/`, owned files only, read-only shell + cargo fmt/check/clippy,
-   no git of ANY kind incl. read-only commands and worktrees (user-ruled
-   2026-07-19), no tests/servers/deps/deletions. Model assignment per §1.4
-   (permanent, 2026-07-13): all subagents run on Opus, Fable 5 is
-   main-loop only, and the main agent owes each agent the tightened
-   scoping §1.4 specifies.
-3. **Conventions the code now relies on** (adds to the C2-era list):
+   see §3). C10f runs R4–R9 resume within/after (2) and still
+   include the C9 runtime verification set (mint/verify/cleanup/
+   deactivate/restore cycles), a held-candidate cleanup cycle
+   (§4 C10 R1), the async-Operation admin surface incl. the force
+   re-parse override path, the CLI poll-loop and renderer surface
+   (never executed), the C10b health counts under real cycles, and
+   the multi-vector overlap diagnostic. After C10 the programme's
+   MVP completes; the QER audit tier and other §5 tiers follow
+   post-MVP. D5 deferred.
+2. **Process in force** (user-approved): the §1.4 execution model
+   governs in full — the cluster cycle, execution modes, model
+   assignment (all subagents on Opus; Fable 5 main-loop only), the
+   spec-decides-it / honest-option / end-state-only-prompt rules,
+   agent constraints, and serialization rules. Verification is the
+   five-dimension adversarially-confirmed workflow (§1.4 step 5).
+3. **Conventions the code relies on**:
    content-derived hashes via `crate::canonical` (incl.
    `canonical_sha256_hex_without_field` for self-hashed profiles/
    reports/manifests); IDs via `crate::ids` (now incl. `loc_`,
@@ -193,7 +73,7 @@ State for the next session picking this up:
    connection inside the owning transaction; staged producer output is
    plain serde_json (canonicalization happens once, at import);
    recorded-outcome vs infrastructure-`Err` split everywhere untrusted
-   producers meet the core. C5 additions: event-payload entries via
+   producers meet the core; event-payload entries via
    `events::entry` (single shared helper); per-source cutover barriers
    via `state::CutoverRegistry` (one instance per process, `main.rs`
    owns the Arc); parser-input containment via
@@ -203,7 +83,7 @@ State for the next session picking this up:
    scheduler and runs only after the entry's whole unit of work
    completes (`complete()` succeeds), never by the importer; parse
    dispatch identity-checks the live file's hash against the run's
-   `source_hash` before any worker runs. CA additions: annotation
+   `source_hash` before any worker runs; annotation
    freshness transitions ONLY via the `annotations::store` functions
    (event-atomic, status-guarded); producer prompts are named constants
    and producer input is exactly the ordered target-unit text (input
@@ -213,7 +93,7 @@ State for the next session picking this up:
    survives parse archival; the annotation worker discovers work
    statelessly per cycle, and any `building` row visible at discovery
    time is a crash orphan to adopt (the single worker completes every
-   build within its cycle). C7 additions: the per-query read path opens
+   build within its cycle); the per-query read path opens
    one read-only connection + transaction via
    `hot_plane::begin_read_transaction` (the DP1 read twin of
    `begin_write_transaction`, "query" namespace) as its first act and
@@ -228,7 +108,7 @@ State for the next session picking this up:
    the reranker's `content_units.body_json` content resolution is a
    deliberate arm-for-arm mirror of `projections/multivector.rs`
    `evidence_text` with must-stay-in-step comments on both sides (a
-   shared helper would couple query/ to projections/). C8 additions:
+   shared helper would couple query/ to projections/);
    the `evidence_text` mirror set is FOUR sites (rerank.rs,
    multivector.rs, assembly/evidence.rs, annotations/producer.rs),
    arm-for-arm identical, each carrying the four-site
@@ -244,8 +124,8 @@ State for the next session picking this up:
    holds it across the blocking call; tokenization for the assembly
    token budget is CPU-only and never acquires the model-call gate;
    the per-query correlation id reuses `new_query_execution_record_id()`
-   and is a correlation handle only until the QER tier lands.
-   2026-07-19 additions: dense embedding is reached ONLY through
+   and is a correlation handle only until the QER tier lands;
+   dense embedding is reached ONLY through
    `DenseEmbeddingBackend` (exclusive Local/Http enum, reranker
    pattern, `src/inference/dense_backend.rs`); dense prompt
    formatting has ONE source of truth in `inference/dense.rs`
@@ -255,8 +135,7 @@ State for the next session picking this up:
    (`uses_local_model_gate`, gate never held across HTTP I/O); the
    builder's http path batches via the `DENSE_HTTP_BATCH_SIZE` code
    constant and both paths persist through the shared
-   `persist_chunk_vector`.
-   2026-07-19 (later) additions: the standing REMOTE-CALL SHAPE is
+   `persist_chunk_vector`; the standing REMOTE-CALL SHAPE is
    scoped-thread fan-out of HTTP calls ONLY, with every SQLite
    write serial on the owning thread (three instances: annotation
    worker waves via `dispatch_and_commit_wave`, dense builder
@@ -266,95 +145,70 @@ State for the next session picking this up:
    `model_call.http_retry`) — all other failures everywhere remain
    fail-immediately recorded outcomes; commercial-endpoint secrets
    live in owner-only key files named in config
-   (`.data-store-dense-api-key`, `.annotator-api-key`); packages
-   that change operator-visible surfaces carry their doc updates
-   (documentation-currency rule).
+   (`.data-store-dense-api-key`, `.annotator-api-key`).
 4. **Standing open items**: rusqlite `hooks` feature decision for
    wall-clock statement deadlines (Cargo.toml change, needs approval;
    busy_timeout 5s is the only bound; seams commented in
-   acquisition.rs open_bounded_* and hot_plane.rs); C4d noted
-   `ParseMetrics` has no byte/char count fields (worker logs them;
-   adding fields needs approval).
-   Graceful shutdown waits out the full scheduler cycle — the
-   shutdown signal is checked per CYCLE, not per drain entry
-   (~2 h 20 m observed at R3; SIGTERM needed at both CPc attempts);
-   bounding latency to one drain entry NEEDS A RULING (banked
-   2026-07-17 commissioning entry, PLAN-HISTORY.md). Docling
-   activity monitor logs ~2 INFO lines/sec per conversion —
-   log-noise review candidate (banked same entry; multiplies by
-   pool size under the Docling-parallelism design — bounding the
-   pool's aggregate inspection logging is folded into that
-   package). NEW 2026-07-19: annotation "issue 1" — a large share
-   of relation producer calls return ~16 output chars in ~220 ms
-   (near-empty results paying full round-trip cost); granularity/
-   filtering discussion PENDING (any prompt/batching change is
-   producer-identity-bearing and memo-invalidating — needs its own
-   ruling; if ruled, its prompt change can BATCH with the first
-   naming-policy authoring to pay one identity invalidation).
-   NEW 2026-07-19 (CA2 session): the OPERATOR RE-ANNOTATE OVERRIDE
-   is a NAMED PRE-PRODUCTION REQUIREMENT (the only production-safe
-   corpus-wide annotation refresh under the Option A satisfaction
-   ruling — see the CA2 design entry, PLAN-HISTORY.md).
-   Rare OpenRouter HTTP-200-truncated-body transients
-   (~1/59 calls) accepted as park-and-retry noise — revisit only
-   if the rate climbs.
-5. **Runtime state (as of the 2026-07-19 test abort)**: the
-   service is STOPPED (test aborted ≈21:25Z under the empty-marker
-   invalidation ruling; clean SIGTERM, no orphans). The fabric
-   plane holds the PARTIAL INVALIDATED commercial run (ingest
-   incomplete — restart interrupted the cycle at 4-of-remaining
-   sources; 2 sources marker-poisoned for graph/summary; delete +
-   `--setup-storage` before the CPd2-fixed re-run, named approval
-   required). Run history this config: started 20:45:41Z,
-   restarted 21:03:21Z for the 300 s annotator timeout, aborted
-   ≈21:25Z. `config.toml`: [models.dense]
+   acquisition.rs open_bounded_* and hot_plane.rs). `ParseMetrics`
+   has no byte/char count fields (worker logs them; adding fields
+   needs approval). Graceful shutdown waits out the full scheduler
+   cycle — the shutdown signal is checked per CYCLE, not per drain
+   entry, so latency can reach hours; bounding it to one drain entry
+   NEEDS A RULING (CPe partially retires this). The Docling activity
+   monitor logs ~2 INFO lines/sec per conversion — log-noise review
+   candidate; bounding the pool's aggregate inspection logging is
+   folded into CPe. Annotation "issue 1": a large share of relation
+   producer calls return near-empty results at full round-trip cost;
+   granularity/filtering discussion PENDING (any prompt/batching
+   change is producer-identity-bearing and memo-invalidating — needs
+   its own ruling; if ruled, its prompt change can BATCH with the
+   first naming-policy authoring to pay one identity invalidation).
+   The OPERATOR RE-ANNOTATE OVERRIDE is a NAMED PRE-PRODUCTION
+   REQUIREMENT (the only production-safe corpus-wide annotation
+   refresh under the content-scoped satisfaction ruling — §4 CA2).
+   Rare OpenRouter HTTP-200-truncated-body transients (~1/59 calls)
+   are accepted as park-and-retry noise — revisit only if the rate
+   climbs.
+5. **Runtime state**: the service is STOPPED. The fabric plane
+   holds a PARTIAL, INVALIDATED commercial run (ingest incomplete;
+   2 sources marker-poisoned for graph/summary); delete
+   `index/fabric/` + `--setup-storage` before the re-run (named
+   approval required). `config.toml`: [models.dense]
    backend="http", https://openrouter.ai/api/v1/embeddings,
    model qwen/qwen3-embedding-8b, dimension 4096, timeout 60 s,
    key file .data-store-dense-api-key; [models.annotator]
    https://openrouter.ai/api/v1/chat/completions, model
    openai/gpt-5-nano, timeout_seconds 300, key file
    .annotator-api-key. Both key files hold the user's OpenRouter
-   key (sk-or-v1), owner-only, gitignored. Release binaries
-   PREDATE CPd2 and CA2 (they carry through the 2026-07-19 morning
-   set: CPd hybrid, ruling-B, HTTP dense backend, concurrency
-   waves/windows, 429 retry, lock-hold comment fix) — release
-   rebuild REQUIRED before the next run.
-   The user's local vLLM endpoints (10.1.0.10:8000/:8001) are
-   DECOMMISSIONED — earlier Little Snitch/egress notes are
-   historical. The 27B-era annotator crash was external
-   misconfiguration (user-confirmed, fixed, one-time). Switching
-   dense backends or models remains a corpus identity change
-   requiring a fresh re-ingest. OPERATIONAL cautions: do not pipe
-   `start.sh` through short-lived readers (SIGPIPE kills the
-   startup relay chain and the service child — observed
-   2026-07-19T06:06Z); config is startup-only, so any config
-   change requires a service restart; OpenRouter data-policy
+   key (sk-or-v1), owner-only, gitignored. Release binaries are
+   STALE — release rebuild REQUIRED before the next run. Switching
+   dense backends or models is a corpus identity change requiring a
+   fresh re-ingest. OPERATIONAL cautions: do not pipe `start.sh`
+   through short-lived readers (SIGPIPE kills the startup relay
+   chain and the service child); config is startup-only, so any
+   config change requires a service restart; OpenRouter data-policy
    settings gate which providers serve a model (a 404 "No
    endpoints ... data policy" points at
    openrouter.ai/settings/privacy, not at a wrong slug).
-   The staged commissioning corpus is the in-repo `sources/` dir (12
-   PDFs + 2 txt; the former out-of-repo symlink was replaced by the
-   user 2026-07-17). The LEGACY service process was killed
-   2026-07-17 (user-approved); its database
-   (`index/data-store.sqlite3` — 120 active docs, 65,369 units)
-   remains read-only reference material beside the approved D6
-   sample conversion at
+   The commissioning corpus is the in-repo `sources/` dir (12 PDFs
+   + 2 txt). The legacy database (`index/data-store.sqlite3` — 120
+   active docs, 65,369 units) is read-only reference material
+   beside the D6 sample conversion at
    `index/docling-conversions/conversion-sample-d6/`; the fabric
-   never reads either. `logs/data-store.log` now carries BOTH legacy
-   and fabric eras (timestamps separate them; commissioning metrics
-   must filter to 2026-07-17T23:00Z onward; re-benchmark metrics to
-   2026-07-19T08:20Z onward).
-   Still never executed: the query surface
-   (POST /query, R4), the admin Operation routes (R5–R6), and the
-   remaining R4–R9 commissioning runs, which resume after the
-   re-benchmark.
+   never reads either. `logs/data-store.log` carries both legacy
+   and fabric eras — commissioning metrics filter to
+   2026-07-17T23:00Z onward, re-benchmark metrics to
+   2026-07-19T08:20Z onward (filter values, not narration).
+   Never executed yet: the query surface (POST /query, R4), the
+   admin Operation routes (R5–R6), and the remaining R4–R9
+   commissioning runs.
 
 ## 1. Target and Ground Rules
 
 ### 1.1 Target
 
-The end state is the full v0.3 specification, reached in two stages
-(rescoped 2026-07-11). The committed, step-planned clusters below cover
+The end state is the full v0.3 specification, reached in two stages.
+The committed, step-planned clusters below cover
 an MVP that pulls semantic annotations, annotation memoization, and the
 multi-vector and graph retrieval channels forward from the spec's own
 recommended MVP cut (§36) — a re-sequencing within the full-spec target,
@@ -368,11 +222,11 @@ the audit tier is a recorded deviation from the spec's committed
 guarantees, not a re-sequencing. Deferred tiers receive their own
 planning passes when reached.
 
-### 1.2 Transition strategy (decided 2026-07-05; end-state-only ruling added 2026-07-10)
+### 1.2 Transition strategy
 
 Rebuild as primary path, developed end-state-only. Nothing depends on the
 current service staying operational or on already-ingested data surviving,
-and — ruled by the user 2026-07-10 — the app does not need to be
+and — user-ruled — the app does not need to be
 functional at ANY point until the programme completes:
 
 - The existing SQLite database contents (schema v4 in `sql/schema.sql`) are
@@ -402,21 +256,20 @@ functional at ANY point until the programme completes:
   acquisition/parse/search cycles) is consolidated at C10f commissioning,
   each run individually user-approved; clusters do not seek per-cluster
   runtime verification and report unverified behavior as residual risk
-  for C10f to retire (2026-07-10 restructure).
+  for C10f to retire.
 - Async stays confined to the HTTP transport shell. All new lifecycle
   machinery (scheduler, importer, activation, snapshotting) is synchronous
   OS-thread work. SQLite access stays synchronous `rusqlite`.
 - Every config shape change requires explicit approval and a matching
   `config.example.toml` update.
 - `README.md`, `ARCHITECTURE.md`, `PROTOCOL.md`, `SPEC-SERVER.md`,
-  `SPEC-CLIENT.md` describe surfaces this programme replaces. They are
-  re-baselined once, at C10d; clusters do not update them incrementally
-  (2026-07-10 restructure — the described surfaces need not function
-  during the programme).
+  `SPEC-CLIENT.md` are as-built operator docs. Documentation-currency
+  rule: packages that change operator-visible surfaces carry their doc
+  updates in the same package.
 - File deletions (legacy module retirement, old schema files) are explicit
   approval items at their cutover package; nothing is deleted implicitly.
 
-### 1.4 Execution model (workflow-oriented; adopted 2026-07-06)
+### 1.4 Execution model (workflow-oriented)
 
 Work is organized as clusters of work packages. Each package declares the
 files it owns, the contracts it consumes, its spec sections, and mechanical
@@ -433,9 +286,9 @@ Execution modes:
 - `agent-parallel`: a workflow fan-out of implementation agents, one per
   package, dispatched together after the cluster plan is approved.
 
-Model assignment (user-ruled 2026-07-13, permanent): ALL subagents —
+Model assignment (user-ruled, permanent): ALL subagents —
 implementation, verification finders, and adversarial confirmers — run on
-Opus. Fable 5 is orchestration only (user-ruled 2026-07-14): dispatch,
+Opus. Fable 5 is orchestration only (user-ruled): dispatch,
 sequencing, structured-verdict reads, decisions and approvals with the
 user, and rulings on design-bearing findings. Everything else —
 implementation, substrate and schema edits, prompt drafting, artifact
@@ -453,9 +306,10 @@ package scoping in-session rather than escalating the agent's model.
 Main-loop reads are limited to structured agent verdicts, summaries, and
 decision packages; full-artifact review (diffs, prompts, reports,
 findings) is performed by reviewer agents with adversarial confirmation,
-not by the main loop (user-ruled 2026-07-14).
-Per-agent coherence cap (user-ruled 2026-07-14): no agent's planned
-cumulative token load (context reads plus output) may exceed ~150k.
+not by the main loop (user-ruled).
+Per-agent coherence cap (user-ruled): an agent's planned cumulative
+token load (context reads plus output) stays within ~150k — a
+guideline, not a hard limit.
 Stages that would exceed it are decomposed into sequential sub-agents
 with explicit handoff contracts; prompt drafting and prompt review check
 planned scope against this cap.
@@ -463,14 +317,14 @@ planned scope against this cap.
 Cluster cycle:
 
 1. Resolve the cluster's open decisions (§4) in-session, one at a time.
-   Spec-decides-it rule (user-ruled 2026-07-15): when one option clearly
+   Spec-decides-it rule (user-ruled): when one option clearly
    aligns most with the spec — citable normative spec text directly
    decides it, and the option conflicts with no recorded ruling and no
    recorded deviation — that option is chosen without asking the user,
    and the ruling is recorded here with its spec citation. Ambiguous
    cases, mixed spec signals, and any conflict with a recorded ruling or
    deviation still go to the user.
-   Honest-option rule (user-ruled 2026-07-15): a decision is presented to
+   Honest-option rule (user-ruled): a decision is presented to
    the user only when at least two options survive honest advocacy at this
    project's actual scale and constraints. An option that contradicts
    PRINCIPLES.md, a recorded ruling, a recorded deviation, or that offers
@@ -490,31 +344,30 @@ Cluster cycle:
    considered done.
 5. Run a verification workflow over the cluster's diff: independent agents
    check spec-section conformance (with file/line citations), `PRINCIPLES.md`
-   adherence, comment sufficiency per `AGENTS.md`, and diagnostics-boundary
-   coverage per `DIAGNOSTICS.md`; findings are adversarially
-   confirmed before being reported.
-6. Report results, fix confirmed findings, and log cluster status in this
-   file's Current Status. The same approval re-verifies the Handoff
-   against the new entry and amends any fact it makes stale, so the
-   Handoff never lags the log (Handoff-currency rule, added 2026-07-18
-   with the PLAN-HISTORY.md relocation — the Handoff is the
-   authoritative current-state digest; completed entries leave this file
-   at the next relocation once superseded).
+   adherence, comment sufficiency per `AGENTS.md`, diagnostics-boundary
+   coverage per `DIAGNOSTICS.md`, and cross-module integration (both
+   sides of every seam read and matched); findings are adversarially
+   confirmed by refute-by-default agents before being reported.
+6. Report results, fix confirmed findings, and bring this file current
+   in place under the Current Status writing rule — replace stale
+   statements, never narrate transitions — and append the session's
+   historical record to PLAN-HISTORY.md, never to this file
+   (Handoff-currency rule).
 
 Constraints stated in every agent prompt: stay inside the repository root;
 never read `specs/`; touch only the package's owned files; read-only shell
 plus `cargo fmt`/`cargo check`/`cargo clippy`; no git commands of ANY kind —
 including read-only ones (`status`, `diff`, `log`) and `worktree`
-(user-ruled 2026-07-19; agents verify with cargo and file reads only);
+(user-ruled; agents verify with cargo and file reads only);
 no tests, no servers, no dependency changes, no file deletion; and the
 end-state-only operating
-premise (§1.2, user-ruled 2026-07-15 as a standing prompt constraint): the
+premise (§1.2, a standing user-ruled prompt constraint): the
 app first runs at C10f, after ALL clusters land — never reason from
 "X doesn't exist yet"; evaluate every design, option analysis, and finding
 against the completed end state, where all planned machinery (through C10)
 is live.
 
-Serialization rules that override parallelism (from recon):
+Serialization rules that override parallelism:
 
 - `src/main.rs` `mod` declarations and the single `AppState::new` call site
   are serialized: edited by at most one exclusive non-parallel agent at a
@@ -531,31 +384,17 @@ Serialization rules that override parallelism (from recon):
   `inference/mod.rs` via `#[path]` includes; any edit to those files must
   keep that binary compiling.
 
-### 1.5–1.6 — retired (2026-07-18 second-stage relocation)
-
-§1.5 Pinned contracts and §1.6 Recon findings moved to `PLAN-HISTORY.md`
-"Retired planning sections" — grep `1.5 Pinned contracts` /
-`1.6 Recon findings`. The one still-live pinned contract (the inference
-inbound API + caller-side gate discipline) is digested in the §4 cluster
-rulings index.
-
 ## 3. Clusters and Work Packages
 
-Completed planning corpus retired to `PLAN-HISTORY.md` "Retired planning
-sections" (2026-07-18, verbatim): §2 Module Disposition, the dependency
-spine, cluster/package texts C1–C9 (C1 seam cuts, C2 substrate, C3
-acquisition, C4 parsing, CR legacy retirement, C5 activation, CA
-annotations, C6 projections, C7 retrieval, C8 assembly), the C7/C9/C10/CP
-fact bases, and the §37 acceptance-traceability table — grep the cluster
-heading (e.g. `### C7 — Retrieval fabric`) or package name (e.g.
-`C9d Superseded-state`). Only the pending work remains below; operative
-rulings from the retired texts are indexed in §4.
+Only pending work appears below. Completed cluster and package texts
+are in `PLAN-HISTORY.md` "Retired planning sections" — grep the
+cluster heading (e.g. `### C7 — Retrieval fabric`) or package name
+(e.g. `C9d Superseded-state`); operative rulings are indexed in §4.
 
-### C10 — Operational shell + commissioning (after C9; cluster plan APPROVED 2026-07-16)
+### C10 — Operational shell + commissioning (cluster plan APPROVED)
 
-C10s–C10e are COMPLETE; their package texts, the cluster's ruling intro,
-and the C10 fact base are retired to `PLAN-HISTORY.md` (grep
-`C10 fact base` or the package name, e.g. `C10a API finalization`).
+C10s–C10e are COMPLETE (package texts in `PLAN-HISTORY.md` — grep
+`C10 fact base` or the package name, e.g. `C10a API finalization`);
 R1/R2 and the queue-coupled completion model are indexed in §4. Only
 C10f remains:
 
@@ -567,7 +406,7 @@ C10f remains:
   all three channels (lexical, dense, graph) with annotation-freshness
   and assembly-trace checks; the async-Operation admin surface and a
   held-candidate cleanup cycle (R1); the offline multi-vector overlap
-  diagnostic (2026-07-15): exhaustive ColBERT top-100 vs the fused
+  diagnostic: exhaustive ColBERT top-100 vs the fused
   pool on sample real queries, quantifying the deferred `multi_vector`
   channel's recall gap from persisted C6e matrices with no new
   infrastructure; a snapshot plus deletion-gate verification (restore
@@ -576,89 +415,49 @@ C10f remains:
   from C2 through C10, including CA, is retired or filed here. Mode:
   main-loop; every run individually user-approved.
 
-### CP — Ingestion performance (commissioning interlude; cluster plan APPROVED 2026-07-17)
+### CP — Ingestion performance (commissioning interlude; cluster plan APPROVED)
 
-Motivation: the first commissioning cycle (2026-07-17) measured 229.7
-min for 14 documents — dense passage embedding 149.6 min (65%; 5,120
-calls, avg 1,753 ms, batch 1), ColBERT 30.2 min (13%; 34,092 calls,
-avg 53 ms), Docling + everything else ≈ 50 min (22%). Dense batching
-is the largest contained win. Bulk throughput recurs operationally:
-any parser-identity change re-ingests the whole corpus (§13).
+CPa/CPb/CPc/CPd/CPd2 are complete or superseded; package texts and
+outcomes are in `PLAN-HISTORY.md` (grep the package name, e.g. `CPd
+ColBERT batched`, `CPc Benchmark re-ingestion`). The CPc
+before-baseline for the benchmark of record: 229.7 min / 14 documents
+(dense passage embedding 149.6 min, ColBERT 30.2 min, Docling + rest
+≈ 50 min). Bulk throughput recurs operationally: any parser-identity
+change re-ingests the whole corpus (§13). The commercial-endpoint
+clean-corpus re-run is the benchmark of record (Handoff item 1a).
+Only CPe remains:
 
-CPa (implemented then REVERTED — no dense batching win on this GPU), CPb
-(complete, verified live), CPd (complete; the length-threshold hybrid
-followed), CPc, and CPd2 have their package texts retired to
-`PLAN-HISTORY.md` (grep the package name, e.g. `CPd ColBERT batched`,
-`CPc Benchmark re-ingestion`, `CPd2 Empty-marker`); as-built records
-live in the PLAN-HISTORY.md session entries. The motivation numbers
-above are the CPc before-baseline. Outcomes and remaining work:
-
-- **CPc — SUPERSEDED**: three attempts (2026-07-18/19) aborted or
-  killed (Metal stride defect, batching-regression kill, HTTP-dense
-  pivot); the HTTP-dense re-benchmark completed 69.8 min / 3.3× but
-  was INVALIDATED by the serial-annotation ceiling. The
-  commercial-endpoint clean-corpus RE-RUN is the benchmark of record
-  (Handoff item 1a).
-- **CPd2 — COMPLETE 2026-07-19**: all three annotation-derived
-  consumers (graph entity/relation mentions+edges, summary) skip the
-  worker's by-design `[]` marker rows with visible counts.
-- **CPe Docling parse pool (APPROVED 2026-07-19; implement in a NEW
-  session after the commercial-endpoint test completes)**: streaming
-  parse pool per the 2026-07-19 design entry (PLAN-HISTORY.md, grep
-  `Docling parallelism design`) — the
+- **CPe Docling parse pool (APPROVED; implement in a new session
+  after the commercial-endpoint test completes)**: streaming parse
+  pool per the design entry (PLAN-HISTORY.md, grep `Docling
+  parallelism design`) — the
   staging-only half (pre-dispatch guards + Docling child) fans out;
   the canonical half (import/gates/projections/activation/queue
   completion) stays serial on the scheduler thread. Pool admission
   DYNAMIC on both axes from observed signals, never a constant or
   config knob: memory (available vs per-child working-set EMA
   seeded from the activity monitor's measured RSS) AND CPU
-  (observed utilization headroom vs per-child CPU-demand EMA —
-  cores÷num_threads ratios rejected as guesses; measured child
-  ≈ 1 core despite --num-threads 10). Streaming completion, no
-  wave barrier (20× per-doc duration variance). Shutdown
-  TERMINATES in-flight children (staging is crash-safe; partially
-  retires the banked shutdown-latency item). Bound the pool's
-  aggregate activity-monitor logging (the banked log-noise item
-  multiplies by pool size). Owned files: src/scheduler.rs (drain/
-  dispatch restructure), src/docling.rs (child-handle pool API);
-  no config changes, no new deps; cross-platform resource
-  sampling (macOS + Linux, no-new-deps mechanism, getloadavg
-  named candidate). Honest scale note: at large admitted pools the
-  serial import half binds next (seams: banked Option A, then
-  parallel projection builds — future tiers). Remote Docling
-  recorded as a legitimate future tier on its own merits; local
-  for now (user-ruled). Mode: one Opus agent-serial package +
-  cargo battery + refute-by-default review (named constraints:
-  queue/Operation lifecycle coupling, bundle-cleanup ordering,
-  crash-replay invariants, startup-sweep safety comment).
-  Estimate ~300–350k tokens, confidence ~75%; runtime
-  verification at the following re-ingest.
-- **Deferred**: parse/embed overlap (pipelining Docling on doc N+1
-  during doc N's embed) — architectural change to the
-  single-scheduler-thread inline-worker design; RE-SEQUENCED
-  2026-07-19 into the Docling-parallelism design pass that follows
-  the HTTP-dense re-benchmark (with dense moving off-device, Docling
-  ~45 min becomes the dominant local cost; concurrent conversion
-  needs a user ruling on the scheduler design). The HTTP
-  dense-embedding backend formerly recorded here as the largest
-  structural lever is IMPLEMENTED (2026-07-19 session entries,
-  PLAN-HISTORY.md).
+  (observed utilization headroom vs per-child CPU-demand EMA; a
+  Docling child measures ≈ 1 core regardless of --num-threads).
+  Streaming completion, no wave barrier (20× per-doc duration
+  variance). Shutdown TERMINATES in-flight children (staging is
+  crash-safe; partially retires the shutdown-latency open item).
+  Bound the pool's aggregate activity-monitor logging (the
+  log-noise open item multiplies by pool size). Owned files:
+  src/scheduler.rs (drain/dispatch restructure), src/docling.rs
+  (child-handle pool API); no config changes, no new deps;
+  cross-platform resource sampling (macOS + Linux, no-new-deps
+  mechanism, getloadavg named candidate). Scale note: at large
+  admitted pools the serial import half binds next (seams:
+  embed-outside-the-transaction Option A, then parallel projection
+  builds — future tiers). Remote Docling is a legitimate future
+  tier; local for now (user-ruled). Mode: one Opus agent-serial
+  package + cargo battery + refute-by-default review (named
+  constraints: queue/Operation lifecycle coupling, bundle-cleanup
+  ordering, crash-replay invariants, startup-sweep safety comment).
+  Runtime verification at the following re-ingest.
 
-### CA2 — Annotation identity, policy governance, inspection (COMPLETE 2026-07-19)
-
-All six packages (P0 policy substrate, P1 content-scoped satisfaction,
-P2 fuzzy graph entry, P3 prompt composition, P4 vocabulary inspection,
-P5 annotation dry-run mode) implemented, wired, documented, and
-verified in one session. Cluster and package texts retired to
-`PLAN-HISTORY.md` (grep `CA2-P0 Policy substrate`); the nine-ruling
-design and the as-built record are the relocated 2026-07-19
-annotation-identity design and CA2 implementation session entries;
-operative rulings indexed in §4 (D3/D9 amendments, CA2). Residuals:
-compile-verified only — first live exercise is the amended re-run
-procedure (Handoff item 1a) — and the integration verification
-dimension was stopped mid-run (recorded gap).
-
-## 4. Design Decisions — Rulings Index (condensed 2026-07-18)
+## 4. Design Decisions — Rulings Index
 
 Full ruling texts — rationale, rejected alternatives, verified facts —
 are in `PLAN-HISTORY.md` "Retired planning sections"; grep the quoted
@@ -793,9 +592,7 @@ Named tiers, their reserved seams (already built by the clusters above),
 and entry points. No step-level detail; each gets its own planning pass.
 
 - **QER audit tier** (§24.2 planHash, §28, §29.2 Guarantees 1/2/4,
-  §30.5 restore drills; deferred 2026-07-11 as a recorded deviation —
-  SemanticAnnotations, memoization, multi-vector, and graph moved the
-  other way, into MVP scope, at the same rescope): per-query QueryPlan +
+  §30.5 restore drills; a recorded deviation): per-query QueryPlan +
   `planHash`, the QueryExecutionRecord writer (C8c shape: embedded
   EvidencePack, freshness record, `retrievalReplayMode:
   "record_replay"`, written before or atomically with the response),
@@ -805,15 +602,14 @@ and entry points. No step-level detail; each gets its own planning pass.
   `/query-executions` inspection surface. Seams already built: C2e QER
   metadata table, `qer_` IDs, C3c per-source boundary timestamps, the
   hashed C7a RetrievalProfile, and the ContextAssemblyTrace embedded in
-  every EvidencePack (C8b). (Corrected 2026-07-15: this entry
-  previously claimed C2d built the QER/trace model types; no §24/§28
-  model types exist in `src/` — this tier defines them.) Until
+  every EvidencePack (C8b). No §24/§28 model types exist in `src/`;
+  this tier defines them. Until
   this tier lands, the delivered system answers evidence questions at
   serve time only; retrospective per-query reconstruction is not
   available.
 - **Additional retrieval channels** (§22, §24): `multi_vector`
-  (deferred 2026-07-15 — an exhaustive MaxSim candidate-generation scan
-  measured infeasible at the actual corpus on the 32 GB M1 Max, ~30–60 s
+  (an exhaustive MaxSim candidate-generation scan measures infeasible
+  at the actual corpus on the 32 GB M1 Max, ~30–60 s
   per query vs 84 ms for the retained C7c fused-pool stage; named
   design: a stateful remote multi-vector index, e.g. Qdrant MaxSim
   multivectors or Vespa late-interaction, operated under the
@@ -823,7 +619,7 @@ and entry points. No step-level detail; each gets its own planning pass.
   re-embedding; a C9-style remote-cleanup obligation for superseded
   parses attaches; stateless inference endpoints rejected — the cost is
   matrix movement/holding, not FLOPs), `learned_sparse_vector`
-  (deferred 2026-07-11 — new model runtime plus weighted-index
+  (new model runtime plus weighted-index
   machinery, overlapping the retained lexical stack) and
   `temporal_projection`. Seam: RetrievalProjection envelope, the
   channel-scoped C7a profile, and the C7b channel contract.
@@ -841,7 +637,7 @@ and entry points. No step-level detail; each gets its own planning pass.
   tier.
 - **Per-domain index partitioning** (§6 caveat): remedy for corpus-global
   lexical statistics if scoped-score shadowing becomes material.
-- **Self-learning annotation rulesets** (banked 2026-07-19, CA2): the
+- **Self-learning annotation rulesets** (banked): the
   operator-inspect-and-adjust loop (CA2-P4 vocabulary surface + CA2-P5
   dry-run + operator-edited policy documents) is the MVP tier; a future
   tier derives naming-rule and match-rule candidates from the observed
