@@ -1007,7 +1007,7 @@ Entity group fields (`camelCase`):
 |-------|------|---------|
 | `normalizedName` | string | The shared normalized-name group key. |
 | `rawForms` | array of `{ rawForm, count }` | Distinct raw name strings with their occurrence counts. |
-| `entityTypes` | array of string | Distinct `entityType` values seen in the group. |
+| `entityTypes` | array of string | Distinct `entityType` values seen in the group, normalized (shared normalizer) and deduplicated so case variants such as `Person`/`person` collapse to one entry. |
 | `sourceCount` | `u64` | Count of distinct source ids the name appears in. |
 | `modelCounts` | array of `{ modelName, count }` | Per-model occurrence counts (`modelName` is `(unknown)` when absent). |
 | `totalCount` | `u64` | Total occurrences across all raw forms. |
@@ -1015,13 +1015,15 @@ Entity group fields (`camelCase`):
 **Response `200` (relation)** — `RelationVocabularyResponse` (`camelCase`):
 same top-level frame (`annotationType` = `relation`, `scope`,
 `skippedMarkerCount`, `malformedRowCount`, `truncated`, `rowsRead`,
-`groupCount`), with `groups` sorted by `predicate` ascending. Relation group
-fields (`camelCase`):
+`groupCount`), with `groups` grouped by the **normalized** predicate (shared
+normalizer, so case/spacing variants fold into one group) and sorted by that
+normalized predicate ascending. Relation group fields (`camelCase`):
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `predicate` | string | The relation predicate group key (verbatim). |
-| `totalCount` | `u64` | Total occurrences of this predicate. |
+| `predicate` | string | The normalized-predicate group key. |
+| `rawForms` | array of `{ rawForm, count }` | Distinct raw predicate strings (pre-normalization) with their occurrence counts, mirroring the entity group's `rawForms`. |
+| `totalCount` | `u64` | Total occurrences across all raw forms. |
 | `sourceCount` | `u64` | Count of distinct source ids. |
 | `modelCounts` | array of `{ modelName, count }` | Per-model occurrence counts. |
 

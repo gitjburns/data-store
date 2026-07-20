@@ -684,8 +684,10 @@ fn verify_multivector_plane(
 /// the ARCHIVED `semantic_annotations` rows using the SAME pure derivation
 /// `graph.rs` uses, and compares against the live `graph_entity_mentions` /
 /// `graph_entity_edges` tables for the subject parse. `normalize_entity_name`
-/// is imported from `graph.rs` so the node identity is byte-identical to the
-/// build-time key; the mention accumulation and edge derivation are MIRRORED
+/// is imported from `graph.rs` so the node identity — and the edge's
+/// relation_type, which the builder also stores as the NORMALIZED predicate —
+/// is byte-identical to the build-time key; the mention accumulation and edge
+/// derivation are MIRRORED
 /// here (the builder's `accumulate_mentions` / `derive_edges` are private) and
 /// MUST STAY IN STEP with `graph.rs` — a change to that derivation must be
 /// reflected here or this gate will spuriously fail. No model is invoked.
@@ -995,7 +997,8 @@ fn accumulate_expected_mention(
 
 /// Re-derive one directional edge from an archived relation annotation,
 /// mirroring `graph.rs::derive_edges`: read the `{subject, predicate, object}`
-/// body, normalize subject/object to node identities, and take the predicate as
+/// body, normalize subject/object to node identities, and take the NORMALIZED
+/// predicate (same `normalize_entity_name` scheme the builder applies) as
 /// relation_type with the annotation's target units as supporting units. A
 /// corrupt body is a verification failure.
 fn derive_expected_edge(
@@ -1020,7 +1023,10 @@ fn derive_expected_edge(
     Ok(EdgeKey {
         from_normalized_name: normalize_entity_name(&subject),
         to_normalized_name: normalize_entity_name(&object_name),
-        relation_type: predicate,
+        // Mirror of the builder: the live plane stores the NORMALIZED predicate
+        // as relation_type (`graph.rs::derive_edges`), so the re-derivation must
+        // normalize identically or the deletion gate would spuriously fail.
+        relation_type: normalize_entity_name(&predicate),
         target_unit_ids: archived_target_unit_ids(object, snapshot)?,
     })
 }

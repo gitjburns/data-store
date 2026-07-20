@@ -15,4 +15,9 @@
 #
 # An EMPTY list is the valid NEUTRAL document: no additional naming guidance is
 # composed into producer prompts. This shipped document is neutral.
-rules = []
+rules = [
+  "Entity types come from this preferred set when applicable: person, organization, location, work, chapter, concept, event, date, group, species, technology. Use 'work' for books, films, and other titled works.",
+  "Name a person by the fullest form the text gives.",
+  "Predicates are concise verb phrases naming a substantive relation - never bare copulas or possessives such as 'is', 'are', 'was', 'has'. Use 'authored' for authorship.",
+  "A predicate never contains an entity's name.",
+]

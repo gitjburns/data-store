@@ -134,9 +134,11 @@ pub(crate) struct EntityGroup {
     /// the raw forms against the shared normalized name shows exactly what
     /// normalization did and did not fold.
     pub(crate) raw_forms: Vec<RawFormCount>,
-    /// The distinct `entityType` values seen across this group's rows, sorted.
-    /// entityType is metadata, not identity (D9): one normalized name may appear
-    /// with several types and stays ONE group.
+    /// The distinct `entityType` values seen across this group's rows,
+    /// case-folded via the shared normalizer and deduplicated (so `Person` and
+    /// `person` collapse to one entry), sorted. entityType is metadata, not
+    /// identity (D9): one normalized name may appear with several types and
+    /// stays ONE group.
     pub(crate) entity_types: Vec<String>,
     /// Count of DISTINCT source_ids contributing to this group.
     pub(crate) source_count: usize,
@@ -148,8 +150,9 @@ pub(crate) struct EntityGroup {
     pub(crate) total_count: usize,
 }
 
-/// The relation vocabulary for one request: the per-predicate groups (sorted by
-/// predicate), plus the same bounded-scan bookkeeping the entity path reports.
+/// The relation vocabulary for one request: the per-normalized-predicate groups
+/// (sorted by normalized predicate ascending so spelling variants sit adjacent),
+/// plus the same bounded-scan bookkeeping the entity path reports.
 #[derive(Debug)]
 pub(crate) struct RelationVocabulary {
     pub(crate) groups: Vec<RelationGroup>,
@@ -159,12 +162,21 @@ pub(crate) struct RelationVocabulary {
     pub(crate) rows_read: usize,
 }
 
-/// One relation vocabulary group: one distinct predicate and its attribution.
+/// One relation vocabulary group: all raw predicate forms that normalize to one
+/// predicate, plus that group's attribution. Mirrors `EntityGroup`'s
+/// normalized-key + raw-forms shape.
 #[derive(Debug)]
 pub(crate) struct RelationGroup {
-    /// The relation body's `predicate` string verbatim (relations are grouped by
-    /// predicate; subject/object are not part of the predicate vocabulary).
+    /// The NORMALIZED predicate (`normalize_entity_name`, the shared source of
+    /// truth): relations are grouped by normalized predicate so spelling/case
+    /// variants sit in one group. Stored annotation rows stay verbatim;
+    /// normalization is applied HERE at this read-plane boundary only.
     pub(crate) predicate: String,
+    /// The distinct raw `predicate` strings (pre-normalization) that folded into
+    /// this group, each with its occurrence count, sorted by raw form —
+    /// mirroring `EntityGroup::raw_forms`. Contrasting the raw forms against the
+    /// normalized predicate shows exactly what normalization folded.
+    pub(crate) raw_forms: Vec<RawFormCount>,
     /// Total occurrences of this predicate.
     pub(crate) total_count: usize,
     /// Count of DISTINCT source_ids contributing this predicate.
@@ -305,7 +317,12 @@ pub(crate) fn entity_vocabulary(
             .entry(raw_name.to_owned())
             .or_insert(0) += 1;
         if let Some(entity_type) = body.get("entityType").and_then(Value::as_str) {
-            accumulator.entity_types.insert(entity_type.to_owned());
+            // Case-fold via the shared normalizer and let the BTreeSet dedup the
+            // folded value, so `Person`/`person` collapse to one entry. Stored
+            // rows stay verbatim; this folding is a read-plane concern.
+            accumulator
+                .entity_types
+                .insert(normalize_entity_name(entity_type));
         }
         accumulator.source_ids.insert(source_id.clone());
         *accumulator.model_counts.entry(model).or_insert(0) += 1;
@@ -345,18 +362,24 @@ pub(crate) fn entity_vocabulary(
     })
 }
 
-/// Mutable per-predicate accumulator for the relation aggregation.
+/// Mutable per-normalized-predicate accumulator for the relation aggregation.
+/// Mirrors `EntityAccumulator`: raw forms are counted in a map for O(1) folding
+/// and rendered into the sorted response vector at flush.
 struct RelationAccumulator {
+    raw_forms: BTreeMap<String, usize>,
     source_ids: std::collections::HashSet<String>,
     model_counts: BTreeMap<String, usize>,
     total_count: usize,
 }
 
 /// Aggregate the relation vocabulary for a scope. Groups fresh relation
-/// annotations by the body's `predicate` string, folding source_id and
-/// provenance model into each group. Empty markers skipped-and-counted;
-/// malformed rows (missing a string `predicate`) counted, never grouped. Groups
-/// sorted by predicate, clipped to `MAX_GROUPS`.
+/// annotations by the NORMALIZED `predicate` (the shared `normalize_entity_name`,
+/// so case/spacing variants fold together), folding each row's raw `predicate`,
+/// source_id, and provenance model into the group. Stored annotation rows stay
+/// verbatim; normalization is a read-plane concern applied HERE only. Empty
+/// markers skipped-and-counted; malformed rows (missing a string `predicate`)
+/// counted, never grouped. Groups sorted by normalized predicate ascending,
+/// clipped to `MAX_GROUPS`.
 pub(crate) fn relation_vocabulary(
     conn: &Connection,
     scope: VocabularyScope,
@@ -378,26 +401,34 @@ pub(crate) fn relation_vocabulary(
             skipped_markers += 1;
             continue;
         }
-        let Some(predicate) = body.get("predicate").and_then(Value::as_str) else {
+        let Some(raw_predicate) = body.get("predicate").and_then(Value::as_str) else {
             malformed_rows += 1;
             continue;
         };
+        // Group key is the NORMALIZED predicate; the raw form is retained for the
+        // group's raw-forms breakdown (mirror of the entity path's raw `name`).
+        let normalized = normalize_entity_name(raw_predicate);
         let source_id = &source_id_map[index];
         let model = model_name_of(&row.provenance_json);
 
-        let accumulator =
-            accumulators
-                .entry(predicate.to_owned())
-                .or_insert_with(|| RelationAccumulator {
-                    source_ids: std::collections::HashSet::new(),
-                    model_counts: BTreeMap::new(),
-                    total_count: 0,
-                });
+        let accumulator = accumulators
+            .entry(normalized)
+            .or_insert_with(|| RelationAccumulator {
+                raw_forms: BTreeMap::new(),
+                source_ids: std::collections::HashSet::new(),
+                model_counts: BTreeMap::new(),
+                total_count: 0,
+            });
+        *accumulator
+            .raw_forms
+            .entry(raw_predicate.to_owned())
+            .or_insert(0) += 1;
         accumulator.source_ids.insert(source_id.clone());
         *accumulator.model_counts.entry(model).or_insert(0) += 1;
         accumulator.total_count += 1;
     }
 
+    // BTreeMap iteration is already normalized-predicate ascending.
     let group_total = accumulators.len();
     let groups_truncated = group_total > MAX_GROUPS;
     let groups: Vec<RelationGroup> = accumulators
@@ -405,6 +436,11 @@ pub(crate) fn relation_vocabulary(
         .take(MAX_GROUPS)
         .map(|(predicate, accumulator)| RelationGroup {
             predicate,
+            raw_forms: accumulator
+                .raw_forms
+                .into_iter()
+                .map(|(raw_form, count)| RawFormCount { raw_form, count })
+                .collect(),
             total_count: accumulator.total_count,
             source_count: accumulator.source_ids.len(),
             model_counts: accumulator

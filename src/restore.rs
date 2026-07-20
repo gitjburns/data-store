@@ -1230,7 +1230,9 @@ INSERT INTO chunk_text_index (chunk_id, targeting_text) VALUES (?1, ?2)";
 /// `graph_entity_edges`) for the parse from its just-re-imported fresh
 /// `semantic_annotations` rows, mirroring `graph.rs`'s pure derivation EXACTLY —
 /// the same one `snapshot::verify::verify_graph_plane` mirrors for the deletion
-/// gate. `normalize_entity_name` is reused from `graph.rs` so node identity is
+/// gate. `normalize_entity_name` is reused from `graph.rs` so node identity —
+/// and the edge's relation_type plus the mention's entityType metadata, which
+/// the builder also stores NORMALIZED through the same scheme — is
 /// byte-identical to the build-time key; the mention accumulation and edge
 /// derivation are mirrored here (the builder's helpers are private) and MUST STAY
 /// IN STEP with `graph.rs`. No model is invoked (§38): the graph channel
@@ -1272,9 +1274,10 @@ INSERT INTO graph_entity_edges (
     let annotations = read_fresh_annotations(tx, SELECT_FRESH_ANNOTATIONS_SQL, parse_id)?;
 
     // Accumulate mentions and edges with the SAME derivation as graph.rs (and
-    // the gate mirror): entity → mention (name normalized to node identity, unit
-    // sets deduplicated + deterministically ordered via BTreeSet); relation →
-    // directional edge (subject/object normalized, predicate as relation type).
+    // the gate mirror): entity → mention (name normalized to node identity,
+    // entityType metadata normalized, unit sets deduplicated + deterministically
+    // ordered via BTreeSet); relation → directional edge (subject/object
+    // normalized, NORMALIZED predicate as relation type).
     let mut mentions: BTreeMap<String, MentionAccumulator> = BTreeMap::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     for annotation in &annotations {
@@ -1293,10 +1296,15 @@ INSERT INTO graph_entity_edges (
                     }
                 })?;
                 let normalized = normalize_entity_name(raw_name);
+                // Mirror of graph.rs::accumulate_mentions: entityType metadata
+                // is stored NORMALIZED (whitespace-only treated as absent, same
+                // as the builder's extractor), so the rebuilt mention row is
+                // byte-identical to the build-time row.
                 let entity_type = body
                     .get("entityType")
                     .and_then(Value::as_str)
-                    .map(str::to_owned);
+                    .filter(|text| !text.trim().is_empty())
+                    .map(normalize_entity_name);
                 let accumulator =
                     mentions
                         .entry(normalized)
@@ -1319,10 +1327,23 @@ INSERT INTO graph_entity_edges (
                             ),
                         })
                 };
+                // Mirror of graph.rs::derive_edges: relation_type is the
+                // NORMALIZED predicate, and a predicate that normalizes to
+                // empty (whitespace-only raw) is rejected loudly the same way a
+                // missing predicate is — an edge with no predicate is
+                // meaningless, and the deletion gate re-derives the same way.
+                let relation_type = normalize_entity_name(&field("predicate")?);
+                if relation_type.is_empty() {
+                    return Err(ApiError::RestoreFailed {
+                        message: "restore graph rebuild: relation annotation has an empty \
+                                  `predicate` after normalization"
+                            .to_owned(),
+                    });
+                }
                 edges.push(GraphEdge {
                     from_normalized_name: normalize_entity_name(&field("subject")?),
                     to_normalized_name: normalize_entity_name(&field("object")?),
-                    relation_type: field("predicate")?,
+                    relation_type,
                     target_unit_ids: target_units,
                     source_id: annotation.source_id.clone(),
                 });

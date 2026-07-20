@@ -633,6 +633,11 @@ struct RelationVocabularyView {
 #[serde(rename_all = "camelCase")]
 struct RelationVocabularyGroupView {
     predicate: String,
+    /// Distinct raw predicate forms with counts that folded into this normalized
+    /// predicate, mirroring the entity group's `raw_forms`. Defaulted so an
+    /// older server that omits `rawForms` still deserializes.
+    #[serde(default)]
+    raw_forms: Vec<RawFormView>,
     total_count: usize,
     source_count: usize,
     model_counts: Vec<ModelCountView>,
@@ -2058,6 +2063,12 @@ fn render_relation_vocabulary(response: &RelationVocabularyView) {
             "  {} (total {}, sources {})",
             group.predicate, group.total_count, group.source_count
         );
+        // Raw predicate forms folded into this normalized predicate, mirroring
+        // the entity renderer's rawForms block.
+        println!("    rawForms:");
+        for raw in &group.raw_forms {
+            println!("      {:?} x{}", raw.raw_form, raw.count);
+        }
         println!("    models:");
         for model in &group.model_counts {
             println!("      {} x{}", model.model_name, model.count);

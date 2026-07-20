@@ -1827,11 +1827,14 @@ struct RelationVocabularyResponse {
     group_count: usize,
 }
 
-/// One relation (predicate) vocabulary group in the response.
+/// One relation (predicate) vocabulary group in the response. `predicate` is
+/// the NORMALIZED group key; `raw_forms` carries the pre-normalization
+/// predicate strings with counts, mirroring the entity group's raw-forms shape.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelationVocabularyGroupDto {
     predicate: String,
+    raw_forms: Vec<RawFormDto>,
     total_count: usize,
     source_count: usize,
     model_counts: Vec<ModelCountDto>,
@@ -2037,6 +2040,14 @@ fn read_vocabulary(
                 .into_iter()
                 .map(|group| RelationVocabularyGroupDto {
                     predicate: group.predicate,
+                    raw_forms: group
+                        .raw_forms
+                        .into_iter()
+                        .map(|raw| RawFormDto {
+                            raw_form: raw.raw_form,
+                            count: raw.count,
+                        })
+                        .collect(),
                     total_count: group.total_count,
                     source_count: group.source_count,
                     model_counts: group

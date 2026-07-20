@@ -90,8 +90,8 @@ DELETE FROM graph_entity_edges WHERE parse_id = ?1";
 /// Insert one `graph_entity_mentions` row: one row per (parse, normalized
 /// entity name), with `unit_ids_json` the canonical JSON string array of the
 /// deduplicated, deterministically ordered ContentUnit IDs the entity's
-/// annotations target, and `entity_type` the body's entityType (metadata, not
-/// identity — D9).
+/// annotations target, and `entity_type` the body's entityType NORMALIZED at
+/// this boundary (metadata, not identity — D9).
 const INSERT_MENTION_SQL: &str = "
 INSERT INTO graph_entity_mentions (
   id, projection_id, source_id, parse_id, normalized_name, entity_type,
@@ -100,7 +100,7 @@ INSERT INTO graph_entity_mentions (
 
 /// Insert one `graph_entity_edges` row: one row per CA relation annotation,
 /// directional (from_normalized_name = normalized subject, to_normalized_name =
-/// normalized object), relation_type = the relation's predicate, and
+/// normalized object), relation_type = the relation's NORMALIZED predicate, and
 /// `target_unit_ids_json` the canonical JSON string array of the relation
 /// annotation's target ContentUnit IDs (the edge's supporting units).
 const INSERT_EDGE_SQL: &str = "
@@ -179,6 +179,14 @@ ORDER BY normalized_name";
 /// lowercasing to guarantee the output is NFC regardless of case-mapping
 /// expansion. The result is therefore idempotent: normalizing an
 /// already-normalized name returns it unchanged.
+///
+/// This one deterministic scheme is ALSO the normalizer for the other two
+/// model-emitted strings — entity TYPES (mention metadata) and relation
+/// PREDICATES (edge `relation_type`) — applied at their derived-plane
+/// boundaries (`accumulate_mentions` / `derive_edges` here, and the vocabulary
+/// aggregation). It is NOT renamed, because the entity-name identity contract
+/// above is its primary and load-bearing role; the type/predicate reuse rides
+/// the identical whitespace-collapse → NFC → lowercase → NFC folding.
 pub(crate) fn normalize_entity_name(raw: &str) -> String {
     // Step 1: trim + collapse internal whitespace runs to a single ASCII space.
     let whitespace_collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -201,7 +209,8 @@ fn lowered_then_nfc(nfc: &str) -> String {
 /// normalized name. `unit_ids` accumulates (deduplicated, then deterministically
 /// ordered on flush) the target ContentUnit IDs of every entity annotation that
 /// normalizes to this name; `entity_type` is the first-seen entityType metadata
-/// for the name (D9: entityType is metadata, not identity, so a name that
+/// (itself normalized at the accumulation boundary) for the name (D9: entityType
+/// is metadata, not identity, so a name that
 /// appears with two entityTypes is still ONE node — the first-seen type is kept
 /// and the divergence is logged, never used to split the node).
 struct MentionAccumulator {
@@ -409,7 +418,13 @@ fn accumulate_mentions(
             continue;
         }
         let raw_name = entity_name(annotation)?;
-        let entity_type = entity_type(annotation);
+        // entityType is model-emitted metadata; stored annotation rows stay
+        // verbatim, so normalization is applied HERE at the derived-plane
+        // boundary. Folding through the same scheme collapses case/spacing
+        // variants (`Person`/`person`) so first-seen and the divergence check
+        // below compare on the normalized form, not the raw casing (D9: type is
+        // metadata, never identity).
+        let entity_type = entity_type(annotation).map(|raw| normalize_entity_name(&raw));
         let normalized = normalize_entity_name(&raw_name);
 
         let accumulator = mentions.entry(normalized).or_insert(MentionAccumulator {
@@ -417,8 +432,11 @@ fn accumulate_mentions(
             entity_type: entity_type.clone(),
         });
         // First-seen entityType wins; a later divergence is metadata noise, not
-        // an identity fork (D9). Logged without contents so the divergence is
-        // observable without leaking annotation bodies.
+        // an identity fork (D9). Compared on the NORMALIZED type, so a pure
+        // case/spacing variant of the same type is no longer reported as
+        // divergence — only a genuine post-normalization difference is. Logged
+        // without contents so the divergence is observable without leaking
+        // annotation bodies.
         if accumulator.entity_type != entity_type {
             info!(
                 event = "graph.entity_type_divergence",
@@ -448,12 +466,20 @@ struct DerivedEdges {
 
 /// Derive one directional edge per relation annotation. For each relation
 /// annotation: read its `{ "subject", "predicate", "object" }` body, normalize
-/// subject and object to their node identities, and emit an edge
-/// (subject→object) with relation_type = predicate and the relation
-/// annotation's target_unit_ids as supporting units. Directional semantics are
-/// preserved (subject is the from-node, object is the to-node): C7b's two-arm
-/// `one_hop_edges` reader restores both-direction traversal, so this builder
-/// stores each edge once in its natural direction rather than duplicating it.
+/// subject and object to their node identities, normalize the predicate through
+/// the same scheme, and emit an edge (subject→object) with relation_type = the
+/// NORMALIZED predicate and the relation annotation's target_unit_ids as
+/// supporting units. Directional semantics are preserved (subject is the
+/// from-node, object is the to-node): C7b's two-arm `one_hop_edges` reader
+/// restores both-direction traversal, so this builder stores each edge once in
+/// its natural direction rather than duplicating it.
+///
+/// Stored `semantic_annotations` rows stay VERBATIM (model output is an external
+/// payload); predicate normalization is applied HERE, at this derived-plane
+/// boundary, so the edge's `relation_type` is deterministic across spelling/case
+/// variants. A predicate that NORMALIZES to empty (whitespace-only raw) is
+/// treated exactly like the existing missing-predicate case: a loud build
+/// failure, because an edge with no predicate is meaningless.
 ///
 /// EMPTY-MARKER SKIP (visible, counted — distinct from malformed-body failure):
 /// an empty producer result is recorded by the worker as a fresh annotation
@@ -477,10 +503,24 @@ fn derive_edges(relation_annotations: &[&SemanticAnnotation]) -> Result<DerivedE
             continue;
         }
         let (subject, predicate, object) = relation_triple(annotation)?;
+        // Normalize the predicate to its derived-plane form. A whitespace-only
+        // predicate normalizes to "" and is rejected the same way a missing
+        // predicate is (see `relation_triple`) — an edge with no predicate is
+        // meaningless, so the build fails loudly rather than storing an empty
+        // relation_type.
+        let relation_type = normalize_entity_name(&predicate);
+        if relation_type.is_empty() {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "relation annotation {} has an empty `predicate` after normalization",
+                    annotation.id
+                ),
+            });
+        }
         edges.push(DerivedEdge {
             from_normalized_name: normalize_entity_name(&subject),
             to_normalized_name: normalize_entity_name(&object),
-            relation_type: predicate,
+            relation_type,
             target_unit_ids: annotation.target_unit_ids.clone(),
         });
     }
