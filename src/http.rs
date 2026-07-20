@@ -77,6 +77,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/shutdown", post(post_shutdown))
         // Held-parse listing (§13.4 disposition surface). Protected.
         .route("/parses", get(get_parses))
+        // Annotation vocabulary inspection (CA2 ruling 8): the operator surface
+        // for authoring the corpus-dependent policy rulesets. Protected.
+        .route("/annotations/vocabulary", get(get_annotation_vocabulary))
         // Inspection reads (§14/§10): public, and unit reads honor the
         // active-parse gate so a non-active parse's units are never served.
         .route("/units/{unitId}", get(get_unit))
@@ -84,6 +87,43 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sources/{sourceId}", get(get_source))
         .route("/sync/status", get(get_sync_status))
         // Operation polling (§34.6). Protected.
+        .route("/operations/{operationId}", get(get_operation))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .with_state(state)
+}
+
+/// Build the REDUCED Axum router for the CA2-P5 annotation dry-run mode (ruling
+/// 9). The mode runs a one-shot scan → parse pass inline, then serves ONLY the
+/// inspection surface until shutdown, so this router exposes exactly four routes:
+///
+///   - `GET /v1/health` — mode readiness (inference reports not-ready by design;
+///     the mode initializes no model runtimes, so its `inference` component
+///     carries the explicit "annotation dry-run mode" error detail).
+///   - `GET /annotations/vocabulary` — the P4 inspection route, the dry run's
+///     whole point. Its `scope=all` reads annotations on NON-ACTIVE parses, which
+///     is exactly the dry-run pass's output (the parses are left ready, never
+///     activated). Protected (admin bearer).
+///   - `GET /operations/{operationId}` — Operation polling, protected. Served so
+///     an operator can inspect any Operation row that predates this run.
+///   - `POST /shutdown` — protected; ends the inspection phase cleanly.
+///
+/// The FULL router is deliberately NOT served: there is no scheduler thread, no
+/// annotation worker, and no inference in this mode, so the query path, the
+/// mutating admin routes (POST /sources, /parses/*, /snapshots, /restore, …), and
+/// the sync/unit/source inspection reads would accept work that nothing drains
+/// (or that has no live retrieval planes to answer). Reusing the existing handlers
+/// unchanged keeps auth, validation, and the spawn-blocking discipline identical
+/// to the full server. The same body-limit layer applies.
+// Consumed by the main-loop dry-run wiring (the `--annotation-dry-run` mode
+// branch main.rs adds serves this router instead of `build_router`); dead until
+// that branch lands.
+#[allow(dead_code)]
+pub fn build_dry_run_router(state: Arc<AppState>) -> Router {
+    let max_request_body_bytes = state.config.server.max_request_body_bytes;
+    Router::new()
+        .route("/v1/health", get(get_health))
+        .route("/annotations/vocabulary", get(get_annotation_vocabulary))
+        .route("/shutdown", post(post_shutdown))
         .route("/operations/{operationId}", get(get_operation))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
@@ -499,6 +539,9 @@ fn run_query_pipeline(
         &gate,
         index_root,
         profile,
+        // CA2 D9 amendment: the operator-loaded entity-match policy governs the
+        // graph channel's fuzzy entry classes (ships disabled = exact-only).
+        state.entity_match_policy(),
         colbert_expected_dimension,
         &query_id,
         &validated.query_text,
@@ -1710,6 +1753,321 @@ fn parse_run_from_row(row: ParseRunRow) -> Result<ParseRun, ApiError> {
         created_at: row.created_at,
         error: row.error,
     })
+}
+
+// --- Annotation vocabulary inspection (CA2 ruling 8) ------------------------
+//
+// The operator-facing surface for authoring the corpus-dependent policy
+// rulesets (entity-match, annotator-naming): it exposes the entity names and
+// relation predicates the annotation models actually produced. Protected (admin
+// bearer), bounded reads with explicit truncation, and — unlike the projection
+// builders — tolerant of imperfect data because it EXISTS to reveal anomalies
+// (see the aggregation module banner, `crate::annotations::vocabulary`).
+
+/// Query params for `GET /annotations/vocabulary`. `annotationType` is required
+/// and MUST be `entity` or `relation` (the only two producers whose vocabulary
+/// is authored against). `scope` defaults to `active` (annotations of each
+/// source's active parse); `all` includes never-activated dry-run output.
+///
+/// Kept as raw strings (not enums) so an unknown value produces the standard
+/// JSON 400 envelope in the handler, AFTER auth — a serde enum reject would leak
+/// a plain-text framework 400 ahead of the bearer check (the same auth-first
+/// discipline `ParsesQuery` documents).
+#[derive(Debug, Deserialize)]
+struct VocabularyQuery {
+    #[serde(rename = "annotationType")]
+    annotation_type: Option<String>,
+    scope: Option<String>,
+}
+
+/// Response envelope for `GET /annotations/vocabulary?annotationType=entity`.
+/// Sorted by normalized name ascending so spelling variants sit adjacent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityVocabularyResponse {
+    annotation_type: String,
+    scope: String,
+    groups: Vec<EntityVocabularyGroupDto>,
+    /// Empty-marker rows (body exactly `[]`) skipped and counted, not grouped.
+    skipped_marker_count: usize,
+    /// Malformed rows counted, not grouped, never fatal (inspection reveals them).
+    malformed_row_count: usize,
+    /// True when the row-read cap OR the group cap clipped the result.
+    truncated: bool,
+    /// Rows read (bounded), for operator sizing of the truncation.
+    rows_read: usize,
+    /// Groups returned (== groups.len(), surfaced for quick reading).
+    group_count: usize,
+}
+
+/// One entity vocabulary group in the response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityVocabularyGroupDto {
+    normalized_name: String,
+    raw_forms: Vec<RawFormDto>,
+    entity_types: Vec<String>,
+    source_count: usize,
+    model_counts: Vec<ModelCountDto>,
+    total_count: usize,
+}
+
+/// Response envelope for `GET /annotations/vocabulary?annotationType=relation`.
+/// Sorted by predicate.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelationVocabularyResponse {
+    annotation_type: String,
+    scope: String,
+    groups: Vec<RelationVocabularyGroupDto>,
+    skipped_marker_count: usize,
+    malformed_row_count: usize,
+    truncated: bool,
+    rows_read: usize,
+    group_count: usize,
+}
+
+/// One relation (predicate) vocabulary group in the response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelationVocabularyGroupDto {
+    predicate: String,
+    total_count: usize,
+    source_count: usize,
+    model_counts: Vec<ModelCountDto>,
+}
+
+/// One raw form and its count within an entity group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFormDto {
+    raw_form: String,
+    count: usize,
+}
+
+/// One model name and its occurrence count within a group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCountDto {
+    model_name: String,
+    count: usize,
+}
+
+/// Either vocabulary response, so one handler serves both annotation types
+/// through one auth/validation/spawn-blocking path. axum serializes the enum's
+/// inner value transparently (untagged), so the wire shape is exactly the
+/// entity or relation envelope with no wrapper.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum VocabularyResponse {
+    Entity(EntityVocabularyResponse),
+    Relation(RelationVocabularyResponse),
+}
+
+/// Handle `GET /annotations/vocabulary?annotationType=entity|relation&scope=active|all`
+/// (CA2 ruling 8, PROTECTED). Auth-first: the query extractor is `Result`-wrapped
+/// so a malformed query is reported through the JSON envelope, not the
+/// framework's plain-text pre-auth rejection (same discipline as `get_parses`).
+/// A missing/invalid `annotationType` is a 400; `scope` defaults to `active`.
+/// The aggregation is SQLite work, so it runs in `spawn_blocking` and opens its
+/// own read-only connection at the boundary (mirroring `get_parses`).
+async fn get_annotation_vocabulary(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<VocabularyQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Result<Json<VocabularyResponse>, ApiError> {
+    let route = "/annotations/vocabulary";
+    let started = log_route_started(route, "authorizing");
+    authorize_request(&state, &headers, route, &started)?;
+
+    // Only after auth do we examine the query extractor result (auth-first).
+    let Query(params) = params.map_err(|rejection| {
+        let error = ApiError::BadRequest {
+            message: rejection.body_text(),
+        };
+        log_route_failed(route, "validating", &error, &started);
+        error
+    })?;
+
+    // annotationType is required and closed to {entity, relation}.
+    let annotation_type = match params.annotation_type.as_deref() {
+        Some("entity") => crate::model::SemanticAnnotationType::Entity,
+        Some("relation") => crate::model::SemanticAnnotationType::Relation,
+        other => {
+            let error = ApiError::BadRequest {
+                message: format!(
+                    "GET /annotations/vocabulary requires annotationType=entity|relation; got {other:?}"
+                ),
+            };
+            log_route_failed(route, "validating", &error, &started);
+            return Err(error);
+        }
+    };
+
+    // scope defaults to active; only active|all are accepted.
+    let scope = match params.scope.as_deref() {
+        None | Some("active") => crate::annotations::vocabulary::VocabularyScope::Active,
+        Some("all") => crate::annotations::vocabulary::VocabularyScope::All,
+        Some(other) => {
+            let error = ApiError::BadRequest {
+                message: format!(
+                    "GET /annotations/vocabulary scope must be active|all; got {other:?}"
+                ),
+            };
+            log_route_failed(route, "validating", &error, &started);
+            return Err(error);
+        }
+    };
+
+    let index_root = state.config.storage.index_root.clone();
+    let response =
+        tokio::task::spawn_blocking(move || read_vocabulary(&index_root, annotation_type, scope))
+            .await
+            .map_err(|join_error| ApiError::InternalIo {
+                message: format!("vocabulary aggregation task failed to join: {join_error}"),
+            })??;
+
+    // Handler-boundary log: bounded facts only — NEVER vocabulary text. Scope,
+    // type, group/row counts, skips, truncation, elapsed (CA2 ruling 8, item 4).
+    let (group_count, rows_read, skipped, malformed, truncated) = match &response {
+        VocabularyResponse::Entity(entity) => (
+            entity.group_count,
+            entity.rows_read,
+            entity.skipped_marker_count,
+            entity.malformed_row_count,
+            entity.truncated,
+        ),
+        VocabularyResponse::Relation(relation) => (
+            relation.group_count,
+            relation.rows_read,
+            relation.skipped_marker_count,
+            relation.malformed_row_count,
+            relation.truncated,
+        ),
+    };
+    let annotation_type_wire = match annotation_type {
+        crate::model::SemanticAnnotationType::Entity => "entity",
+        crate::model::SemanticAnnotationType::Relation => "relation",
+        // Unreachable: the match above admits only entity/relation.
+        _ => "unknown",
+    };
+    let scope_wire = match scope {
+        crate::annotations::vocabulary::VocabularyScope::Active => "active",
+        crate::annotations::vocabulary::VocabularyScope::All => "all",
+    };
+    info!(
+        event = "http.route.result_ready",
+        route,
+        stage = "result_ready",
+        status = 200_u16,
+        annotation_type = annotation_type_wire,
+        scope = scope_wire,
+        group_count,
+        rows_read,
+        skipped_marker_count = skipped,
+        malformed_row_count = malformed,
+        truncated,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP route result ready"
+    );
+    Ok(Json(response))
+}
+
+/// Open a read-only connection at the boundary and aggregate the requested
+/// vocabulary (mirrors `read_held_parses`: the read function owns `open_read`;
+/// the handler runs it in `spawn_blocking`). Maps the aggregation module's typed
+/// result into the camelCase wire DTOs.
+fn read_vocabulary(
+    index_root: &std::path::Path,
+    annotation_type: crate::model::SemanticAnnotationType,
+    scope: crate::annotations::vocabulary::VocabularyScope,
+) -> Result<VocabularyResponse, ApiError> {
+    let connection = crate::hot_plane::open_read(index_root)?;
+    let scope_wire = match scope {
+        crate::annotations::vocabulary::VocabularyScope::Active => "active",
+        crate::annotations::vocabulary::VocabularyScope::All => "all",
+    }
+    .to_owned();
+
+    match annotation_type {
+        crate::model::SemanticAnnotationType::Entity => {
+            let vocabulary = crate::annotations::vocabulary::entity_vocabulary(&connection, scope)?;
+            let groups: Vec<EntityVocabularyGroupDto> = vocabulary
+                .groups
+                .into_iter()
+                .map(|group| EntityVocabularyGroupDto {
+                    normalized_name: group.normalized_name,
+                    raw_forms: group
+                        .raw_forms
+                        .into_iter()
+                        .map(|raw| RawFormDto {
+                            raw_form: raw.raw_form,
+                            count: raw.count,
+                        })
+                        .collect(),
+                    entity_types: group.entity_types,
+                    source_count: group.source_count,
+                    model_counts: group
+                        .model_counts
+                        .into_iter()
+                        .map(|model| ModelCountDto {
+                            model_name: model.model_name,
+                            count: model.count,
+                        })
+                        .collect(),
+                    total_count: group.total_count,
+                })
+                .collect();
+            Ok(VocabularyResponse::Entity(EntityVocabularyResponse {
+                annotation_type: "entity".to_owned(),
+                scope: scope_wire,
+                group_count: groups.len(),
+                groups,
+                skipped_marker_count: vocabulary.skipped_markers,
+                malformed_row_count: vocabulary.malformed_rows,
+                truncated: vocabulary.truncated,
+                rows_read: vocabulary.rows_read,
+            }))
+        }
+        crate::model::SemanticAnnotationType::Relation => {
+            let vocabulary =
+                crate::annotations::vocabulary::relation_vocabulary(&connection, scope)?;
+            let groups: Vec<RelationVocabularyGroupDto> = vocabulary
+                .groups
+                .into_iter()
+                .map(|group| RelationVocabularyGroupDto {
+                    predicate: group.predicate,
+                    total_count: group.total_count,
+                    source_count: group.source_count,
+                    model_counts: group
+                        .model_counts
+                        .into_iter()
+                        .map(|model| ModelCountDto {
+                            model_name: model.model_name,
+                            count: model.count,
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok(VocabularyResponse::Relation(RelationVocabularyResponse {
+                annotation_type: "relation".to_owned(),
+                scope: scope_wire,
+                group_count: groups.len(),
+                groups,
+                skipped_marker_count: vocabulary.skipped_markers,
+                malformed_row_count: vocabulary.malformed_rows,
+                truncated: vocabulary.truncated,
+                rows_read: vocabulary.rows_read,
+            }))
+        }
+        // The handler admits only entity/relation into this function; any other
+        // type is a caller bug surfaced loudly rather than served empty.
+        other => Err(ApiError::InternalIo {
+            message: format!(
+                "vocabulary aggregation received unsupported annotation type {other:?}"
+            ),
+        }),
+    }
 }
 
 // --- Inspection read helpers -----------------------------------------------

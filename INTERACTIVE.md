@@ -16,6 +16,10 @@ data-store                            # uses ./config.toml
 data-store --config /path/to/config.toml
 ```
 
+Service-binary flags (`--setup-storage`, `--foreground`, `--smoke-dense`,
+`--annotation-dry-run`) belong to `data-store-service`; the `data-store` client
+rejects them as unknown arguments.
+
 The REPL shares the same `config.toml` as the service. From it, the client
 resolves:
 
@@ -52,6 +56,7 @@ Commands and their usage strings (from the client's command table):
 | `shutdown` | `shutdown` | Admin; control action (not polled). |
 | `held-parses` (alias `held`) | `held-parses` | List held parses awaiting disposition. |
 | `operation` | `operation <operationId>` | Read one operation record (single snapshot). |
+| `vocabulary` (alias `vocab`) | `vocabulary <entity\|relation> [active\|all]` | Inspect the annotation vocabulary; scope defaults to `active`. |
 | `unit` | `unit <unitId>` | Read a unit. |
 | `relationships` | `relationships <unitId> [direction] [relationshipType]` | Optional filters. |
 | `source` | `source <sourceId>` | Read a source. |
@@ -64,7 +69,17 @@ tokens; inside quotes a backslash escapes only `"` and `\` (any other escaped
 character keeps its backslash); outside quotes a backslash is literal; an
 unterminated quote is an error. There is no shell expansion of any kind. JSON
 arguments (`query`, and the optional `snapshot` body) are parsed and validated
-before any request is sent.
+before any request is sent. The `vocabulary` arguments are likewise validated
+locally: the first must be `entity` or `relation`, the optional second must be
+`active` or `all`.
+
+`vocabulary` prints the grouped annotation vocabulary in the server's served
+order — a header with the type, scope, and group count, then a completeness line
+(rows read, empty-marker and malformed-row counts, and a loud truncation warning
+when the view is partial), then one block per group (entity: normalized name
+with total/source counts, entity types, raw forms, and per-model counts;
+relation: predicate with total/source counts and per-model counts). See
+`SPEC-CLIENT.md` for the full rendering detail.
 
 ## Polling model
 

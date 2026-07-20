@@ -54,6 +54,16 @@ pub(crate) struct ApplicationIdentity {
     /// §30.7 aggregate `configurationHash` — lowercase-hex SHA-256 over the
     /// audit-relevant configuration (secret PATHS only; see `configuration_hash`).
     pub(crate) configuration_hash: String,
+    /// Content hash of the loaded entity-match policy document (D3 amendment,
+    /// CA2). The configuration hash covers only the document's PATH; the
+    /// document itself is operator-mutable, so its content identity is pinned
+    /// here — a replay environment must reconstruct the same ruleset, not just
+    /// the same path.
+    pub(crate) entity_match_policy_hash: String,
+    /// Content hash of the loaded annotator naming-rules policy document
+    /// (same rationale as `entity_match_policy_hash`; this one is also
+    /// producer-identity-bearing via promptHash composition).
+    pub(crate) annotator_naming_policy_hash: String,
 }
 
 impl ApplicationIdentity {
@@ -64,12 +74,21 @@ impl ApplicationIdentity {
     /// existing `system_version`/`build_features`/`configuration_hash` sources
     /// and the `SPEC_VERSION` constant so the captured shape never drifts from
     /// what a snapshot header stamps.
-    pub(crate) fn capture(config: &ServiceConfig) -> Result<Self, ApiError> {
+    /// The two policy content hashes come from the documents loaded moments
+    /// earlier in startup (`policy::load_*`); capture takes the hashes rather
+    /// than the paths so the identity records what was actually loaded.
+    pub(crate) fn capture(
+        config: &ServiceConfig,
+        entity_match_policy_hash: &str,
+        annotator_naming_policy_hash: &str,
+    ) -> Result<Self, ApiError> {
         Ok(ApplicationIdentity {
             system_version: system_version().to_owned(),
             spec_version: SPEC_VERSION.to_owned(),
             build_features: build_features().into_iter().map(str::to_owned).collect(),
             configuration_hash: configuration_hash(config)?,
+            entity_match_policy_hash: entity_match_policy_hash.to_owned(),
+            annotator_naming_policy_hash: annotator_naming_policy_hash.to_owned(),
         })
     }
 }
@@ -145,6 +164,13 @@ struct ConfigurationIdentity {
 
     docling: DoclingIdentity,
     models: ModelIdentity,
+
+    /// PATHS of the operator-editable policy documents (D3 amendment, CA2).
+    /// Paths only — the documents' CONTENT identity is carried by the two
+    /// content-hash fields on `ApplicationIdentity` itself, because the
+    /// content is operator-mutable state outside this config projection.
+    policy_entity_match_file_path: String,
+    policy_annotator_naming_file_path: String,
 }
 
 /// Docling execution settings that affect conversion output and therefore
@@ -283,6 +309,10 @@ impl ConfigurationIdentity {
                     .as_deref()
                     .map(path_string),
             },
+            policy_entity_match_file_path: path_string(&config.policies.entity_match_file_path),
+            policy_annotator_naming_file_path: path_string(
+                &config.policies.annotator_naming_file_path,
+            ),
         }
     }
 }

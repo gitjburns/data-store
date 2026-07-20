@@ -8,6 +8,18 @@
 //! identical model input under an identical producer configuration, so the
 //! prior output can be re-minted without re-invoking the model.
 //!
+//! CA2 KEY SPLIT (user-ruled 2026-07-19). Two keys derive from ONE shared
+//! `KeyMaterial` (ordered target content hashes × annotation type):
+//!   - the CONTENT KEY (`content_key_hash`) hashes that material alone and
+//!     scopes SATISFACTION and reopenable classification (in `store`/`worker`),
+//!     so a model switch re-annotates only the frontier, not the whole corpus;
+//!   - the MEMO KEY (`memoization_key_hash`) hashes that material PLUS the
+//!     producer identity hash and stays the CACHE key here — cross-identity
+//!     reuse must remain impossible (memoization honesty).
+//!
+//! The memo key's output bytes are UNCHANGED from the pre-CA2 formula; only its
+//! construction now flows through the shared material builder.
+//!
 //! One cache ROW caches one producer INVOCATION's full output — an array of
 //! produced items — because a single invocation can yield many annotations
 //! (e.g. every entity in a section). `original_annotation_id` anchors the row
@@ -88,31 +100,103 @@ struct PersistedMemoItem {
     original_annotation_id: String,
 }
 
-/// Compute the §21.2 memoization key hash for one planned invocation:
-/// canonical SHA-256 over `{targetContentHashes, annotationType,
-/// producerIdentityHash}`. `targetContentHashes` is the ordered per-target
-/// content hash list (textHash-or-bodyHash of each target's content unit),
-/// keeping the key faithful to the exact input the producer will send. Reads
-/// the per-unit hashes by unit id via a named-constant SQL query.
-pub(crate) fn memoization_key_hash(
+/// The canonical material shared by BOTH keys of one invocation: the ordered
+/// per-target content hash list (textHash-or-bodyHash of each target's content
+/// unit, in target order) and the annotation type wire name. This is the SINGLE
+/// SOURCE OF TRUTH the content key and the memo key both derive from (CA2-P1,
+/// user-ruled 2026-07-19) — the content key hashes exactly this material, the
+/// memo key hashes this material PLUS the producer identity hash. Building it
+/// once guarantees the two keys can never drift in their shared ingredients.
+struct KeyMaterial {
+    target_content_hashes: Vec<String>,
+    annotation_type: String,
+}
+
+/// Read the shared key material for one planned invocation. Reads each target's
+/// content hash by unit id (via a named-constant SQL query) in target order,
+/// then resolves the annotation type wire name. Consumed by both key derivations.
+fn key_material(
     conn: &Connection,
     kind: ProducerKind,
-    config: &AnnotatorModelConfig,
     invocation: &Invocation,
-) -> Result<String, ApiError> {
+) -> Result<KeyMaterial, ApiError> {
     let mut target_content_hashes = Vec::with_capacity(invocation.targets.len());
     for target in &invocation.targets {
         target_content_hashes.push(unit_content_hash(conn, &target.unit_id)?);
     }
     let annotation_type = annotation_type_wire_name(kind.annotation_type())?;
-    let producer_identity_hash = kind.identity_hash(config)?;
+    Ok(KeyMaterial {
+        target_content_hashes,
+        annotation_type,
+    })
+}
+
+/// Compute the CA2 CONTENT KEY hash for one planned invocation: canonical
+/// SHA-256 over `{targetContentHashes, annotationType}` — the memo-key material
+/// MINUS the producer identity hash. This key scopes SATISFACTION and reopenable
+/// classification (`store`/`worker`) to target CONTENT alone, so an
+/// annotator-model change re-annotates only the frontier (new/changed content,
+/// re-parses, failed-row retries) instead of the whole corpus. The memo CACHE
+/// stays identity-scoped (see `memoization_key_hash`): a model switch annotates
+/// the frontier, but cross-identity cache reuse remains impossible because
+/// memoization honesty forbids re-minting one model's output as another's.
+/// (CA2 ruling, user-approved 2026-07-19.)
+pub(crate) fn content_key_hash(
+    conn: &Connection,
+    kind: ProducerKind,
+    invocation: &Invocation,
+) -> Result<String, ApiError> {
+    let material = key_material(conn, kind, invocation)?;
+    content_key_hash_from_material(&material)
+}
+
+/// Compute the §21.2 memoization key hash for one planned invocation: canonical
+/// SHA-256 over `{targetContentHashes, annotationType, producerIdentityHash}`.
+/// Byte-identical to the pre-CA2 formula for identical inputs — the derivation
+/// was restructured to share `KeyMaterial` with the content key, but the hashed
+/// document is unchanged (canonical §16.2 sorts keys, so field order in the
+/// `json!` literal is irrelevant to the bytes). The added `producerIdentityHash`
+/// ingredient is what keeps the memo CACHE identity-scoped: a producer identity
+/// or configuration change changes this key and invalidates reuse, so one
+/// model's output is never re-minted as another's (memoization honesty).
+///
+/// `naming_rules` (CA2-P3, user-ruled 2026-07-19) flows in ONLY through the
+/// producer-identity-hash ingredient — `identity_hash` folds the COMPOSED
+/// prompt's hash — so an operator naming-policy edit changes this key
+/// (invalidating Entity/Relation memo reuse) while the key document gains no
+/// new field. With an EMPTY rule list the composed prompt is byte-identical to
+/// the bare prompt, so the identity hash — and therefore this key's output
+/// bytes — are unchanged. The CONTENT key below never sees the rules:
+/// satisfaction stays content-scoped exactly as CA2-P1 left it.
+pub(crate) fn memoization_key_hash(
+    conn: &Connection,
+    kind: ProducerKind,
+    config: &AnnotatorModelConfig,
+    naming_rules: &[String],
+    invocation: &Invocation,
+) -> Result<String, ApiError> {
+    let material = key_material(conn, kind, invocation)?;
+    let producer_identity_hash = kind.identity_hash(config, naming_rules)?;
 
     // Canonical §16.2 serialization (sorted keys, NFC strings) makes this key
     // deterministic across processes: the same inputs always hash identically.
+    // This document — and thus the output bytes — is UNCHANGED from the pre-CA2
+    // formula; only its construction now flows through `KeyMaterial`.
     let key_document = json!({
-        "targetContentHashes": target_content_hashes,
-        "annotationType": annotation_type,
+        "targetContentHashes": material.target_content_hashes,
+        "annotationType": material.annotation_type,
         "producerIdentityHash": producer_identity_hash,
+    });
+    crate::canonical::canonical_sha256_hex(&key_document)
+}
+
+/// Hash the shared content material into the CA2 content key. Separated from
+/// `content_key_hash` so a caller already holding `KeyMaterial` (never today,
+/// but kept symmetric with the memo path) does not re-read the unit hashes.
+fn content_key_hash_from_material(material: &KeyMaterial) -> Result<String, ApiError> {
+    let key_document = json!({
+        "targetContentHashes": material.target_content_hashes,
+        "annotationType": material.annotation_type,
     });
     crate::canonical::canonical_sha256_hex(&key_document)
 }

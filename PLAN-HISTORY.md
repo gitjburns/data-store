@@ -5,7 +5,7 @@ Status entries from `PLAN-CANONICAL-FABRIC.md`: the 2026-07-05 first entry
 through the 2026-07-18 CPc-attempt-2 / NaN-sanitize-fix / CPb-verification
 session. Nothing was summarized or edited in the move; date-cited
 cross-references elsewhere in the plan ("see the YYYY-MM-DD entry") resolve
-here. The plan file retains the latest session entry, the Handoff, and its
+here. The plan file retains the one-line ledger, the Handoff, and its
 §1–§5 sections. This file is an audit record, not part of the default
 onboarding read list — read it only when a dated entry must be consulted.
 
@@ -17,6 +17,13 @@ C10/CP fact bases, CPa/CPb/CPd, the §37 acceptance-traceability table, and
 the §4 full decision texts. The plan file now retains condensed rulings
 indexes in §4 pointing here by grep anchor; nothing was summarized or
 edited in the move.
+
+Third-stage relocation (2026-07-19, user-approved): the session entries
+from the 2026-07-18 CPd-hybrid session through the 2026-07-19 CA2
+implementation session moved into "Completed Current Status entries",
+and the completed CPc/CPd2 package texts plus cluster CA2 moved into a
+third-stage "Retired planning sections" part at the end of this file.
+Same rule: verbatim, nothing summarized or edited in the move.
 
 ## Completed Current Status entries
 
@@ -2406,6 +2413,577 @@ edited in the move.
     the annotation-chain first run), then discussion B (parse/embed
     overlap), then C10f runs R4–R9.
 
+- 2026-07-18 (CPd hybrid session): the CPd length-threshold HYBRID
+  ruled (Option A, user-approved 2026-07-18) and COMPLETE —
+  implemented main-loop per the approved plan (small ruled fix;
+  CPc-session precedent, a disclosed §1.4 deviation including this
+  status entry), verified by the cargo battery plus ONE Opus
+  refute-by-default review agent over the diff (the
+  focused-confirmer precedent) in place of the full five-dimension
+  ceremony — the change only routes between two already-validated
+  embed paths.
+  - multivector.rs: new code constant
+    `COLBERT_BATCH_ROUTE_MAX_TOKENS = 128` (engineering-fact
+    comment citing the 2026-07-18 interim length-bucketed
+    measurements — 4.4x near 16 tokens, break-even ~130, 1.8x
+    slower at the 512 cap; revisit against CPc full-corpus data);
+    `build_rows` counts each unit's raw-text ColBERT tokens once
+    (`count_document_tokens` — same tokenizer call as the C6b chunk
+    builder, failures unit-id-attributed via
+    `ApiError::InferenceInit`, the runtime's own
+    tokenization-failure class), partitions at the threshold,
+    embeds long units through the singular `embed_document`
+    (per-unit `model_call.*` pairs return for exactly those units)
+    and packs short units into 16-doc `embed_documents` windows
+    sorted by the routing token counts — retiring the banked
+    byte-length proxy sort; per-unit validate→encode→INSERT
+    extracted into shared `persist_unit_matrix` (persistence
+    byte-identical on both paths); `multivector_build.completed`
+    gained `batched_unit_count`/`singular_unit_count` (per-path
+    benchmark attribution; the failed arm omits them — routing may
+    not have completed at that boundary).
+  - colbert.rs: `embed_document` returned to production — stale
+    `#[allow(dead_code)]` removed, doc rewritten (long-unit hybrid
+    role + diagnostic-bin consumer + pinned byte-compatibility
+    reference). No behavior edits in this file.
+  - Verification: review checklist all clean (exactly-once routing
+    coverage, post-sort indexing, persistence fidelity, gate
+    discipline, empty-pool edges, log-field safety, scope
+    containment), 12 candidates refuted, ONE MED finding CONFIRMED
+    and fixed: the embed paths tokenize the prompt-PREFIXED text
+    (`"search_document: [D] " + text`, colbert.rs
+    `format_document`), so the embedded sequence runs a fixed few
+    tokens longer than the routing count and the original comments
+    falsely claimed the two counts always agree. The bias itself is
+    benign (a constant ~5-token shift at the gentle break-even; the
+    constant delta preserves the packing sort order exactly) —
+    fixed as comment corrections at four sites recording the bias
+    honestly; counting the prefixed text instead was excluded as
+    disproportionate coupling to the runtime's private prompt
+    format (recorded routing-boundary bias, threshold unchanged
+    at 128).
+  - Residual risk (CPc): the hybrid routing is compile-verified
+    only; first live execution is the CPc re-ingest, where the
+    unchanged batch-consistency smoke still gates the batched path
+    at startup and the new per-path counts make stage time directly
+    attributable per path.
+  - All checks green, zero warnings: `cargo fmt`, `cargo check`,
+    `cargo check --features metal`, `cargo clippy`,
+    `cargo clippy --features metal`.
+  - Next: rule on the annotation-worker write-lock starvation
+    finding, then the CPc full re-ingest (FRESH approval needed for
+    the `index/fabric/` deletion — the plane still holds partial
+    aborted cycle #2), then discussion B (parse/embed overlap),
+    then C10f runs R4–R9.
+
+- 2026-07-18 (lock-starvation ruling session): the annotation-worker
+  WRITE-LOCK STARVATION finding RULED (Option B, user-approved
+  2026-07-18 — quiet pre-paid deferral + shutdown-bounded post-paid
+  wait; Option A, moving model compute outside the projection-build
+  write transaction, BANKED as a post-CPc structural candidate whose
+  case notes the same starvation hits C10a admin-Operation
+  `insert_pending` writes during bulk ingest) and COMPLETE —
+  implemented by one Opus agent-serial package per §1.4, verified by
+  one Opus refute-by-default review agent (the CPd-hybrid
+  focused-confirmer precedent) plus a directed fix pass.
+  - hot_plane.rs: new `WriteTransactionAttempt` +
+    `begin_write_transaction_if_free` — SQLITE_BUSY
+    (`ErrorCode::DatabaseBusy` after busy_timeout expiry) is
+    classified as a typed INFO `Busy` outcome (the authoritative
+    writer-contention signal; a scheduler-published in-progress flag
+    was excluded as a hand-maintained parallel copy of lock truth);
+    every other error keeps the exact existing ERROR +
+    `StorageOperation` mapping. `begin_write_transaction` and all
+    its callers untouched.
+  - annotations/worker.rs: two-category boundary policy (module
+    header documents it). PRE-PAID boundaries (`memo_remint`,
+    `build_open`, the annotation-derived `projection_build`) defer
+    quietly on Busy — no producer call, `deferred` count, ONE
+    `annotation_worker.cycle_deferred` INFO, cycle build work ends
+    early via typed `BuildFlow` outcomes (never a sentinel error);
+    stateless discovery re-finds the work next cycle. POST-PAID
+    boundaries (`build_complete`, `build_fail`) retry in a
+    shutdown-bounded wait loop — each attempt rides the 5 s
+    busy_timeout, `completion_waiting` INFO ~every 5 min, on
+    shutdown a `completion_abandoned_shutdown` WARN falling back to
+    the existing crash-orphan adoption path; NO retry-count bound —
+    the shutdown signal is the bound (knob-free, deliberate).
+    Shutdown probe = `ShutdownSignal::wait_timeout(Duration::ZERO)`.
+    `record_projection_build_failure` unchanged (already
+    best-effort).
+  - state.rs: `AnnotationCycleCounts.deferred` added and threaded
+    through the cycle summary log, the health publish, and the
+    operator health render.
+  - Verification: 12 candidates refuted, TWO findings CONFIRMED and
+    fixed: (HIGH) the `build_open` boundary deferred silently — no
+    count, no log, with comments asserting otherwise — now
+    counted+logged at the single `build_work_item` choke point,
+    comments corrected; (MED) post-paid shutdown-abandon returned
+    `Continue`, so a fresh PAID producer call could start after a
+    shutdown request when the writer lock raced free — new
+    `BuildFlow::ShutdownAbort` variant ends the cycle, deliberately
+    distinct from `Deferred` so a shutdown event is never
+    misattributed as lock contention in the deferred count.
+  - All checks green, zero warnings: `cargo fmt`, `cargo check`,
+    `cargo check --features metal`, `cargo clippy`,
+    `cargo clippy --features metal`.
+  - Residual risk (CPc): compile-verified only; the contention
+    reproduces naturally at the CPc re-ingest, where the `deferred`
+    count and quiet-cycle logs become directly observable (and the
+    previous every-30s ERROR pairs must be ABSENT from the run's
+    log era).
+  - Next: the CPc full re-ingest (FRESH approval needed for the
+    `index/fabric/` deletion — the plane still holds partial aborted
+    cycle #2; release rebuild required first), then discussion B
+    (parse/embed overlap), then C10f runs R4–R9.
+
+- 2026-07-19 (HTTP-dense-backend session): CPc attempt 3 ran cleanly
+  to ~5/14 sources on a fresh plane (approved deletion +
+  `--setup-storage`; a first start at 06:06Z died from an operator
+  pipe — the background-mode startup relay chain dies on SIGPIPE if
+  its stdout reader closes early, taking the service child with it;
+  do not pipe `start.sh` through short-lived readers — clean restart
+  06:09Z). Startup batch-consistency smoke PASSED (CPd batched path
+  admitted live). Ruling-B OBSERVED WORKING on both boundary
+  categories: a real annotator outage (endpoint down 06:32–07:01Z,
+  163+ status-none ~1 s failures — the endpoint itself, curl failed
+  identically; NOT Little Snitch) parked builds failed with per-call
+  attributed ERRORs and clean recovery on restore, and the post-paid
+  `completion_waiting` loop rode a ~16-minute writer-lock hold
+  (scheduler dense projection build) at the designed ~5-min INFO
+  cadence with ZERO error pairs — live evidence for the banked
+  Option A structural candidate. Partial measurements: local
+  passage_embedding avg 1,678 ms (63% of wall through 5 sources);
+  CPd ColBERT hybrid ~4.8 min total (383 batched windows avg 259 ms
+  + 1,469 singular). Run KILLED at user direction (SIGTERM + orphan
+  Docling child) for the HTTP-dense pivot, user-ruled: implement the
+  recorded largest-structural-lever HTTP dense backend NOW,
+  re-benchmark after, then a Docling-parallelism design pass
+  superseding discussion B; C10f R4–R9 after that.
+- 2026-07-19 (same session, package): HTTP dense-embedding backend
+  COMPLETE — user-approved design: reranker-pattern exclusive
+  Local/Http enum split (`DenseEmbeddingBackend`, NEW
+  src/inference/dense_backend.rs), OpenAI-compatible /v1/embeddings
+  client (per-`index` reorder, per-vector dimension/finite/
+  nonzero-norm validation, client-side L2 normalize, bearer key
+  loaded once and never logged), batched `embed_passage_vectors`
+  with builder windows of `DENSE_HTTP_BATCH_SIZE = 32` (code
+  constant, engineering-fact comment, pending re-benchmark), prompt
+  formatting single source of truth
+  (`format_dense_query_text`/`format_dense_passage_text` +
+  `DENSE_SMOKE_TEXT` in inference/dense.rs — the HTTP path sends
+  byte-identical text to what the local runtime tokenizes),
+  backend-aware caller-side gating (`uses_local_model_gate`; HTTP
+  acquires NOTHING, never held across HTTP I/O; local path
+  bit-identical incl. batch-1), http startup smoke replacing the
+  local artifact/model load, honest per-backend identity capture
+  (key PATH only), `model_call.*` diagnostics with no
+  payloads/vectors/secrets. Config (main-loop): [models.dense]
+  backend discriminator + exclusive per-backend validation mirroring
+  [models.reranker]; config.example.toml updated in kind. One Opus
+  agent-serial package; one main-loop config.rs miss (stale
+  unconditional dense.path absolute-path check) agent-surfaced and
+  fixed. Verified by one Opus refute-by-default review (24
+  candidates, 23 refuted, 1 LOW confirmed+fixed: pre-existing stale
+  `#[allow(dead_code)]` + future-tense comments on the local embed
+  methods, made live-consumed by this package). All checks green,
+  zero warnings: cargo fmt, check, check --features metal, clippy,
+  clippy --features metal.
+- 2026-07-19 (re-benchmark start): dense endpoint model RULED
+  (user): Qwen/Qwen3-Embedding-4B AS SERVED on
+  http://10.1.0.10:8001 (vLLM), dimension 2560 — a deliberate
+  model+hardware change; the dense-stage comparison against the
+  149.6-min local-8B baseline conflates the two, and retrieval
+  quality shifts to 4B's (recorded). config.toml switched to
+  backend="http" (dimension 2560, timeout 60 s, no key); release
+  rebuilt; fabric plane deleted (fresh approval consumed) +
+  `--setup-storage`; run STARTED 2026-07-19T08:20:46Z with
+  dense_http_smoke PASSED live (dimension + unit norm validated
+  against the server). Run in progress at entry time; metric
+  extraction and before/after comparison follow at run end
+  (baseline: 229.7-min cycle, dense 149.6 min, plus the attempt-3
+  partials above).
+
+- 2026-07-19 (re-benchmark result + invalidation): the 08:20Z cycle
+  COMPLETED in 69.8 min, 14/14 activated, zero failures — 3.3× vs
+  the 229.7-min baseline (dense 149.6 → 1.5 min ≈ 100×, 164 HTTP
+  batches; ColBERT 30.2 → 15.1 min = 2.0× via the CPd hybrid, 86%
+  of units batched; Docling 47.5 min unchanged, now 68% of cycle).
+  The post-cycle annotation backfill then exposed the LATENT SERIAL
+  DESIGN CEILING: one worker thread, one blocking producer call in
+  flight, ~6 calls/min against a continuous-batching server — 2 of
+  14 sources examined after 71 min, 5–10 h projected. USER-RULED:
+  run INVALIDATED, service killed mid-backfill. Recorded
+  corrections: no regression occurred (the annotator was always
+  remote+serial; this was its first full-volume run), and the
+  morning's 27B server crash was external misconfiguration
+  (one-time, fixed, unrelated to client load — earlier
+  contention/dead-but-listening attributions were WRONG and are
+  retracted; the era-conflation in the 120 s-timeout size table is
+  likewise corrected: today's timeouts were all large-input
+  marginal-budget cases).
+- 2026-07-19 (concurrency package): bounded concurrent HTTP
+  dispatch COMPLETE — dense builder fans out batch windows
+  (`DENSE_HTTP_CONCURRENT_REQUESTS = 8`, scoped threads, vectors
+  persisted serially in chunk order, failed window fails the build
+  with nothing persisted); annotation worker fans out producer
+  calls in waves (`ANNOTATOR_CONCURRENT_CALLS = 32`;
+  prepare/dispatch/commit split with ALL SQLite writes serial on
+  the worker thread; ruling-B BuildFlow semantics preserved;
+  shutdown probe before each wave, `wave_abandoned_shutdown` WARN).
+  One Opus agent-serial package + refute-by-default review: 24
+  candidates, 23 refuted, 1 HIGH CONFIRMED — the dense HTTP fan-out
+  runs under the scheduler's IMMEDIATE write transaction (writer
+  lock across network I/O, the ruling-B hazard class). Ruled: a
+  PRE-EXISTING property of the take-the-caller's-tx contract, made
+  strictly shorter by waves, ACCEPTED for now and documented
+  honestly in dense.rs (comment fix applied); the structural fix is
+  the already-banked Option A (embed before the transaction — the
+  pattern the worker waves follow). Worker path fully clean.
+  Battery zero warnings.
+- 2026-07-19 (commercial endpoint switch, user-directed): BOTH
+  models moved to OpenRouter. config.toml: [models.dense]
+  endpoint https://openrouter.ai/api/v1/embeddings +
+  api_key_file_path .data-store-dense-api-key (new owner-only
+  secret, user-gitignored); [models.annotator] endpoint
+  https://openrouter.ai/api/v1/chat/completions, model
+  openai/gpt-5-nano, api_key_file_path .annotator-api-key.
+  Startup shakeout, in order: 401 (an OpenAI key had been placed;
+  client exonerated by identical curl behavior), 404
+  data-policy (user relaxed OpenRouter privacy settings; the
+  "OpenRouter has no embeddings" claim from the models-catalog
+  probe was WRONG — the catalog just omits embedding models),
+  transient 429 engine_overloaded → USER-RULED bounded 429-only
+  retry in the dense client (separate package: 3 retries, 2/4/8 s
+  backoff, `model_call.http_retry` WARN per attempt,
+  `retried_attempts` on terminal logs; amends the dense package's
+  original no-retry policy by explicit user instruction; the
+  original implementation agent correctly HALTED on the pinned-
+  requirement conflict and the package was re-dispatched with a
+  self-consistent spec). Embedding model test (user-selected
+  candidates, 5×32-batch probes each): qwen/qwen3-embedding-8b
+  5/5 OK dim 4096 avg ~3.5 s; openai/text-embedding-3-small 5/5
+  OK dim 1536 ~1.3 s. USER-RULED: qwen/qwen3-embedding-8b —
+  restores the corpus's original 8B model family; dimension back
+  to 4096.
+- 2026-07-19 (commercial run + timeout ruling): clean-corpus run
+  STARTED 20:45:41Z (fresh plane; smoke passed against OpenRouter).
+  gpt-5-nano first live exposure surfaced the same marginal-budget
+  timeout class as the 27B: max-input calls die at the 120 s
+  whole-request budget (observed as HTTP 200 with body read
+  truncated at ~120.3 s). USER-RULED (with the acknowledgment that
+  the raise should have been carried through at the endpoint
+  switch): [models.annotator].timeout_seconds 120 → 300; config is
+  startup-only so the service was restarted 21:03:21Z. VALIDATED
+  live post-restart: the 24,500-char entity call completed at
+  122.2 s and the 10,950-char relation call at 141.4 s — both
+  impossible under 120 s; 58 completed / 3 failed in the first
+  window; one HTTP-200-truncated-body transient (~1/59) accepted
+  as park-and-retry noise. Run IN PROGRESS at entry time.
+- 2026-07-19 (Docling parallelism design, decisions resolved;
+  package NOT yet approved): streaming parse pool — the
+  parallelizable half is pre-dispatch guards + the Docling child
+  (staging-only); the canonical half (import/gates/projections/
+  activation/queue completion) stays serial on the scheduler
+  thread. Pool admission is DYNAMIC on both axes from observed
+  signals, never a constant or config knob (USER-RULED: deployment
+  target is a generously specced server with much larger corpora;
+  scale assumptions like "14-document scale" are wrong and were
+  retracted): memory admission = available system memory vs a
+  per-child working-set EMA seeded from the activity monitor's
+  measured RSS (~5.8 GB observed); CPU admission = observed
+  utilization headroom vs a per-child CPU-demand EMA (USER
+  correction: the proposed cores÷num_threads ceiling presumed
+  thread saturation — measured child CPU ≈ 97% of ONE core —
+  and was rejected as a §35-class guess). Streaming completion
+  (no wave barrier — 20× per-doc duration variance). Shutdown
+  terminates in-flight children (staging is crash-safe; partially
+  retires the banked shutdown-latency item for the parse stage).
+  Remote Docling (docling-serve-class) recorded as a legitimate
+  future tier on its own merits — the earlier scale-based
+  exclusion rationale is RETRACTED; Docling stays local for now
+  per user's reasons. Honest scale note: at large admitted pools
+  the serial import half becomes the binding constraint; seams =
+  banked Option A, then parallel projection builds (future tier).
+- 2026-07-19 (documentation-currency ruling, user): standing
+  process rule — a package that changes operator-visible surfaces
+  or architecture-documented behavior carries its doc updates in
+  the same package, verified in the same review (supersedes the
+  C10d-era "docs re-baseline once" posture now that surfaces are
+  live). Drift status: PLAN caught up by this entry set; the seven
+  operator docs are being audited against live code (SPEC-SERVER.md
+  confirmed as the living as-built server spec and update target;
+  canonical_content_graph_retrieval_fabric_v_0_3.md is the
+  normative reference and is NEVER updated). COMPLETE same
+  session: audit found PROTOCOL/INTERACTIVE/SPEC-CLIENT clean and
+  cited drift in README (1 stale/2 missing), INSTALL (1/2),
+  ARCHITECTURE (2/7), SPEC-SERVER (2/1); all four rewritten from
+  code-verified claims (two Opus agents, disjoint files; extra
+  finds fixed: INSTALL's [inference].device in-process scoping;
+  ARCHITECTURE gained the honest writer-lock-across-fan-out
+  caveat); refute-by-default review over the edits: 14 candidates,
+  14 refuted, ZERO findings, cross-doc constant/event-name
+  spelling verified identical to code, no doc overclaims on the
+  known empty-marker bug. Observation banked: .data-store-rerank-
+  api-key appears in config.example.toml but not .gitignore — add
+  it if a reranker key is ever provisioned.
+
+- 2026-07-19 (empty-marker consumer bug, RULED): the commercial run
+  surfaced a LATENT C6-era defect — the annotation worker records
+  an empty producer result as a fresh annotation row with body `[]`
+  BY DESIGN (worker.rs `complete_fresh` empty-marker convention:
+  the freshness key stays satisfied, no per-cycle rebuild), but the
+  graph projection builder requires a string `name` body field on
+  every entity annotation and fails the whole source's
+  annotation-derived projection build on the first marker row —
+  a deterministic per-cycle rolled-back retry loop. First trigger:
+  gpt-5-nano legitimately returns `{"entities":[]}` on small/table
+  unit groups (38 of 3,058 entity rows; 2 sources poisoned); the
+  prior 27B never returned empty, so the mismatch stayed latent.
+  The relation consumer path has the identical hazard (`[]`
+  relation markers — the "issue 1" ~16-char responses are exactly
+  these). USER-RULED: fix is the FIRST SCOPE OF WORK next session,
+  before CPe — consumer-side skip of `[]` marker rows in the
+  annotation-derived projection builders (entity AND relation
+  paths), visibly counted on the build log (no silent narrowing),
+  comments cross-referencing the worker marker convention; no
+  producer change, no data cleanup (marker rows are valid);
+  poisoned sources self-heal on the post-fix restart's worker
+  cycles. FOLLOW-UP RULING (same session): the bug INVALIDATES the
+  commercial-endpoint test — every source with any empty
+  entity/relation result poisons its own graph build, so the
+  annotation chain can never complete on this binary. Test ABORTED
+  (SIGTERM ≈21:25Z, 4 sources completed post-restart; clean stop,
+  no orphans). The test resumes ONLY after CPd2 — as a fresh
+  clean-corpus run (fabric deletion will need its named approval
+  then).
+
+- 2026-07-19 (CPd2 implementation session): CPd2 empty-marker
+  consumer fix COMPLETE — one Opus agent-serial package, verified by
+  one Opus refute-by-default review (9 candidates, 9 refuted, ZERO
+  findings). Scope as ruled PLUS the summary path: the
+  pre-implementation code read confirmed the identical hazard in
+  view.rs `build_summary` (a `[]` summary marker fails `summary_text`,
+  and the worker builds summary THEN graph, so a summary marker would
+  poison the source before the graph builder runs) — all THREE
+  consumer paths gained the skip.
+  - graph.rs: `accumulate_mentions` / `derive_edges` skip bodies that
+    are exactly an empty JSON array
+    (`body.as_array().is_some_and(Vec::is_empty)`) before
+    `entity_name` / `relation_triple`; new `AccumulatedMentions` /
+    `DerivedEdges` carriers thread the counts;
+    `graph.build_succeeded` gained `skipped_entity_markers` /
+    `skipped_relation_markers`.
+  - view.rs: `build_summary` skips markers before `summary_text`;
+    `extracted_texts` counts real summaries only;
+    `summary.build_succeeded` gained `skipped_summary_markers`.
+  - worker.rs: COMMENT-ONLY must-stay-in-step banner at the
+    `complete_build` marker-write site naming the three consumer
+    sites.
+  - Deliberate: marker rows STAY in `input_annotation_ids` lineage
+    (the builder consumed them; the skip is visible via the counts);
+    any non-marker malformed body still fails loudly through the
+    pre-existing errors.
+  - All checks green, zero warnings: cargo fmt, check,
+    check --features metal, clippy, clippy --features metal.
+  - Residual risk: compile-verified only; the marker-poisoned sources
+    self-heal on the first post-rebuild worker cycles, observable via
+    the new skip counts. RELEASE REBUILD REQUIRED before the next run
+    (current release binaries predate CPd2).
+  - Banked: graph.rs / view.rs file-level `#![allow(dead_code)]` cite
+    "not yet landed" C7b/C6f wiring, but worker.rs live-consumes both
+    builders — stale-allow review candidate.
+
+- 2026-07-19 (annotation-identity design session; cluster CA2 ruled
+  and APPROVED): a user question — do annotator-model changes require
+  corpus re-annotation? — exposed that worker discovery keys
+  satisfaction on the §21.2 memo key, which embeds producer identity
+  (model, endpoint, promptHash, max_input_chars): a model switch
+  re-annotates the ENTIRE corpus at full producer cost AND leaves the
+  old generation's rows fresh with no cross-identity supersession, so
+  consumers read BOTH generations (duplicate mentions/edges, doubled
+  evidence annotations). Latent only because every switch to date was
+  followed by a fresh-plane re-ingest. RULINGS (user, 2026-07-19):
+  (1) OPTION A — CONTENT-SCOPED SATISFACTION: satisfaction and
+  reopenable classification move to a content-scoped key (annotation
+  type × ordered target content hashes = the memo key MINUS the
+  identity hash), stamped in a new
+  `semantic_annotations.content_key_hash` column; the memo key
+  becomes DERIVED FROM content key + identity hash through one shared
+  derivation path; the memo cache stays identity-scoped (memoization
+  honesty). Model switches then cost ZERO calls for already-annotated
+  content; the new model annotates only the frontier (new/changed
+  content, re-parses, failed-row retries — failed rows are retried by
+  the CURRENT identity, re-stamping memo key + provenance at
+  completion). Accepted consequences, recorded: mixed-model corpus —
+  graph entity-name vocabulary drift at model boundaries (amplifying
+  the document-driven variance that already exists single-model;
+  bounded by per-source annotation atomicity and by the graph channel
+  being additive to dense+lexical), extraction-density bias between
+  model eras, era-dependent summary style, and corpus-history-
+  dependent retrieval behavior (provenance stays complete; no replay
+  contract is violated — retrieval replay is `not_supported` at MVP).
+  (2) A `max_input_chars` change REQUIRES a corpus-wide update
+  (operational rule; keep it stable across ordinary model switches —
+  a grouping shift orphans old rows readable-but-unmatched).
+  (3) The OPERATOR RE-ANNOTATE OVERRIDE (deliberate paid sweep) is a
+  NAMED PRE-PRODUCTION REQUIREMENT — the only production-safe
+  corpus-wide refresh path under A; deliberately NOT in CA2 scope.
+  (4) D3 AMENDMENT — both mitigation rulesets are OPERATOR-EDITABLE
+  external policy documents (corpus-dependent by nature: authorable
+  only from observed annotation values), referenced by path from a
+  new `[policies]` config section, loaded once at startup, strictly
+  validated (missing/invalid/unknown-key = fatal), content-hashed at
+  load; the compile-sealed documents (RetrievalProfile,
+  AssemblyPolicy, §21.4) stay sealed — this uses D3's reserved
+  "config may hold the path to a policy document" seam.
+  (5) AUTO-VERSIONING — versions are SYSTEM-ASSIGNED, never
+  operator-written: a new append-only `policy_versions` hot-plane
+  table (policy_id, version, content_hash, observed_at); startup
+  hash-change detection appends latest+1 (a revert to previously seen
+  content still increments — versions count change events), minting a
+  `policy.changed` SystemEvent (recorded additive extension to the
+  §33 closed set) in the same transaction; policy content hashes fold
+  into ApplicationIdentity; a plane-missing startup logs hash-only
+  identity and defers registration to the next valid-plane startup
+  (versions are audit labels; behavior keys on the HASH everywhere —
+  promptHash for naming rules, startup identity for match rules).
+  (6) D9 AMENDMENT — graph-entry fuzzy matching: exact match stays
+  primary; ACRONYM-derivation and TOKEN-PREFIX classes added;
+  deterministic rank-only ordering exact > acronym > token-prefix,
+  then matched-name length, then unitId ascending; knobs live in the
+  entity-match policy document, NOT the RetrievalProfile.
+  (7) SHIP-NEUTRAL DEFAULTS — the naming document ships EMPTY and the
+  fuzzy classes ship DISABLED: rulesets are corpus-dependent and are
+  authored only after inspecting observed vocabulary (an earlier
+  main-loop draft of generic naming guidance was RETRACTED on this
+  ground; self-learning rulesets banked post-MVP, §5). An EMPTY
+  naming document composes to the byte-identical existing prompts
+  (identity-stable no-op), so landing CA2 itself changes no producer
+  identity.
+  (8) INSPECTION SURFACE — protected
+  `GET /annotations/vocabulary?annotationType=entity|relation` with a
+  scope param (default active-only; `all` includes dry-run output on
+  non-active parses): entity response sorted by normalized name so
+  variants sit adjacent — normalized name → raw forms with counts
+  (shows what normalization did and did not fold), entity types,
+  source count, per-model provenance counts; relation response =
+  predicate vocabulary with counts and model attribution; bounded
+  reads with explicit truncation; CLI `--vocabulary` verb.
+  (9) ANNOTATION DRY-RUN MODE —
+  `data-store-service --annotation-dry-run <groups-per-source>`: one
+  deliberate operator pass — scan → acquire → parse per source, then
+  the ENTITY and RELATION producers over the first N section groups
+  per source (deterministic by unit order; summary excluded —
+  sampling exists to surface naming/predicate vocabulary), writing
+  real annotation rows + memo entries; parses left READY (no
+  projections, no activation, NO dense/ColBERT — no inference init in
+  this mode; the annotator endpoint is the only external dependency;
+  no scheduler or worker thread — the mode's one-pass driver owns the
+  work); then serve for inspection (health + vocabulary route) until
+  shutdown. The later normal start adopts the ready parses via the
+  §13.5 GateExisting replay arm — Docling is paid once and never
+  redone; unchanged-identity producer samples re-mint from memo.
+  Corpus subsetting deferred: pointing `[storage].corpus_root` at a
+  subset directory already provides it. The ruleset loop: dry-run →
+  inspect → author policies → optional dry-run compare → normal start
+  under the final rulesets. RE-RUN PROCEDURE AMENDED accordingly:
+  fresh plane → `--setup-storage` → `--annotation-dry-run` →
+  inspect/author → normal start (full chain, benchmark of record).
+  Cluster plan CA2 (§3) APPROVED with named approvals consumed: the
+  `sql/fabric/schema.sql` edit (content_key_hash column + index,
+  policy_versions table; testing-phase in-place edit installed by the
+  next fresh-plane `--setup-storage` — NO migration, per the user's
+  testing-phase ruling) and the config diff (`[policies]` section
+  with `entity_match_file_path` / `annotator_naming_file_path`;
+  `config.example.toml` in kind; shipped neutral
+  `policies/entity-match.toml` + `policies/annotator-naming.toml`,
+  committed, no secrets). CA2-P5 carries a RECON-FIRST condition:
+  verify queue-row reclamation and GateExisting adoption in
+  scheduler.rs before P5 internals are finalized (findings adjust
+  internals only; contradictions return to the user pre-dispatch).
+
+- 2026-07-19 (CA2 implementation session): cluster CA2 COMPLETE — all
+  six packages implemented, wired, documented, and verified in one
+  session. As-built notes beyond the approved texts:
+  - P5 recon (read-only, pre-dispatch) CONFIRMED all five adoption
+    assumptions against scheduler.rs: in_flight reclaim, ready-at-
+    import, GateExisting rebuilds projections without re-invoking
+    Docling, bundle retention until complete(), startup-sweep safety.
+    One resolution recorded: a queue-coupled Operation caught by a
+    dry-run pass sits at `running` until the adopting normal start
+    completes it (accepted — truthful state, idempotent recovery,
+    unreachable in the fresh-plane procedure).
+  - P1: memo-key derivation restructured through one shared
+    KeyMaterial builder in memo.rs (content key = material minus
+    identity; memo-key output bytes verified unchanged); every
+    semantic_annotations insert stamps both keys; `building → fresh`
+    completion re-stamps memoization_key_hash to the completing
+    producer (content key untouched by construction).
+  - P2: full deterministic ordering chain as built — tier, class
+    (exact > acronym > token_prefix), matched-name char-length DESC,
+    name ASC, unitId ASC, parseId ASC; `max_fuzzy_candidates` applies
+    PER PARSE (§4 D9-amendment wording reconciled to code by this
+    entry). Disabled classes verified byte-identical to the
+    pre-amendment path (no fuzzy scan runs).
+  - P3: scope extended into memo.rs (orchestrator-ruled: the ruled
+    identity semantics REQUIRE the naming rules to reach the memo key
+    — via the producer-identity-hash ingredient ONLY; content-key
+    path byte-untouched). Empty-rules byte-identity verified link by
+    link: composed prompt → promptHash → identityHash → memo key all
+    unchanged; Summary provably never composes.
+  - P4: vocabulary aggregation caps MAX_ROWS_READ=200_000 /
+    MAX_GROUPS=50_000 (code constants, explicit truncation);
+    empty-marker rows skipped+counted per the CPd2 convention;
+    malformed bodies counted, never fatal (deliberate posture
+    contrast: this surface exists to reveal anomalies).
+  - P5 follow-up (orchestrator-directed): the dispatch context split
+    into ParsePrefixContext + gate-side inputs so the dry-run pass
+    requires NO ProjectionRuntime (the mode initializes no
+    inference); normal dispatch path verified behavior-identical
+    (prefix body unchanged; the two formerly-duplicated ready-arm
+    gate copies unified into gate_ready_parse with the consumed-
+    bundle Option preserving the fresh-arm delete).
+  - Main-loop wiring: `[policies]` in config.rs + config.toml +
+    config.example.toml; policy load fatal + version registration in
+    ONE IMMEDIATE tx (shared register_policy_versions helper) gated
+    on plane validity in normal startup and plane-required-FATAL in
+    dry-run mode; identity fold (entity_match_policy_hash /
+    annotator_naming_policy_hash); AppState carries the entity-match
+    document (query/graph channel consumer); worker start threads the
+    naming policy; `--annotation-dry-run <N>` CLI flag (positive
+    integer, service binary only); run_annotation_dry_run_mode
+    (foreground-only, reduced router health/vocabulary/operation-
+    read/shutdown, pass on a blocking task while serving, failed pass
+    keeps serving for inspection, every early fatal boundary logs
+    dry_run.fatal with stage).
+  - Docs: all seven operator docs updated from live code reads
+    (SPEC-SERVER §2.10 + §3 + §4.1/§4.7 + §6 + §13 + §14.3 + §16 now
+    37 event types; ARCHITECTURE §2.1 + §3.1 + new §3.2 + §6 + §7;
+    PROTOCOL vocabulary contract; README; INSTALL §5 dry-run
+    procedure; SPEC-CLIENT; INTERACTIVE). Zero unverifiable claims;
+    discrepancies resolved code-wins.
+  - Verification: finder agents with self-refutation over three
+    dimensions — spec/rulings ~26 candidates / 2 surviving (both LOW
+    wording; reconciled in §4 by this entry); principles+comments
+    8 / 4 (stale dead_code allow justifications — ALL removed,
+    including the banked graph.rs/view.rs file-level allows; zero
+    narrow allows needed, every stated consumer verified live);
+    diagnostics 7 / 1 MED (dry-run early fatal boundaries left no
+    durable log evidence — FIXED with staged dry_run.fatal logging at
+    policy load, plane validation, registration, and identity
+    capture) plus one rider fixed (inner driver event renamed
+    dry_run.driver_started). The INTEGRATION dimension was stopped by
+    the user mid-run and is NOT independently verified — recorded
+    residual.
+  - All checks green, zero warnings: cargo fmt, check,
+    check --features metal, clippy, clippy --features metal.
+  - Residual risk: the entire cluster is compile-verified only; first
+    live exercise is the amended re-run procedure (fresh plane →
+    --setup-storage → --annotation-dry-run → inspect/author → normal
+    start). RELEASE REBUILD required (binaries predate CPd2 + CA2).
+    Integration-dimension verification gap recorded above.
+
 ## Retired planning sections (relocated verbatim 2026-07-18, second stage)
 
 Sections appear in their original plan-file order: §1.5, §1.6, §2, the §3
@@ -3840,3 +4418,116 @@ D8 (resolved), D9 (resolved), then D2 (before C8d, finalized C10), D5
     entity; tier 2 = direct mentions; tier 3 = one-hop related units;
     within tiers by entity-name match strength; deterministic tiebreak
     by unitId ascending.
+
+## Retired planning sections (third stage, relocated verbatim 2026-07-19)
+
+Relocated by the 2026-07-19 trim pass, in original plan-file order: the
+CPc and CPd2 package texts and cluster CA2.
+
+- **CPc Benchmark re-ingestion (runtime, main-loop, run-by-run
+  user-approved)**: FIRST ATTEMPT ABORTED 2026-07-18 (smoke-caught
+  Metal defect, then the batching-regression kill — see Current
+  Status); the run now happens AFTER CPd and requires FRESH approval
+  of the `index/fabric/` deletion (the original named approval was
+  consumed; the plane holds a partial aborted cycle). Procedure
+  unchanged: cargo battery → release rebuild → `--setup-storage` →
+  start → full cycle over the same 14-file corpus → per-purpose
+  `model_call` metric extraction filtered to the run's timestamps →
+  before/after comparison. Doubles as the first live annotation run
+  (CPb) and unblocks the graph channel for R4. THIRD ATTEMPT
+  2026-07-19 killed at user direction at ~5/14 sources for the
+  HTTP-dense pivot (partial data retained: local passage avg
+  1,678 ms; CPd ColBERT hybrid ~4.8 min through 5 sources);
+  SUPERSEDED by the HTTP-dense re-benchmark (2026-07-19 Current
+  Status entries): that run completed in 69.8 min (3.3×) and was
+  then INVALIDATED by the serial-annotation ceiling; the
+  commercial-endpoint clean-corpus run (OpenRouter
+  qwen/qwen3-embedding-8b @ 4096 + gpt-5-nano, concurrent
+  dispatch) is the benchmark of record — see the 2026-07-19
+  entries.
+- **CPd2 Empty-marker consumer fix (COMPLETE 2026-07-19 — see the
+  CPd2 Current Status entry; the summary consumer was verified
+  same-hazard and scoped IN, so all three paths carry the skip)**:
+  consumer-side skip of the
+  worker's by-design `[]` empty-marker annotation rows in the
+  annotation-derived projection builders — BOTH the entity path
+  (graph mentions; the observed poison: "no string `name` body
+  field" per-cycle build failure) and the relation path (graph
+  edges; same hazard, unobserved only by ordering). Skips are
+  VISIBLE: a skipped-marker count on the projection-build
+  completion log; comments at both consumers cross-reference the
+  worker.rs `complete_fresh` empty-marker convention. No producer
+  change; no data cleanup (marker rows are valid by design);
+  requires rebuild + restart, after which the poisoned sources'
+  builds self-heal via stateless rediscovery. Owned files: the
+  annotation-derived projection builders (graph/summary path —
+  locate via `build_graph_projection`; verify whether the summary
+  consumer needs the same guard before scoping it in or out).
+  Mode: one Opus agent-serial package + cargo battery +
+  refute-by-default review. Full root cause: 2026-07-19
+  empty-marker Current Status entry.
+
+### CA2 — Annotation identity, policy governance, inspection (COMPLETE 2026-07-19 — see the CA2 implementation Current Status entry)
+
+Motivation and the full nine-ruling set: the 2026-07-19 CA2 Current
+Status entry. Sequencing: CA2 lands BEFORE the commercial-endpoint
+clean-corpus re-run (which gains the dry-run → inspect →
+author-rulesets loop); CPe follows the re-run unchanged. Mode: all
+packages Opus agent-serial with cargo battery + refute-by-default
+review each; P1–P4 may run concurrently after P0 (disjoint owned
+files); `config.rs` and `main.rs` wiring are main-loop-owned per
+§1.4. Named approvals (consumed 2026-07-19): the schema edit and the
+config diff, both itemized in the CA2 Current Status entry.
+
+- **CA2-P0 Policy substrate (serial, FIRST)**: `sql/fabric/schema.sql`
+  (`semantic_annotations.content_key_hash` + index;
+  `policy_versions` table), `hot_plane.rs` table-contract mirror,
+  NEW `src/policy.rs` (strict TOML document structs for the
+  entity-match and annotator-naming documents, canonical content
+  hashing, append-only version registration minting the additive
+  `policy.changed` event, load-at-startup API), identity-capture
+  fold (`identity.rs`). Reports required `main.rs` registrations;
+  edits neither `main.rs` nor `config.rs`.
+- **CA2-P1 Content-scoped satisfaction**: `producer.rs`
+  key-derivation split (content key; memo key = content key +
+  identity hash, ONE shared path); `store.rs` (INSERT stamps
+  `content_key_hash`; satisfaction + reopenable queries move to the
+  content key; completion re-stamps memo key + provenance to the
+  producer that ran); `worker.rs` (`WorkItem` carries both keys);
+  SPEC-SERVER §13 + ARCHITECTURE §3.1 updates
+  (documentation-currency rule). Integration review dimension: must
+  preserve ruling-B BuildFlow semantics, wave dispatch, and
+  crash-orphan adoption.
+- **CA2-P2 Fuzzy graph entry (D9 amendment)**: consumes the loaded
+  entity-match document; `projections/graph.rs` gains a per-parse
+  normalized-name enumeration read (the fuzzy scan surface);
+  `query/channels.rs` entry rework — exact primary, acronym +
+  token-prefix classes, deterministic rank-only ordering (exact >
+  acronym > token-prefix, then matched-name length, then unitId);
+  SPEC-SERVER §14 + ARCHITECTURE §6. RetrievalProfile untouched.
+- **CA2-P3 Prompt guidance composition**: the naming-policy document
+  composes into the entity/relation producer prompts in a fixed
+  canonical order; `promptHash` covers the composition; an EMPTY
+  document composes to the byte-identical existing prompts
+  (identity-stable no-op — landing CA2 changes no producer
+  identity). Owned: the producer prompt constants + composition in
+  `annotations/`; docs.
+- **CA2-P4 Vocabulary inspection**: protected
+  `GET /annotations/vocabulary` (annotationType=entity|relation;
+  scope param, default active-only, `all` for dry-run output);
+  bounded aggregation over `semantic_annotations` (raw forms +
+  normalized names + per-model provenance counts; predicates for
+  relations) with explicit truncation; DTOs; CLI `--vocabulary`
+  verb + renderer; PROTOCOL/README/SPEC-SERVER/SPEC-CLIENT/
+  INTERACTIVE docs.
+- **CA2-P5 Annotation dry-run mode (RECON-FIRST)**:
+  `--annotation-dry-run <groups-per-source>` one-pass driver per the
+  CA2 Current Status entry (scan → acquire → parse → entity/relation
+  producers over the first N groups per source; parses left READY
+  for GateExisting adoption; no inference init, no scheduler/worker
+  threads; serve-for-inspection until shutdown); queue rows left for
+  normal-cycle reclamation; INSTALL/README/SPEC-SERVER/PROTOCOL/
+  INTERACTIVE docs. PRECONDITION: read-only scheduler.rs recon
+  verifying queue-row reclamation and GateExisting adoption;
+  findings adjust internals only, contradictions return to the user
+  pre-dispatch.

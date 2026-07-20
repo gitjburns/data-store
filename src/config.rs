@@ -32,6 +32,11 @@ pub struct ServiceConfig {
     pub docling: DoclingConfig,
     /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,
+    /// Paths to the operator-editable external policy documents (D3
+    /// amendment, CA2): config holds the PATH to a policy document, never
+    /// its values. Documents are loaded once at startup, strictly validated,
+    /// and content-hashed; versions are system-assigned (`policy_versions`).
+    pub policies: PoliciesConfig,
     /// Directory of the loaded config file; the base every relative config
     /// path resolves against. Set by `load`, never deserialized.
     #[serde(skip)]
@@ -49,6 +54,11 @@ pub struct CliOptions {
     pub setup_storage: bool,
     /// Keep the HTTP service attached to the current terminal instead of daemonizing.
     pub foreground: bool,
+    /// Annotation dry-run mode (CA2-P5): sample-annotate the first N section
+    /// groups per source per type (entity/relation), then serve the
+    /// inspection surface until shutdown. Service binary only; the
+    /// `data-store` client rejects it like `--setup-storage`.
+    pub annotation_dry_run: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +89,21 @@ pub struct AdminConfig {
     /// Runtime file where the service writes the current startup-scoped admin bearer token.
     /// Relative paths resolve against the config file's directory.
     pub token_file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoliciesConfig {
+    /// Entity-match policy document (graph-entry fuzzy-match ruleset,
+    /// D9 amendment). Relative paths resolve against the config file's
+    /// directory. The document is operator-editable; its identity is its
+    /// content hash and its version is system-assigned at startup.
+    pub entity_match_file_path: PathBuf,
+    /// Annotator naming-rules policy document, composed into the entity and
+    /// relation producer prompts (producer-identity-bearing: an edit changes
+    /// promptHash and invalidates memo reuse). Relative paths resolve against
+    /// the config file's directory.
+    pub annotator_naming_file_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -564,6 +589,14 @@ impl ServiceConfig {
         if let Some(api_key_file_path) = self.models.annotator.api_key_file_path.as_ref() {
             require_non_empty_path("models.annotator.api_key_file_path", api_key_file_path)?;
         }
+        require_non_empty_path(
+            "policies.entity_match_file_path",
+            &self.policies.entity_match_file_path,
+        )?;
+        require_non_empty_path(
+            "policies.annotator_naming_file_path",
+            &self.policies.annotator_naming_file_path,
+        )?;
 
         Ok(())
     }
@@ -588,6 +621,28 @@ impl AdminConfig {
         }
 
         config_root.join(&self.token_file_path)
+    }
+}
+
+impl PoliciesConfig {
+    /// Resolve the entity-match policy document path against the config
+    /// file's directory when it is relative.
+    pub fn resolved_entity_match_file_path(&self, config_root: &Path) -> PathBuf {
+        if self.entity_match_file_path.is_absolute() {
+            return self.entity_match_file_path.clone();
+        }
+
+        config_root.join(&self.entity_match_file_path)
+    }
+
+    /// Resolve the annotator naming-rules policy document path against the
+    /// config file's directory when it is relative.
+    pub fn resolved_annotator_naming_file_path(&self, config_root: &Path) -> PathBuf {
+        if self.annotator_naming_file_path.is_absolute() {
+            return self.annotator_naming_file_path.clone();
+        }
+
+        config_root.join(&self.annotator_naming_file_path)
     }
 }
 
@@ -631,6 +686,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
     let mut smoke_dense = false;
     let mut setup_storage = false;
     let mut foreground = false;
+    let mut annotation_dry_run = None;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -658,6 +714,27 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
             continue;
         }
 
+        if arg == "--annotation-dry-run" {
+            let Some(value) = args.next() else {
+                return Err(ApiError::InvalidCli {
+                    message: "--annotation-dry-run requires a groups-per-source count".to_string(),
+                });
+            };
+            // Positive by requirement: a zero-group sample would parse the
+            // corpus but annotate nothing, which is not the ruled mode.
+            let groups: usize = value
+                .parse()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| ApiError::InvalidCli {
+                    message: format!(
+                        "--annotation-dry-run expects a positive integer, got {value}"
+                    ),
+                })?;
+            annotation_dry_run = Some(groups);
+            continue;
+        }
+
         return Err(ApiError::InvalidCli {
             message: format!("unknown argument: {arg}"),
         });
@@ -668,6 +745,7 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
         smoke_dense,
         setup_storage,
         foreground,
+        annotation_dry_run,
     })
 }
 

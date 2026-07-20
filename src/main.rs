@@ -9,6 +9,7 @@ mod connectors;
 mod deletion;
 mod docling;
 mod docling_activity;
+mod dry_run;
 mod error;
 mod events;
 mod hot_plane;
@@ -20,6 +21,7 @@ mod logging;
 mod model;
 mod operations;
 mod parse;
+mod policy;
 mod primitives;
 mod projections;
 mod query;
@@ -302,6 +304,18 @@ fn main() -> anyhow::Result<()> {
         run_dense_smoke(&cli_options, &config)?;
         return Ok(());
     }
+    if let Some(groups_per_source) = cli_options.annotation_dry_run {
+        // CA2-P5 annotation dry-run mode: one deliberate operator pass —
+        // scan → acquire → parse per source, sample-annotate the first N
+        // entity/relation groups, then serve the vocabulary inspection
+        // surface until POST /shutdown. Always foreground (an interactive
+        // ruleset-authoring session, not a daemon); no scheduler, worker, or
+        // inference runtime exists in this mode.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(run_annotation_dry_run_mode(config, groups_per_source));
+    }
 
     let bind_address = config.bind_address();
     println!("data-store bootstrap bind_address={bind_address}");
@@ -478,6 +492,70 @@ async fn run_http_service(
             false
         }
     };
+    // CA2 policy documents (D3 amendment): the two operator-editable external
+    // policy documents load ONCE here — strict validation, fatal on failure,
+    // matching the config posture (a service running under an unloadable
+    // ruleset has no valid identity to record). Loaded BEFORE identity
+    // capture below so both content hashes fold into the captured
+    // ApplicationIdentity.
+    let loaded_policies = policy::load_entity_match_policy(
+        &config
+            .policies
+            .resolved_entity_match_file_path(config.config_root()),
+    )
+    .and_then(|entity_match| {
+        let naming = policy::load_annotator_naming_policy(
+            &config
+                .policies
+                .resolved_annotator_naming_file_path(config.config_root()),
+        )?;
+        Ok((entity_match, naming))
+    });
+    let (entity_match_policy, annotator_naming_policy) = match loaded_policies {
+        Ok(policies) => policies,
+        Err(source) => {
+            error!(
+                event = "startup.fatal",
+                stage = "policy_document_load",
+                %bind_address,
+                error = %source,
+                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+                "startup failed loading an operator policy document"
+            );
+            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+            admin_token_file.cleanup_if_current();
+            return Err(source.into());
+        }
+    };
+    // System-assigned policy versioning (CA2 ruling 5): hash-change detection
+    // appends to the append-only policy_versions registry, atomically with its
+    // policy.changed event, under one IMMEDIATE transaction. Runs ONLY when
+    // the fabric pre-check passed: with the plane absent (commissioning
+    // state), the load logs above already carry the hashes and registration
+    // defers to the next valid-plane startup — versions are audit labels;
+    // behavior keys on the hashes everywhere. A registration failure on a
+    // VALID plane is fatal for the same reason identity-capture failure is:
+    // the registry is the audit record of the ruleset the service runs under.
+    if fabric_ready_at_startup {
+        let registration = register_policy_versions(
+            &config.storage.index_root,
+            &entity_match_policy.content_hash,
+            &annotator_naming_policy.content_hash,
+        );
+        if let Err(source) = registration {
+            error!(
+                event = "startup.fatal",
+                stage = "policy_version_registration",
+                %bind_address,
+                error = %source,
+                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+                "startup failed registering policy versions"
+            );
+            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+            admin_token_file.cleanup_if_current();
+            return Err(source.into());
+        }
+    }
     // The scheduler owns clones of its inputs because `config` moves into
     // AppState next; the shared health slot is the only channel between the
     // scheduler thread and health reporting.
@@ -495,7 +573,11 @@ async fn run_http_service(
     // failure is fatal: a service that cannot pin the identity its forensic
     // snapshots stamp has nothing valid to record, so it exits with the same
     // startup.fatal reporting as a failed scheduler spawn.
-    let application_identity = match identity::ApplicationIdentity::capture(&config) {
+    let application_identity = match identity::ApplicationIdentity::capture(
+        &config,
+        &entity_match_policy.content_hash,
+        &annotator_naming_policy.content_hash,
+    ) {
         Ok(identity) => identity,
         Err(source) => {
             error!(
@@ -549,6 +631,10 @@ async fn run_http_service(
         // identity the scheduler stamps; the original moves into scheduler::start
         // below (C10 resolution 7).
         application_identity.clone(),
+        // CA2 entity-match policy: the loaded document moves into AppState (its
+        // content hash was already folded into the identity capture above); the
+        // query pipeline's graph channel is its only runtime consumer.
+        entity_match_policy.document,
     ));
     // The projection runtime's model-call gate is the SAME process-global gate
     // AppState holds (`model_call_gate_handle`), so scheduler-thread model calls
@@ -602,6 +688,10 @@ async fn run_http_service(
         annotation_index_root,
         annotation_annotator,
         annotation_config_root,
+        // CA2-P3: the operator-loaded naming rules compose into the entity/
+        // relation producer prompts (identity-bearing); the document moves
+        // here — its content hash was already folded into identity capture.
+        annotator_naming_policy.document,
         Arc::clone(&shutdown_signal),
         annotation_health,
     );
@@ -672,6 +762,245 @@ async fn run_http_service(
     serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
+    Ok(())
+}
+
+/// Register both operator policy documents' system-assigned versions in one
+/// IMMEDIATE transaction (CA2 ruling 5): hash-change detection appends to the
+/// append-only `policy_versions` registry atomically with its `policy.changed`
+/// event. Shared by the normal startup path and the annotation dry-run mode so
+/// both record versions through identical mechanics.
+fn register_policy_versions(
+    index_root: &std::path::Path,
+    entity_match_hash: &str,
+    annotator_naming_hash: &str,
+) -> Result<(), ApiError> {
+    let mut connection = hot_plane::open_write(index_root)?;
+    let tx = hot_plane::begin_write_transaction(
+        &mut connection,
+        "policy",
+        "policy_version_registration",
+    )?;
+    policy::register_policy_version(&tx, policy::POLICY_ID_ENTITY_MATCH, entity_match_hash)?;
+    policy::register_policy_version(
+        &tx,
+        policy::POLICY_ID_ANNOTATOR_NAMING,
+        annotator_naming_hash,
+    )?;
+    hot_plane::commit_transaction(tx, "policy", "policy_version_registration")
+}
+
+/// CA2-P5 annotation dry-run mode. One deliberate operator pass for the
+/// ruleset-authoring loop: acquisition + parse across the corpus (parses left
+/// READY for the next normal start's §13.5 GateExisting adoption — Docling is
+/// paid once), entity/relation producers sampled over the first N section
+/// groups per source, then the reduced inspection router served until
+/// `POST /shutdown`.
+///
+/// Deliberate divergences from the normal startup, all mode-defining:
+/// - NO inference runtime: `AppState` carries an explicit `Err`, so any
+///   inference-touching path fails loudly; health honestly reports the
+///   inference component not-ready with the mode message as its detail.
+/// - NO scheduler or annotation-worker thread: the pass runs once on a
+///   blocking task; the sampling driver owns all producer calls.
+/// - A VALID fabric plane is REQUIRED (fatal otherwise): unlike the normal
+///   serve path, this mode has no purpose without the plane — the remedy is
+///   `--setup-storage` first.
+/// - The reduced router serves only health, vocabulary inspection, Operation
+///   reads, and shutdown; mutating admin routes would accept work nothing
+///   drains here.
+///
+/// The HTTP listener serves DURING the pass (Docling over a corpus can take
+/// a long time), so health and vocabulary are inspectable while sampling is
+/// still running; pass completion or failure is logged, and a failed pass
+/// keeps serving so whatever landed stays inspectable.
+async fn run_annotation_dry_run_mode(
+    config: ServiceConfig,
+    groups_per_source: usize,
+) -> anyhow::Result<()> {
+    let started_at = Instant::now();
+    let bind_address = config.bind_address();
+    info!(
+        event = "dry_run.mode_started",
+        %bind_address,
+        groups_per_source,
+        corpus_root = %config.storage.corpus_root.display(),
+        "annotation dry-run mode starting"
+    );
+
+    // Every fatal boundary in this mode logs `dry_run.fatal` with its stage
+    // before returning: terminal/stderr output is not durable diagnostics
+    // (DIAGNOSTICS-ONBOARDING), and these helpers return typed errors
+    // expecting the caller to own the boundary — this function is that owner.
+    let dry_run_fatal = |stage: &'static str, source: &ApiError| {
+        error!(
+            event = "dry_run.fatal",
+            stage,
+            error = %source,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "annotation dry-run mode startup failed"
+        );
+    };
+
+    // Operator policy documents: same strict load-or-die posture as the
+    // normal path; the naming rules feed the sampled producers directly.
+    let entity_match_policy = policy::load_entity_match_policy(
+        &config
+            .policies
+            .resolved_entity_match_file_path(config.config_root()),
+    )
+    .inspect_err(|source| dry_run_fatal("policy_document_load", source))?;
+    let annotator_naming_policy = policy::load_annotator_naming_policy(
+        &config
+            .policies
+            .resolved_annotator_naming_file_path(config.config_root()),
+    )
+    .inspect_err(|source| dry_run_fatal("policy_document_load", source))?;
+
+    // The fabric plane is REQUIRED here (fatal), unlike the normal serve
+    // path's degrade-to-unready: the pass writes acquisition/parse/annotation
+    // rows and the inspection surface reads them, so a missing plane leaves
+    // nothing to do. Registration then runs unconditionally.
+    crate::hot_plane::open_read(&config.storage.index_root)
+        .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
+        .inspect_err(|source| dry_run_fatal("fabric_plane_validation", source))?;
+    register_policy_versions(
+        &config.storage.index_root,
+        &entity_match_policy.content_hash,
+        &annotator_naming_policy.content_hash,
+    )
+    .inspect_err(|source| dry_run_fatal("policy_version_registration", source))?;
+
+    let application_identity = identity::ApplicationIdentity::capture(
+        &config,
+        &entity_match_policy.content_hash,
+        &annotator_naming_policy.content_hash,
+    )
+    .inspect_err(|source| dry_run_fatal("application_identity_capture", source))?;
+
+    // Admin token: the vocabulary route and POST /shutdown are protected, so
+    // the mode publishes the token file exactly like the normal path. The
+    // token value goes to stdout only (foreground operator channel); the
+    // durable log records presence, never the value.
+    let admin_shutdown_token = generate_admin_shutdown_token()?;
+    let admin_token_file = match AdminTokenFile::write_current(&config, &admin_shutdown_token) {
+        Ok(token_file) => token_file,
+        Err(source) => {
+            error!(
+                event = "dry_run.fatal",
+                stage = "admin_token_file",
+                error = %source,
+                "dry-run mode failed publishing the admin token file"
+            );
+            return Err(source.into());
+        }
+    };
+    println!("admin_shutdown_token={admin_shutdown_token}");
+    info!(
+        event = "dry_run.admin_token_published",
+        token_present = true,
+        "admin token published for the dry-run inspection surface"
+    );
+
+    let listener = TcpListener::bind(bind_address)
+        .await
+        .inspect_err(|source| {
+            error!(
+                event = "dry_run.fatal",
+                stage = "http_bind",
+                %bind_address,
+                error = %source,
+                "dry-run mode failed binding HTTP"
+            );
+            admin_token_file.cleanup_if_current();
+        })?;
+
+    // Pass inputs cloned out BEFORE `config` moves into AppState.
+    let pass_inputs = dry_run::DryRunInputs {
+        corpus_root: config.storage.corpus_root.clone(),
+        index_root: config.storage.index_root.clone(),
+        governance_domain: config.connectors.filesystem.governance_domain.clone(),
+        docling: config.docling.clone(),
+        annotator: config.models.annotator.clone(),
+        config_root: config.config_root().to_path_buf(),
+        naming_policy: annotator_naming_policy.document,
+        groups_per_source,
+    };
+
+    let shutdown_signal = Arc::new(ShutdownSignal::default());
+    let state = Arc::new(AppState::new(
+        config,
+        // No inference in this mode — an explicit error so any accidental
+        // inference-touching path fails loudly, and health reports the mode.
+        Err(ApiError::InferenceInit {
+            message: "annotation dry-run mode: inference not initialized".to_string(),
+        }),
+        admin_shutdown_token.clone(),
+        Arc::clone(&shutdown_signal),
+        Arc::new(Mutex::new(SyncHealth::startup_pending())),
+        Arc::new(Mutex::new(FabricHealth::default())),
+        Arc::new(Mutex::new(AnnotationHealth::startup_pending())),
+        Arc::new(projections::dense_cache::DenseCache::new()),
+        Arc::new(state::CutoverRegistry::new()),
+        application_identity,
+        entity_match_policy.document,
+    ));
+    let app = http::build_dry_run_router(state).layer(TraceLayer::new_for_http());
+
+    // The pass runs on a blocking task while the listener serves, so the
+    // inspection surface answers during long Docling conversions. Completion
+    // and failure are logged by the wrapper task; a failed pass deliberately
+    // keeps the service up — partial vocabulary is still worth inspecting.
+    let pass_shutdown = Arc::clone(&shutdown_signal);
+    let pass_handle =
+        tokio::task::spawn_blocking(move || dry_run::run(pass_inputs, &pass_shutdown));
+    let pass_watcher = tokio::spawn(async move {
+        match pass_handle.await {
+            Ok(Ok(())) => info!(
+                event = "dry_run.pass_completed",
+                "dry-run pass complete; vocabulary is ready for inspection (POST /shutdown to end)"
+            ),
+            Ok(Err(source)) => error!(
+                event = "dry_run.pass_failed",
+                error = %source,
+                "dry-run pass failed; serving whatever landed for inspection"
+            ),
+            Err(join_error) => error!(
+                event = "dry_run.pass_panicked",
+                error = %join_error,
+                "dry-run pass panicked; serving whatever landed for inspection"
+            ),
+        }
+    });
+
+    let health_url = format!("http://{bind_address}/v1/health");
+    println!("data-store dry-run serving inspection health_url={health_url}");
+    info!(
+        event = "dry_run.serving",
+        %bind_address,
+        health_url = %health_url,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "dry-run inspection surface serving"
+    );
+
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown_signal(Arc::clone(&shutdown_signal)))
+        .await;
+    admin_token_file.cleanup_if_current();
+    // A shutdown mid-pass ends the pass at its next between-item probe; await
+    // the watcher so the pass's terminal log lands before the process exits.
+    if pass_watcher.await.is_err() {
+        error!(
+            event = "dry_run.pass_watcher_join_failed",
+            "dry-run pass watcher task failed to join"
+        );
+    }
+    serve_result?;
+    info!(
+        event = "dry_run.mode_stopped",
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "annotation dry-run mode stopped"
+    );
     Ok(())
 }
 

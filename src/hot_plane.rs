@@ -307,6 +307,10 @@ const FABRIC_TABLE_CONTRACTS: &[(&str, &[FabricColumn])] = &[
             col("confidence", "REAL", false),
             col("freshness_status", "TEXT", true),
             col("memoization_key_hash", "TEXT", true),
+            // CA2 content-scoped satisfaction key; NOT NULL, populated by
+            // CA2-P1. Distinct from memoization_key_hash (which also folds in
+            // producer identity).
+            col("content_key_hash", "TEXT", true),
             col("created_at", "TEXT", true),
             col("deleted_at", "TEXT", false),
         ],
@@ -335,6 +339,19 @@ const FABRIC_TABLE_CONTRACTS: &[(&str, &[FabricColumn])] = &[
             col("object_id", "TEXT", true),
             col("payload_json", "TEXT", false),
             col("created_at", "TEXT", true),
+        ],
+    ),
+    (
+        // CA2 policy substrate: append-only version log. policy_id and version
+        // together form the PRIMARY KEY, so both satisfy their NOT NULL
+        // requirement by PK membership (pk > 0), matching the annotation_memo
+        // and chunk_dense_vectors PK-column declarations above.
+        "policy_versions",
+        &[
+            col("policy_id", "TEXT", true),
+            col("version", "INTEGER", true),
+            col("content_hash", "TEXT", true),
+            col("observed_at", "TEXT", true),
         ],
     ),
     // C6 retrieval-projection payload tables (spec §22–§23). The FTS5 lexical

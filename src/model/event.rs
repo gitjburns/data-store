@@ -97,6 +97,16 @@ pub(crate) enum SystemEventType {
     ProjectionSuperseded,
     #[serde(rename = "assembly_policy.changed")]
     AssemblyPolicyChanged,
+    // policy.changed is a recorded ADDITIVE extension of the spec §33 closed
+    // enumeration (CA2 cluster, 2026-07-19), on the annotation.* precedent:
+    // the D3-amendment operator-editable policy documents (entity-match,
+    // annotator-naming) carry SYSTEM-ASSIGNED versions, and this event is
+    // minted atomically with each append to the policy_versions registry
+    // (policy::register_policy_version) when a content-hash change advances a
+    // version. Distinct from assembly_policy.changed, which belongs to the
+    // compile-sealed document family and is never minted at MVP.
+    #[serde(rename = "policy.changed")]
+    PolicyChanged,
     #[serde(rename = "snapshot.started")]
     SnapshotStarted,
     #[serde(rename = "snapshot.completed")]

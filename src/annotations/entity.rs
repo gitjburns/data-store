@@ -21,6 +21,13 @@ use crate::error::ApiError;
 
 /// System prompt for the entity producer. Fixes the task and the exact
 /// bare-JSON response contract the parser below enforces.
+///
+/// This is the BASE prompt: the EFFECTIVE (sent and hashed) prompt is this
+/// text composed with the operator's naming rules by `ProducerKind::prompt`
+/// (CA2-P3, user-ruled 2026-07-19); an empty naming document composes to
+/// exactly these bytes. Editing this constant — like editing the naming
+/// document — is a producer-identity change (promptHash) that invalidates
+/// memo reuse.
 pub(crate) const SYSTEM_PROMPT: &str = "You are an entity extraction component. \
 Read the provided text and extract the named entities it mentions. \
 Respond with a single bare JSON object and nothing else: no prose, no explanation, and no Markdown code fences. \

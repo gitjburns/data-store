@@ -335,16 +335,32 @@ pub(crate) struct ProjectionRuntime {
     pub(crate) dense_cache: Arc<DenseCache>,
 }
 
-/// Everything the drain-loop parse chain needs beyond the queue entry
-/// itself, grouped so `run_cycle` keeps a short signature. `storage`
-/// re-packages the exact corpus/index roots main read from config.storage —
-/// no new configuration is introduced — because
-/// `crate::source::resolve_source_reference` takes the typed config shape.
-/// `projections` carries the inference/cache handles the post-import,
-/// pre-activation content-derived build step consumes.
-struct ParseDispatchContext {
+/// What the parse-chain PREFIX (`parse_chain_prefix`: route → guard →
+/// containment → identity check → worker → import) needs — deliberately free of
+/// any projection-build, gate, or snapshot handle. `storage` re-packages the
+/// exact corpus/index roots main read from config.storage — no new configuration
+/// is introduced — because `crate::source::resolve_source_reference` takes the
+/// typed config shape.
+///
+/// OWNERSHIP BOUNDARY (CA2-P5): this split exists because the annotation
+/// dry-run pass runs the prefix WITHOUT inference — a `ProjectionRuntime`'s
+/// dense/colbert handles are constructible only from an initialized
+/// `InferenceRuntime`, which the dry-run mode never initializes by design. The
+/// prefix must therefore never grow a projection/gate dependency; anything the
+/// gate continuation needs belongs on `ParseDispatchContext` instead.
+struct ParsePrefixContext {
     storage: StorageConfig,
     docling: DoclingConfig,
+}
+
+/// Everything the FULL drain-loop parse chain needs beyond the queue entry
+/// itself, grouped so `run_cycle` keeps a short signature: the prefix inputs
+/// plus the gate continuation's handles. `projections` carries the
+/// inference/cache handles the post-import, pre-activation content-derived
+/// build step consumes — consumed ONLY by `gate_ready_parse`, never by the
+/// prefix (see `ParsePrefixContext`'s ownership boundary).
+struct ParseDispatchContext {
+    prefix: ParsePrefixContext,
     registry: Arc<CutoverRegistry>,
     projections: ProjectionRuntime,
     /// The §30.2 application identity captured once at startup and threaded to
@@ -386,6 +402,38 @@ enum NoRetryGuardDecision {
     Skip {
         parse_run_id: String,
         reason: &'static str,
+    },
+}
+
+/// Outcome of the parse-chain PREFIX — route → no-retry guard → containment →
+/// content-identity → worker → importer — up to (and including) the point where
+/// the importer returns a committed parse run, but BEFORE any content-derived
+/// projection build, snapshot, or activation gate. Both the normal
+/// `dispatch_parse_chain` and the CA2-P5 annotation dry-run pass share this
+/// prefix (see `parse_chain_prefix`); the normal path continues to build/gate,
+/// the dry-run path truncates here (mechanic 1: leave the ready row un-held for
+/// the next normal cycle's §13.5 GateExisting adoption). `bundle_dir` is carried
+/// only for `FreshReady` because the fresh path is the only arm that owns a
+/// consumable parser bundle to remove after gating (the GateExisting arm's
+/// bundle was already removed by the import that first committed the ready run).
+enum ParseChainPrefix {
+    /// Nothing to parse, guard skip, or content-changed skip: terminal for this
+    /// entry, no ready run produced.
+    Skipped,
+    /// A recorded parse failure (durable failed run row) — counted as a cycle
+    /// failure by the caller.
+    ParseFailed,
+    /// The §13.5 guard matched a pre-existing ready, un-held run: gate THAT run
+    /// (crash-recovery idempotence). No fresh worker ran; no bundle to remove.
+    GateExisting { parse_run_id: String },
+    /// A fresh worker produced a ready run the importer just committed. `source_id`
+    /// is carried alongside so the dry-run pass can record the (source, parse)
+    /// pair without a second read; `bundle_dir` is the consumed parser bundle the
+    /// normal gate path removes after activation.
+    FreshReady {
+        parse_run_id: String,
+        source_id: String,
+        bundle_dir: PathBuf,
     },
 }
 
@@ -1180,13 +1228,15 @@ fn run_scheduler(
 
     // Parse-chain inputs threaded into every drain pass. The StorageConfig
     // is re-packaged from the exact roots main read out of config.storage
-    // (see ParseDispatchContext docs) — no configuration is invented here.
+    // (see ParsePrefixContext docs) — no configuration is invented here.
     let dispatch = ParseDispatchContext {
-        storage: StorageConfig {
-            corpus_root,
-            index_root: index_root.clone(),
+        prefix: ParsePrefixContext {
+            storage: StorageConfig {
+                corpus_root,
+                index_root: index_root.clone(),
+            },
+            docling,
         },
-        docling,
         registry,
         projections,
         identity,
@@ -1329,6 +1379,312 @@ fn run_scheduler(
         reason = "shutdown_requested",
         "sync scheduler thread stopped cleanly"
     );
+}
+
+/// One ready parse the CA2-P5 dry-run pass surfaced for annotation sampling: the
+/// (source, parse) pair whose parse run is `ready` (freshly imported this pass,
+/// or a pre-existing un-held ready run the §13.5 GateExisting guard matched).
+/// The dry-run driver builds each parse's invocation plan from this pair.
+#[derive(Debug, Clone)]
+pub(crate) struct DryRunReadyParse {
+    pub(crate) source_id: String,
+    pub(crate) parse_run_id: String,
+}
+
+/// Per-pass outcome of the CA2-P5 annotation dry-run scan/parse pass, for the
+/// mode's summary log. `ready` carries each source's ready parse (annotation
+/// sampling targets); the counts are the drain accounting. `claimed` is every
+/// queue entry the pass processed once (the pending SELECT is uncapped).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DryRunPassOutcome {
+    /// Ready parses surfaced this pass (freshly imported or GateExisting-matched).
+    pub(crate) ready: Vec<DryRunReadyParse>,
+    /// Queue entries claimed and processed this pass.
+    pub(crate) claimed: u64,
+    /// Entries whose prefix produced a ready run (== `ready.len()`, surfaced for
+    /// the summary line).
+    pub(crate) parsed_ready: u64,
+    /// Entries the prefix skipped (no parser, guard skip, content changed).
+    pub(crate) skipped: u64,
+    /// Entries with a recorded parse failure (durable failed run row).
+    pub(crate) parse_failed: u64,
+    /// Entries that faulted on the canonical side (infrastructure error). The
+    /// pass records and counts them, then continues — the row stays in_flight for
+    /// normal-cycle reclamation, exactly like the crash-replay states.
+    pub(crate) faulted: u64,
+}
+
+/// CA2-P5 annotation dry-run scan/parse pass (ruling 9). Runs INLINE on the
+/// caller's thread — no scheduler thread is spawned — exactly ONE full
+/// scan → acquire → parse pass over the whole corpus, with the fresh-dispatch
+/// chain TRUNCATED immediately after the importer returns a ready run (mechanic
+/// 1): the pass does NOT build content-derived projections, mint snapshots, run
+/// the activation gate, complete/fail the queue entry, or remove the consumed
+/// acquisition bundle. Every claimed row is left `in_flight` and every ready run
+/// is left un-held (`held_reason` NULL) — the exact precondition the NEXT normal
+/// start's §13.5 GateExisting arm adopts (reclaiming the `in_flight` row,
+/// rebuilding projections from canonical rows, gating WITHOUT re-invoking
+/// Docling). Docling is paid once here and never redone.
+///
+/// The full dispatch prefix runs unchanged, so every guard that must still run
+/// does: the §13.5 no-retry guard, corpus containment, and the pre-worker
+/// content-identity check (all inside `parse_chain_prefix`). Queue-coupled
+/// Operations behave exactly as documented (mechanic 2): `mark_operation_running`
+/// runs at dispatch and such an Operation sits at `running` until the adopting
+/// normal start completes it — accepted, recovery-idempotent behavior; dispatch
+/// is NOT special-cased.
+///
+/// Returns per-pass outcomes for the mode's summary log; `Err` is a cycle-wide
+/// canonical-side fault (e.g. a failed plane gate or a source-side scan failure),
+/// which the mode driver surfaces as a fatal.
+///
+/// Deliberately takes NO `ProjectionRuntime`, `CutoverRegistry`, or
+/// `ApplicationIdentity`: those are gate-continuation inputs
+/// (`gate_ready_parse` — projection build, activation, snapshots), and this
+/// pass truncates before all of them. `ProjectionRuntime` in particular is
+/// constructible only from an initialized `InferenceRuntime`, which the
+/// dry-run mode never initializes by design — the prefix-scoped
+/// `ParsePrefixContext` is what makes the mode wireable without inference.
+pub(crate) fn run_annotation_dry_run_pass(
+    corpus_root: PathBuf,
+    index_root: PathBuf,
+    governance_domain: String,
+    docling: DoclingConfig,
+) -> Result<DryRunPassOutcome, ApiError> {
+    let started = Instant::now();
+    info!(
+        event = "scheduler.dry_run_pass.started",
+        corpus_root = %corpus_root.display(),
+        index_root = %index_root.display(),
+        "annotation dry-run scan/parse pass starting"
+    );
+
+    // Same fatal fabric-plane gate the scheduler thread applies before any queue
+    // or acquisition work: the pass has nothing valid to drive otherwise.
+    validate_fabric_plane(&index_root)?;
+
+    let staging_root = acquisition_staging_root(&index_root);
+    let connector =
+        FilesystemConnector::new(corpus_root.clone(), staging_root.clone(), governance_domain)
+            .map_err(|source| ApiError::InvalidCli {
+                message: format!("filesystem connector configuration invalid: {source}"),
+            })?;
+    let context = AcquisitionContext {
+        connector_name: connector.connector_name().to_string(),
+        connector_version: connector.connector_version().to_string(),
+        connector_config_hash: connector.connector_config_hash().to_string(),
+        source_system: connector.source_system().to_string(),
+        governance_domain: connector.governance_domain().to_string(),
+    };
+    let scope_uri = corpus_root.display().to_string();
+
+    // Startup sweep of orphaned parser temp workspaces, safe by the single-thread
+    // invariant (the pass owns the only worker on this thread), exactly as the
+    // scheduler thread does before its first cycle.
+    sweep_orphan_parse_temp_dirs(&index_root);
+
+    // Prefix-scoped context only (see ParsePrefixContext's ownership boundary):
+    // the pass truncates before any gate work, so it never holds projection,
+    // registry, or identity handles.
+    let dispatch = ParsePrefixContext {
+        storage: StorageConfig {
+            corpus_root,
+            index_root: index_root.clone(),
+        },
+        docling,
+    };
+
+    // ONE full scan (which also stages new/changed items) then a single uncapped
+    // drain. This mirrors `run_cycle`'s scan → enqueue → claim → import ordering,
+    // but the per-entry chain truncates at the prefix and the entry is never
+    // completed/failed. Autonomous full-scan detections only (no operator queue
+    // coupling in this mode), so the prescreen-override path is not exercised.
+    let known = acquisition::known_location_state(&index_root, connector.source_system())?;
+    let scan = match connector.full_scan(&known) {
+        Ok(scan) => scan,
+        Err(ScanError::SourceSide {
+            failure_class,
+            detail,
+        }) => {
+            // A source-side scan failure is meaningful operational state: record it
+            // durably (mirroring `run_cycle`) then surface it as the pass's fatal.
+            acquisition::record_failed_acquisition(
+                &index_root,
+                &context,
+                &scope_uri,
+                failure_class,
+                &detail,
+            )?;
+            return Err(ApiError::InternalIo {
+                message: format!(
+                    "annotation dry-run full scan failed on the source side: {detail}"
+                ),
+            });
+        }
+        Err(ScanError::Internal(source)) => return Err(source),
+    };
+    info!(
+        event = "scheduler.dry_run_pass.changes_observed",
+        enumerated = scan.enumerated_native_uris.len(),
+        staged = scan.staged_bundle_dirs.len(),
+        skipped_unchanged = scan.skipped_unchanged,
+        scan_failures = scan.failures.len(),
+        enumeration_complete = scan.enumeration_complete,
+        elapsed_ms = scan.elapsed_ms,
+        "annotation dry-run pass: full scan finished"
+    );
+
+    for bundle_dir in &scan.staged_bundle_dirs {
+        match staged_bundle_native_uri(bundle_dir) {
+            Ok(native_uri) => {
+                enqueue_coalesced(
+                    &index_root,
+                    connector.source_system(),
+                    &native_uri,
+                    REASON_STAGED_BY_FULL_SCAN,
+                    None,
+                )?;
+            }
+            Err(detail) => {
+                // Unreadable manifest: import directly so the outcome is recorded,
+                // matching `run_cycle`. A direct import bypasses the queue, so it
+                // contributes no ready pair to the sampling set (its parse, if any,
+                // is adopted by the next normal cycle like any un-gated ready run).
+                warn!(
+                    event = "scheduler.dry_run_pass.staged_manifest_unreadable",
+                    bundle_dir = %bundle_dir.display(),
+                    detail = %detail,
+                    "staged bundle manifest unreadable at enqueue; importing directly"
+                );
+                acquisition::import_staged_bundle(&index_root, bundle_dir)?;
+            }
+        }
+    }
+
+    for failure in &scan.failures {
+        acquisition::record_failed_acquisition(
+            &index_root,
+            &context,
+            &failure.native_uri,
+            failure.failure_class,
+            &failure.detail,
+        )?;
+    }
+
+    // Drain: claim every pending (and stale in_flight) row once. The pass leaves
+    // each row in_flight after processing — no complete()/fail() — so the next
+    // normal cycle reclaims it. Deliberately NOT looping to quiescence: this is a
+    // deliberate one-shot pass over the corpus (ruling 9).
+    let entries = claim_pending(&index_root)?;
+    let mut outcome = DryRunPassOutcome {
+        claimed: entries.len() as u64,
+        ..DryRunPassOutcome::default()
+    };
+    for entry in &entries {
+        let bundle_dir = bundle_dir_for(&staging_root, &entry.native_uri);
+        // Queue-coupled Operations do not arise in this mode (all detections are
+        // autonomous), but the dispatch step is NOT special-cased (mechanic 2):
+        // mark_operation_running_at_dispatch is a no-op for autonomous rows.
+        if let Err(source) = mark_operation_running_at_dispatch(&index_root, &entry.id) {
+            // Infrastructure fault before the prefix: record, count, and continue;
+            // the row stays in_flight for normal-cycle reclamation.
+            warn!(
+                event = "scheduler.dry_run_pass.entry_faulted",
+                entry_id = entry.id,
+                native_uri = entry.native_uri,
+                stage = "mark_running",
+                error = %source,
+                "annotation dry-run entry faulted at dispatch; left in_flight for reclamation"
+            );
+            outcome.faulted += 1;
+            continue;
+        }
+        match acquisition::import_staged_bundle(&index_root, &bundle_dir) {
+            Ok(import) if import.imported => {
+                // Run the SHARED prefix, then TRUNCATE (mechanic 1): no gate work,
+                // no complete()/fail(), no bundle removal. The row and bundle stay
+                // exactly as crash-replay would leave them.
+                match parse_chain_prefix(&dispatch, &index_root, entry, &import) {
+                    Ok(ParseChainPrefix::Skipped) => outcome.skipped += 1,
+                    Ok(ParseChainPrefix::ParseFailed) => outcome.parse_failed += 1,
+                    Ok(ParseChainPrefix::GateExisting { parse_run_id }) => {
+                        // A pre-existing un-held ready run: surface it for sampling.
+                        // source linkage is guaranteed by imported=true.
+                        if let Some(source_id) = import.source_object_id.clone() {
+                            outcome.parsed_ready += 1;
+                            outcome.ready.push(DryRunReadyParse {
+                                source_id,
+                                parse_run_id,
+                            });
+                        } else {
+                            outcome.faulted += 1;
+                        }
+                    }
+                    Ok(ParseChainPrefix::FreshReady {
+                        parse_run_id,
+                        source_id,
+                        bundle_dir: _consumed_bundle,
+                    }) => {
+                        // Fresh ready run: surface it and DELIBERATELY leave the
+                        // consumed parser bundle on disk (do not remove) so the
+                        // crash-replay adoption path the next normal cycle uses
+                        // sees the exact same on-disk state.
+                        outcome.parsed_ready += 1;
+                        outcome.ready.push(DryRunReadyParse {
+                            source_id,
+                            parse_run_id,
+                        });
+                    }
+                    Err(source) => {
+                        warn!(
+                            event = "scheduler.dry_run_pass.entry_faulted",
+                            entry_id = entry.id,
+                            native_uri = entry.native_uri,
+                            stage = "parse_prefix",
+                            error = %source,
+                            "annotation dry-run entry faulted in parse prefix; left in_flight"
+                        );
+                        outcome.faulted += 1;
+                    }
+                }
+            }
+            Ok(_not_imported) => {
+                // The importer rejected the bundle (e.g. missing after crash mid
+                // removal). Count as a fault; the row stays in_flight.
+                warn!(
+                    event = "scheduler.dry_run_pass.entry_faulted",
+                    entry_id = entry.id,
+                    native_uri = entry.native_uri,
+                    stage = "import",
+                    "annotation dry-run entry bundle not imported; left in_flight"
+                );
+                outcome.faulted += 1;
+            }
+            Err(source) => {
+                warn!(
+                    event = "scheduler.dry_run_pass.entry_faulted",
+                    entry_id = entry.id,
+                    native_uri = entry.native_uri,
+                    stage = "import",
+                    error = %source,
+                    "annotation dry-run entry faulted at import; left in_flight"
+                );
+                outcome.faulted += 1;
+            }
+        }
+    }
+
+    info!(
+        event = "scheduler.dry_run_pass.completed",
+        claimed = outcome.claimed,
+        parsed_ready = outcome.parsed_ready,
+        skipped = outcome.skipped,
+        parse_failed = outcome.parse_failed,
+        faulted = outcome.faulted,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "annotation dry-run scan/parse pass completed; queue rows left in_flight for normal-cycle adoption"
+    );
+    Ok(outcome)
 }
 
 /// Record one failed cycle: log it with elapsed time, keep the subsystem
@@ -1925,20 +2281,30 @@ fn run_cycle(
     })
 }
 
-/// The drain-loop parse chain for one imported entry (spec §9.4: one queue
-/// drives acquisition → parse → gate → activation): route by the stored
-/// mime type, apply the §13.5 rule 5 no-blind-retry guard, run the routed
-/// worker, import its staged bundle, and gate the resulting ready run.
-/// Every producer-side outcome — nothing to parse, guard skip, recorded
-/// parse failure, held candidate — returns `Ok` and the entry completes;
-/// `Err` is a canonical-side infrastructure fault the caller parks the
-/// entry failed with.
-fn dispatch_parse_chain(
-    dispatch: &ParseDispatchContext,
+/// The PREFIX of the drain-loop parse chain (spec §9.4: one queue drives
+/// acquisition → parse → gate → activation), stopping at the importer's
+/// committed-parse boundary: route by the stored mime type, apply the §13.5
+/// rule 5 no-blind-retry guard, resolve corpus containment, run the
+/// content-identity check, run the routed worker, and import its staged bundle.
+/// Returns WITHOUT building projections, minting snapshots, or gating — those
+/// are the caller's continuation (`gate_ready_parse`). Every producer-side
+/// outcome — nothing to parse, guard skip, content-changed skip, recorded parse
+/// failure — is an `Ok(ParseChainPrefix)` variant; `Err` is a canonical-side
+/// infrastructure fault the caller parks the entry failed with.
+///
+/// Shared by the normal `dispatch_parse_chain` (which continues to build/gate)
+/// and the CA2-P5 dry-run pass (which truncates HERE per mechanic 1). The normal
+/// path stays behavior-identical: it is exactly the former inline prefix, and
+/// the gate work it used to do inline now lives in `gate_ready_parse`, called
+/// with byte-equivalent arguments. Takes the prefix-scoped context ONLY — no
+/// projection/gate handles — so the dry-run pass can run it without inference
+/// (see ParsePrefixContext's ownership boundary).
+fn parse_chain_prefix(
+    dispatch: &ParsePrefixContext,
     index_root: &Path,
     entry: &SyncQueueEntry,
     import: &ImportOutcome,
-) -> Result<ParseChainOutcome, ApiError> {
+) -> Result<ParseChainPrefix, ApiError> {
     let started = Instant::now();
     // imported=true guarantees this linkage per the ImportOutcome contract;
     // absence is a broken internal contract, never producer input.
@@ -1979,7 +2345,7 @@ fn dispatch_parse_chain(
                 mime_type,
                 "no parser is registered for this mime type; source stays unparsed"
             );
-            return Ok(ParseChainOutcome::Skipped);
+            return Ok(ParseChainPrefix::Skipped);
         }
     };
 
@@ -2019,93 +2385,18 @@ fn dispatch_parse_chain(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "no-blind-retry guard matched a prior run; worker skipped"
             );
-            return Ok(ParseChainOutcome::Skipped);
+            return Ok(ParseChainPrefix::Skipped);
         }
         NoRetryGuardDecision::GateExisting { parse_run_id } => {
-            // Crash-recovery idempotence: an earlier import committed this
-            // run `ready` but the process died before gating it. Gating the
-            // existing run — instead of re-parsing identical bytes through
-            // an identical parser — is the §13.5-conformant replay.
-            //
-            // The projection build is (re)run here too: the crash may have died
-            // before OR after building, and the build is idempotent (each type is
-            // deleted-for-parse then rebuilt), so replaying it makes the parse's
-            // content-derived projections fresh again before the prerequisite
-            // gate consults them — a bare gate on an un-built ready run would be
-            // rejected by verify_activation_prerequisites.
-            build_content_derived_projections(
-                &dispatch.projections,
-                index_root,
-                source_id,
-                &parse_run_id,
-            )?;
-            // Pre-activation snapshot (§30.6): minted immediately BEFORE the gate
-            // for the candidate under `parse_run_id`. §30.6/§31.2 — the gate holds
-            // the per-source cutover barrier INTERNALLY; the snapshot runs OUTSIDE
-            // that hold (this call precedes gate_and_activate), so §31.1's brevity
-            // rule is preserved.
-            crate::snapshot::pre_activation_snapshot(
-                index_root,
-                &dispatch.identity,
-                &parse_run_id,
-            )?;
-            let decision = activation::gate_and_activate(
-                index_root,
-                &dispatch.registry,
-                &dispatch.projections.dense_cache,
-                dispatch.projections.dense_dimension,
-                &parse_run_id,
-            )?;
-            // Post-activation snapshot ONLY when the gate actually activated: a
-            // Held decision changes no active state, so there is nothing new to
-            // capture over. §30.6/§31.2 — this post-activation snapshot is the one
-            // the deletion gate later verifies over; like the pre-activation one it
-            // runs OUTSIDE the gate's internal barrier hold.
-            if let ActivationDecision::Activated {
-                superseded_predecessor_id,
-                ..
-            } = &decision
-            {
-                crate::snapshot::post_activation_snapshot(
-                    index_root,
-                    &dispatch.identity,
-                    &parse_run_id,
-                )?;
-                // §31.2 steps 3–5: complete the superseded predecessor's
-                // archive-verify-delete. The gate verifies over the
-                // post_activation snapshot JUST minted above (never re-taken),
-                // whose subject is the newly activated candidate `parse_run_id`.
-                // A gate failure or delete fault propagates through `?`, halting
-                // this source's lifecycle — the queue entry parks failed on the
-                // same error path this arm already uses for a gate error. Only
-                // runs when a predecessor existed (None = first-time activation).
-                if let Some(predecessor_id) = superseded_predecessor_id {
-                    crate::restore::complete_superseded_parse(
-                        index_root,
-                        source_id,
-                        predecessor_id,
-                        crate::restore::SupersededCleanupMode::ActivationSupersession {
-                            activated_parse_id: parse_run_id.to_owned(),
-                        },
-                    )?;
-                }
-            }
-            // Ruling 1: clean any held candidate the gate/hold path superseded.
-            // Runs for BOTH decisions (a hold can supersede an older held one),
-            // so it is OUTSIDE the Activated-only block above. Post-barrier,
-            // gated over each candidate's own pre_activation snapshot. MUST STAY
-            // IN STEP with the fresh-dispatch twin below.
-            clean_superseded_held(index_root, source_id, &decision)?;
-            info!(
-                event = "scheduler.parse_dispatch.gated_existing",
-                entry_id = entry.id,
-                source_id,
-                parse_run_id,
-                decision = decision_label(&decision),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "pre-existing ready run gated (crash recovery)"
-            );
-            return Ok(ParseChainOutcome::Gated);
+            // Crash-recovery idempotence: an earlier import committed this run
+            // `ready` but the process died before gating it. The §13.5-conformant
+            // replay is to gate the EXISTING run rather than re-parse identical
+            // bytes through an identical parser. The prefix stops here; the caller
+            // (`gate_ready_parse`) runs the idempotent projection (re)build, the
+            // snapshots, and the gate. The dry-run pass instead records this run
+            // and leaves it un-held for the NEXT normal cycle's GateExisting
+            // adoption (which re-reaches exactly this arm).
+            return Ok(ParseChainPrefix::GateExisting { parse_run_id });
         }
         NoRetryGuardDecision::DispatchOverStaleBuilding { stale_run_id } => {
             // With the single scheduler thread, dispatch and import run
@@ -2169,7 +2460,7 @@ fn dispatch_parse_chain(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "corpus file changed between staging and dispatch; parse skipped pending re-detection"
         );
-        return Ok(ParseChainOutcome::Skipped);
+        return Ok(ParseChainPrefix::Skipped);
     }
 
     // Worker execution (spec §12.1): the worker stages an untrusted bundle
@@ -2210,110 +2501,195 @@ fn dispatch_parse_chain(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "parse dispatch finished with a recorded parse failure"
             );
-            Ok(ParseChainOutcome::ParseFailed)
+            Ok(ParseChainPrefix::ParseFailed)
         }
         ImportedParseStatus::Ready => {
-            // C6 content-derived projection build (spec §22–§23): runs AFTER the
-            // importer committed the ready run's canonical ContentUnits and
-            // BEFORE the activation gate, so a parse cannot activate without its
-            // retrieval-targeting projections (see verify_activation_prerequisites).
-            // Crash-replay atomicity is preserved: the ready run and its bundle
-            // are already durable, so a build failure here surfaces as an Err the
-            // caller parks the entry failed with, and the next detection re-runs
-            // the whole chain (the guard's GateExisting replay re-reaches this
-            // build step for an un-gated ready run).
-            build_content_derived_projections(
-                &dispatch.projections,
-                index_root,
+            // The importer committed a fresh ready run. The prefix stops here; the
+            // caller (`gate_ready_parse`) runs the C6 content-derived projection
+            // build, the snapshots, the activation gate, and the consumed-bundle
+            // removal. The dry-run pass instead truncates HERE (mechanic 1): the
+            // ready row stamped `held_reason` NULL is the exact GateExisting
+            // precondition the next normal cycle adopts. `source_id` and
+            // `bundle_dir` ride along so the caller needs no second read.
+            info!(
+                event = "scheduler.parse_dispatch.imported_ready",
+                entry_id = entry.id,
                 source_id,
-                &imported_parse.parse_run_id,
-            )?;
+                parse_run_id = imported_parse.parse_run_id,
+                unit_count = imported_parse.unit_count,
+                relationship_count = imported_parse.relationship_count,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "parse worker output imported as a ready run (pre-gate)"
+            );
+            Ok(ParseChainPrefix::FreshReady {
+                parse_run_id: imported_parse.parse_run_id,
+                source_id: source_id.clone(),
+                bundle_dir,
+            })
+        }
+    }
+}
 
-            // Pre-activation snapshot (§30.6): minted immediately BEFORE the gate
-            // for the freshly imported candidate. §30.6/§31.2 — the gate holds the
-            // per-source cutover barrier INTERNALLY; the snapshot runs OUTSIDE that
-            // hold (this call precedes gate_and_activate), preserving §31.1 brevity.
-            crate::snapshot::pre_activation_snapshot(
+/// The normal drain-loop parse chain for one imported entry (spec §9.4): run the
+/// shared prefix, then — for a ready run (freshly imported OR adopted by the
+/// §13.5 GateExisting arm) — build the content-derived projections, mint the
+/// pre/post snapshots, run the activation gate, and clean any superseded held
+/// candidate. Every producer-side outcome returns `Ok` and the entry completes;
+/// `Err` is a canonical-side infrastructure fault the caller parks the entry
+/// failed with. Behavior is identical to the former inline body: the prefix is
+/// the former prefix verbatim, and `gate_ready_parse` is the former gate work,
+/// now shared by both ready arms.
+fn dispatch_parse_chain(
+    dispatch: &ParseDispatchContext,
+    index_root: &Path,
+    entry: &SyncQueueEntry,
+    import: &ImportOutcome,
+) -> Result<ParseChainOutcome, ApiError> {
+    let started = Instant::now();
+    // The prefix consumes only the prefix-scoped slice of the context; the gate
+    // continuation below consumes the rest (projections/registry/identity).
+    match parse_chain_prefix(&dispatch.prefix, index_root, entry, import)? {
+        ParseChainPrefix::Skipped => Ok(ParseChainOutcome::Skipped),
+        ParseChainPrefix::ParseFailed => Ok(ParseChainOutcome::ParseFailed),
+        ParseChainPrefix::GateExisting { parse_run_id } => {
+            // Crash-recovery idempotence: gate the pre-existing ready run without
+            // re-parsing. No fresh worker ran, so there is no consumed bundle to
+            // remove (`consumed_bundle: None`). The projection (re)build inside is
+            // idempotent (each type is deleted-for-parse then rebuilt), so a crash
+            // that died before OR after the original build replays cleanly.
+            let source_id =
+                import
+                    .source_object_id
+                    .as_deref()
+                    .ok_or_else(|| ApiError::InternalIo {
+                        message: format!(
+                            "imported acquisition outcome for entry {} carries no source linkage \
+                             at GateExisting; the import/dispatch contract is broken",
+                            entry.id
+                        ),
+                    })?;
+            let decision = gate_ready_parse(dispatch, index_root, source_id, &parse_run_id, None)?;
+            info!(
+                event = "scheduler.parse_dispatch.gated_existing",
+                entry_id = entry.id,
+                source_id,
+                parse_run_id,
+                decision = decision_label(&decision),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "pre-existing ready run gated (crash recovery)"
+            );
+            Ok(ParseChainOutcome::Gated)
+        }
+        ParseChainPrefix::FreshReady {
+            parse_run_id,
+            source_id,
+            bundle_dir,
+        } => {
+            let decision = gate_ready_parse(
+                dispatch,
                 index_root,
-                &dispatch.identity,
-                &imported_parse.parse_run_id,
+                &source_id,
+                &parse_run_id,
+                Some(&bundle_dir),
             )?;
-            let decision = activation::gate_and_activate(
-                index_root,
-                &dispatch.registry,
-                &dispatch.projections.dense_cache,
-                dispatch.projections.dense_dimension,
-                &imported_parse.parse_run_id,
-            )?;
-            // Post-activation snapshot ONLY when the gate actually activated: a
-            // Held decision changes no active state, so there is nothing new to
-            // capture. §30.6/§31.2 — this is the snapshot the deletion gate later
-            // verifies over; it runs OUTSIDE the gate's internal barrier hold.
-            if let ActivationDecision::Activated {
-                superseded_predecessor_id,
-                ..
-            } = &decision
-            {
-                crate::snapshot::post_activation_snapshot(
-                    index_root,
-                    &dispatch.identity,
-                    &imported_parse.parse_run_id,
-                )?;
-                // §31.2 steps 3–5: complete the superseded predecessor's
-                // archive-verify-delete. The gate verifies over the
-                // post_activation snapshot JUST minted above (never re-taken),
-                // whose subject is the newly activated candidate
-                // `imported_parse.parse_run_id`. A gate failure or delete fault
-                // propagates through `?`, halting this source's lifecycle — the
-                // queue entry parks failed on the same error path this arm
-                // already uses for a gate error. Only runs when a predecessor
-                // existed (None = first-time activation, nothing to supersede).
-                if let Some(predecessor_id) = superseded_predecessor_id {
-                    crate::restore::complete_superseded_parse(
-                        index_root,
-                        source_id,
-                        predecessor_id,
-                        crate::restore::SupersededCleanupMode::ActivationSupersession {
-                            activated_parse_id: imported_parse.parse_run_id.to_owned(),
-                        },
-                    )?;
-                }
-            }
-            // Ruling 1: clean any held candidate the gate/hold path superseded.
-            // Runs for BOTH decisions (a hold can supersede an older held one),
-            // so it is OUTSIDE the Activated-only block above. Post-barrier,
-            // gated over each candidate's own pre_activation snapshot. MUST STAY
-            // IN STEP with the crash-recovery twin above.
-            clean_superseded_held(index_root, source_id, &decision)?;
-            // Activated and Held are both recorded outcomes, so the staged
-            // bundle is consumed either way. A deletion error must NOT fail
-            // the chain: the import and gate decision are already durable,
-            // and a leftover promoted bundle is inert because only this
-            // dispatch ever points the importer at it.
-            if let Err(source) = fs::remove_dir_all(&bundle_dir) {
-                error!(
-                    event = "scheduler.parse_dispatch.bundle_delete_failed",
-                    entry_id = entry.id,
-                    source_id,
-                    bundle_dir = %bundle_dir.display(),
-                    error = %source,
-                    "consumed parser bundle could not be deleted; chain continues"
-                );
-            }
             info!(
                 event = "scheduler.parse_dispatch.completed",
                 entry_id = entry.id,
                 source_id,
-                parse_run_id = imported_parse.parse_run_id,
+                parse_run_id,
                 outcome = decision_label(&decision),
-                unit_count = imported_parse.unit_count,
-                relationship_count = imported_parse.relationship_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "parse dispatch finished; ready run gated"
             );
             Ok(ParseChainOutcome::Gated)
         }
     }
+}
+
+/// Gate one ready parse run: build its content-derived projections (spec §22–§23,
+/// runs AFTER the importer committed the run's canonical ContentUnits and BEFORE
+/// the gate so a parse cannot activate without its retrieval-targeting
+/// projections — see `verify_activation_prerequisites`), mint the pre-activation
+/// snapshot (§30.6), run the activation gate, mint the post-activation snapshot
+/// and complete the superseded predecessor ONLY when the gate activated
+/// (§30.6/§31.2), and clean any superseded held candidate (ruling 1, for BOTH
+/// decisions). When `consumed_bundle` is `Some`, the freshly-produced parser
+/// bundle is removed after gating (a delete error is logged, never fatal — the
+/// import and gate decision are already durable and a leftover promoted bundle is
+/// inert). This is the exact former inline gate body, factored so the fresh-ready
+/// and GateExisting arms share ONE copy (they were byte-equivalent twins).
+///
+/// NOT called by the CA2-P5 dry-run pass: the pass truncates before this step by
+/// design (mechanic 1), leaving the ready run un-held for normal-cycle adoption.
+fn gate_ready_parse(
+    dispatch: &ParseDispatchContext,
+    index_root: &Path,
+    source_id: &str,
+    parse_run_id: &str,
+    consumed_bundle: Option<&Path>,
+) -> Result<ActivationDecision, ApiError> {
+    build_content_derived_projections(&dispatch.projections, index_root, source_id, parse_run_id)?;
+
+    // Pre-activation snapshot (§30.6): minted immediately BEFORE the gate. The
+    // gate holds the per-source cutover barrier INTERNALLY; the snapshot runs
+    // OUTSIDE that hold (this call precedes gate_and_activate), preserving the
+    // §31.1 brevity rule.
+    crate::snapshot::pre_activation_snapshot(index_root, &dispatch.identity, parse_run_id)?;
+    let decision = activation::gate_and_activate(
+        index_root,
+        &dispatch.registry,
+        &dispatch.projections.dense_cache,
+        dispatch.projections.dense_dimension,
+        parse_run_id,
+    )?;
+    // Post-activation snapshot ONLY when the gate actually activated: a Held
+    // decision changes no active state, so there is nothing new to capture over.
+    // §30.6/§31.2 — this is the snapshot the deletion gate later verifies over; it
+    // runs OUTSIDE the gate's internal barrier hold.
+    if let ActivationDecision::Activated {
+        superseded_predecessor_id,
+        ..
+    } = &decision
+    {
+        crate::snapshot::post_activation_snapshot(index_root, &dispatch.identity, parse_run_id)?;
+        // §31.2 steps 3–5: complete the superseded predecessor's
+        // archive-verify-delete. The gate verifies over the post_activation
+        // snapshot JUST minted above (never re-taken), whose subject is the newly
+        // activated candidate. A gate failure or delete fault propagates through
+        // `?`, halting this source's lifecycle. Only runs when a predecessor
+        // existed (None = first-time activation, nothing to supersede).
+        if let Some(predecessor_id) = superseded_predecessor_id {
+            crate::restore::complete_superseded_parse(
+                index_root,
+                source_id,
+                predecessor_id,
+                crate::restore::SupersededCleanupMode::ActivationSupersession {
+                    activated_parse_id: parse_run_id.to_owned(),
+                },
+            )?;
+        }
+    }
+    // Ruling 1: clean any held candidate the gate/hold path superseded. Runs for
+    // BOTH decisions (a hold can supersede an older held one), so it is OUTSIDE
+    // the Activated-only block above. Post-barrier, gated over each candidate's
+    // own pre_activation snapshot.
+    clean_superseded_held(index_root, source_id, &decision)?;
+    // A freshly-produced bundle is consumed either way (Activated and Held are
+    // both recorded outcomes). A deletion error must NOT fail the chain: the
+    // import and gate decision are already durable, and a leftover promoted
+    // bundle is inert because only this dispatch ever points the importer at it.
+    if let Some(bundle_dir) = consumed_bundle
+        && let Err(source) = fs::remove_dir_all(bundle_dir)
+    {
+        error!(
+            event = "scheduler.parse_dispatch.bundle_delete_failed",
+            source_id,
+            bundle_dir = %bundle_dir.display(),
+            error = %source,
+            "consumed parser bundle could not be deleted; chain continues"
+        );
+    }
+    Ok(decision)
 }
 
 /// Build the five content-derived retrieval projections for one ready parse,

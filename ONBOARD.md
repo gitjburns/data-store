@@ -15,18 +15,18 @@ Please read the following files one at a time, in the given order:
 
 AGENTS.md
 PRINCIPLES.md
+DIAGNOSTICS.md
 README.md
-INSTALL.md
-DIAGNOSTICS-ONBOARDING.md
 ARCHITECTURE.md - Current MVP architecture
 SPEC-SERVER.md - Current MVP server spec
 IN-PROG.md - Development in-progress
 
 The following reference documents are also available, but should only be read when needed:
 
-canonical_content_graph_retrieval_fabric_v_0_3.md - Origincal spec for eventual full-featured data fabric (current repo contains a subset of this as an MVP)
+canonical_content_graph_retrieval_fabric_v_0_3.md - Original spec for eventual full-featured data fabric (current repo contains a subset of this as an MVP)
 SPEC-CLIENT.md - Current MVP client spec
 PROTOCOL.md - Current MVP comprehensive client/server API contract
+INSTALL.md - Installation guide
 
 Files these documents explicitly instruct you to read. If any of the above files contain explicit instructions to read a specific file (e.g., "Read the spec: filename"), follow that instruction. Do not follow casual mentions or "where to look" pointers.
 

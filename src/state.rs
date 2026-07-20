@@ -15,6 +15,7 @@ use crate::{
     error::ApiError,
     identity::ApplicationIdentity,
     inference::InferenceRuntime,
+    policy::EntityMatchPolicy,
     projections::dense_cache::DenseCache,
     types::{HealthComponent, HealthCount, HealthResponse},
 };
@@ -63,6 +64,13 @@ pub struct AppState {
     // it by reference without reaching a global — main.rs clones the identity
     // into AppState BEFORE the original moves into `scheduler::start`.
     application_identity: ApplicationIdentity,
+    // CA2 entity-match policy document (D3 amendment): operator-loaded at
+    // startup (main.rs), consumed by the query pipeline's graph channel. Held
+    // here rather than as a compile-sealed global accessor because the values
+    // are operator-editable runtime data, not a sealed code document — the
+    // loaded content is fixed for the process lifetime (config is
+    // startup-only) and its identity is hash-pinned in ApplicationIdentity.
+    entity_match_policy: EntityMatchPolicy,
 }
 
 /// Live health snapshot of the sync scheduler (spec §9.5–§9.6): queue
@@ -395,6 +403,7 @@ impl AppState {
         dense_cache: Arc<DenseCache>,
         cutover_registry: Arc<CutoverRegistry>,
         application_identity: ApplicationIdentity,
+        entity_match_policy: EntityMatchPolicy,
     ) -> Self {
         let model_call_gate =
             Arc::new(ExclusiveGate::new("model_gate.lock_poisoned", "model gate"));
@@ -419,6 +428,7 @@ impl AppState {
             cutover_registry,
             search_admission,
             application_identity,
+            entity_match_policy,
         }
     }
 
@@ -446,6 +456,15 @@ impl AppState {
     // Consumed at C10a (POST /snapshots and POST /restore detached tasks).
     pub(crate) fn application_identity(&self) -> &ApplicationIdentity {
         &self.application_identity
+    }
+
+    /// The CA2 entity-match policy document (D9-amendment fuzzy-match ruleset)
+    /// the `/query` handler threads into `execute_query` for the graph
+    /// channel. Borrowed for the duration of the blocking pipeline call; the
+    /// document is immutable for the process lifetime (loaded once at startup,
+    /// hash-pinned in the application identity).
+    pub(crate) fn entity_match_policy(&self) -> &EntityMatchPolicy {
+        &self.entity_match_policy
     }
 
     /// Try to admit one search into the fail-fast admission window, returning a

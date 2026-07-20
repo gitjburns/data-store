@@ -266,6 +266,33 @@ as failed for later retry; there is no fallback model or endpoint.
 | `api_key_file_path` | Optional owner-only file holding the bearer API key. |
 | `max_input_chars` | Producer input budget in characters; larger section groups split deterministically before invocation. Sized from the endpoint model's context window. > 0. |
 
+### 2.10 `[policies]`
+
+Operator-editable **policy documents** are external facts the same way secret
+files are: config holds their **paths only**, never their values (the D3 ruling
+extended — retrieval knobs already moved to sealed code documents; these two are
+operator-editable documents whose *identity* is content-hashed, not their values
+inlined into config).
+
+| Key | Meaning |
+| --- | --- |
+| `entity_match_file_path` | Path to the graph-entry entity-match ruleset (§14.3 fuzzy-match classes and caps). Required. Relative resolves against the config directory. |
+| `annotator_naming_file_path` | Path to the annotator naming-rules document composed into the entity/relation producer prompts (§13). Required. Relative resolves against the config directory. |
+
+Both documents are **strict TOML** (`deny_unknown_fields`), **loaded once at
+startup**, and **fatal on invalid** — an unknown key or out-of-range value halts
+startup with a config error naming the document. Each is **content-hashed over
+its parsed canonical serialization**, so comment- and whitespace-only edits do
+not change a document's identity. Both content hashes fold into
+`ApplicationIdentity` (§15.3). Because config is startup-only, **editing a policy
+document requires a service restart to take effect**. The shipped documents are
+neutral (`policies/entity-match.toml` ships both fuzzy classes disabled;
+`policies/annotator-naming.toml` ships an empty rule list), so the default
+posture is byte-identical to no policy.
+
+System-assigned versioning of these documents is recorded in the append-only
+`policy_versions` table with a `policy.changed` event per advance (§3, §16).
+
 ---
 
 ## 3. Storage and schema contract
@@ -306,7 +333,9 @@ Fabric tables (from `sql/fabric/schema.sql`):
 `query_execution_records`, `forensic_snapshots`, `operations`,
 `semantic_annotations`, `annotation_memo`, `system_events`, `chunk_projections`,
 `chunk_dense_vectors`, `unit_multivector_projections`, `graph_entity_mentions`,
-`graph_entity_edges`, plus the `chunk_text_index` FTS5 virtual table (the
+`graph_entity_edges`, `policy_versions` (the append-only system-assigned
+registry of operator policy-document content hashes, §2.10), plus the
+`chunk_text_index` FTS5 virtual table (the
 lexical index over chunk text). (`query_execution_records` exists as a reserved
 seam; the QER audit tier that writes it is deferred — see §19.)
 
@@ -322,6 +351,7 @@ seam; the QER audit tier that writes it is deferred — see §19.)
 | `--setup-storage` | Create/validate the **fabric hot plane** schema, then exit. A single deliberate operator action; the only path that creates or validates schema. |
 | `--foreground` | Keep the service attached to the terminal instead of daemonizing. |
 | `--smoke-dense` | Run inference readiness smoke checks without binding HTTP, then exit. |
+| `--annotation-dry-run <groups-per-source>` | Run the annotation dry-run mode (§4.7), sampling the first N section groups per source per type. Positive integer; a missing or non-positive value is a fatal CLI error. Service binary only — the `data-store` client rejects it as an unknown argument, same as `--setup-storage`. |
 
 An unknown argument is a fatal CLI error.
 
@@ -401,6 +431,54 @@ observes EOF and exits, leaving the detached child serving. Startup failures
 surface on the same channel before it closes, so the parent can exit non-zero
 with the failure visible.
 
+### 4.7 Annotation dry-run mode
+
+`--annotation-dry-run <groups-per-source>` runs a deliberately truncated,
+inspection-only mode whose purpose is **authoring the corpus-dependent operator
+rulesets (§2.10) from observed vocabulary before paying for full annotation and
+embedding**: it parses the corpus, sample-annotates a bounded slice, and serves
+the vocabulary route for inspection — nothing more. The mode always runs
+foreground (it never daemonizes).
+
+Startup sequence, in order:
+
+1. **Policies load and register.** Both policy documents load (fatal on
+   invalid, as always) and their versions register. Unlike a normal start —
+   where a missing fabric plane degrades to `ready=false` — **a valid fabric
+   plane is REQUIRED here and its absence is fatal**: the mode exists to write
+   and read annotation rows, so there is nothing to do without a plane.
+2. **Identity capture** (§15.3), policy hashes included.
+3. **Admin token generated and published** (§4.3) — the vocabulary and
+   shutdown routes are protected.
+4. **Bind**, then serve a **reduced router**: exactly
+   `GET /v1/health`, `GET /annotations/vocabulary`,
+   `GET /operations/{operationId}`, and `POST /shutdown`. No other route
+   exists in this mode.
+5. **The dry-run pass runs on a blocking task while HTTP serves.**
+   `POST /shutdown` ends the mode.
+
+**No inference runtime, no scheduler thread, no annotation worker** is started.
+Health reports the inference component not-ready with the mode message
+`annotation dry-run mode: inference not initialized` — by design; `ready=false`
+is the expected state of this mode.
+
+The pass **truncates at import-READY**: parses run through acquisition, Docling
+conversion, and import (the `parse_runs` rows reach `ready`), but **no
+projections are built, no gating or activation runs**, queue rows are left
+`in_flight`, and acquisition bundles are retained on disk. The next **normal**
+start adopts this state through the §13.5 no-blind-retry guard's
+`GateExisting` arm — it rebuilds the content-derived projections and gates the
+existing ready runs, so **Docling conversion is never re-paid**.
+
+Sampling annotates with the **entity and relation** producers only, over the
+**first N section groups per source per type** in plan order (N is the CLI
+argument); the **summary producer is excluded** — sampling exists to surface
+naming and predicate vocabulary. The sampled annotations are ordinary
+`semantic_annotations` rows on parses that are never activated, so vocabulary
+inspection in this mode uses `scope=all`. A **failed pass keeps the process
+serving** whatever annotations landed, so a partial sample is still
+inspectable.
+
 ---
 
 ## 5. Async-operation administrative model
@@ -461,6 +539,10 @@ The full wire contract is in **PROTOCOL.md**. Routes split into public
   Operation row (not async work).
 - `GET /parses?status=held` — held-parse listing (spec §13.4 disposition surface).
 - `GET /operations/{operationId}` — Operation polling.
+- `GET /annotations/vocabulary?annotationType=entity|relation&scope=active|all`
+  — annotation vocabulary inspection (grouped entity or relation vocabulary
+  drawn from `semantic_annotations`; `scope` defaults to `active`). The
+  inspect-and-adjust surface for authoring the operator policy documents (§2.10).
 
 ---
 
@@ -845,16 +927,37 @@ empty).
 - **Parse-scoped readability.** Annotations are parse-scoped and readable only
   for the source's **current active parse**, enforced in the read SQL itself.
 - **Eligibility: pure function of target content.** A producer's model input
-  is *exactly* the ordered text of its target units — no corpus context, no
-  neighbors, no metadata, no synthesized headings. This input purity is what
-  makes every producer memoization-eligible.
-- **The §21.2 memo key.** The memo cache is keyed by a canonical SHA-256 over
-  the **ordered per-target content hashes** (each target's `textHash`, falling
-  back to `bodyHash`), the **annotation type**, and the **producer identity
-  hash**. A producer identity or configuration change changes the key and
-  invalidates reuse. One cache row caches one full producer invocation output;
-  memo rows deliberately survive parse archival and hot cleanup — cross-parse
-  reuse is the cache's purpose (§15.10).
+  (the USER content) is *exactly* the ordered text of its target units — no
+  corpus context, no neighbors, no metadata, no synthesized headings. This
+  input purity is what makes every producer memoization-eligible, and it is
+  **untouched** by the naming-rules composition below: naming rules are producer
+  *instruction* (identity-bearing configuration, folded into the SYSTEM prompt),
+  never corpus content.
+- **Naming-rule prompt composition.** The entity and relation producers compose
+  the annotator naming-rules document (§2.10) into their base system prompt as
+  `"\n\nNaming rules:\n"` followed by one `- `-prefixed line per rule in
+  document order, when the rule list is non-empty; an **empty document yields
+  the byte-identical bare prompt** (an identity-stable no-op). The composed
+  prompt folds into the producer's `promptHash` and thus its producer identity
+  hash. The **summary producer never composes** naming rules.
+- **Two keys, two scopes (§21.2).** Every annotation carries two canonical
+  SHA-256 keys derived from one shared material:
+  - The **content key** hashes the **annotation type** crossed with the
+    **ordered per-target content hashes** (each target's `textHash`, falling
+    back to `bodyHash`) — **no producer identity**. Discovery **satisfaction**
+    and **reopenable** classification decide from the content key alone: a
+    content key already fresh under *any* producer identity is left satisfied,
+    and a `failed`/`building` row with no fresh sibling is reopened for the
+    current producer. This is what lets a model switch re-annotate only the
+    frontier, not the whole corpus.
+  - The **memoization key** additionally folds in the **producer identity hash**
+    (which folds the composed prompt above); it keys the identity-scoped
+    `annotation_memo` cache, so a producer identity or configuration change
+    changes the memo key and invalidates reuse. On completion the annotation's
+    stored memoization key is **re-stamped to the completing producer** (the
+    content key is unchanged by construction). One cache row caches one full
+    producer invocation output; memo rows deliberately survive parse archival
+    and hot cleanup — cross-parse reuse is the cache's purpose (§15.10).
 - **Memoization honesty.** Reuse is recorded through the Provenance
   memoization fields: a re-minted annotation carries `memoized` and a
   per-item `memoizedFrom` naming the originating annotation. An auditor can
@@ -896,9 +999,22 @@ an immediate 503. (§7.)
 3. **Dense + lexical candidate generation**, then **RRF fusion** — fusion is
    **rank-only**: the fused score is a reciprocal-rank signal, never a
    semantic similarity.
-4. **Graph channel appended** to the fused pool: lexical entity-name entry,
+4. **Graph channel appended** to the fused pool: entity-name entry, then a
    semantic-only one-hop traversal over annotation-derived mentions/edges, no
-   LLM in the query path.
+   LLM in the query path. Entry matching (the D9 amendment) has an always-on
+   **exact** class plus two policy-gated fuzzy classes drawn from the
+   entity-match policy document (§2.10), *not* the RetrievalProfile:
+   **acronym** (a single query token equals the first-letter acronym of a
+   stored name whose token count is at least `min_name_tokens`) and
+   **token_prefix** (each query token of at least `min_token_len` characters is
+   a leading prefix of the correspondingly positioned stored-name token). Fuzzy
+   candidates are capped at `max_fuzzy_candidates`. Graph hits order by tier,
+   then match class (`exact` > `acronym` > `token_prefix`), then matched-name
+   length descending, then unitId then parseId ascending — a rank-only
+   deterministic order. **With both fuzzy classes disabled (the shipped
+   default) the path is byte-identical to the prior exact-only behavior:** no
+   per-parse name enumeration runs at all, so every match is `exact` and the
+   class component of the order is constant.
 5. **ColBERT MaxSim over the fused pool** — **retained at MVP.** The deferred
    `multi_vector` *retrieval channel* (§19) is candidate generation; this
    stage is late-interaction re-scoring of the already-fused pool and is
@@ -1065,7 +1181,7 @@ every deletion path — cross-parse reuse is the cache's entire purpose (§13).
 ## 16. System events
 
 The `system_events` log is the audit surface of the autonomous pipeline. The
-`eventType` vocabulary is a **closed set of 36 types**, by family:
+`eventType` vocabulary is a **closed set of 37 types**, by family:
 
 - `acquisition.*` — `succeeded`, `failed`.
 - `source.*` — `ingested`, `location_added`, `location_deleted`,
@@ -1077,6 +1193,8 @@ The `system_events` log is the audit surface of the autonomous pipeline. The
 - `projection.*` — `requested`, `completed`, `failed`, `stale`, `superseded`.
 - `assembly_policy.changed` — exists but is reserved: the sealed MVP policy
   documents never change at runtime, so it is never minted at MVP.
+- `policy.changed` — minted per system-assigned version advance of an operator
+  policy document (§2.10), atomically with the `policy_versions` row.
 - `snapshot.*` — `started`, `completed`, `failed`.
 - `drill.*` — `completed`, `failed`.
 - `query.executed`.
@@ -1090,7 +1208,8 @@ operation context and are **never swallowed** by callers.
 Recorded **additive extensions** to the spec's §33 closed enumeration: the
 `annotation.*` family (the spec defines semantic annotations but omits their
 lifecycle events), `projection.superseded` (the spec defines the transition
-but omits its event), and — in spec §34.6 — the `parse_discard` operationType (§5).
+but omits its event), the `policy.changed` event (§2.10 operator policy-document
+versioning), and — in spec §34.6 — the `parse_discard` operationType (§5).
 
 ---
 

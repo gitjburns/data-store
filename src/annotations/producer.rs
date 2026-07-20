@@ -16,6 +16,8 @@
 //! into the §21.2 memo key. This module exposes that set (`Invocation.targets`)
 //! and the producer identity (`identity_hash`); stage 3 computes the key.
 
+use std::borrow::Cow;
+
 use rusqlite::Connection;
 use serde_json::json;
 use tracing::warn;
@@ -119,13 +121,45 @@ impl ProducerKind {
         "1"
     }
 
-    /// This producer's system prompt (a named external-language constant per
-    /// PRINCIPLES; the text lives in the per-producer module).
-    pub(crate) fn prompt(self) -> &'static str {
+    /// This producer's BASE system prompt (a named external-language constant
+    /// per PRINCIPLES; the text lives in the per-producer module). Every call
+    /// path — sending and hashing alike — must go through `prompt`, which
+    /// composes the operator naming rules onto this base; this accessor exists
+    /// only as the composition input.
+    fn base_prompt(self) -> &'static str {
         match self {
             Self::Entity => entity::SYSTEM_PROMPT,
             Self::Relation => relation::SYSTEM_PROMPT,
             Self::Summary => summary::SYSTEM_PROMPT,
+        }
+    }
+
+    /// The EFFECTIVE system prompt: the base prompt composed with the
+    /// operator's naming rules (CA2-P3, user-ruled 2026-07-19). SINGLE SOURCE
+    /// OF TRUTH for the prompt bytes — the live producer call path (`invoke`)
+    /// and `prompt_hash` (and through it `identity_hash` and the §21.2 memo
+    /// key) all read this one function, so the hashed prompt and the sent
+    /// prompt are the same bytes by construction.
+    ///
+    /// Naming rules govern entity/relation NAMING only, so Summary is
+    /// deliberately excluded: its arm returns the bare base prompt regardless
+    /// of the rule list, which keeps the summary producer's prompt hash — and
+    /// therefore its `identity_hash` output bytes — unchanged by any
+    /// naming-policy edit.
+    ///
+    /// EMPTY-IS-BYTE-IDENTICAL (CA2 ruling 7): with an empty rule list the
+    /// composed prompt is the bare `SYSTEM_PROMPT` with ZERO appended
+    /// characters (`Cow::Borrowed`), so shipping the neutral (empty) naming
+    /// document changes no producer identity and invalidates no memo entries.
+    ///
+    /// Input purity (§21.3 / D8) is untouched: naming rules are producer
+    /// INSTRUCTION (identity-bearing configuration, like the model name or
+    /// endpoint), not corpus context — the USER content stays exactly the
+    /// ordered target-unit text.
+    pub(crate) fn prompt(self, naming_rules: &[String]) -> Cow<'static, str> {
+        match self {
+            Self::Entity | Self::Relation => compose_naming_rules(self.base_prompt(), naming_rules),
+            Self::Summary => Cow::Borrowed(self.base_prompt()),
         }
     }
 
@@ -144,8 +178,20 @@ impl ProducerKind {
     /// target units under a different cap produce a different model input.
     /// It is therefore producer configuration, and a change to it must
     /// invalidate memo reuse just like a prompt or model change.
-    pub(crate) fn identity_hash(self, config: &AnnotatorModelConfig) -> Result<String, ApiError> {
-        let prompt_hash = self.prompt_hash()?;
+    ///
+    /// `naming_rules` (CA2-P3, user-ruled 2026-07-19): `promptHash` here is the
+    /// COMPOSED prompt's hash, so the operator naming policy is
+    /// identity-bearing — editing it changes this hash, which invalidates memo
+    /// reuse, and under CONTENT-scoped satisfaction (CA2-P1) the re-annotation
+    /// lands only at the frontier (new/changed content, re-parses, failed-row
+    /// retries), never as a corpus-wide rebuild. Summary composes nothing (see
+    /// `prompt`), so its identity bytes never move with the naming policy.
+    pub(crate) fn identity_hash(
+        self,
+        config: &AnnotatorModelConfig,
+        naming_rules: &[String],
+    ) -> Result<String, ApiError> {
+        let prompt_hash = self.prompt_hash(naming_rules)?;
         let identity = json!({
             "producerName": self.producer_name(),
             "producerVersion": self.producer_version(),
@@ -157,11 +203,13 @@ impl ProducerKind {
         crate::canonical::canonical_sha256_hex(&identity)
     }
 
-    /// Canonical content hash of the prompt text, recorded as provenance
-    /// `promptHash` and folded into the producer identity.
-    fn prompt_hash(self) -> Result<String, ApiError> {
+    /// Canonical content hash of the EFFECTIVE (composed) prompt text,
+    /// recorded as provenance `promptHash` and folded into the producer
+    /// identity. Hashes exactly what `prompt` returns — the same function
+    /// `invoke` sends — so hashed and sent bytes can never diverge.
+    fn prompt_hash(self, naming_rules: &[String]) -> Result<String, ApiError> {
         crate::canonical::canonical_sha256_hex(&serde_json::Value::String(
-            self.prompt().to_string(),
+            self.prompt(naming_rules).into_owned(),
         ))
     }
 
@@ -180,6 +228,34 @@ impl ProducerKind {
     fn request_purpose(self) -> &'static str {
         self.producer_name()
     }
+}
+
+/// Compose the operator naming rules onto a base system prompt (CA2-P3,
+/// user-ruled 2026-07-19). The composition format is FIXED and canonical:
+/// with a non-empty rule list, exactly `"\n\nNaming rules:\n"` is appended,
+/// followed by the rules in document order, each as a `- ` line, joined by
+/// single newlines with no trailing newline. Changing this format is a
+/// producer-identity change for every non-empty naming document.
+///
+/// With an EMPTY rule list the base is returned BORROWED — zero appended
+/// characters — which is the CA2 ruling-7 identity-stability invariant: the
+/// neutral (empty) naming document composes to the byte-identical existing
+/// prompt, so landing this composition changes no producer identity and
+/// invalidates no memo entries.
+fn compose_naming_rules(base: &'static str, naming_rules: &[String]) -> Cow<'static, str> {
+    if naming_rules.is_empty() {
+        return Cow::Borrowed(base);
+    }
+    let mut composed = String::from(base);
+    composed.push_str("\n\nNaming rules:\n");
+    for (index, rule) in naming_rules.iter().enumerate() {
+        if index > 0 {
+            composed.push('\n');
+        }
+        composed.push_str("- ");
+        composed.push_str(rule);
+    }
+    Cow::Owned(composed)
 }
 
 /// Read `parse_id`'s content units and group them into the invocation plan
@@ -294,13 +370,16 @@ pub(crate) fn build_invocation_plan(
 
 /// Assemble §20 provenance for a planned (about-to-run) invocation of `kind`.
 /// `producerType` is Model; `modelName` and `endpoint`-derived `configHash`
-/// come from config; `promptHash` is the prompt's content hash; `inputRefs`
-/// are ContentUnit references for the ordered targets. The memoization fields
-/// and confidence are left None here — they are filled by the stage-3 worker
-/// on completion (confidence) and on memo reuse (memoized/memoizedFrom).
+/// come from config; `promptHash` is the COMPOSED prompt's content hash
+/// (CA2-P3 — the same bytes `invoke` sends and `identity_hash` folds);
+/// `inputRefs` are ContentUnit references for the ordered targets. The
+/// memoization fields and confidence are left None here — they are filled by
+/// the stage-3 worker on completion (confidence) and on memo reuse
+/// (memoized/memoizedFrom).
 pub(crate) fn planned_provenance(
     kind: ProducerKind,
     config: &AnnotatorModelConfig,
+    naming_rules: &[String],
     targets: &[InvocationTarget],
 ) -> Result<model::Provenance, ApiError> {
     let input_refs = targets
@@ -315,10 +394,10 @@ pub(crate) fn planned_provenance(
         producer_type: ProducerType::Model,
         producer_name: kind.producer_name().to_string(),
         producer_version: Some(kind.producer_version().to_string()),
-        config_hash: Some(kind.identity_hash(config)?),
+        config_hash: Some(kind.identity_hash(config, naming_rules)?),
         model_name: Some(config.model.clone()),
         model_version: None,
-        prompt_hash: Some(kind.prompt_hash()?),
+        prompt_hash: Some(kind.prompt_hash(naming_rules)?),
         confidence: None,
         memoized: None,
         memoized_from: None,
@@ -340,6 +419,7 @@ pub(crate) fn invoke(
     kind: ProducerKind,
     client: &AnnotatorClient,
     invocation: &Invocation,
+    naming_rules: &[String],
 ) -> Result<Vec<ProducedAnnotation>, ApiError> {
     match (kind, &invocation.kind) {
         (ProducerKind::Entity | ProducerKind::Relation, InvocationKind::SectionGroup { .. }) => {}
@@ -364,7 +444,11 @@ pub(crate) fn invoke(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let raw = client.complete(kind.request_purpose(), kind.prompt(), &user_content)?;
+    // The sent system prompt is the COMPOSED prompt from `ProducerKind::prompt`
+    // — the same function `prompt_hash` reads — so the bytes sent here are the
+    // bytes the recorded promptHash/identity cover, by construction (CA2-P3).
+    let system_prompt = kind.prompt(naming_rules);
+    let raw = client.complete(kind.request_purpose(), &system_prompt, &user_content)?;
     kind.parse_output(&raw)
 }
 

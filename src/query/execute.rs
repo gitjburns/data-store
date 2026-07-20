@@ -49,6 +49,7 @@ use crate::assembly::model::EvidencePack;
 use crate::assembly::policy::{CapturedParseRef, active_policy};
 use crate::error::ApiError;
 use crate::inference::{ColbertCandidateScore, InferenceRuntime, RerankerCandidateScore};
+use crate::policy::EntityMatchPolicy;
 use crate::projections::dense_cache::DenseCache;
 use crate::query::channels::{CapturedParse, dense_lexical_fusion_channel, graph_channel};
 use crate::query::model::{ResolvedScope, ResolvedScopeKind, RetrievalHit};
@@ -182,6 +183,11 @@ pub(crate) struct QueryRequestContext {
 /// - `index_root` is the fabric index root the read connection opens against.
 /// - `profile` is the sealed §24.2 `RetrievalProfile`; every knob (top_k, pool
 ///   sizes, rrf_k, hop budget) is threaded from it, never from config.
+/// - `entity_match_policy` is the operator-editable entity-match policy (D9
+///   amendment, CA2-P2 2026-07-19) loaded at startup and threaded to the graph
+///   channel for its fuzzy match classes. It is DELIBERATELY separate from
+///   `profile`: the sealed RetrievalProfile stays sealed (D3 amendment); this
+///   document is operator-tunable. Passed by reference (no clone).
 /// - `colbert_expected_dimension` is the runtime ColBERT projection width the
 ///   multi-vector decoder validates against. It arrives as an explicit value
 ///   because `ColbertRuntime` exposes no dimension accessor; the build path
@@ -209,6 +215,7 @@ pub(crate) fn execute_query(
     gate: &Arc<ExclusiveGate>,
     index_root: &Path,
     profile: &RetrievalProfile,
+    entity_match_policy: &EntityMatchPolicy,
     colbert_expected_dimension: usize,
     query_id: &str,
     query_text: &str,
@@ -275,6 +282,7 @@ pub(crate) fn execute_query(
         inference,
         gate,
         profile,
+        entity_match_policy,
         colbert_expected_dimension,
         query_id,
         query_text,
@@ -341,6 +349,7 @@ fn run_pipeline_body(
     inference: &InferenceRuntime,
     gate: &Arc<ExclusiveGate>,
     profile: &RetrievalProfile,
+    entity_match_policy: &EntityMatchPolicy,
     colbert_expected_dimension: usize,
     query_id: &str,
     query_text: &str,
@@ -436,6 +445,7 @@ fn run_pipeline_body(
         &captured,
         query_text,
         profile.graph_hop_budget as usize,
+        entity_match_policy,
     )?;
     latencies.graph_ms = graph_started_at.elapsed().as_millis() as u64;
     pool.extend(graph_hits);

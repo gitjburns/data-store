@@ -22,4 +22,5 @@ pub(crate) mod producer;
 pub(crate) mod relation;
 pub(crate) mod store;
 pub(crate) mod summary;
+pub(crate) mod vocabulary;
 pub(crate) mod worker;

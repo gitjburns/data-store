@@ -26,10 +26,13 @@ use rusqlite::{Connection, params};
 use tracing::{debug, info};
 
 use crate::error::ApiError;
+use crate::policy::EntityMatchPolicy;
 use crate::primitives::bm25::build_bm25_queries;
 use crate::primitives::fusion::{Bm25Match, DenseMatch, FusedMatch, fuse_matches};
 use crate::projections::dense_cache::DensePlane;
-use crate::projections::graph::{mentions_for_name, normalize_entity_name, one_hop_edges};
+use crate::projections::graph::{
+    entity_names_for_parse, mentions_for_name, normalize_entity_name, one_hop_edges,
+};
 use crate::projections::lexical::match_chunks;
 use crate::query::model::{RetrievalChannel, RetrievalHit, RetrievalHitType};
 
@@ -552,48 +555,131 @@ enum GraphTier {
     Tier3,
 }
 
+/// How a query matched a stored NORMALIZED entity name (D9 amendment, CA2-P2
+/// 2026-07-19). Strength order is RULED: `Exact` is strongest, then `Acronym`,
+/// then `TokenPrefix`. `#[derive(Ord)]` makes `Exact < Acronym < TokenPrefix`
+/// (declaration order), i.e. "stronger first" — a plain ascending sort places
+/// exact-derived matches before fuzzy ones, and acronym before token-prefix,
+/// exactly as the ruled ordering key requires. This ordinal ranks WITHIN a D9
+/// tier, strictly BELOW the tier discriminator and strictly ABOVE matched-name
+/// length (ordering key = tier, class, matched-name length, unitId).
+///
+/// Never double-classify: a stored name a query matches EXACTLY is `Exact` and
+/// is never also recorded as a fuzzy class (the fuzzy scan skips names already
+/// matched exactly — see `fuzzy_matched_names`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchClass {
+    /// Normalized query n-gram == stored name (existing behavior, always on).
+    Exact,
+    /// A normalized query token == the first-letter acronym of a stored name.
+    Acronym,
+    /// Each normalized query token is a prefix of the corresponding stored-name
+    /// token, in order (a leading-subsequence prefix match).
+    TokenPrefix,
+}
+
+/// A stable, bounded label for a match class — used in the debug explanation and
+/// (as class keys) in the fuzzy diagnostics. Safe to log: a fixed enum label,
+/// never operator or entity content.
+fn match_class_label(class: MatchClass) -> &'static str {
+    match class {
+        MatchClass::Exact => "exact",
+        MatchClass::Acronym => "acronym",
+        MatchClass::TokenPrefix => "token_prefix",
+    }
+}
+
+/// A stored NORMALIZED entity name a query matched, tagged with the class it
+/// matched under. The name is the STORED node identity (not the query string):
+/// it is what the graph lookups (`mentions_for_name` / `one_hop_edges`) are
+/// probed with and whose length feeds within-tier strength.
+///
+/// Ordered as `(class, Reverse(char_count), name)` via the derived `Ord` so a
+/// candidate's STRONGEST matched entry is its `min`: strongest class first, then
+/// longest name, then name ascending — the ruled within-tier order below the
+/// tier discriminator. Character count (not byte length) so multi-byte names
+/// compare by the count a human would read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatchedName {
+    class: MatchClass,
+    name: String,
+}
+
+impl MatchedName {
+    /// The `(class, Reverse(char_count), &name)` sort key. Kept as a method so
+    /// the borrowed `&str` in the key lives only as long as the borrow at the
+    /// comparison site.
+    fn strength_key(&self) -> (MatchClass, std::cmp::Reverse<usize>, &str) {
+        (
+            self.class,
+            std::cmp::Reverse(self.name.chars().count()),
+            self.name.as_str(),
+        )
+    }
+}
+
+impl PartialOrd for MatchedName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MatchedName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.strength_key().cmp(&other.strength_key())
+    }
+}
+
 /// One graph candidate unit, carrying everything the D9 ordering needs before
 /// it collapses into a `RetrievalHit`. `tier` is the unit's strongest tier
 /// (a unit reached several ways keeps its strongest classification); `matched`
-/// is the set of NORMALIZED matched-entity names by which this unit was reached
-/// (a set so a unit reached twice under the same name is not double-counted and
-/// so tier-1 membership — reached via MORE THAN ONE matched entity — is exact);
+/// is the set of matched STORED entity names (each tagged with its match class)
+/// by which this unit was reached (a set so a unit reached twice under the same
+/// name+class is not double-counted, and so tier-1 membership — reached via MORE
+/// THAN ONE matched entity — is computed from distinct NAMES below);
 /// `source_id`/`parse_id` are the owning parse the unit was reached in.
 ///
-/// Within-tier strength (RULED 2026-07-15) keys on the character length of the
-/// matched normalized entity name (longer = stronger), then name ascending. A
-/// unit may be reached under several matched names (notably a tier-1 unit); the
-/// unit's within-tier strength uses its STRONGEST matched name — the longest,
-/// breaking ties by name ascending — so a unit is ranked by the strongest
-/// evidence that reached it.
+/// Within-tier strength (RULED 2026-07-15; D9-amended 2026-07-19 to lead with
+/// match class): a candidate's strength is that of its STRONGEST matched entry —
+/// strongest class first (exact > acronym > token-prefix), then the longest
+/// name, then name ascending — so a unit is ranked by the strongest evidence
+/// that reached it.
 struct GraphUnitCandidate {
     unit_id: String,
     tier: GraphTier,
-    matched: std::collections::BTreeSet<String>,
+    matched: std::collections::BTreeSet<MatchedName>,
     source_id: String,
     parse_id: String,
 }
 
-/// The within-tier sort key of a matched normalized entity name (RULED
-/// 2026-07-15): longer name is stronger, then name ascending. Encoded as
-/// `(Reverse(char_count), name)` so a plain ascending sort yields
-/// longest-first, then name-ascending. Character count (not byte length) is
-/// used so multi-byte names are compared by the count a human would read.
-fn name_strength_key(name: &str) -> (std::cmp::Reverse<usize>, &str) {
-    (std::cmp::Reverse(name.chars().count()), name)
-}
-
-/// The strongest matched-name strength key across a candidate's matched set —
-/// the key of its longest matched name (ties broken by name ascending). The
-/// matched set is never empty for a produced candidate (every candidate was
-/// reached via at least one matched entity), so `min` always yields a key.
-fn candidate_strength_key(candidate: &GraphUnitCandidate) -> (std::cmp::Reverse<usize>, &str) {
+/// The strongest matched-entry strength key across a candidate's matched set —
+/// the key of its strongest class / longest name (see `MatchedName::strength_key`
+/// for the ruled ordering). The matched set is never empty for a produced
+/// candidate (every candidate was reached via at least one matched entity), so
+/// `min` always yields a key.
+fn candidate_strength_key(
+    candidate: &GraphUnitCandidate,
+) -> (MatchClass, std::cmp::Reverse<usize>, &str) {
     candidate
         .matched
         .iter()
-        .map(|name| name_strength_key(name))
+        .map(MatchedName::strength_key)
         .min()
         .expect("a graph candidate is always reached via at least one matched entity")
+}
+
+/// The count of DISTINCT matched entity NAMES a candidate was reached under,
+/// regardless of match class. Tier-1 membership (D9) is "direct mention of MORE
+/// THAN ONE distinct matched entity", and entity identity is the normalized name
+/// (not the class), so a unit reached under the same stored name via two classes
+/// is ONE entity here — the count keys on distinct names only.
+fn distinct_matched_name_count(candidate: &GraphUnitCandidate) -> usize {
+    candidate
+        .matched
+        .iter()
+        .map(|matched| matched.name.as_str())
+        .collect::<std::collections::BTreeSet<&str>>()
+        .len()
 }
 
 /// Derive candidate entity-name strings from the query text for the D9 entry
@@ -636,6 +722,163 @@ fn candidate_entity_names(query_text: &str, max_name_tokens: usize) -> Vec<Strin
 /// query-path derivation constant local to the graph entry.
 const MAX_ENTITY_NAME_TOKENS: usize = 6;
 
+// ===========================================================================
+// D9 fuzzy match classes (D9 amendment, CA2-P2 2026-07-19).
+//
+// Two DETERMINISTIC fuzzy classes augment the always-on EXACT class, each gated
+// by the operator-editable entity-match policy document
+// (`crate::policy::EntityMatchPolicy`) loaded at startup — deliberately NOT the
+// sealed RetrievalProfile (D3 amendment): the knobs are corpus-dependent and
+// operator-tunable. Both classes operate on ALREADY-NORMALIZED strings — the
+// query side is normalized by `candidate_entity_names`, the stored side by the
+// builder's `normalize_entity_name` — so no side is re-normalized here.
+//
+// A stored name a query matches EXACTLY is never also fuzzy-classified (never
+// double-classify): `fuzzy_matched_names` skips names already in the exact set.
+// ===========================================================================
+
+/// Derive the first-letter acronym of an already-normalized stored name from its
+/// whitespace-split tokens (e.g. "international business machines" → "ibm").
+/// Each token contributes its FIRST CHARACTER (by `chars`, so a multi-byte
+/// leading code point is taken whole). Returns `None` when the name has fewer
+/// than `min_name_tokens` tokens (no multi-token acronym to match) or when any
+/// token is empty (cannot happen for a normalized name — whitespace is collapsed
+/// — but guarded so the derivation is total). The stored name is already
+/// normalized (lowercased), so the derived acronym is lowercase and compares
+/// directly against a normalized query token.
+fn derive_acronym(stored_name: &str, min_name_tokens: usize) -> Option<String> {
+    let tokens: Vec<&str> = stored_name.split_whitespace().collect();
+    if tokens.len() < min_name_tokens {
+        return None;
+    }
+    let mut acronym = String::with_capacity(tokens.len());
+    for token in tokens {
+        let first = token.chars().next()?;
+        acronym.push(first);
+    }
+    Some(acronym)
+}
+
+/// Whether the normalized query n-gram token-prefix-matches the normalized
+/// stored name, per the RULED deterministic rule (D9 amendment):
+///
+///   - Split both into whitespace tokens. The query must have the SAME number of
+///     tokens as the stored name OR FEWER, matching a LEADING subsequence: query
+///     token `i` must be a prefix of stored token `i` for every `i` in
+///     `0..query_tokens.len()` (the query's leading tokens align with the
+///     stored name's leading tokens, in order).
+///   - EACH query token must be at least `min_token_len` characters — a shorter
+///     token is too weak to be an evidentiary prefix and disqualifies the match.
+///   - A match that is EQUAL on ALL tokens with EQUAL token counts is EXACT, not
+///     token-prefix (it would already be the exact class, and the fuzzy scan
+///     excludes exact-matched names upstream); this predicate additionally
+///     returns `false` for the all-equal-and-same-count case so it never
+///     re-reports an exact identity as fuzzy even in isolation.
+///
+/// Example: query "acme corp" prefixes stored "acme corporation" ("acme"=="acme"
+/// is a prefix, "corp" is a prefix of "corporation"), a token-prefix match.
+fn is_token_prefix_match(query_ngram: &str, stored_name: &str, min_token_len: usize) -> bool {
+    let query_tokens: Vec<&str> = query_ngram.split_whitespace().collect();
+    let stored_tokens: Vec<&str> = stored_name.split_whitespace().collect();
+    // Query must be no wider than the stored name (leading-subsequence rule) and
+    // non-empty (an empty n-gram matches nothing).
+    if query_tokens.is_empty() || query_tokens.len() > stored_tokens.len() {
+        return false;
+    }
+    let mut all_equal = query_tokens.len() == stored_tokens.len();
+    for (query_token, stored_token) in query_tokens.iter().zip(stored_tokens.iter()) {
+        // Each query token must clear the minimum length (chars, not bytes).
+        if query_token.chars().count() < min_token_len {
+            return false;
+        }
+        if !stored_token.starts_with(query_token) {
+            return false;
+        }
+        if query_token != stored_token {
+            all_equal = false;
+        }
+    }
+    // All-equal with equal counts is the EXACT identity — not a fuzzy match.
+    !all_equal
+}
+
+/// Select the stored NORMALIZED entity names a query FUZZY-matches for one parse,
+/// tagged with their class, deterministically ordered and capped (D9 amendment).
+///
+/// Inputs: `query_ngrams` are the query's normalized contiguous token n-grams
+/// (from `candidate_entity_names`); `stored_names` is the parse's stored name set
+/// in ascending order (from `entity_names_for_parse`); `exact_matched` is the set
+/// of stored names already matched EXACTLY this parse (skipped here so no name is
+/// double-classified); `policy` supplies the class enables and thresholds.
+///
+/// Per stored name, the STRONGEST class that matches is chosen (exact was already
+/// excluded, so acronym outranks token-prefix). A single query TOKEN drives the
+/// acronym class (a multi-token n-gram is not an acronym); any query n-gram may
+/// drive token-prefix.
+///
+/// Ordering (deterministic, RULED selection order — strongest first): by class
+/// (acronym before token-prefix), then longest stored name, then name ascending.
+/// The first `max_fuzzy_candidates` names in that order are kept; the rest are
+/// dropped. Selection is over the whole per-query fuzzy set for THIS parse.
+fn fuzzy_matched_names(
+    query_ngrams: &[String],
+    stored_names: &[String],
+    exact_matched: &std::collections::BTreeSet<String>,
+    policy: &EntityMatchPolicy,
+) -> Vec<MatchedName> {
+    let min_name_tokens = policy.acronym.min_name_tokens as usize;
+    let min_token_len = policy.token_prefix.min_token_len as usize;
+
+    let mut matched: Vec<MatchedName> = Vec::new();
+    for stored_name in stored_names {
+        // Never double-classify: a stored name matched exactly is not fuzzy.
+        if exact_matched.contains(stored_name) {
+            continue;
+        }
+
+        // Strongest class first: acronym outranks token-prefix, so test acronym
+        // before token-prefix and record only the strongest that matches.
+        let mut class: Option<MatchClass> = None;
+
+        if policy.acronym.enabled
+            && let Some(acronym) = derive_acronym(stored_name, min_name_tokens)
+        {
+            // A single query TOKEN (a one-token n-gram, no internal space) equal
+            // to the derived acronym is an acronym match.
+            let acronym_hit = query_ngrams
+                .iter()
+                .any(|ngram| !ngram.contains(' ') && *ngram == acronym);
+            if acronym_hit {
+                class = Some(MatchClass::Acronym);
+            }
+        }
+
+        if class.is_none()
+            && policy.token_prefix.enabled
+            && query_ngrams
+                .iter()
+                .any(|ngram| is_token_prefix_match(ngram, stored_name, min_token_len))
+        {
+            class = Some(MatchClass::TokenPrefix);
+        }
+
+        if let Some(class) = class {
+            matched.push(MatchedName {
+                class,
+                name: stored_name.clone(),
+            });
+        }
+    }
+
+    // Deterministic selection order (strongest first): class, then longest name,
+    // then name ascending — the same key the within-tier ordering uses, so the
+    // cap keeps the names that would rank highest. `MatchedName`'s `Ord` IS this
+    // key, so a plain sort orders strongest-first.
+    matched.sort();
+    matched.truncate(policy.max_fuzzy_candidates as usize);
+    matched
+}
+
 /// Build a graph `RetrievalHit` from a ranked graph candidate. Parallel to
 /// `fused_hit` (C7b-1) — same population convention — but written separately per
 /// the handoff contract (do NOT generalize `fused_hit`). The graph channel's
@@ -650,11 +893,18 @@ const MAX_ENTITY_NAME_TOKENS: usize = 6;
 /// - `score` = a rank-monotonic score (higher = stronger) the caller computes
 ///   from the D9 order; `rank` = the 1-based D9 rank.
 /// - `matched_projection_id` / `matched_annotation_id` = `None`.
-/// - `explanation` = the matched-entity explanation (the normalized matched
-///   names and the tier), the one optional field the graph channel populates so
-///   a debug/trace surface can see WHY the unit was reached.
+/// - `explanation` = the matched-entity explanation (the matched normalized
+///   names, each tagged with its match class, and the tier), the one optional
+///   field the graph channel populates so a debug/trace surface can see WHY the
+///   unit was reached. The matched set iterates strongest-first (`MatchedName`'s
+///   `Ord`: class, then longest name), so the explanation lists the strongest
+///   evidence first.
 fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> RetrievalHit {
-    let matched_names: Vec<&str> = candidate.matched.iter().map(String::as_str).collect();
+    let matched_names: Vec<String> = candidate
+        .matched
+        .iter()
+        .map(|matched| format!("{}[{}]", matched.name, match_class_label(matched.class)))
+        .collect();
     let tier_label = match candidate.tier {
         GraphTier::Tier1 => "tier1_multi_entity",
         GraphTier::Tier2 => "tier2_direct_mention",
@@ -677,17 +927,25 @@ fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> Retriev
 }
 
 /// Accumulate one reached unit into the global candidate map, recording its
-/// tier and the matched normalized name it was reached under. A unit reached
-/// several ways KEEPS ITS STRONGEST tier (`min` over `GraphTier`, where
-/// `Tier1 < Tier2 < Tier3`) and UNIONS its matched-name set — this is exactly
-/// how a unit that is a direct mention of two matched entities lands in tier 1
-/// (two distinct matched names in its set), while its within-tier strength uses
-/// its longest matched name. Keyed by `(parse_id, unit_id)` across all parses.
+/// tier and the matched entity (stored name + its match class) it was reached
+/// under. A unit reached several ways KEEPS ITS STRONGEST tier (`min` over
+/// `GraphTier`, where `Tier1 < Tier2 < Tier3`) and UNIONS its matched set — this
+/// is exactly how a unit that is a direct mention of two matched entities lands
+/// in tier 1 (two distinct matched NAMES in its set — see
+/// `distinct_matched_name_count`), while its within-tier strength uses its
+/// strongest matched entry (strongest class, then longest name). Keyed by
+/// `(parse_id, unit_id)` across all parses.
+///
+/// The SAME stored name may be recorded under two different classes only across
+/// separate reach paths; the exact class is never among them for a name reached
+/// fuzzily, because a name matched exactly is excluded from the fuzzy set
+/// upstream (never double-classify). Deduplication is by `(class, name)`, so a
+/// name recorded twice under one class is stored once.
 fn record_graph_unit(
     candidates: &mut HashMap<(String, String), GraphUnitCandidate>,
     unit_id: &str,
     tier: GraphTier,
-    matched_name: &str,
+    matched_name: &MatchedName,
     source_id: &str,
     parse_id: &str,
 ) {
@@ -697,11 +955,11 @@ fn record_graph_unit(
             if tier < existing.tier {
                 existing.tier = tier;
             }
-            existing.matched.insert(matched_name.to_owned());
+            existing.matched.insert(matched_name.clone());
         })
         .or_insert_with(|| {
             let mut matched = std::collections::BTreeSet::new();
-            matched.insert(matched_name.to_owned());
+            matched.insert(matched_name.clone());
             GraphUnitCandidate {
                 unit_id: unit_id.to_owned(),
                 tier,
@@ -730,9 +988,30 @@ fn record_graph_unit(
 /// - `hop_budget` is the D9 relational hop budget (C7a profile `graph_hop_budget`
 ///   = 1); C7d passes it. Only `hop_budget >= 1` walks the one-hop tier; the
 ///   structural `UnitRelationships` are NEVER walked at query time (D9).
+/// - `policy` is the operator-editable entity-match policy (D9 amendment,
+///   CA2-P2 2026-07-19) loaded at startup — deliberately threaded in, NOT the
+///   sealed RetrievalProfile (D3 amendment). It governs the two fuzzy classes
+///   (acronym, token-prefix) and the `max_fuzzy_candidates` cap. When both fuzzy
+///   classes are DISABLED (the shipped default) this path is BYTE-IDENTICAL to
+///   the pre-amendment behavior: `entity_names_for_parse` is never called (zero
+///   fuzzy scans), no fuzzy names are produced, and every matched name is
+///   `MatchClass::Exact`, so the ordering key's class component is constant and
+///   the emitted order is exactly the pre-amendment (tier, name-length, unitId)
+///   order.
 ///
-/// Traversal (D9 semantic-only; per in-scope parse, for each matched normalized
-/// name — candidates then merge into one global order across parses):
+/// Match classes per captured parse (D9 amendment):
+///   - EXACT (always on): a normalized query n-gram equal to a stored name.
+///     Every query n-gram is treated as an exact candidate name and probed —
+///     `mentions_for_name` returns empty for a name with no mention row, so a
+///     non-matching n-gram contributes nothing (this preserves the exact path
+///     verbatim).
+///   - ACRONYM / TOKEN_PREFIX (each gated by `policy`): computed by
+///     `fuzzy_matched_names` over the parse's enumerated stored names, excluding
+///     any name already matched exactly (never double-classify), capped at
+///     `policy.max_fuzzy_candidates` per query for this parse.
+///
+/// Traversal (D9 semantic-only; per in-scope parse, for each matched entity —
+/// candidates then merge into one global order across parses):
 ///   1. `mentions_for_name` → the entity's direct-mention units (tier 2 source).
 ///   2. If `hop_budget >= 1`, `one_hop_edges` (both directions unioned) → each
 ///      edge's own supporting `target_unit_ids` are one-hop related (tier 3),
@@ -740,34 +1019,48 @@ fn record_graph_unit(
 ///      `mentions_for_name` so the FAR entity's mention units are also one-hop
 ///      related (tier 3). A far entity that is itself a matched entity does not
 ///      upgrade the tier here; tier 1 is detected by multi-entity DIRECT-mention
-///      membership below.
+///      membership below. The far entity's mention units inherit the NEAR matched
+///      entity's class (the class that reached them), keeping within-tier
+///      strength keyed on the query-matched evidence.
 ///   3. Tier 1: a unit is upgraded to tier 1 iff it is a DIRECT mention (tier 2)
 ///      of MORE THAN ONE distinct matched entity — detected because such a unit
-///      accumulates two distinct matched names in its set. This is computed by
-///      recording every direct mention first, then upgrading units whose matched
-///      set has size > 1.
+///      accumulates two distinct matched NAMES in its set
+///      (`distinct_matched_name_count`, class-independent since entity identity
+///      is the normalized name). Computed by recording every direct mention
+///      first, then upgrading units with more than one distinct matched name.
 ///
-/// Ordering IS the score (D9): fusion is rank-only, so the emitted ORDER is the
-/// entire meaning of a graph result. Candidates are sorted by (tier strongest
-/// first; then within-tier by longest matched normalized name, then name
-/// ascending; then unit id ascending) and the emitted `score` is assigned
-/// STRICTLY DECREASING with rank so any downstream f64 comparison agrees with
-/// the emitted order. A future maintainer MUST NOT "improve" this ordering — it
-/// is the ruled D9 order and the score is derived from it, not the reverse.
+/// Ordering IS the score (D9 amendment): fusion is rank-only, so the emitted
+/// ORDER is the entire meaning of a graph result. Candidates are sorted by
+/// (tier strongest first; then within-tier by match class exact > acronym >
+/// token-prefix; then longest matched normalized name; then name ascending; then
+/// unit id ascending) and the emitted `score` is assigned STRICTLY DECREASING
+/// with rank so any downstream f64 comparison agrees with the emitted order. A
+/// future maintainer MUST NOT "improve" this ordering — it is the ruled D9
+/// order and the score is derived from it, not the reverse.
 pub(crate) fn graph_channel(
     conn: &Connection,
     query_id: &str,
     parses: &[CapturedParse],
     query_text: &str,
     hop_budget: usize,
+    policy: &EntityMatchPolicy,
 ) -> Result<Vec<RetrievalHit>, ApiError> {
     let started_at = Instant::now();
 
-    // D9 entry: derive candidate entity names from the query text and match them
-    // against stored NORMALIZED entity names (no LLM, no fuzzy match). Names are
-    // already normalized by `candidate_entity_names`, so they are passed to the
-    // graph lookups as-is (which require a normalized key).
-    let matched_names = candidate_entity_names(query_text, MAX_ENTITY_NAME_TOKENS);
+    // D9 entry: derive candidate entity n-grams from the query text. Each is
+    // already normalized by `candidate_entity_names`, so it is both the exact
+    // probe key AND (for fuzzy) the query side compared against stored names.
+    let query_ngrams = candidate_entity_names(query_text, MAX_ENTITY_NAME_TOKENS);
+
+    // Whether ANY fuzzy class runs at all. When false the fuzzy scan surface
+    // (`entity_names_for_parse`) is NEVER read — the disabled default does zero
+    // extra reads and is byte-identical to the pre-amendment path.
+    let fuzzy_enabled = policy.acronym.enabled || policy.token_prefix.enabled;
+
+    // Bounded fuzzy diagnostics (D9 amendment): counts per class and the applied
+    // cap, never any name text (DIAGNOSTICS-ONBOARDING forbidden data).
+    let mut acronym_matched: usize = 0;
+    let mut token_prefix_matched: usize = 0;
 
     // Global candidate accumulation across ALL in-scope parses, keyed by
     // (parse_id, unit_id) — a unit lives in exactly one parse (mentions/edges are
@@ -776,21 +1069,59 @@ pub(crate) fn graph_channel(
     // in-scope parses, so no out-of-scope parse is ever probed. The D9 order is a
     // SINGLE global order over all matched units, so accumulation and ordering
     // span parses — emitting per-parse would grain the emitted order by parse and
-    // break the ruled global (tier, strength, unitId) order that IS the score.
+    // break the ruled global (tier, class, strength, unitId) order that IS the
+    // score.
     let mut candidates: HashMap<(String, String), GraphUnitCandidate> = HashMap::new();
     for parse in parses {
+        // Build this parse's matched entities: EXACT for every query n-gram
+        // (always on), then the fuzzy classes when enabled. Exact names carry the
+        // query n-gram verbatim (byte-identical to the stored name on a hit).
+        let mut parse_matches: Vec<MatchedName> = query_ngrams
+            .iter()
+            .map(|ngram| MatchedName {
+                class: MatchClass::Exact,
+                name: ngram.clone(),
+            })
+            .collect();
+
+        if fuzzy_enabled {
+            // Enumerate the parse's stored names (the fuzzy scan surface) ONLY
+            // when a fuzzy class is enabled. The exact-matched set is the query
+            // n-grams that ARE stored names in this parse; fuzzy excludes them so
+            // no name is double-classified.
+            let stored_names = entity_names_for_parse(conn, &parse.parse_id)?;
+            let stored_set: std::collections::BTreeSet<&str> =
+                stored_names.iter().map(String::as_str).collect();
+            let exact_matched: std::collections::BTreeSet<String> = query_ngrams
+                .iter()
+                .filter(|ngram| stored_set.contains(ngram.as_str()))
+                .cloned()
+                .collect();
+
+            let fuzzy = fuzzy_matched_names(&query_ngrams, &stored_names, &exact_matched, policy);
+            for matched in &fuzzy {
+                match matched.class {
+                    MatchClass::Acronym => acronym_matched += 1,
+                    MatchClass::TokenPrefix => token_prefix_matched += 1,
+                    // Exact is never produced by the fuzzy selector.
+                    MatchClass::Exact => {}
+                }
+            }
+            parse_matches.extend(fuzzy);
+        }
+
         // Pass 1 — direct mentions (tier 2). Every matched entity's mention units
-        // are recorded under that entity's normalized name. A unit that is a
-        // direct mention of two matched entities accumulates two matched names,
-        // which pass 3 uses to upgrade it to tier 1.
-        for name in &matched_names {
-            let (normalized_name, unit_ids) = mentions_for_name(conn, &parse.parse_id, name)?;
+        // are recorded under that entity's stored name and match class. A unit
+        // that is a direct mention of two distinct matched entities accumulates
+        // two distinct matched names, which pass 3 uses to upgrade it to tier 1.
+        for matched in &parse_matches {
+            let (_, unit_ids) = mentions_for_name(conn, &parse.parse_id, &matched.name)?;
             for unit_id in unit_ids {
                 record_graph_unit(
                     &mut candidates,
                     &unit_id,
                     GraphTier::Tier2,
-                    &normalized_name,
+                    matched,
                     &parse.source_id,
                     &parse.parse_id,
                 );
@@ -803,26 +1134,27 @@ pub(crate) fn graph_channel(
         // keeps a unit's strongest tier, so a unit that is ALSO a direct mention
         // stays tier 2 (its stronger classification).
         if hop_budget >= 1 {
-            for name in &matched_names {
-                let edges = one_hop_edges(conn, &parse.parse_id, name)?;
+            for matched in &parse_matches {
+                let edges = one_hop_edges(conn, &parse.parse_id, &matched.name)?;
                 for edge in edges {
                     // The edge's own supporting units are one-hop related; the
-                    // matched name that reached them is the near (query-matched)
-                    // entity, so within-tier strength keys on the matched name,
-                    // not the far name.
+                    // matched entity that reached them is the near (query-matched)
+                    // entity, so within-tier strength keys on the near matched
+                    // name AND its class, not the far name.
                     for unit_id in &edge.target_unit_ids {
                         record_graph_unit(
                             &mut candidates,
                             unit_id,
                             GraphTier::Tier3,
-                            name,
+                            matched,
                             &parse.source_id,
                             &parse.parse_id,
                         );
                     }
                     // Follow the far entity back to ITS mention units (D9:
                     // "far-end entities' target units"). These too are one-hop
-                    // related and reached via the near matched name.
+                    // related and reached via the near matched entity, so they
+                    // inherit the near entity's matched name and class.
                     let (_, far_units) =
                         mentions_for_name(conn, &parse.parse_id, &edge.far_normalized_name)?;
                     for unit_id in far_units {
@@ -830,7 +1162,7 @@ pub(crate) fn graph_channel(
                             &mut candidates,
                             &unit_id,
                             GraphTier::Tier3,
-                            name,
+                            matched,
                             &parse.source_id,
                             &parse.parse_id,
                         );
@@ -842,22 +1174,26 @@ pub(crate) fn graph_channel(
 
     // Pass 3 — tier-1 upgrade: a unit reached as a DIRECT mention of MORE THAN
     // ONE distinct matched entity is tier 1. Such a unit is currently tier 2 with
-    // two-or-more matched names; upgrade it. A tier-3-only unit is never upgraded
-    // here (it is not a direct mention), even if it was reached via several
-    // matched names, because tier 1 is a multi-entity DIRECT-mention property per
-    // D9. Runs once over the global candidate set.
+    // two-or-more distinct matched NAMES; upgrade it. A tier-3-only unit is never
+    // upgraded here (it is not a direct mention), even if it was reached via
+    // several matched names, because tier 1 is a multi-entity DIRECT-mention
+    // property per D9. Distinct-NAME count (not matched-entry count) so a single
+    // stored name reached under two classes is still ONE entity. Runs once over
+    // the global candidate set.
     for candidate in candidates.values_mut() {
-        if candidate.tier == GraphTier::Tier2 && candidate.matched.len() > 1 {
+        if candidate.tier == GraphTier::Tier2 && distinct_matched_name_count(candidate) > 1 {
             candidate.tier = GraphTier::Tier1;
         }
     }
 
     // D9 ordering (single global order, fusion is rank-only so this IS the
-    // score): tier strongest first; then within-tier by longest matched
-    // normalized name, then name ascending; then unit id ascending. `parse_id` is
-    // the final discriminator only to keep the sort total when the SAME unit_id
-    // string appears in two different parses (two distinct units) — it never
-    // reorders within one parse and is not part of the ruled tiebreak.
+    // score): tier strongest first; then within-tier by match class (exact >
+    // acronym > token-prefix), then longest matched normalized name, then name
+    // ascending — all three carried by `candidate_strength_key`; then unit id
+    // ascending. `parse_id` is the final discriminator only to keep the sort
+    // total when the SAME unit_id string appears in two different parses (two
+    // distinct units) — it never reorders within one parse and is not part of the
+    // ruled tiebreak.
     let mut ordered: Vec<GraphUnitCandidate> = candidates.into_values().collect();
     ordered.sort_by(|left, right| {
         left.tier
@@ -883,8 +1219,17 @@ pub(crate) fn graph_channel(
         event = "query.channel.graph.completed",
         query_id,
         parse_count = parses.len(),
-        matched_name_count = matched_names.len(),
+        query_ngram_count = query_ngrams.len(),
         hop_budget,
+        // Bounded fuzzy facts (D9 amendment): per-class matched-name counts and
+        // the applied cap; never any name text. When fuzzy is disabled these are
+        // zero and no fuzzy scan ran.
+        fuzzy_enabled,
+        acronym_enabled = policy.acronym.enabled,
+        token_prefix_enabled = policy.token_prefix.enabled,
+        acronym_matched,
+        token_prefix_matched,
+        max_fuzzy_candidates = policy.max_fuzzy_candidates,
         hit_count = hits.len(),
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "graph channel candidate generation completed"

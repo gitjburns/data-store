@@ -9,3 +9,4 @@ config.toml
 .data-store.history
 .annotator-api-key
 .data-store-dense-api-key
+.data-store-rerank-api-key

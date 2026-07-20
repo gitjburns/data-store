@@ -95,6 +95,13 @@ enum Command {
     },
     Shutdown,
     HeldParses,
+    /// Annotation vocabulary inspection (CA2 ruling 8): the entity names or
+    /// relation predicates the annotation models produced, for authoring the
+    /// corpus-dependent policy rulesets. `scope` defaults to `active`.
+    Vocabulary {
+        annotation_type: String,
+        scope: String,
+    },
     Operation {
         operation_id: String,
     },
@@ -242,6 +249,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_usage: "held-parses",
         cli_usage: Some("data-store [--config <path>] --held-parses"),
         build: build_held_parses_command,
+    },
+    CommandSpec {
+        repl_name: "vocabulary",
+        repl_aliases: &["vocab"],
+        cli_flag: Some("--vocabulary"),
+        cli_aliases: &["--vocab"],
+        repl_usage: "vocabulary <entity|relation> [active|all]",
+        cli_usage: Some("data-store [--config <path>] --vocabulary <entity|relation> [active|all]"),
+        build: build_vocabulary_command,
     },
     CommandSpec {
         repl_name: "operation",
@@ -567,6 +583,75 @@ struct ParseRunView {
     created_at: String,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// Client mirror of the CA2 `GET /annotations/vocabulary` entity response. Fields
+/// mirror the service DTO exactly (camelCase, `deny_unknown_fields` on the
+/// server side), so the renderer surfaces the served order (normalized name
+/// ascending) and the truncation notice faithfully.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityVocabularyView {
+    annotation_type: String,
+    scope: String,
+    groups: Vec<EntityVocabularyGroupView>,
+    skipped_marker_count: usize,
+    malformed_row_count: usize,
+    truncated: bool,
+    rows_read: usize,
+    group_count: usize,
+}
+
+/// Client mirror of one entity vocabulary group.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityVocabularyGroupView {
+    normalized_name: String,
+    raw_forms: Vec<RawFormView>,
+    entity_types: Vec<String>,
+    source_count: usize,
+    model_counts: Vec<ModelCountView>,
+    total_count: usize,
+}
+
+/// Client mirror of the CA2 `GET /annotations/vocabulary` relation response.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelationVocabularyView {
+    annotation_type: String,
+    scope: String,
+    groups: Vec<RelationVocabularyGroupView>,
+    skipped_marker_count: usize,
+    malformed_row_count: usize,
+    truncated: bool,
+    rows_read: usize,
+    group_count: usize,
+}
+
+/// Client mirror of one relation (predicate) vocabulary group.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelationVocabularyGroupView {
+    predicate: String,
+    total_count: usize,
+    source_count: usize,
+    model_counts: Vec<ModelCountView>,
+}
+
+/// Client mirror of one raw form and its count.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFormView {
+    raw_form: String,
+    count: usize,
+}
+
+/// Client mirror of one model name and its count.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCountView {
+    model_name: String,
+    count: usize,
 }
 
 /// Client mirror of the §15 ContentUnit (`GET /units/{unitId}`). `body` is the
@@ -935,6 +1020,31 @@ fn build_held_parses_command(args: &[String]) -> Result<Command> {
     Ok(Command::HeldParses)
 }
 
+/// Build the `vocabulary` command targeting
+/// `GET /annotations/vocabulary?annotationType=<type>&scope=<scope>`. The
+/// annotation type is required and closed to {entity, relation}; scope is
+/// optional and defaults to `active` (the service applies the same default, but
+/// the client resolves it here so the query string is always explicit). Argument
+/// validation mirrors the service's 400 set so an obvious mistake fails locally
+/// before a round trip.
+fn build_vocabulary_command(args: &[String]) -> Result<Command> {
+    let (annotation_type, scope) = match args {
+        [annotation_type] => (annotation_type.clone(), "active".to_owned()),
+        [annotation_type, scope] => (annotation_type.clone(), scope.clone()),
+        _ => bail!("usage: vocabulary <entity|relation> [active|all]"),
+    };
+    if annotation_type != "entity" && annotation_type != "relation" {
+        bail!("vocabulary annotationType must be entity|relation; got {annotation_type:?}");
+    }
+    if scope != "active" && scope != "all" {
+        bail!("vocabulary scope must be active|all; got {scope:?}");
+    }
+    Ok(Command::Vocabulary {
+        annotation_type,
+        scope,
+    })
+}
+
 /// Build the `operation` command targeting `GET /operations/{operationId}`.
 fn build_operation_command(args: &[String]) -> Result<Command> {
     require_arg_count(args, 1, "operation <operationId>")?;
@@ -1279,6 +1389,25 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
             let value = get_protected(context, "/parses?status=held")?;
             let response: HeldParsesResponse = decode_value("/parses?status=held", value)?;
             render_held_parses(&response);
+        }
+        Command::Vocabulary {
+            annotation_type,
+            scope,
+        } => {
+            // Both type and scope are already validated to the closed sets by the
+            // builder, so the query string is safe to interpolate directly.
+            let path =
+                format!("/annotations/vocabulary?annotationType={annotation_type}&scope={scope}");
+            let value = get_protected(context, &path)?;
+            // Decode into the matching typed mirror; the response shape is fixed by
+            // the requested annotationType (entity vs relation envelope).
+            if annotation_type == "entity" {
+                let response: EntityVocabularyView = decode_value(&path, value)?;
+                render_entity_vocabulary(&response);
+            } else {
+                let response: RelationVocabularyView = decode_value(&path, value)?;
+                render_relation_vocabulary(&response);
+            }
         }
         Command::Operation { operation_id } => {
             let record = poll_operation_once(context, &operation_id)?;
@@ -1866,6 +1995,95 @@ fn render_held_parses(response: &HeldParsesResponse) {
             }
             print_labeled_json("    conformanceReport:", report);
         }
+    }
+}
+
+/// Render the CA2 entity vocabulary as a table in the served order (normalized
+/// name ascending, so spelling variants sit adjacent). The truncation notice and
+/// the skipped-marker / malformed counts are surfaced up front so the operator
+/// knows the completeness of the view before authoring rulesets against it.
+fn render_entity_vocabulary(response: &EntityVocabularyView) {
+    println!(
+        "{} vocabulary (scope {}): {} groups",
+        response.annotation_type, response.scope, response.group_count
+    );
+    render_vocabulary_counts(
+        response.rows_read,
+        response.skipped_marker_count,
+        response.malformed_row_count,
+        response.truncated,
+    );
+    if response.groups.is_empty() {
+        println!("  (no entity vocabulary)");
+        return;
+    }
+    for group in &response.groups {
+        println!(
+            "  {} (total {}, sources {})",
+            group.normalized_name, group.total_count, group.source_count
+        );
+        if !group.entity_types.is_empty() {
+            println!("    entityTypes: {}", group.entity_types.join(", "));
+        }
+        println!("    rawForms:");
+        for raw in &group.raw_forms {
+            println!("      {:?} x{}", raw.raw_form, raw.count);
+        }
+        println!("    models:");
+        for model in &group.model_counts {
+            println!("      {} x{}", model.model_name, model.count);
+        }
+    }
+}
+
+/// Render the CA2 relation vocabulary as a table in the served order (predicate
+/// ascending). Same up-front completeness notice as the entity renderer.
+fn render_relation_vocabulary(response: &RelationVocabularyView) {
+    println!(
+        "{} vocabulary (scope {}): {} predicates",
+        response.annotation_type, response.scope, response.group_count
+    );
+    render_vocabulary_counts(
+        response.rows_read,
+        response.skipped_marker_count,
+        response.malformed_row_count,
+        response.truncated,
+    );
+    if response.groups.is_empty() {
+        println!("  (no relation vocabulary)");
+        return;
+    }
+    for group in &response.groups {
+        println!(
+            "  {} (total {}, sources {})",
+            group.predicate, group.total_count, group.source_count
+        );
+        println!("    models:");
+        for model in &group.model_counts {
+            println!("      {} x{}", model.model_name, model.count);
+        }
+    }
+}
+
+/// Print the shared per-response completeness line for both vocabulary renderers:
+/// rows read, empty-markers skipped, malformed rows counted, and an explicit
+/// truncation warning when the view is partial (the row-read or group cap was
+/// hit). Truncation is called out loudly because an operator authoring rulesets
+/// from a truncated view would miss vocabulary.
+fn render_vocabulary_counts(
+    rows_read: usize,
+    skipped_marker_count: usize,
+    malformed_row_count: usize,
+    truncated: bool,
+) {
+    println!(
+        "  rowsRead: {rows_read}, skippedMarkers: {skipped_marker_count}, \
+         malformedRows: {malformed_row_count}"
+    );
+    if truncated {
+        println!(
+            "  TRUNCATED: the row-read or group cap was hit; this vocabulary is a PARTIAL view"
+        );
     }
 }
 

@@ -1,0 +1,18 @@
+# Annotator-naming policy (CA2). Ordered naming-rule lines composed, in order,
+# into annotation-producer prompts (CA2-P3). This is an OPERATOR-EDITABLE
+# document: edit it, then restart the service to load and validate the new
+# content.
+#
+# Strictly validated at startup: `rules` is REQUIRED and unknown keys are
+# rejected. There is no version field — versions are SYSTEM-ASSIGNED, recorded
+# automatically each time the parsed content changes (whitespace/comment-only
+# edits do not count as a change).
+#
+# Editing these rules is PRODUCER-IDENTITY-BEARING: a rule change alters the
+# producer prompt, which invalidates memoized annotations and, under
+# content-scoped satisfaction, drives frontier re-application. Treat every edit
+# as a semantic change to how annotations are produced, not a cosmetic tweak.
+#
+# An EMPTY list is the valid NEUTRAL document: no additional naming guidance is
+# composed into producer prompts. This shipped document is neutral.
+rules = []

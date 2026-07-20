@@ -38,16 +38,29 @@ const INSERT_BUILDING_SQL: &str = "
 INSERT INTO semantic_annotations (
   id, source_id, parse_id, target_unit_ids_json, annotation_type,
   body_json, provenance_json, confidence, freshness_status,
-  memoization_key_hash, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, 'building', ?7, ?8)";
+  memoization_key_hash, content_key_hash, created_at
+) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, 'building', ?7, ?8, ?9)";
 
 /// Status-guarded `building → fresh` transition: writes the completed body,
 /// confidence, and final provenance, and only matches a row still `building`.
 /// The guard is what makes double-completion or completion of an
 /// already-failed row a loud zero-row failure instead of a silent overwrite.
+///
+/// CA2 memo-key RE-STAMP (user-ruled 2026-07-19). This UPDATE also re-stamps
+/// `memoization_key_hash` (?5) to the key of the producer that ACTUALLY ran.
+/// Under content-scoped satisfaction a reopened `failed`/orphaned row may have
+/// been minted under a DIFFERENT producer identity than the one now completing
+/// it (a model switch reopens the prior model's failed rows for the current
+/// model to retry); the memo key must therefore key the memo CACHE row on the
+/// completing identity, not the stale minting identity. `content_key_hash` is
+/// left untouched: by construction the target content is unchanged, so the
+/// content key is identity-invariant. Completion is the earliest point the
+/// running identity is known (the reopen transition cannot know which producer
+/// will run), so the re-stamp lives here, not at `retry_failed`.
 const COMPLETE_FRESH_SQL: &str = "
 UPDATE semantic_annotations
 SET body_json = ?2, confidence = ?3, provenance_json = ?4,
+    memoization_key_hash = ?5,
     freshness_status = 'fresh'
 WHERE id = ?1 AND freshness_status = 'building'";
 
@@ -76,8 +89,8 @@ const INSERT_FRESH_SQL: &str = "
 INSERT INTO semantic_annotations (
   id, source_id, parse_id, target_unit_ids_json, annotation_type,
   body_json, provenance_json, confidence, freshness_status,
-  memoization_key_hash, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'fresh', ?9, ?10)";
+  memoization_key_hash, content_key_hash, created_at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'fresh', ?9, ?10, ?11)";
 
 /// Status-guarded `failed → building` transition reopening one failed row for
 /// a fresh build attempt. The guard makes reopening a non-failed row a loud
@@ -103,42 +116,54 @@ WHERE source_id = ?1
   AND freshness_status = 'fresh'
   AND deleted_at IS NULL";
 
-/// Read the memoization key hash of every non-deleted annotation of a parse,
+/// Read the CONTENT key hash of every non-deleted annotation of a parse,
 /// regardless of freshness. This is the discovery worker's set-difference
-/// input: the keys already present for the parse, so it can compute which
-/// required annotations are still missing.
-const SELECT_MEMO_KEYS_FOR_PARSE_SQL: &str = "
-SELECT memoization_key_hash FROM semantic_annotations
+/// input: the content keys already present for the parse, so it can compute
+/// which required annotations are still missing. CA2 (user-ruled 2026-07-19):
+/// satisfaction is content-scoped — a model switch leaves the content key
+/// unchanged, so already-annotated content stays satisfied and only the
+/// frontier is (re-)annotated. (The identity-scoped memo key still keys the
+/// memo CACHE lookup in `memo::lookup`; the two scopes are deliberately split.)
+const SELECT_CONTENT_KEYS_FOR_PARSE_SQL: &str = "
+SELECT content_key_hash FROM semantic_annotations
 WHERE parse_id = ?1 AND deleted_at IS NULL";
 
 /// Read every reopenable row of a parse: `failed` and `building` rows whose
-/// memoization key has NO `fresh` sibling. A key with a fresh row is
+/// CONTENT key has NO `fresh` sibling. A content key with a fresh row is
 /// satisfied and never reopened (the NOT-IN subselect). `building` rows
 /// qualify because the single worker thread completes every build inside the
 /// cycle that opened it — a building row still visible at DISCOVERY time is
 /// by construction a crash orphan (the process died between the build_open
 /// and build_complete transactions), not in-flight work. Ordered so callers
 /// can pick the lexicographically first row per key deterministically.
+///
+/// CA2 (user-ruled 2026-07-19): reopen matching is content-scoped, so a
+/// content key satisfied by ANY producer identity's fresh row is not reopened,
+/// and a failed row minted under a prior identity is reopened for the CURRENT
+/// identity to retry (its memo key is re-stamped at completion).
 const SELECT_REOPENABLE_ROWS_FOR_PARSE_SQL: &str = "
-SELECT memoization_key_hash, id, freshness_status
+SELECT content_key_hash, id, freshness_status
 FROM semantic_annotations
 WHERE parse_id = ?1 AND deleted_at IS NULL
   AND freshness_status IN ('failed', 'building')
-  AND memoization_key_hash NOT IN (
-    SELECT memoization_key_hash FROM semantic_annotations
+  AND content_key_hash NOT IN (
+    SELECT content_key_hash FROM semantic_annotations
     WHERE parse_id = ?1 AND deleted_at IS NULL
       AND freshness_status = 'fresh'
   )
-ORDER BY memoization_key_hash, id";
+ORDER BY content_key_hash, id";
 
 /// SystemEvent object_type for semantic_annotations rows.
 const OBJECT_TYPE_SEMANTIC_ANNOTATION: &str = "semantic_annotation";
 
 /// The inputs needed to open one annotation build: everything known before
 /// the producer runs. The planned producer identity is carried as a full
-/// Provenance because it is known up front (spec §21 rule 3), and
-/// memoization_key_hash is the §21.2 content key denormalized into its own
-/// indexed column for discovery and memo lookup.
+/// Provenance because it is known up front (spec §21 rule 3).
+/// `memoization_key_hash` is the §21.2 identity-scoped memo key (keys the memo
+/// CACHE lookup/row); `content_key_hash` is the CA2 content-scoped key
+/// (annotation type × ordered target content hashes, WITHOUT producer identity)
+/// that keys SATISFACTION and reopenable classification. Both are denormalized
+/// into their own indexed columns. (CA2 ruling, user-approved 2026-07-19.)
 #[derive(Debug, Clone)]
 pub(crate) struct NewAnnotation {
     pub(crate) source_id: String,
@@ -147,6 +172,7 @@ pub(crate) struct NewAnnotation {
     pub(crate) annotation_type: SemanticAnnotationType,
     pub(crate) provenance: Provenance,
     pub(crate) memoization_key_hash: String,
+    pub(crate) content_key_hash: String,
 }
 
 /// Insert a `building` annotation and append its `annotation.requested` event
@@ -180,6 +206,7 @@ pub(crate) fn insert_building(
             annotation_type,
             provenance_json,
             request.memoization_key_hash,
+            request.content_key_hash,
             now,
         ],
     )
@@ -250,6 +277,7 @@ pub(crate) fn insert_fresh(
             provenance_json,
             confidence,
             request.memoization_key_hash,
+            request.content_key_hash,
             now,
         ],
     )
@@ -292,12 +320,19 @@ pub(crate) fn insert_fresh(
 /// `annotation.completed`. The UPDATE is status-guarded and asserted to hit
 /// exactly one row, so completing a missing or non-building row is a loud
 /// failure, never a silent overwrite. Row write and event are one atomic unit.
+///
+/// `memoization_key_hash` is the key of the producer that ACTUALLY completed
+/// this row and is RE-STAMPED onto the row (CA2, user-ruled 2026-07-19): a
+/// content-scoped reopen may have adopted a row minted under a different
+/// producer identity, so the memo CACHE key must key on the completing
+/// identity. `content_key_hash` is unchanged by construction (same content).
 pub(crate) fn complete_fresh(
     tx: &Transaction<'_>,
     annotation_id: &str,
     body: &Value,
     confidence: Option<f64>,
     final_provenance: &Provenance,
+    memoization_key_hash: &str,
 ) -> Result<(), ApiError> {
     let body_json =
         canonical_json_string_of(body, &format!("body for annotation {annotation_id}"))?;
@@ -309,7 +344,13 @@ pub(crate) fn complete_fresh(
     let updated = tx
         .execute(
             COMPLETE_FRESH_SQL,
-            params![annotation_id, body_json, confidence, provenance_json],
+            params![
+                annotation_id,
+                body_json,
+                confidence,
+                provenance_json,
+                memoization_key_hash
+            ],
         )
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to complete annotation {annotation_id}: {source}"),
@@ -399,11 +440,14 @@ pub(crate) fn retry_failed(tx: &Transaction<'_>, annotation_id: &str) -> Result<
 /// Transition `fresh → stale` and append `annotation.stale`, making a
 /// post-activation staling visible truth rather than silent absence (spec §21
 /// rule 3). Row write and event are one atomic unit.
-// Post-MVP consumer: re-keying/staleness handling when a producer identity
-// changes WITHOUT a content change is deferred. Today a changed identity
-// simply builds NEW rows under new keys, and the old fresh rows become
-// unreachable garbage that C9-era hot cleanup removes — no active caller marks
-// them stale yet, so the allow names that future consumer.
+// Post-MVP consumer: no active caller marks a row stale yet, so the allow names
+// that future consumer. CA2 (user-ruled 2026-07-19) changed the producer-
+// identity-change story that this comment previously described: satisfaction is
+// now content-scoped, so a changed producer identity does NOT rebuild
+// already-satisfied content — an unchanged content key stays fresh under its
+// original identity and no new row is minted (the frontier alone is annotated).
+// Only CHANGED content (a new content key) mints a new row; the superseded
+// parse's rows still become unreachable and are removed by C9-era hot cleanup.
 #[allow(dead_code)]
 pub(crate) fn mark_stale(tx: &Transaction<'_>, annotation_id: &str) -> Result<(), ApiError> {
     let updated = tx
@@ -474,29 +518,31 @@ pub(crate) fn fresh_for_active_parse(
     Ok(annotations)
 }
 
-/// Read the memoization key hash of every non-deleted annotation of one
-/// parse, regardless of freshness. This is the discovery worker's
-/// set-difference input: the keys already present, so the worker can compute
-/// which required annotations remain to be built.
-pub(crate) fn memo_key_hashes_for_parse(
+/// Read the CONTENT key hash of every non-deleted annotation of one parse,
+/// regardless of freshness. This is the discovery worker's set-difference
+/// input: the content keys already present, so the worker can compute which
+/// required annotations remain to be built. CA2 (user-ruled 2026-07-19):
+/// satisfaction keys on content, not producer identity, so a model switch
+/// re-annotates only the frontier while the memo CACHE stays identity-scoped.
+pub(crate) fn content_key_hashes_for_parse(
     conn: &Connection,
     parse_id: &str,
 ) -> Result<std::collections::HashSet<String>, ApiError> {
     let mut statement = conn
-        .prepare(SELECT_MEMO_KEYS_FOR_PARSE_SQL)
+        .prepare(SELECT_CONTENT_KEYS_FOR_PARSE_SQL)
         .map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to prepare memo-key query for parse {parse_id}: {source}"),
+            message: format!("failed to prepare content-key query for parse {parse_id}: {source}"),
         })?;
     let rows = statement
         .query_map(params![parse_id], |row| row.get::<_, String>(0))
         .map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to query memo keys for parse {parse_id}: {source}"),
+            message: format!("failed to query content keys for parse {parse_id}: {source}"),
         })?;
 
     let mut hashes = std::collections::HashSet::new();
     for row in rows {
         let hash = row.map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to read memo-key row for parse {parse_id}: {source}"),
+            message: format!("failed to read content-key row for parse {parse_id}: {source}"),
         })?;
         hashes.insert(hash);
     }
@@ -522,12 +568,15 @@ pub(crate) struct ReopenableRow {
 }
 
 /// Read one reopenable row per unsatisfied key of a parse, as a map from
-/// memoization key hash to the chosen row. A key appears here only when it
+/// CONTENT key hash to the chosen row. A content key appears here only when it
 /// has NO fresh row: its rows are `failed` (a prior producer call failed) or
 /// crash-orphaned `building` (the process died mid-build — see the SQL
 /// comment for why a discovery-time building row can never be live work).
 /// The first row per key in (key, id) order is chosen, so the pick is
-/// deterministic across runs; discovery reopens exactly one row per key.
+/// deterministic across runs; discovery reopens exactly one row per key. CA2
+/// (user-ruled 2026-07-19): keying reopen on the content key means a row minted
+/// under a prior producer identity is reopened for the current identity, and a
+/// content key already fresh under ANY identity is left satisfied.
 pub(crate) fn reopenable_rows_for_parse(
     conn: &Connection,
     parse_id: &str,

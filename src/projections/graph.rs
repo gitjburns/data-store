@@ -44,12 +44,6 @@
 //!       the annotation-worker hook) because it reads FRESH annotations —
 //!       running pre-activation would read zero annotations (spec §21 rule 1).
 
-// Read functions are consumed by the C7b query-time graph channel (not yet
-// landed); the file-level allow names that consumer and is removed when C7b
-// calls `mentions_for_name` / `one_hop_edges` / `normalize_entity_name`. The
-// builder itself is consumed by C6f integration wiring, likewise pending.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -141,6 +135,20 @@ SELECT from_normalized_name AS far_name, relation_type, target_unit_ids_json,
 FROM graph_entity_edges
 WHERE parse_id = ?1 AND to_normalized_name = ?2
 ORDER BY far_name, relation_type, target_unit_ids_json, direction";
+
+/// Every stored normalized entity name for a parse, ascending (D9-amendment
+/// fuzzy scan surface, CA2-P2 2026-07-19). One row per (parse, normalized_name)
+/// by construction, so this enumerates each stored name exactly once. `ORDER BY
+/// normalized_name` gives a DETERMINISTIC scan order so the fuzzy match classes
+/// C7b runs over this set are order-stable across reads. Uses the
+/// `idx_graph_entity_mentions_parse_name` index (the same index the exact
+/// entry probes). Names only — no unit ids — because the fuzzy classes select
+/// WHICH stored names a query matches; the matched names are then resolved to
+/// units through the existing `mentions_for_name` / `one_hop_edges` lookups.
+const SELECT_ENTITY_NAMES_FOR_PARSE_SQL: &str = "
+SELECT normalized_name FROM graph_entity_mentions
+WHERE parse_id = ?1
+ORDER BY normalized_name";
 
 /// Normalize a raw entity name to its node identity (D9: entity node identity
 /// IS the normalized name). The scheme is deterministic and is the SINGLE
@@ -267,13 +275,25 @@ pub(crate) fn build_graph_projection(
 
     // Accumulate mentions and derive edge rows OUTSIDE the envelope, so a
     // corrupt annotation body fails the build before any envelope row exists.
-    let mentions = accumulate_mentions(&entity_annotations)?;
-    let edges = derive_edges(&relation_annotations)?;
+    // Each helper also reports how many empty-marker rows (body EXACTLY `[]`) it
+    // skipped; the counts are surfaced in the success log below.
+    let AccumulatedMentions {
+        mentions,
+        skipped_markers: skipped_entity_markers,
+    } = accumulate_mentions(&entity_annotations)?;
+    let DerivedEdges {
+        edges,
+        skipped_markers: skipped_relation_markers,
+    } = derive_edges(&relation_annotations)?;
 
     // input_annotation_ids = every entity+relation annotation consumed, so the
     // envelope's lineage names exactly the annotations this graph was built
     // from (spec §22 inputAnnotationIds). Deterministic order (sorted) so
     // repeated builds over the same set produce identical envelope payloads.
+    // DELIBERATE: skipped empty-marker rows REMAIN in this lineage — the builder
+    // consumed them (it read and classified each), and the skip is made visible
+    // via the logged `skipped_entity_markers`/`skipped_relation_markers` counts,
+    // not by omitting them from lineage.
     let mut input_annotation_ids: Vec<String> = entity_annotations
         .iter()
         .chain(relation_annotations.iter())
@@ -323,6 +343,8 @@ pub(crate) fn build_graph_projection(
         projection_id = %projection_id,
         entity_annotation_count = entity_annotations.len(),
         relation_annotation_count = relation_annotations.len(),
+        skipped_entity_markers,
+        skipped_relation_markers,
         mention_rows,
         edge_rows,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -341,6 +363,15 @@ struct DerivedEdge {
     target_unit_ids: Vec<String>,
 }
 
+/// The accumulated mentions plus the count of empty-marker entity annotations
+/// skipped while accumulating. The count is threaded out (rather than logged
+/// inside the helper) so the build-success log carries it alongside the other
+/// per-build facts; see `build_graph_projection`.
+struct AccumulatedMentions {
+    mentions: BTreeMap<String, MentionAccumulator>,
+    skipped_markers: usize,
+}
+
 /// Accumulate entity annotations into per-normalized-name mentions. For each
 /// entity annotation: read its `{ "name", "entityType" }` body, normalize the
 /// name to its node identity, and fold the annotation's target_unit_ids into
@@ -349,14 +380,34 @@ struct DerivedEdge {
 /// entityType is metadata: the first-seen value is kept per name; a name later
 /// seen with a DIFFERENT entityType still maps to the SAME node (D9 identity
 /// rule) and the divergence is logged (no contents), never used to fork.
+///
+/// EMPTY-MARKER SKIP (visible, counted — distinct from malformed-body failure):
+/// the annotation worker records an EMPTY producer result as a fresh annotation
+/// whose body is EXACTLY `[]` (an empty JSON array), so the freshness key stays
+/// satisfied and the work is not rediscovered every cycle. That by-design marker
+/// carries no entity, so it is skipped here and the skip is COUNTED (surfaced in
+/// the build-success log), never fed to `entity_name`. This is NOT a silent drop
+/// of a malformed body: any OTHER body missing a string `name` still fails
+/// loudly via `entity_name`. Only the exact `[]` shape is skipped.
+/// MUST STAY IN STEP with the worker's empty-marker write site
+/// (`crate::annotations::worker::complete_build`) and the two sibling consumer
+/// skips (`derive_edges` here, `crate::projections::view::build_summary`); the
+/// worker's must-stay-in-step banner names all three.
 fn accumulate_mentions(
     entity_annotations: &[&SemanticAnnotation],
-) -> Result<BTreeMap<String, MentionAccumulator>, ApiError> {
+) -> Result<AccumulatedMentions, ApiError> {
     // BTreeMap keyed by normalized name → deterministic mention-row emission
     // order (name ascending) independent of annotation read order.
     let mut mentions: BTreeMap<String, MentionAccumulator> = BTreeMap::new();
+    let mut skipped_markers: usize = 0;
 
     for annotation in entity_annotations {
+        // Skip the empty-marker row (body is EXACTLY `[]`) before extraction; it
+        // encodes "no entities found", not a corrupt entity (see doc above).
+        if annotation.body.as_array().is_some_and(Vec::is_empty) {
+            skipped_markers += 1;
+            continue;
+        }
         let raw_name = entity_name(annotation)?;
         let entity_type = entity_type(annotation);
         let normalized = normalize_entity_name(&raw_name);
@@ -381,7 +432,18 @@ fn accumulate_mentions(
         }
     }
 
-    Ok(mentions)
+    Ok(AccumulatedMentions {
+        mentions,
+        skipped_markers,
+    })
+}
+
+/// The derived edge rows plus the count of empty-marker relation annotations
+/// skipped while deriving. The count is threaded out for the build-success log
+/// (see `build_graph_projection`), mirroring `AccumulatedMentions`.
+struct DerivedEdges {
+    edges: Vec<DerivedEdge>,
+    skipped_markers: usize,
 }
 
 /// Derive one directional edge per relation annotation. For each relation
@@ -392,11 +454,28 @@ fn accumulate_mentions(
 /// preserved (subject is the from-node, object is the to-node): C7b's two-arm
 /// `one_hop_edges` reader restores both-direction traversal, so this builder
 /// stores each edge once in its natural direction rather than duplicating it.
-fn derive_edges(
-    relation_annotations: &[&SemanticAnnotation],
-) -> Result<Vec<DerivedEdge>, ApiError> {
+///
+/// EMPTY-MARKER SKIP (visible, counted — distinct from malformed-body failure):
+/// an empty producer result is recorded by the worker as a fresh annotation
+/// whose body is EXACTLY `[]` (see `accumulate_mentions` for the full rationale).
+/// That by-design marker carries no relation, so it is skipped here and the skip
+/// is COUNTED, never fed to `relation_triple`. Any OTHER body missing a string
+/// `subject`/`predicate`/`object` still fails loudly via `relation_triple`; only
+/// the exact `[]` shape is skipped.
+/// MUST STAY IN STEP with the worker's empty-marker write site
+/// (`crate::annotations::worker::complete_build`) and the two sibling consumer
+/// skips (`accumulate_mentions` here, `crate::projections::view::build_summary`);
+/// the worker's must-stay-in-step banner names all three.
+fn derive_edges(relation_annotations: &[&SemanticAnnotation]) -> Result<DerivedEdges, ApiError> {
     let mut edges = Vec::with_capacity(relation_annotations.len());
+    let mut skipped_markers: usize = 0;
     for annotation in relation_annotations {
+        // Skip the empty-marker row (body is EXACTLY `[]`) before extraction; it
+        // encodes "no relations found", not a corrupt relation (see doc above).
+        if annotation.body.as_array().is_some_and(Vec::is_empty) {
+            skipped_markers += 1;
+            continue;
+        }
         let (subject, predicate, object) = relation_triple(annotation)?;
         edges.push(DerivedEdge {
             from_normalized_name: normalize_entity_name(&subject),
@@ -405,7 +484,10 @@ fn derive_edges(
             target_unit_ids: annotation.target_unit_ids.clone(),
         });
     }
-    Ok(edges)
+    Ok(DerivedEdges {
+        edges,
+        skipped_markers,
+    })
 }
 
 /// Clear the parse's prior payload rows (mentions then edges, fixed order) and
@@ -647,10 +729,53 @@ pub(crate) fn one_hop_edges(
     Ok(edges)
 }
 
+/// Enumerate every stored NORMALIZED entity name for a parse, ascending (D9
+/// amendment, CA2-P2 2026-07-19): the scan surface the graph channel's fuzzy
+/// match classes (acronym, token-prefix) run over. Returns the names already in
+/// their node-identity form (they were stored via `normalize_entity_name`), so
+/// C7b compares its already-normalized query tokens/n-grams against them
+/// directly — no re-normalization of the stored side is needed or performed.
+///
+/// Deterministic order (ascending) so the fuzzy scan and the candidate cap C7b
+/// applies over it are order-stable across repeated reads. Per-parse name counts
+/// are bounded (entity vocabulary per source is small), so enumerating the whole
+/// set and matching in Rust is the intended shape — this is NOT a per-name
+/// indexed probe like `mentions_for_name`. Reads only the passed parse (scope is
+/// enforced by the caller iterating only in-scope parses, §6/§38).
+pub(crate) fn entity_names_for_parse(
+    conn: &Connection,
+    parse_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut statement = conn
+        .prepare(SELECT_ENTITY_NAMES_FOR_PARSE_SQL)
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!(
+                "failed to prepare graph entity-name enumeration for parse {parse_id}: {source}"
+            ),
+        })?;
+    let rows = statement
+        .query_map(params![parse_id], |row| row.get::<_, String>(0))
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("failed to query graph entity names for parse {parse_id}: {source}"),
+        })?;
+
+    let mut names = Vec::new();
+    for row in rows {
+        let name = row.map_err(|source| ApiError::StorageOperation {
+            message: format!("failed to read graph entity-name row for parse {parse_id}: {source}"),
+        })?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
 /// Extract the `name` string from an entity annotation's `{ "name",
 /// "entityType" }` body. A missing or non-string `name` is a corrupt entity
 /// annotation surfaced with the annotation id — the materialization reflects
-/// its inputs honestly, never silently drops a malformed one.
+/// its inputs honestly and fails loudly on a malformed body. The one body shape
+/// NOT reaching here is the by-design empty-marker (`[]`), which `accumulate_
+/// mentions` skips and counts BEFORE calling this; that visible, counted skip is
+/// not a malformed body and is not this function's concern.
 fn entity_name(annotation: &SemanticAnnotation) -> Result<String, ApiError> {
     annotation
         .body
@@ -682,7 +807,9 @@ fn entity_type(annotation: &SemanticAnnotation) -> Option<String> {
 /// `{ "subject", "predicate", "object" }` body. Any missing or non-string
 /// field is a corrupt relation annotation surfaced with the annotation id: an
 /// edge with no endpoint or no predicate is meaningless, so it fails the build
-/// rather than being silently dropped.
+/// loudly rather than being silently dropped. The by-design empty-marker (`[]`)
+/// body never reaches here — `derive_edges` skips and counts it BEFORE calling
+/// this; that visible, counted skip is not a malformed body.
 fn relation_triple(annotation: &SemanticAnnotation) -> Result<(String, String, String), ApiError> {
     let field = |name: &str| -> Result<String, ApiError> {
         annotation

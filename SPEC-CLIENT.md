@@ -63,7 +63,10 @@ renderers; the only difference is how the command is entered.
 - Exactly **one operation flag** per invocation: a second operation
   flag is rejected (*"only one operation flag may be provided"*).
 - `--help` cannot be combined with an operation flag.
-- Unknown arguments are rejected with a pointer to `--help`.
+- Unknown arguments are rejected with a pointer to `--help`. This includes
+  the service-binary flags (`--setup-storage`, `--foreground`, `--smoke-dense`,
+  `--annotation-dry-run`): they are not client flags and are rejected as
+  unknown arguments.
 - Positional-argument collection for an operation flag stops at the
   **next recognized flag** (`--config` or any operation flag/alias):
   everything between the flag and the next recognized flag is taken as
@@ -142,6 +145,7 @@ are cross-checked against the router in `src/http.rs`.
 | `shutdown` | `--shutdown` | — | `POST /shutdown` | protected | no (control action) |
 | `held-parses` (`held`) | `--held-parses` | — | `GET /parses?status=held` | protected | no |
 | `operation` | `--operation` | `<operationId>` | `GET /operations/{operationId}` | protected | no (single read) |
+| `vocabulary` (`vocab`) | `--vocabulary` (`--vocab`) | `<entity\|relation> [active\|all]` | `GET /annotations/vocabulary` | protected | no |
 | `unit` | `--unit` | `<unitId>` | `GET /units/{unitId}` | public | no |
 | `relationships` | `--relationships` | `<unitId> [direction] [relationshipType]` | `GET /units/{unitId}/relationships` | public | no |
 | `source` | `--source` | `<sourceId>` | `GET /sources/{sourceId}` | public | no |
@@ -167,6 +171,12 @@ Notes on individual commands:
 - **`relationships`** — `direction` and `relationshipType` are optional
   positional filters, encoded as `direction=` / `relationshipType=`
   query parameters only when supplied.
+- **`vocabulary <entity|relation> [active|all]`** (alias `vocab`) — the
+  required first argument selects the vocabulary; the optional second argument
+  is the scope, defaulting to `active`. Both are validated **locally** before
+  any request (annotation type must be `entity` or `relation`, scope must be
+  `active` or `all`) and sent as the `annotationType` / `scope` query
+  parameters of `GET /annotations/vocabulary`.
 - **`exit` / `quit`** — REPL-only; no one-shot flag.
 
 ---
@@ -230,8 +240,8 @@ and printed **in full** rather than narrowed. As a consequence,
 not as a decode failure.** The claim holds **only** for the
 `serde_json::Value` passthroughs: drift in a typed **required** field
 (e.g. the evidence pack's `queryId`) IS a decode failure, rendered as
-an "unexpected response body" error (§5.9). Errors of every kind
-render per §5.9.
+an "unexpected response body" error (§5.10). Errors of every kind
+render per §5.10.
 
 ### 5.1 `health`
 
@@ -326,7 +336,28 @@ Renders the sync scheduler snapshot: `fabricReady` (`yes`/`no`), optional
 `detail`, and the `pending` / `inFlight` / `failed` / `coalescedTotal`
 counters, plus optional `cadenceMs` and `lastSuccessAt`.
 
-### 5.9 Error rendering (both modes)
+### 5.9 `vocabulary` (`vocab`)
+
+Renders the annotation vocabulary in the server's served order. The response
+shape follows the requested annotation type, and the renderer decodes into the
+matching mirror (`EntityVocabularyView` / `RelationVocabularyView`).
+
+A header line reports the annotation type, effective scope, and group count
+(`… vocabulary (scope <scope>): N groups` for entities, `… N predicates` for
+relations), followed by a shared completeness line — `rowsRead`, empty-`[]`
+markers skipped (`skippedMarkerCount`), malformed rows counted
+(`malformedRowCount`), and a **loud truncation warning** when the view is
+partial (a row-read or group cap was hit), because authoring rulesets from a
+truncated view would miss vocabulary. An empty result prints `(no entity
+vocabulary)` / `(no relation vocabulary)`.
+
+- **Entity** groups: per group, `normalizedName` with its `totalCount` and
+  `sourceCount`, then the distinct `entityTypes`, the `rawForms` (each raw form
+  with its count), and per-model counts.
+- **Relation** groups: per predicate, the `predicate` with its `totalCount` and
+  `sourceCount`, then per-model counts.
+
+### 5.10 Error rendering (both modes)
 
 Every failure renders as one of the following operator-facing errors:
 

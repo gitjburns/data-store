@@ -158,6 +158,8 @@ chunk_dense_vectors         dense embeddings per chunk
 unit_multivector_projections ColBERT token matrices per unit
 graph_entity_mentions       normalized entity → unit_ids (D9 entry)
 graph_entity_edges          normalized name-pair relation edges (D9 traversal)
+policy_versions             append-only system-assigned registry of operator
+                            policy-document content hashes (Section 3.2)
 ```
 
 ### 2.2 Artifact store — content-addressed filesystem tree
@@ -290,20 +292,74 @@ The annotation worker (`src/annotations/worker.rs`) is a **single dedicated
 `std::thread`**. Each cycle it discovers which active parses need annotations —
 the required set is the `post_activation_types` of the sealed **§21.4
 required-annotation-set policy** (`src/annotations/policy.rs`, one of the three
-sealed policy documents in Section 6) — and builds them, reusing cached
-producer output when a **§21.2 memo key**
-(`annotation_memo`) matches — the memo is keyed on target content × producer
-identity, so unchanged content never re-invokes a producer. The three producers
-(`entity`, `relation`, `summary`) call one external OpenAI-compatible
-chat-completions endpoint (`src/annotations/llm_client.rs`). Producers write
-`semantic_annotations`; the worker then builds the two **annotation-derived
-projections** for the source's active parse — **summary, then graph**
-(`view::build_summary`, `graph::build_graph_projection`) — completing the
-graph entity mentions/edges that the query-time graph channel consumes.
+sealed policy documents in Section 6). Discovery works two keys derived from one
+shared `KeyMaterial` (`src/annotations/memo.rs`):
+
+- The **content key** (`content_key_hash`, denormalized onto
+  `semantic_annotations` and indexed by `(parse_id, content_key_hash)`) hashes
+  the annotation type × the ordered per-target content hashes
+  (`COALESCE(text_hash, body_hash)`) — **no producer identity**. Discovery
+  **satisfaction** (`store::content_key_hashes_for_parse`) and **reopenable**
+  classification (`store::reopenable_rows_for_parse`) decide from the content
+  key alone: a content key already fresh under *any* producer identity is left
+  satisfied; a `failed`/`building` row with no fresh sibling is reopened for the
+  current producer. This is what makes a model switch re-annotate only the
+  frontier, not the whole corpus.
+- The **memoization key** (`memoization_key_hash`) additionally folds in the
+  producer identity hash and keys the identity-scoped `annotation_memo` cache,
+  so a producer identity or configuration change invalidates reuse. On
+  completion the row's stored `memoization_key_hash` is **re-stamped to the
+  completing producer** (`store::complete_fresh`); the content key is unchanged
+  by construction.
+
+The three producers (`entity`, `relation`, `summary`) call one external
+OpenAI-compatible chat-completions endpoint (`src/annotations/llm_client.rs`);
+the entity and relation producers compose the annotator naming-rules document
+(Section 3.2) into their system prompt, folding it into their producer identity
+hash. Producers write `semantic_annotations`; the worker then builds the two
+**annotation-derived projections** for the source's active parse — **summary,
+then graph** (`view::build_summary`, `graph::build_graph_projection`) —
+completing the graph entity mentions/edges that the query-time graph channel
+consumes.
 
 The worker loads its client **inside** the thread: a bad key file **parks** the
 worker (annotations disabled for the run) instead of failing startup. A parked
 worker is diagnostic-only and never gates readiness.
+
+### 3.2 Operator policy documents and the auto-versioning registry
+
+Two **operator-editable policy documents** (`src/policy.rs`) sit beside the
+sealed code documents of Section 6, but their identity is content-hashed rather
+than build-sealed. `[policies]` config holds their **paths only**
+(`entity_match_file_path`, `annotator_naming_file_path`, `src/config.rs`,
+`deny_unknown_fields`); the documents themselves are strict TOML
+(`deny_unknown_fields` on every struct):
+
+- **`policies/entity-match.toml`** — the graph-entry fuzzy-match ruleset
+  (`EntityMatchPolicy`: `acronym.{enabled,min_name_tokens}`,
+  `token_prefix.{enabled,min_token_len}`, `max_fuzzy_candidates`) consumed by
+  the query graph channel (Section 6). Shipped neutral: both fuzzy classes
+  disabled.
+- **`policies/annotator-naming.toml`** — the `rules` list composed into the
+  entity/relation producer prompts (Section 3.1). Shipped empty.
+
+Both are **loaded once at startup and fatal on invalid** (`src/main.rs`); each
+is content-hashed over its **parsed canonical serialization**
+(`canonical::canonical_sha256_hex_of`), so comment/whitespace edits do not
+change identity. Editing a document requires a **service restart** (config is
+startup-only). Both content hashes fold into `ApplicationIdentity`
+(`entity_match_policy_hash`, `annotator_naming_policy_hash`, Section 7); the
+config-hash projection carries their **paths only**.
+
+Versioning is **system-assigned** through the append-only `policy_versions`
+table (`policy_id`, `version`, `content_hash`, `observed_at`; INSERT-only by
+convention). `register_policy_version` reads the latest row per policy: an
+unchanged content hash writes nothing; a new or changed hash appends
+`latest.version + 1` and mints a `policy.changed` SystemEvent in the same
+transaction. A **revert to previously seen content still advances** the counter
+(it records change events, not distinct contents). Registration runs only when
+the fabric plane is ready at startup; a **plane-missing start defers**
+registration to the next valid-plane start.
 
 ## 4. Cutover discipline
 
@@ -502,13 +558,30 @@ open read-only tx  ─▶  capture scope-filtered active set (+ dense Arc clones
   generate chunk-grained candidates, resolve chunk → unit, and are **fused by
   RRF** into a unit-grained pool (the fused hit is tagged `RetrievalChannel::Dense`
   as the fused pool's channel). The **graph** channel is a **separate channel**
-  (D9): lexical match of query text against stored entity-annotation names, one
-  semantic relational hop over `graph_entity_mentions`/`graph_entity_edges`
-  (structural UnitRelationships are never walked at query time), tiered
-  deterministically (multi-entity units, then direct mentions, then one-hop
-  related, tiebroken by unitId). No LLM call is made in the query path. The graph
-  hits are **appended downstream** to the RRF-fused pool to form the candidate
-  pool.
+  (D9): entity-name match of query text against stored entity-annotation names,
+  one semantic relational hop over
+  `graph_entity_mentions`/`graph_entity_edges` (structural UnitRelationships are
+  never walked at query time), tiered deterministically (multi-entity units,
+  then direct mentions, then one-hop related). No LLM call is made in the query
+  path. The graph hits are **appended downstream** to the RRF-fused pool to form
+  the candidate pool.
+
+  Entry matching is **policy-threaded** (the D9 amendment). `graph_channel`
+  receives the `EntityMatchPolicy` (Section 3.2), threaded from startup through
+  `execute_query` → `run_pipeline_body`. An always-on **exact** class is joined,
+  when a class is enabled, by **acronym** (a single query token equals the
+  first-letter acronym of a stored name whose token count is at least
+  `min_name_tokens`) and **token_prefix** (each query token of at least
+  `min_token_len` chars is a leading prefix of the correspondingly positioned
+  stored-name token) classes, capped at `max_fuzzy_candidates`. Candidate order
+  is rank-only and deterministic: tier, then match class (`Exact` < `Acronym` <
+  `TokenPrefix`), then matched-name length descending, then unitId then parseId
+  ascending. **When both fuzzy classes are disabled (the shipped default) the
+  path is byte-identical to the prior exact-only behavior:**
+  `entity_names_for_parse` (`src/projections/graph.rs`, the per-parse name
+  enumeration) is **never called**, so the class order component is constant.
+  These knobs live in the entity-match policy document, deliberately **not** the
+  `RetrievalProfile`.
 - **MaxSim** (`src/query/rerank.rs`). ColBERT MaxSim **re-scores the already-fused
   pool** from persisted C6e matrices; the loader decodes stored blobs and never
   re-embeds. This is a rerank/scoring stage, not candidate generation — see the
@@ -590,7 +663,11 @@ database connections. Slots are poison-recovered on read.
 - **Identity capture** (`src/identity.rs`) records the dense backend kind and
   its per-backend facts — local `path`/`max_tokens`, or HTTP
   `endpoint`/`model`/`timeout_seconds`/`api_key_file_path` — with credential
-  files captured as their resolved **PATH only**, never contents.
+  files captured as their resolved **PATH only**, never contents. It also folds
+  the two operator policy-document content hashes into `ApplicationIdentity`
+  (`entity_match_policy_hash`, `annotator_naming_policy_hash`, Section 3.2),
+  captured once at startup alongside the config hash; the config-hash projection
+  itself carries the two document **paths only**.
 
 ## 8. Model runtime
 

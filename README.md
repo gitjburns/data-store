@@ -92,6 +92,30 @@ API-key files).
 readiness-critical components: `inference` and `sync`. Everything else reported by
 health is diagnostic-only and never makes a running service report unavailable.
 
+**Tuning the rulesets (inspect, then adjust).** Two policy documents shape
+retrieval and annotation without changing code: the entity-match ruleset
+(graph-entry fuzzy matching) and the annotator naming rules (composed into the
+entity/relation producer prompts). Both ship neutral. Author them from the
+corpus's own observed vocabulary: read `GET /annotations/vocabulary`
+(`--vocabulary <entity|relation>`) to see the grouped entity/relation
+vocabulary, edit the documents under `policies/`, then restart the service —
+config is startup-only, so edits take effect on the next start. The service
+content-hashes each document (ignoring comments and whitespace) and appends a
+system-assigned version to an internal registry on every change; editing the
+naming document changes producer identity, which invalidates memoized producer
+output and re-annotates the frontier.
+
+On a **fresh corpus**, the intended first step is the **annotation dry-run
+mode**: `data-store-service --annotation-dry-run <N>` parses the corpus and
+sample-annotates only the first `<N>` section groups per source per type
+(entity and relation; no summaries, no embeddings), then serves the vocabulary
+route so you can author the rulesets from observed vocabulary **before**
+committing to full annotation. Inspect with `--vocabulary <entity|relation>
+all` (the sampled parses are not active, so scope `all` is required), edit the
+documents, then start normally — the normal start adopts the dry-run's parses
+without re-converting them and completes ingestion under the final rulesets.
+See **INSTALL.md** section 5 for the full procedure.
+
 ## The HTTP surface at a glance
 
 PROTOCOL.md is the contract of record. This is the map.
@@ -121,6 +145,7 @@ PROTOCOL.md is the contract of record. This is the map.
 | `POST /shutdown` | Graceful shutdown (immediate confirmation, then signal). |
 | `GET /parses?status=held` | List parses awaiting disposition. |
 | `GET /operations/{operationId}` | Poll an async Operation's status. |
+| `GET /annotations/vocabulary?annotationType=…&scope=…` | Inspect the grouped entity/relation annotation vocabulary. |
 
 ## The polling admin model
 
@@ -228,6 +253,7 @@ Operator verbs (CLI flag / REPL name):
 | `--restore` | `<sourceId> <parseId>` | Restore from a snapshot. |
 | `--held-parses` | — | List held parses awaiting disposition. |
 | `--operation` | `<operationId>` | Read an Operation once. |
+| `--vocabulary` (`--vocab`) | `<entity\|relation> [active\|all]` | Inspect the annotation vocabulary (scope defaults to `active`). |
 | `--unit` | `<unitId>` | Read one unit. |
 | `--relationships` | `<unitId> [direction] [relationshipType]` | Read unit relationships. |
 | `--source` | `<sourceId>` | Read source locations and freshness. |
@@ -291,5 +317,6 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 | `[connectors.filesystem]` | Governance domain stamped on acquired sources. |
 | `[docling]` | Docling executable and PDF conversion controls. |
 | `[models]` | Model backends: `[models.dense]` and `[models.reranker]` each pick an exclusive `backend` (`local` = on-accelerator artifacts + token limits; `http` = remote OpenAI-/Cohere-compatible endpoint, model, timeout, and optional key file); ColBERT and the annotator alongside. |
+| `[policies]` | Paths to the two operator-editable policy documents (entity-match ruleset, annotator naming rules); config holds paths only, and edits require a restart. |
 
 See **INSTALL.md** for the annotated example and the required absolute paths.

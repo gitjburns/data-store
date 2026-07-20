@@ -41,6 +41,7 @@ an asynchronous **Operation** you poll (see [Operations](#operations)).
   - [`POST /shutdown`](#post-shutdown)
   - [`GET /parses`](#get-parses)
   - [`GET /operations/{operationId}`](#get-operationsoperationid)
+  - [`GET /annotations/vocabulary`](#get-annotationsvocabulary)
 - [Operations](#operations)
   - [Polling model](#polling-model)
   - [`succeeded` is not a parse verdict](#succeeded-is-not-a-parse-verdict)
@@ -173,6 +174,7 @@ failures and are reported as `500`, not `503`. Only `cutover_barrier_active`
 | POST | `/shutdown`                                       | protected | — → `202` (no body) |
 | GET  | `/parses?status=held`                            | protected | — → `{ parses }` |
 | GET  | `/operations/{operationId}`                      | protected | — → `Operation` |
+| GET  | `/annotations/vocabulary?annotationType=…&scope=…` | protected | — → `EntityVocabularyResponse` \| `RelationVocabularyResponse` |
 
 ---
 
@@ -954,6 +956,77 @@ unknown.
 
 ```bash
 curl -s http://localhost:PORT/operations/op_ABC123 \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+---
+
+### `GET /annotations/vocabulary`
+
+Inspect the annotation vocabulary observed in `semantic_annotations`, grouped
+for review. Protected. This is the read surface an operator uses to author the
+operator policy documents from the corpus's own observed vocabulary.
+
+**Query parameters:**
+
+| Param | Values | Default | Meaning |
+|-------|--------|---------|---------|
+| `annotationType` | `entity`, `relation` | — | **Required.** Which vocabulary to return. |
+| `scope` | `active`, `all` | `active` | `active` reads only active-parse rows; `all` additionally includes non-active-parse rows. |
+
+**400 behavior** (both `400` `bad_request`, checked **after** the bearer token):
+
+- Missing or unrecognized `annotationType` →
+  `"GET /annotations/vocabulary requires annotationType=entity|relation; got ..."`.
+- Unrecognized `scope` →
+  `"GET /annotations/vocabulary scope must be active|all; got ..."`.
+
+Both responses share a common frame of counters. The reader is bounded: it reads
+at most `MAX_ROWS_READ = 200_000` rows and forms at most `MAX_GROUPS = 50_000`
+groups; `truncated` is `true` when either cap was hit. Rows whose body is the
+empty-marker `[]` (the "no annotations here" convention) are counted into
+`skippedMarkerCount` and never grouped; rows with an otherwise-unparseable body
+are counted into `malformedRowCount` and never grouped.
+
+**Response `200` (entity)** — `EntityVocabularyResponse` (`camelCase`):
+
+| Field | Type | Presence |
+|-------|------|----------|
+| `annotationType` | string | always — `entity` |
+| `scope` | string | always — echoes the effective scope |
+| `groups` | array of entity group | always — sorted by `normalizedName` ascending |
+| `skippedMarkerCount` | `u64` | always — empty-`[]` marker rows skipped |
+| `malformedRowCount` | `u64` | always — unparseable non-marker rows skipped |
+| `truncated` | bool | always — a row or group cap was hit |
+| `rowsRead` | `u64` | always — total rows read (≤ `MAX_ROWS_READ`) |
+| `groupCount` | `u64` | always — number of groups returned |
+
+Entity group fields (`camelCase`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `normalizedName` | string | The shared normalized-name group key. |
+| `rawForms` | array of `{ rawForm, count }` | Distinct raw name strings with their occurrence counts. |
+| `entityTypes` | array of string | Distinct `entityType` values seen in the group. |
+| `sourceCount` | `u64` | Count of distinct source ids the name appears in. |
+| `modelCounts` | array of `{ modelName, count }` | Per-model occurrence counts (`modelName` is `(unknown)` when absent). |
+| `totalCount` | `u64` | Total occurrences across all raw forms. |
+
+**Response `200` (relation)** — `RelationVocabularyResponse` (`camelCase`):
+same top-level frame (`annotationType` = `relation`, `scope`,
+`skippedMarkerCount`, `malformedRowCount`, `truncated`, `rowsRead`,
+`groupCount`), with `groups` sorted by `predicate` ascending. Relation group
+fields (`camelCase`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `predicate` | string | The relation predicate group key (verbatim). |
+| `totalCount` | `u64` | Total occurrences of this predicate. |
+| `sourceCount` | `u64` | Count of distinct source ids. |
+| `modelCounts` | array of `{ modelName, count }` | Per-model occurrence counts. |
+
+```bash
+curl -s 'http://localhost:PORT/annotations/vocabulary?annotationType=entity&scope=active' \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 

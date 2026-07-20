@@ -8,7 +8,7 @@ When instructions conflict, follow this order:
 2. Agent conduct rules in this file, including safety, scope, approval,
    filesystem, command, and patch process rules.
 3. Repository technical policy in `PRINCIPLES.md` and diagnostics policy in
-   `DIAGNOSTICS-ONBOARDING.md`.
+   `DIAGNOSTICS.md`.
 4. Existing local code patterns, only when they do not conflict with the above.
 
 ## Verification Behavior
@@ -135,10 +135,6 @@ refactor.
 - **Function signature changes**: When changing parameters, use
   `rg -n "function_name\\(" src` or an equivalent search and update every
   caller.
-- **Operation API and event changes**: When changing `POST /v1/operations`, the
-  streamed NDJSON event fields (`status`, `progress`, `result`, `error`), or
-  event ordering, check both the Rust emitter in `src/http.rs` and the CLI
-  consumer in `src/bin/data-store.rs`.
 - **Config changes**: Any config shape change requires explicit approval,
   updates to `config.example.toml`, and corresponding config parsing behavior.
 - **Async paths**: Follow `PRINCIPLES.md` for async and blocking-work policy.
@@ -187,16 +183,15 @@ Use targeted operator logs as the primary debugging tool. Add logs when existing
 logs do not explain operation start, boundary transitions, errors, completions,
 or elapsed time. Do not add noisy logging.
 
-User-facing feedback must appear inline in the CLI client output or streamed
-operation events. Do not add modals, toasts, alerts, or tooltips unless the user
-specifically asks for them.
+User-facing feedback must appear inline in the CLI client output. Do not add modals,
+toasts, alerts, or tooltips unless the user specifically asks for them.
 
 Errors must preserve source context. Do not replace a specific provider, SQL,
 config, or protocol error with a generic message.
 
 ## Diagnostic Hygiene
 
-- Follow `DIAGNOSTICS-ONBOARDING.md` for day-to-day diagnostics policy and
+- Follow `DIAGNOSTICS.md` for day-to-day diagnostics policy and
   implementation standards.
 - Before relying on diagnostics for a feature, identify the authoritative log or
   audit path from the applicable configuration, documentation, or

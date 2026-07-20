@@ -84,6 +84,22 @@ start, fill in at least the following:
   **`api_key_file_path`** to an owner-only file holding the bearer API key if the
   endpoint requires authentication.
 
+- **`[policies].entity_match_file_path`** and
+  **`annotator_naming_file_path`** — paths to the two operator-editable policy
+  documents (both required; relative paths resolve against the config
+  directory). `config.example.toml` ships `policies/entity-match.toml` and
+  `policies/annotator-naming.toml`, and the shipped documents **work as-is** —
+  the entity-match ruleset ships with both fuzzy-match classes disabled and the
+  naming document ships an empty rule list, a neutral posture. Editing them is
+  optional and best done after inspecting the corpus vocabulary
+  (`GET /annotations/vocabulary`); note that editing the naming document is
+  **producer-identity-bearing** — it changes the entity/relation producer prompt
+  hash, invalidating memoized producer output and re-annotating the frontier.
+  The documents carry **no version field**: the service assigns versions itself
+  by content-hashing each document, so do not add one. Both documents are loaded
+  once at startup and are strictly validated (unknown keys or invalid values are
+  fatal); an edit takes effect only after a service restart.
+
 ### Owner-only secret files
 
 The admin token file, the annotator API-key file (`.annotator-api-key`), the
@@ -190,3 +206,55 @@ check as the first live confirmation of the install rather than a re-run of
 previously verified behavior.
 
 For interactive use of the service, see `INTERACTIVE.md`.
+
+## 5. Annotation dry-run mode (authoring rulesets on a fresh corpus)
+
+The policy documents in section 1 are corpus-dependent: sensible entity-match
+and naming rules come from the corpus's own observed vocabulary, not from
+guessing. The annotation dry-run mode exists so you can observe that vocabulary
+**before** paying for full annotation and embedding. On a fresh corpus, the
+intended procedure is:
+
+1. **Start from a fresh plane.** Point `[storage].index_root` at a new or clean
+   location and run `--setup-storage` (section 2). Unlike a normal start, the
+   dry-run mode **requires** a valid fabric plane and fails fatally without
+   one.
+
+2. **Run the dry-run pass:**
+
+   ```sh
+   data-store-service --config config.toml --annotation-dry-run <N>
+   ```
+
+   `<N>` is a positive integer: the pass parses the corpus, then
+   sample-annotates the first `<N>` section groups per source per type with the
+   entity and relation producers (summaries are excluded). The mode always runs
+   in the foreground and serves only health, the vocabulary route, operation
+   reads, and shutdown. (`--annotation-dry-run`, like `--setup-storage`, is a
+   service-binary flag; the `data-store` client rejects it.)
+
+   **`Ready: no` in health is expected here**: no inference runtime is
+   started, and the inference component reports
+   `annotation dry-run mode: inference not initialized` by design.
+
+3. **Inspect the observed vocabulary** while the mode serves:
+
+   ```sh
+   data-store --vocabulary entity all
+   data-store --vocabulary relation all
+   ```
+
+   Use scope `all`: the dry-run parses are never activated, so the default
+   `active` scope would show nothing.
+
+4. **Author the rulesets.** Edit `policies/entity-match.toml` and
+   `policies/annotator-naming.toml` against what you observed (section 1 —
+   remember the naming document is producer-identity-bearing).
+
+5. **Optionally run a second dry-run** with the edited documents and compare
+   the resulting vocabulary before committing to the rulesets.
+
+6. **Stop the mode** (`data-store --shutdown`) and **start the service
+   normally.** The normal start adopts the dry-run's imported parses (no
+   Docling re-conversion), builds projections, gates and activates, and
+   completes ingestion under the final rulesets.

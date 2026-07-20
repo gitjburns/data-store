@@ -217,3 +217,20 @@ timeout_seconds = 120
 # split deterministically before invocation. External fact: size from the
 # endpoint model's context window.
 max_input_chars = 24000
+
+[policies]
+# Paths to the operator-editable external policy documents. Config holds the
+# PATH to a policy document, never its values; each document is loaded once at
+# startup, strictly validated (unknown keys and invalid values are fatal), and
+# content-hashed. Versions are SYSTEM-ASSIGNED: the service detects content
+# changes by hash and appends the next version to the policy_versions registry
+# at startup — do not put version fields in the documents. Editing a document
+# requires a service restart to take effect. Relative paths resolve from this
+# config file's directory.
+#
+# Graph-entry entity-match ruleset (fuzzy matching classes and caps).
+entity_match_file_path = "policies/entity-match.toml"
+# Annotator naming rules composed into the entity/relation producer prompts.
+# NOTE: editing that document changes producer identity (promptHash) and
+# invalidates memoized producer output — see the document's own comments.
+annotator_naming_file_path = "policies/annotator-naming.toml"

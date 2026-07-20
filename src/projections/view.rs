@@ -30,11 +30,6 @@
 //! same way via its own ordered SELECT), because rendering needs the ordered
 //! unit tree and no shared reader exposes it to this module.
 
-// Both builders are consumed by C6d integration wiring (not yet landed in this
-// package); the allow names that consumer and is removed when integration
-// calls `build_derived_view` / `build_summary`.
-#![allow(dead_code)]
-
 use std::time::Instant;
 
 use rusqlite::{Connection, Transaction, params};
@@ -220,6 +215,13 @@ pub(crate) fn build_derived_view(
 /// `Summary` projection (empty `input_annotation_ids`): an empty materialized
 /// summary is visible truth (spec §22), not silent absence.
 ///
+/// EMPTY-MARKER SKIP: a summary annotation whose body is EXACTLY `[]` is the
+/// annotation worker's by-design empty-producer marker (no summary was produced),
+/// not a corrupt body. It is SKIPPED before the `summary_text` extraction and the
+/// skip is COUNTED (`skipped_summary_markers` in the success log) — a visible,
+/// counted skip, distinct from the loud failure a genuinely malformed body still
+/// gets. Such a marker still appears in `input_annotation_ids` (it was consumed).
+///
 /// REBUILD idempotence: like the view builder, this does NOT delete prior
 /// `Summary` envelopes — that is an envelope operation this module must not
 /// hand-write (design fact 7). Integration MUST delete-for-parse (reported as
@@ -249,6 +251,10 @@ pub(crate) fn build_summary(
         })
         .collect();
 
+    // DELIBERATE: skipped empty-marker rows REMAIN in this lineage — the builder
+    // consumed them (it read and classified each), and the skip is made visible
+    // via the logged `skipped_summary_markers` count below, not by omitting them
+    // from lineage.
     let input_annotation_ids: Vec<String> = summaries
         .iter()
         .map(|annotation| annotation.id.clone())
@@ -256,12 +262,29 @@ pub(crate) fn build_summary(
 
     // Extract each summary's text from its `{ "text": <string> }` body. A body
     // missing the `text` field is a corrupt/malformed summary annotation and is
-    // surfaced loudly (never silently skipped): the materialization must be an
-    // honest reflection of its inputs. The extracted texts are counted/logged
-    // for diagnostics but NOT persisted here (the text lives on the annotation)
-    // and NEVER logged (document contents are forbidden in logs).
+    // surfaced loudly: the materialization must be an honest reflection of its
+    // inputs. The one body shape NOT surfaced loudly is the by-design empty
+    // marker (body EXACTLY `[]`): the annotation worker records an empty producer
+    // result as a fresh `[]`-bodied annotation so the freshness key stays
+    // satisfied and the work is not rediscovered each cycle. That marker carries
+    // no summary, so it is skipped here and the skip is COUNTED
+    // (`skipped_summary_markers`), never fed to `summary_text`. `extracted_texts`
+    // counts only REAL summaries. Both counts are logged for diagnostics; neither
+    // the text nor the body is ever persisted here (the text lives on the
+    // annotation) or logged (document contents are forbidden in logs).
+    // MUST STAY IN STEP with the worker's empty-marker write site
+    // (`crate::annotations::worker::complete_build`) and the two sibling consumer
+    // skips (`crate::projections::graph::accumulate_mentions` / `derive_edges`);
+    // the worker's must-stay-in-step banner names all three.
     let mut extracted_texts = 0usize;
+    let mut skipped_summary_markers = 0usize;
     for annotation in &summaries {
+        // Skip the empty-marker row (body is EXACTLY `[]`) before extraction; it
+        // encodes "no summary produced", not a corrupt summary (see above).
+        if annotation.body.as_array().is_some_and(Vec::is_empty) {
+            skipped_summary_markers += 1;
+            continue;
+        }
         summary_text(annotation)?;
         extracted_texts += 1;
     }
@@ -303,6 +326,7 @@ pub(crate) fn build_summary(
         projection_id = %projection_id,
         summary_annotation_count = input_annotation_ids.len(),
         extracted_texts,
+        skipped_summary_markers,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "summary projection build succeeded"
     );
@@ -416,8 +440,10 @@ fn text_field<'body>(body: &'body Value, field: &str) -> Option<&'body str> {
 /// Extract a summary annotation's text from its `{ "text": <string> }` body
 /// (the CA summary body shape). A missing or non-string `text` is a corrupt
 /// summary annotation surfaced as an error with the annotation id — the
-/// materialization must reflect its inputs honestly, never silently drop a
-/// malformed one.
+/// materialization reflects its inputs honestly and fails loudly on a malformed
+/// body. The by-design empty-marker (`[]`) body never reaches here — `build_
+/// summary` skips and counts it BEFORE calling this; that visible, counted skip
+/// is not a malformed body.
 fn summary_text(annotation: &SemanticAnnotation) -> Result<String, ApiError> {
     annotation
         .body

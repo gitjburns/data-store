@@ -330,6 +330,12 @@ CREATE TABLE IF NOT EXISTS semantic_annotations (
     freshness_status IN ('fresh', 'stale', 'building', 'failed')
   ),
   memoization_key_hash TEXT NOT NULL,
+  -- CA2 content-scoped satisfaction key: annotation type crossed with the
+  -- ordered target ContentUnit content hashes, so frontier application can
+  -- decide satisfaction from target content identity alone. Distinct from
+  -- memoization_key_hash, which also folds in producer identity. CA2-P1
+  -- populates it; NOT NULL because every annotation row is content-scoped.
+  content_key_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   deleted_at TEXT
 );
@@ -344,6 +350,12 @@ ON semantic_annotations(parse_id, annotation_type);
 -- content key through this index.
 CREATE INDEX IF NOT EXISTS idx_semantic_annotations_memo_key
 ON semantic_annotations(memoization_key_hash);
+
+-- Content-scoped satisfaction lookup (CA2): frontier application within a parse
+-- resolves whether an annotation type is already satisfied for a target content
+-- key, so this keys on (parse_id, content_key_hash).
+CREATE INDEX IF NOT EXISTS idx_semantic_annotations_content_key
+ON semantic_annotations(parse_id, content_key_hash);
 
 -- Spec §21.2. Content-keyed memoization cache: a producer output keyed by the
 -- content-derived memoization_key_hash, so an identical (annotation_type,
@@ -379,6 +391,25 @@ CREATE TABLE IF NOT EXISTS system_events (
 -- The event log is read as an ordered audit trail.
 CREATE INDEX IF NOT EXISTS idx_system_events_created_at
 ON system_events(created_at);
+
+-- CA2 policy substrate. One row per observed content of an operator-editable
+-- policy document (entity_match, annotator_naming): version is a SYSTEM-ASSIGNED
+-- change-event counter, not an operator-authored field. content_hash is the
+-- SHA-256 over the PARSED document's canonical serialization (crate::canonical),
+-- so whitespace/comment-only edits do not append a version. observed_at is when
+-- registration first saw this content.
+--
+-- APPEND-ONLY by convention: rows are only ever INSERTed. No UPDATE or DELETE is
+-- ever issued against this table. A revert to previously seen content still
+-- appends a NEW version (the counter records change events, not distinct
+-- contents), so history is a faithful timeline of when each content took effect.
+CREATE TABLE IF NOT EXISTS policy_versions (
+  policy_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (policy_id, version)
+);
 
 -- Spec §22–§23 (C6 retrieval projections). The typed projection payloads
 -- below are parse-scoped and rebuildable, mirroring the content_units /
