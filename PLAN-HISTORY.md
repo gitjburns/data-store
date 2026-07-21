@@ -3159,6 +3159,96 @@ plan's current-state sections in place (amended §1.4 step 6).
   batching-regression kill, HTTP-dense pivot) with the 69.8-min /
   3.3× re-benchmark invalidated by the serial-annotation ceiling.
 
+- 2026-07-20: C10f commercial-endpoint clean-corpus re-run COMPLETE
+  (benchmark of record + first complete annotation chain + first live
+  CPd2/CA2 exercise) and R4 query testing COMPLETE (first execution of
+  the query surface), plus the derived-boundary normalization change
+  and the first naming-ruleset authoring.
+  - Release rebuild (metal); fresh plane (`index/fabric/` deleted,
+    user-approved; `--setup-storage`). Annotator model changed by the
+    user pre-run: `google/gemini-3.1-flash-lite` (was
+    `openai/gpt-5-nano`); fresh plane, so no memo/identity
+    consequence.
+  - Dry-run `--annotation-dry-run 5`: 05:33:26–06:24:15Z (50.8 min,
+    Docling for all 14 sources), 124 groups sampled, 124 producer
+    calls, 0 failures, 0 memo hits. Observed vocabulary: 524 entity
+    groups, 241 predicates. Defects driving the ruleset: entity-type
+    case/synonym splits (Person 177 / person 120, location 42 /
+    Location 30 / Place 4), copular predicates (`is` ×88 across 12
+    sources), authorship synonym split (authored 17 / wrote 8 /
+    author 7 / is-the-author-of 6 / published 4), entity names
+    leaking into predicates (`taught Marcus Aurelius`), and
+    `is grateful to` ×60 from one acknowledgments section.
+  - Derived-boundary normalization session (user-ruled): deterministic
+    casing/whitespace normalization belongs in CODE, not prompts;
+    prompts carry only semantic rules (fewer instructions carry more
+    weight). Implementation (Opus agent-serial + refute-by-default
+    review): `normalize_entity_name` reused for entity types and
+    relation predicates at every derived boundary — graph builder
+    (`derive_edges` relation_type, `accumulate_mentions` entityType;
+    empty-normalized predicate fails loudly), vocabulary aggregation
+    (relation groups keyed by normalized predicate + `rawForms`
+    mirroring the entity shape; entityTypes case-folded and deduped),
+    deletion-gate verifier (`derive_expected_edge`), and restore
+    rebuild (`rebuild_graph_planes` — the review's BLOCKER catch: a
+    third derivation mirror; also mirrors the whitespace-only→None
+    entityType filter); http.rs DTO, CLI renderer, and PROTOCOL.md
+    updated in the same change; stored `semantic_annotations` rows
+    stay VERBATIM (external-payload principle). Lesson recorded:
+    graph derivation is a THREE-site mirror set
+    (builder / verify / restore). Full battery zero warnings.
+    Naming ruleset authored (policies/annotator-naming.toml, 4
+    rules): preferred lowercase type set (incl. 'work' for titled
+    works); fullest person-name form; substantive verb-phrase
+    predicates, never bare copulas/possessives, 'authored' for
+    authorship; no entity names inside predicates.
+  - Episode cleanup ruling (user-ruled): coherent cleanup of
+    test/sampling episodes is an operator FEATURE the production
+    system must support — removing an episode must not leave
+    audit-failing residue, and doctrine must not fight the operator;
+    a designed purge leaves one honest operator-purge record.
+    Applied immediately as a sanctioned three-table purge of the
+    sampling episode (1,152 `semantic_annotations` + 122
+    `annotation_memo` + 2,304 `annotation.*` `system_events`, one
+    transaction; history retained in the service log), making the
+    plane single-identity before the benchmark — content-scoped
+    satisfaction would otherwise have permanently pinned the sampled
+    lead sections to the neutral ruleset.
+  - Benchmark of record (log era 2026-07-20T08:55–09:51Z): first
+    cycle 08:55:53Z; GateExisting adopted all 14 dry-run parses
+    (Docling never re-paid); all 14 activated by 09:22:58Z
+    (27.1 min); dense passage embedding 6.5 min total (HTTP, vs
+    149.6 min CPc local — ~23×); ColBERT 15.2 min (vs 30.2 min CPc);
+    28 lifecycle snapshots; annotation frontier converged 09:50:59Z
+    at 3,112/3,121 built. 9 rows parked-failed on malformed model
+    JSON (duplicate `entityType` key inside one object; invented
+    `achieves` field in a triple) — strict untrusted-producer
+    boundary rejects them; retried every cycle. End-to-end ≈106 min
+    including annotations vs 229.7 min CPc without annotations.
+    Fabric health counters all zero. OpenRouter annotator rate limit
+    observed live: 300 rpm; the 32-wide worker saturates the
+    allowance exactly (300 ok + ~200 shed per minute at full
+    fan-out) and converges; shed calls are wasted round-trips plus
+    ERROR-level log noise.
+  - R4 (log era from 2026-07-20T19:36Z): first-ever POST /query
+    executions. All three channels proven live: dense on every
+    query; lexical 197 units RRF-fused with 746 dense on a
+    term-heavy query; graph 118/128 pool hits (entity match +
+    one-hop, 69 ms, no LLM). MaxSim 100 → rerank 10 → assembly per
+    profile; assemblyTrace embedded (policy id/version/hash,
+    appliedRules, budget, selectedUnitIds); pack-level annotations
+    (212, with freshnessStatus and full producer provenance) and
+    relationships (17) delivered; §25.1 inert-rule disclosure
+    observed (`assembly.dependency_check.unmet` WARN). Latency:
+    queryEmbedMs ≈10 s of ≈12.8 s total — the OpenRouter embed
+    round-trip dominates; local stages are ms-scale except the local
+    reranker (2.4 s). Observations: the lexical strict-AND form
+    falls back to broad-OR only at construction time, not on empty
+    result (zero lexical units on a conversational query); the
+    per-channel completion logs are debug!-level and invisible at
+    the configured info level (debug:true response diagnostics are
+    the operator's channel window).
+
 ## Retired planning sections (relocated verbatim 2026-07-18, second stage)
 
 Sections appear in their original plan-file order: §1.5, §1.6, §2, the §3

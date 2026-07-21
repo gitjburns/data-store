@@ -285,10 +285,11 @@ startup with a config error naming the document. Each is **content-hashed over
 its parsed canonical serialization**, so comment- and whitespace-only edits do
 not change a document's identity. Both content hashes fold into
 `ApplicationIdentity` (§15.3). Because config is startup-only, **editing a policy
-document requires a service restart to take effect**. The shipped documents are
-neutral (`policies/entity-match.toml` ships both fuzzy classes disabled;
-`policies/annotator-naming.toml` ships an empty rule list), so the default
-posture is byte-identical to no policy.
+document requires a service restart to take effect**. A neutral posture — both
+fuzzy classes disabled, an empty naming-rule list — is a valid default that is
+byte-identical to no policy; `policies/entity-match.toml` ships neutral, while
+the in-repo `policies/annotator-naming.toml` carries the commissioning corpus's
+authored rules (not an empty list).
 
 System-assigned versioning of these documents is recorded in the append-only
 `policy_versions` table with a `policy.changed` event per advance (§3, §16).

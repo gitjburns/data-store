@@ -9,7 +9,7 @@ what the code does at startup, not runtime-observed behavior.
 The build produces two operator-facing binaries. `data-store-service` is the
 service itself (`start.sh` runs `./target/release/data-store-service`);
 `data-store` is the separate CLI client, which also provides the interactive
-REPL (see `INTERACTIVE.md`).
+REPL (see `SPEC-CLIENT.md`).
 
 ## 1. Prerequisites and configuration
 
@@ -88,9 +88,11 @@ start, fill in at least the following:
   **`annotator_naming_file_path`** — paths to the two operator-editable policy
   documents (both required; relative paths resolve against the config
   directory). `config.example.toml` ships `policies/entity-match.toml` and
-  `policies/annotator-naming.toml`, and the shipped documents **work as-is** —
-  the entity-match ruleset ships with both fuzzy-match classes disabled and the
-  naming document ships an empty rule list, a neutral posture. Editing them is
+  `policies/annotator-naming.toml`. A neutral posture — an empty naming-rule
+  list, both fuzzy-match classes disabled — is a valid default that is
+  byte-identical to no policy; `policies/entity-match.toml` ships neutral, but
+  this repo's `policies/annotator-naming.toml` is authored for the commissioning
+  corpus (it carries authored naming rules, not an empty list). Editing them is
   optional and best done after inspecting the corpus vocabulary
   (`GET /annotations/vocabulary`); note that editing the naming document is
   **producer-identity-bearing** — it changes the entity/relation producer prompt
@@ -205,7 +207,7 @@ Because the service is first exercised at C10f commissioning, treat this health
 check as the first live confirmation of the install rather than a re-run of
 previously verified behavior.
 
-For interactive use of the service, see `INTERACTIVE.md`.
+For interactive use of the service, see `SPEC-CLIENT.md`.
 
 ## 5. Annotation dry-run mode (authoring rulesets on a fresh corpus)
 

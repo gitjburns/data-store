@@ -8,7 +8,6 @@ mutations, and how each response is rendered.
 Cross-references:
 
 - `PROTOCOL.md` — the wire routes each command targets.
-- `INTERACTIVE.md` — the interactive REPL (line editor, history, prompt).
 - `INSTALL.md` — config file and admin-token file setup.
 
 Verification status: this client surface is first runtime-exercised at
@@ -51,9 +50,12 @@ Select the config with `--config <path>`; it defaults to `config.toml`.
 - **One-shot** — invoke a single command via its `--flag` and exit.
   Example: `data-store --config config.toml --health`.
 - **Interactive REPL** — invoke `data-store` with no command flag to
-  enter the read-eval-print loop. See `INTERACTIVE.md`. The prompt is
-  `data-store> `; type `help` for the command list, `exit` (or `quit`)
-  to leave. History is stored in `.data-store.history`.
+  enter the read-eval-print loop (`--config <path>` is honored). The
+  prompt is `data-store> `; type `help` for the command list, `exit`
+  (or `quit`), or EOF (Ctrl-D), to leave; Ctrl-C interrupts the current
+  line and reminds you to use `exit`. Line editing and history are
+  provided by rustyline; command history persists to `.data-store.history`
+  (resolved against the config file's directory) across sessions.
 
 Both modes dispatch through the same command table and the same
 renderers; the only difference is how the command is entered.
@@ -109,9 +111,13 @@ usage lines; `data-store --help` (alias `-h`) prints the one-shot usage
 lines without reading the config.
 
 Bracketed arguments (`[...]`) are optional; angle-bracketed arguments
-(`<...>`) are required. `<requestJson>` arguments are raw JSON strings
-passed straight to the request body; invalid JSON is rejected locally
-before any request is sent.
+(`<...>`) are required. A `[requestJson]` argument (`snapshot` only) is a
+raw JSON string passed straight to the request body; invalid JSON is
+rejected locally before any request is sent. `query` takes bare query
+text (`<queryText...>`): the trailing arguments are joined with single
+spaces and the client constructs the `{"queryText": ...}` body itself
+via serde_json, so the text is JSON-escaped correctly and never parsed
+as JSON. Raw query envelopes are curl's job.
 
 REPL lines are tokenized by a minimal splitter (`split_shell_like`) —
 no shell is involved:
@@ -134,7 +140,7 @@ are cross-checked against the router in `src/http.rs`.
 | REPL name (aliases) | One-shot flag | Arguments | Route | Access | Async? |
 |---|---|---|---|---|---|
 | `health` | `--health` | — | `GET /v1/health` | public | no |
-| `query` | `--query` | `<requestJson>` | `POST /query` | public | no |
+| `query` | `--query` | `<queryText...>` | `POST /query` | public | no |
 | `ingest` | `--ingest` | `<sourceSystem> <nativeUri>` | `POST /sources` | protected | yes (operation) |
 | `reparse` | `--reparse` | `<sourceId> <sourceSystem> <nativeUri>` | `POST /sources/{sourceId}/parses` | protected | yes (operation) |
 | `activate` | `--activate` | `<sourceId> <parseId>` | `POST /sources/{sourceId}/parses/{parseId}/activate` | protected | yes (operation) |
@@ -273,6 +279,11 @@ note.
 
 ### 5.3 `query`
 
+Takes bare query text: the trailing arguments are joined with single
+spaces and the client builds the `{"queryText": ...}` request body itself
+via serde_json (never string-formatted). It does not accept a raw JSON
+envelope; a full-envelope query is curl's job.
+
 Renders the evidence pack: `queryId`, `queryText`, `assembledAt`, the
 evidence-unit count, then each unit with its `unitId`, `contentType`,
 `sourceId`/`parseId`, optional `score`, optional `reasons`, an
@@ -354,8 +365,9 @@ vocabulary)` / `(no relation vocabulary)`.
 - **Entity** groups: per group, `normalizedName` with its `totalCount` and
   `sourceCount`, then the distinct `entityTypes`, the `rawForms` (each raw form
   with its count), and per-model counts.
-- **Relation** groups: per predicate, the `predicate` with its `totalCount` and
-  `sourceCount`, then per-model counts.
+- **Relation** groups: relations group by **normalized predicate**. Per group,
+  the `predicate` with its `totalCount` and `sourceCount`, then the `rawForms`
+  (each raw predicate form with its count), and per-model counts.
 
 ### 5.10 Error rendering (both modes)
 

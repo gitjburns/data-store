@@ -14,7 +14,7 @@ it. For the exact contracts and comprehensive detail, see:
 - **INSTALL.md** — installation, models, and one-time storage setup.
 - **PROTOCOL.md** — the HTTP contract of record (request/response shapes, status
   codes, error envelopes).
-- **INTERACTIVE.md** — the bundled CLI / REPL client.
+- **QUICKSTART.md** — condensed install/operation command reference.
 - **SPEC-SERVER.md**, **SPEC-CLIENT.md**, **ARCHITECTURE.md** — the comprehensive
   design references.
 
@@ -95,7 +95,10 @@ health is diagnostic-only and never makes a running service report unavailable.
 **Tuning the rulesets (inspect, then adjust).** Two policy documents shape
 retrieval and annotation without changing code: the entity-match ruleset
 (graph-entry fuzzy matching) and the annotator naming rules (composed into the
-entity/relation producer prompts). Both ship neutral. Author them from the
+entity/relation producer prompts). A neutral posture — an empty naming-rule list,
+both fuzzy-match classes disabled — is the valid default; the in-repo
+annotator-naming document is authored for the commissioning corpus from its
+observed vocabulary, while entity-match remains neutral. Author them from the
 corpus's own observed vocabulary: read `GET /annotations/vocabulary`
 (`--vocabulary <entity|relation>`) to see the grouped entity/relation
 vocabulary, edit the documents under `policies/`, then restart the service —
@@ -236,14 +239,14 @@ These are recorded MVP narrowings, not defects:
 The bundled `data-store` CLI wraps the HTTP surface, reads the admin token file
 for protected calls, and renders results for operators. Its verbs map directly to
 the routes above. Run `data-store --help` for the full list; the interactive REPL
-is documented in **INTERACTIVE.md**.
+is documented in **SPEC-CLIENT.md** §1.2.
 
 Operator verbs (CLI flag / REPL name):
 
 | Verb | Arguments | What it does |
 | --- | --- | --- |
 | `--health` | — | Read `/v1/health`. |
-| `--query` | `<requestJson>` | Run a query. |
+| `--query` | `<queryText...>` | Run a query; remaining args join into the query text. |
 | `--ingest` | `<sourceSystem> <nativeUri>` | Register/ingest a source. |
 | `--reparse` | `<sourceId> <sourceSystem> <nativeUri>` | Force a parse run. |
 | `--activate` | `<sourceId> <parseId>` | Activate a parse. |
@@ -285,10 +288,11 @@ curl -s http://127.0.0.1:8091/query \
 The response is a `QueryResponse` carrying the assembled `evidencePack`; raw
 per-stage retrieval `diagnostics` are attached only when `debug` is `true`.
 
-Via the CLI:
+Via the CLI, pass bare query text — the client builds the `{"queryText": ...}`
+body itself, so the remaining arguments are the text (quoted or unquoted):
 
 ```sh
-data-store --config config.toml --query '{"queryText":"how does activation gating work"}'
+data-store --config config.toml --query how does activation gating work
 ```
 
 ### Example: check readiness

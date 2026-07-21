@@ -64,8 +64,11 @@ struct ClientContext {
 #[derive(Debug)]
 enum Command {
     Health,
+    /// `query` carries the operator's bare query text; the dispatch arm wraps it
+    /// in the `{"queryText": ...}` request body via serde_json, so raw envelopes
+    /// stay curl's job and this field is never itself JSON.
     Query {
-        request: String,
+        query_text: String,
     },
     IngestSource {
         source_system: String,
@@ -163,8 +166,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_aliases: &[],
         cli_flag: Some("--query"),
         cli_aliases: &[],
-        repl_usage: "query <requestJson>",
-        cli_usage: Some("data-store [--config <path>] --query <requestJson>"),
+        repl_usage: "query <queryText...>",
+        cli_usage: Some("data-store [--config <path>] --query <queryText...>"),
         build: build_query_command,
     },
     CommandSpec {
@@ -938,11 +941,16 @@ fn build_health_command(args: &[String]) -> Result<Command> {
     Ok(Command::Health)
 }
 
-/// Build the `query` command: one required raw JSON request body string.
+/// Build the `query` command from bare query text: every trailing token is joined
+/// with single spaces so quoted single-argument and unquoted multi-word forms
+/// both yield the same text. At least one token is required; the dispatch arm
+/// builds the `{"queryText": ...}` body from it.
 fn build_query_command(args: &[String]) -> Result<Command> {
-    require_arg_count(args, 1, "query <requestJson>")?;
+    if args.is_empty() {
+        bail!("usage: query <queryText...>");
+    }
     Ok(Command::Query {
-        request: args[0].clone(),
+        query_text: args.join(" "),
     })
 }
 
@@ -1325,8 +1333,12 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
             let health: HealthResponse = get_public(context, HEALTH_PATH)?;
             render_health(health);
         }
-        Command::Query { request } => {
-            let body = parse_json_request("query", &request)?;
+        Command::Query { query_text } => {
+            // The client owns the request envelope: the operator supplies bare
+            // query text and we construct `{"queryText": ...}` with serde_json so
+            // the text is JSON-escaped correctly (never string-formatted). Raw
+            // envelopes are curl's job, so there is no JSON-passthrough path here.
+            let body = serde_json::json!({ "queryText": query_text });
             let value = post_public_json(context, "/query", &body)?;
             // Decode the raw transport value into the typed mirror at the dispatch
             // seam so the transport layer stays byte-unchanged; a decode failure

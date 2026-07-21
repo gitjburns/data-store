@@ -34,27 +34,20 @@ State for the next session picking this up:
    package.
 1a. **Next work (ruled order)**: all implementation clusters and
    packages through C10e, CP, CPd2, and CA2 are COMPLETE (records in
-   PLAN-HISTORY.md). C10f commissioning is UNDERWAY: R0–R3 and a
-   graceful shutdown are COMPLETE; no open rulings block the
-   remaining runs. The sequence from here:
-   (1) the commercial-endpoint clean-corpus test RE-RUN (NEXT; fresh
-   plane — the `index/fabric/` deletion needs its named approval
-   then; RELEASE REBUILD required first — current binaries are
-   stale; procedure: `--setup-storage` → `--annotation-dry-run` →
-   vocabulary inspection / ruleset authoring → normal start;
-   benchmark of record + first complete annotation chain; also the
-   first live exercise of CPd2 and CA2);
-   (2) R4 query testing (user-sequenced: queries proven before
-   Docling implementation); (3) CPe Docling parse pool (APPROVED —
-   see §3). C10f runs R4–R9 resume within/after (2) and still
-   include the C9 runtime verification set (mint/verify/cleanup/
-   deactivate/restore cycles), a held-candidate cleanup cycle
-   (§4 C10 R1), the async-Operation admin surface incl. the force
-   re-parse override path, the CLI poll-loop and renderer surface
-   (never executed), the C10b health counts under real cycles, and
-   the multi-vector overlap diagnostic. After C10 the programme's
-   MVP completes; the QER audit tier and other §5 tiers follow
-   post-MVP. D5 deferred.
+   PLAN-HISTORY.md). C10f commissioning is UNDERWAY: R0–R4, the
+   graceful shutdown, the commercial-endpoint clean-corpus re-run
+   (the benchmark of record and first complete annotation chain,
+   incl. the first live CPd2/CA2/GateExisting exercise), and the
+   derived-boundary normalization change are COMPLETE. The sequence
+   from here: (1) the remaining C10f runs R5–R9 — the C9 runtime
+   verification set (mint/verify/cleanup/deactivate/restore cycles),
+   a held-candidate cleanup cycle (§4 C10 R1), the async-Operation
+   admin surface incl. the force re-parse override path, the CLI
+   poll-loop and renderer surface (never executed), the C10b health
+   counts under real cycles, and the multi-vector overlap
+   diagnostic; (2) CPe Docling parse pool (APPROVED — see §3; new
+   session). After C10 the programme's MVP completes; the QER audit
+   tier and other §5 tiers follow post-MVP. D5 deferred.
 2. **Process in force** (user-approved): the §1.4 execution model
    governs in full — the cluster cycle, execution modes, model
    assignment (all subagents on Opus; Fable 5 main-loop only), the
@@ -145,7 +138,15 @@ State for the next session picking this up:
    `model_call.http_retry`) — all other failures everywhere remain
    fail-immediately recorded outcomes; commercial-endpoint secrets
    live in owner-only key files named in config
-   (`.data-store-dense-api-key`, `.annotator-api-key`).
+   (`.data-store-dense-api-key`, `.annotator-api-key`);
+   `normalize_entity_name` (projections/graph.rs) is the single
+   normalizer for entity NAMES, entity TYPES, and relation
+   PREDICATES at every derived boundary — stored
+   `semantic_annotations` rows stay VERBATIM, and graph derivation
+   is a THREE-site must-stay-in-step mirror set (builder
+   `derive_edges`/`accumulate_mentions`, deletion-gate verifier
+   `derive_expected_edge`, restore `rebuild_graph_planes`), with
+   the vocabulary aggregation as a fourth normalized consumer.
 4. **Standing open items**: rusqlite `hooks` feature decision for
    wall-clock statement deadlines (Cargo.toml change, needs approval;
    busy_timeout 5s is the only bound; seams commented in
@@ -161,46 +162,76 @@ State for the next session picking this up:
    producer calls return near-empty results at full round-trip cost;
    granularity/filtering discussion PENDING (any prompt/batching
    change is producer-identity-bearing and memo-invalidating — needs
-   its own ruling; if ruled, its prompt change can BATCH with the
-   first naming-policy authoring to pay one identity invalidation).
+   its own ruling; under content-scoped satisfaction it re-annotates
+   only the frontier unless paired with the re-annotate override).
    The OPERATOR RE-ANNOTATE OVERRIDE is a NAMED PRE-PRODUCTION
    REQUIREMENT (the only production-safe corpus-wide annotation
    refresh under the content-scoped satisfaction ruling — §4 CA2).
+   The OPERATOR EPISODE-PURGE surface is a NAMED PRE-PRODUCTION
+   REQUIREMENT alongside it (§4 CL1): a designed operation that
+   removes a test/sampling episode's annotations, memo rows, and
+   events coherently, leaving one operator-purge record.
    Rare OpenRouter HTTP-200-truncated-body transients (~1/59 calls)
    are accepted as park-and-retry noise — revisit only if the rate
-   climbs.
-5. **Runtime state**: the service is STOPPED. The fabric plane
-   holds a PARTIAL, INVALIDATED commercial run (ingest incomplete;
-   2 sources marker-poisoned for graph/summary); delete
-   `index/fabric/` + `--setup-storage` before the re-run (named
-   approval required). `config.toml`: [models.dense]
-   backend="http", https://openrouter.ai/api/v1/embeddings,
+   climbs. Annotator 429 shedding NEEDS A RULING: at full fan-out
+   the worker saturates OpenRouter's 300 rpm allowance and sheds
+   overflow as parked-failed rows (converges, but wastes round
+   trips and emits ERROR noise; options: bounded 429 backoff
+   mirroring the dense client, or dynamic wave sizing). 9
+   annotations sit parked-failed on deterministic malformed model
+   JSON (duplicate `entityType` key; invented triple field) and
+   retry every cycle — tolerant-parse vs leave-strict NEEDS A
+   RULING. The lexical channel's strict-AND FTS form falls back to
+   broad-OR only at construction time, never on an empty result —
+   intended-contract ruling wanted. `sql/fabric/schema.sql`
+   `relation_type` comment predates predicate normalization (stale;
+   schema-file edit needs its named approval). Per-channel query
+   completion logs are debug!-level and invisible at info; the
+   debug:true response diagnostics are the operator window.
+5. **Runtime state**: the service is RUNNING (ready=true, bind
+   127.0.0.1:8091, daemonized). The fabric plane holds the
+   BENCHMARK-OF-RECORD corpus: 14 sources active, all projection
+   planes fresh, 3,112/3,121 annotations fresh under the authored
+   ruleset identity (9 parked-failed on malformed model output,
+   retried each worker cycle), 28 lifecycle snapshots, fabric
+   health counters all zero. `policies/annotator-naming.toml`
+   carries 4 rules (system-assigned version advanced);
+   `policies/entity-match.toml` stays NEUTRAL (both fuzzy classes
+   disabled — query-time-only, editable at any restart without
+   identity cost). `config.toml`: [models.dense] backend="http",
+   https://openrouter.ai/api/v1/embeddings,
    model qwen/qwen3-embedding-8b, dimension 4096, timeout 60 s,
    key file .data-store-dense-api-key; [models.annotator]
    https://openrouter.ai/api/v1/chat/completions, model
-   openai/gpt-5-nano, timeout_seconds 300, key file
+   google/gemini-3.1-flash-lite, timeout_seconds 300, key file
    .annotator-api-key. Both key files hold the user's OpenRouter
    key (sk-or-v1), owner-only, gitignored. Release binaries are
-   STALE — release rebuild REQUIRED before the next run. Switching
-   dense backends or models is a corpus identity change requiring a
-   fresh re-ingest. OPERATIONAL cautions: do not pipe `start.sh`
+   CURRENT (include the derived-boundary normalization change).
+   Switching dense backends or models is a corpus identity change
+   requiring a fresh re-ingest; switching the annotator model
+   re-annotates only the frontier (content-scoped satisfaction).
+   Query latency is dominated by the OpenRouter query-embed round
+   trip (≈10 s of ≈12.8 s; local stages ms-scale, local reranker
+   ≈2.4 s). OPERATIONAL cautions: do not pipe `start.sh`
    through short-lived readers (SIGPIPE kills the startup relay
    chain and the service child); config is startup-only, so any
    config change requires a service restart; OpenRouter data-policy
    settings gate which providers serve a model (a 404 "No
    endpoints ... data policy" points at
-   openrouter.ai/settings/privacy, not at a wrong slug).
+   openrouter.ai/settings/privacy, not at a wrong slug); the
+   annotator is rate-limited by OpenRouter at 300 rpm (see the §4
+   open item).
    The commissioning corpus is the in-repo `sources/` dir (12 PDFs
    + 2 txt). The legacy database (`index/data-store.sqlite3` — 120
    active docs, 65,369 units) is read-only reference material
    beside the D6 sample conversion at
    `index/docling-conversions/conversion-sample-d6/`; the fabric
    never reads either. `logs/data-store.log` carries both legacy
-   and fabric eras — commissioning metrics filter to
-   2026-07-17T23:00Z onward, re-benchmark metrics to
-   2026-07-19T08:20Z onward (filter values, not narration).
-   Never executed yet: the query surface (POST /query, R4), the
-   admin Operation routes (R5–R6), and the remaining R4–R9
+   and fabric eras — benchmark-of-record metrics filter to
+   2026-07-20T08:55–09:51Z, R4 query metrics to 2026-07-20T19:36Z
+   onward (filter values, not narration).
+   Never executed yet: the admin Operation routes and the CLI
+   poll-loop/renderer surface (R5–R6), and the remaining R5–R9
    commissioning runs.
 
 ## 1. Target and Ground Rules
@@ -399,21 +430,27 @@ R1/R2 and the queue-coupled completion model are indexed in §4. Only
 C10f remains:
 
 - **C10f Commissioning (first runtime verification)**: the programme's
-  first runtime execution, performed deliberately with the user:
-  `--setup-storage` on a clean index root; the autonomous
-  scan→acquire→parse→gate→activate cycle over the real corpus,
-  including post-activation annotation builds; query execution across
-  all three channels (lexical, dense, graph) with annotation-freshness
-  and assembly-trace checks; the async-Operation admin surface and a
-  held-candidate cleanup cycle (R1); the offline multi-vector overlap
+  first runtime execution, performed deliberately with the user.
+  COMPLETE: `--setup-storage` on a clean index root; the autonomous
+  scan→acquire→parse→gate→activate cycle over the real corpus
+  including post-activation annotation builds (the benchmark of
+  record — Handoff item 1a, era filters in item 5); query execution
+  across all three channels (lexical, dense, graph) with
+  annotation-freshness and assembly-trace checks (R4);
+  startup/readiness/health observation under real cycles.
+  REMAINING (R5–R9): the async-Operation admin surface incl. the
+  force re-parse override and the CLI poll-loop/renderer surface; a
+  held-candidate cleanup cycle (R1); the C9 runtime verification set
+  (mint/verify/cleanup/deactivate/restore cycles) beyond the 28
+  lifecycle snapshots already minted; the C10b health-counts review
+  under non-zero conditions; the offline multi-vector overlap
   diagnostic: exhaustive ColBERT top-100 vs the fused
   pool on sample real queries, quantifying the deferred `multi_vector`
   channel's recall gap from persisted C6e matrices with no new
-  infrastructure; a snapshot plus deletion-gate verification (restore
-  drills defer with the QER audit tier); startup/readiness/health
-  review. Every accumulated "NOT runtime-verified" residual-risk item
-  from C2 through C10, including CA, is retired or filed here. Mode:
-  main-loop; every run individually user-approved.
+  infrastructure. Every accumulated "NOT runtime-verified"
+  residual-risk item from C2 through C10, including CA, is retired
+  or filed here. Mode: main-loop; every run individually
+  user-approved.
 
 ### CP — Ingestion performance (commissioning interlude; cluster plan APPROVED)
 
@@ -535,6 +572,26 @@ rulings the §1.4 spec-decides-it / honest-option rules check against.
   the CA2-P4 inspection surface and the CA2-P5 dry-run mode. Full
   nine-ruling text: PLAN-HISTORY.md, grep
   `annotation-identity design session`.
+- **NM1 — Derived-boundary normalization (RULED 2026-07-20).**
+  Deterministic casing/whitespace normalization is CODE work, never
+  prompt instruction; producer prompts carry only semantic rules.
+  `normalize_entity_name` is the single normalizer for entity names,
+  entity types, and relation predicates at every derived boundary
+  (the three-site graph-derivation mirror set plus the vocabulary
+  aggregation — Handoff item 3); stored `semantic_annotations` rows
+  stay verbatim (model output is an external payload). Full text:
+  PLAN-HISTORY.md, grep `Derived-boundary normalization session`.
+- **CL1 — Coherent episode cleanup (RULED 2026-07-20).** Cleanup of
+  a test/sampling episode is an operator FEATURE, not a doctrine
+  violation: production must support removing an episode without
+  audit-failing residue, and a designed purge leaves one honest
+  operator-purge record; helpfulness governs — a feature that stops
+  being helpful stops being a good idea. Reframes the §11.5 erasure
+  deferral's "must not be improvised" as "must be BUILT"; the
+  operator episode-purge surface is a named pre-production
+  requirement beside the re-annotate override (Handoff item 4). The
+  interim sanctioned form is a deliberate one-time operator script.
+  Full text: PLAN-HISTORY.md, grep `Episode cleanup ruling`.
 
 ### Cluster rulings index (operative rulings from retired §3 texts)
 

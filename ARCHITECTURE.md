@@ -157,7 +157,8 @@ chunk_projections           chunk grain for retrieval targeting
 chunk_dense_vectors         dense embeddings per chunk
 unit_multivector_projections ColBERT token matrices per unit
 graph_entity_mentions       normalized entity → unit_ids (D9 entry)
-graph_entity_edges          normalized name-pair relation edges (D9 traversal)
+graph_entity_edges          normalized name-pair relation edges, relation_type
+                            (predicate) stored normalized too (D9 traversal)
 policy_versions             append-only system-assigned registry of operator
                             policy-document content hashes (Section 3.2)
 ```
@@ -320,7 +321,10 @@ hash. Producers write `semantic_annotations`; the worker then builds the two
 **annotation-derived projections** for the source's active parse — **summary,
 then graph** (`view::build_summary`, `graph::build_graph_projection`) —
 completing the graph entity mentions/edges that the query-time graph channel
-consumes.
+consumes. Entity names, entity types, and relation predicates all pass the
+single normalizer (`normalize_entity_name`) at every derived boundary
+(projection build, deletion-gate verification, restore rebuild); the stored
+`semantic_annotations` remain verbatim.
 
 The worker loads its client **inside** the thread: a bad key file **parks** the
 worker (annotations disabled for the run) instead of failing startup. A parked
