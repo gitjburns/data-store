@@ -4,7 +4,8 @@
 
 Please read:
 
-PLAN-CANONICAL-FABRIC.md
+SPEC-web-ui.md
+PLAN-web-ui.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 
