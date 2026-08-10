@@ -966,6 +966,7 @@ fn assign_canonical_rows(
         model_name: None,
         model_version: None,
         prompt_hash: None,
+        temperature: None,
         confidence: None,
         memoized: None,
         memoized_from: None,

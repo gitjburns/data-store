@@ -271,6 +271,11 @@ pub struct AnnotationCycleCounts {
     /// Items deferred this cycle because the hot-plane writer lock was held
     /// (typically by a scheduler projection build); re-attempted next cycle.
     pub deferred: u64,
+    /// Failed rows skipped this cycle because their per-run reopen budget is
+    /// spent (worker `ANNOTATION_RETRY_CAP`, user-ruled 2026-07-21). Exhausted
+    /// work stays durably `failed`; a restart or producer identity change
+    /// re-arms it.
+    pub exhausted: u64,
 }
 
 impl AnnotationHealth {
@@ -1381,7 +1386,7 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
             details.push(format!(
                 "last cycle (as of {as_of}): sources {} expected {} missing {} built {} \
                  memoized {} failed {} source-failures {} projection-failures {} \
-                 orphans-adopted {} deferred {}",
+                 orphans-adopted {} deferred {} exhausted {}",
                 cycle.sources_examined,
                 cycle.expected,
                 cycle.missing,
@@ -1392,6 +1397,7 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
                 cycle.projection_failures,
                 cycle.orphans_adopted,
                 cycle.deferred,
+                cycle.exhausted,
             ));
             for (label, value) in [
                 ("sources_examined", cycle.sources_examined),
@@ -1404,6 +1410,7 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
                 ("projection_failures", cycle.projection_failures),
                 ("orphans_adopted", cycle.orphans_adopted),
                 ("deferred", cycle.deferred),
+                ("exhausted", cycle.exhausted),
             ] {
                 counts.push(HealthCount {
                     label: label.to_string(),

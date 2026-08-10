@@ -79,6 +79,7 @@
 //! this owning thread does all the measuring.
 
 use std::{
+    collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -89,7 +90,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{error, info, warn};
 
-use crate::annotations::llm_client::AnnotatorClient;
+use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
 use crate::annotations::memo::{self, MemoItem};
 use crate::annotations::policy;
 use crate::annotations::producer::{self, Invocation, ProducedAnnotation, ProducerKind};
@@ -119,6 +120,29 @@ const CYCLE_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 /// Only the producer HTTP invocation fans out; every SQLite write (discovery,
 /// memo, freshness, INSERT, park-failed) stays serial on the worker thread.
 const ANNOTATOR_CONCURRENT_CALLS: usize = 32;
+
+/// Maximum failed-row reopens per annotation per PROCESS RUN (user-ruled
+/// 2026-07-21, amending the §35 unbounded-retry stance). A code constant,
+/// never config (§35). The budget is deliberately in-memory, not durable:
+/// the bound exists to stop unbounded paid producer calls against content the
+/// model fails on deterministically, and restarts are rare, deliberate
+/// operator actions — so a restart re-arming the budget is the intended
+/// recovery lever (a naming-policy edit requires one anyway). Durable
+/// evidence is unaffected: every attempt still logs and appends its
+/// `annotation.failed` event, and exhaustion logs once at ERROR.
+const ANNOTATION_RETRY_CAP: u32 = 10;
+
+/// Temperature added per failed-row retry (user-ruled 2026-07-21). First
+/// attempts run at the base `PRODUCER_TEMPERATURE` (0.0, maximum memo-friendly
+/// reproducibility); retry k samples at `0.1 × k`, deliberately introducing
+/// the output variation the §35 retry rationale assumes — a stable failure
+/// mode at temperature 0 would otherwise fail identically every attempt.
+const RETRY_TEMPERATURE_STEP: f64 = 0.1;
+
+/// Escalation ceiling: the provider-default sampling temperature. Values
+/// above 1.0 degrade sampling quality, so the ladder saturates here even if
+/// `ANNOTATION_RETRY_CAP` is ever raised past 10.
+const RETRY_TEMPERATURE_CEILING: f64 = 1.0;
 
 /// Log-event namespace passed to the shared hot-plane transaction helpers, so
 /// every begin/commit/rollback boundary log is attributable to this worker.
@@ -279,6 +303,12 @@ fn run_worker(
         }
     };
 
+    // Per-run retry budget: annotation_id → failed-row reopens issued this
+    // run (`ANNOTATION_RETRY_CAP`). Owned here — across cycles, never across
+    // restarts — as the ONE exception to cycle statelessness; entries only
+    // accumulate for failing annotations, so the map stays tiny.
+    let mut retry_attempts: HashMap<String, u32> = HashMap::new();
+
     loop {
         // One cycle failing is never fatal: the error is logged with context
         // and the next cycle re-discovers from the hot plane (statelessness).
@@ -293,6 +323,7 @@ fn run_worker(
             &naming_policy.rules,
             &client,
             &shutdown,
+            &mut retry_attempts,
         ) {
             Ok(report) => publish_cycle_annotation_health(&health_slot, &report),
             Err(source) => error!(
@@ -324,12 +355,15 @@ fn run_worker(
 /// so `Err` is reserved for a cycle-wide fault (e.g. the active-source read
 /// itself failing). On success it returns the cycle's freshness `CycleReport`
 /// for the C10b health publish (the same counts the completion log carries).
+/// `retry_attempts` is the thread-owned per-run reopen budget threaded down to
+/// each source's discovery gate (see `ANNOTATION_RETRY_CAP`).
 fn run_cycle(
     index_root: &Path,
     config: &AnnotatorModelConfig,
     naming_rules: &[String],
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
+    retry_attempts: &mut HashMap<String, u32>,
 ) -> Result<CycleReport, ApiError> {
     let started = Instant::now();
     info!(
@@ -344,7 +378,15 @@ fn run_cycle(
 
     let mut totals = CycleTotals::default();
     for source in &sources {
-        match build_source(index_root, config, naming_rules, client, source, shutdown) {
+        match build_source(
+            index_root,
+            config,
+            naming_rules,
+            client,
+            source,
+            shutdown,
+            retry_attempts,
+        ) {
             Ok((source_counts, flow)) => {
                 totals.add(&source_counts);
                 if flow == BuildFlow::Deferred {
@@ -446,6 +488,7 @@ fn run_cycle(
         projection_failures = totals.projection_failures,
         orphans_adopted = totals.orphans_adopted,
         deferred = totals.deferred,
+        exhausted = totals.exhausted,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "annotation discovery cycle completed"
     );
@@ -493,6 +536,11 @@ struct CycleTotals {
     /// projection build). Deferred work is re-discovered next cycle; nothing is
     /// lost. Folded from each source's `SourceCounts`.
     deferred: u64,
+    /// Failed rows skipped this cycle because their per-run reopen budget
+    /// (`ANNOTATION_RETRY_CAP`) is spent. Exhausted work stays `failed` in the
+    /// hot plane and is re-armed only by a restart or a producer identity
+    /// change. Folded from each source's `SourceCounts`.
+    exhausted: u64,
 }
 
 impl CycleTotals {
@@ -505,6 +553,7 @@ impl CycleTotals {
         self.failed += other.failed;
         self.orphans_adopted += other.orphans_adopted;
         self.deferred += other.deferred;
+        self.exhausted += other.exhausted;
     }
 }
 
@@ -523,6 +572,9 @@ struct SourceCounts {
     /// boundary hit SQLITE_BUSY (writer-lock contention); re-discovered next
     /// cycle.
     deferred: u64,
+    /// Failed rows skipped for this source this cycle because their per-run
+    /// reopen budget (`ANNOTATION_RETRY_CAP`) is spent.
+    exhausted: u64,
 }
 
 /// One unit of work: a single (invocation × matching producer) pair. Entity
@@ -687,6 +739,10 @@ struct PendingBuild {
     item: WorkItem,
     request: NewAnnotation,
     building_id: String,
+    /// Sampling temperature for this build's producer call, decided at the
+    /// discovery gate (base for first attempts, retry-ladder value for
+    /// reopens) and stamped into the completed row's provenance.
+    effective_temperature: f64,
 }
 
 /// Discover and build every missing annotation for one source. Reads the
@@ -714,6 +770,10 @@ struct PendingBuild {
 /// commit abandoned on shutdown) still ends the source's work immediately. No
 /// NEW wave starts after a shutdown request: `dispatch_and_commit_wave` probes
 /// shutdown before dispatching, and the caller probes between waves.
+///
+/// `retry_attempts` is the per-run failed-row reopen budget: a failed row is
+/// reopened at most `ANNOTATION_RETRY_CAP` times per run, then skipped as
+/// exhausted at this discovery gate (never reaching a paid producer call).
 fn build_source(
     index_root: &Path,
     config: &AnnotatorModelConfig,
@@ -721,6 +781,7 @@ fn build_source(
     client: &AnnotatorClient,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
+    retry_attempts: &mut HashMap<String, u32>,
 ) -> Result<(SourceCounts, BuildFlow), ApiError> {
     let mut counts = SourceCounts::default();
 
@@ -764,6 +825,10 @@ fn build_source(
             continue;
         }
 
+        // Effective sampling temperature for this item's producer call: base
+        // for first attempts, escalated per retry below (the ladder).
+        let mut effective_temperature = PRODUCER_TEMPERATURE;
+
         if let Some(row) = reopened {
             // REOPENABLE: reuse the chosen row as the build's building row,
             // skipping the building-insert. A crash orphan is adopted where a
@@ -782,6 +847,46 @@ fn build_source(
                     "crash-orphaned building annotation adopted for completion"
                 );
             }
+            // Per-run reopen budget (user-ruled 2026-07-21): each failed-row
+            // reopen spends one attempt; a row observed failed with its budget
+            // spent is EXHAUSTED — skipped, counted for health, and left
+            // `failed` in the hot plane. The crossing logs ERROR exactly once
+            // (the count is then bumped past the cap as the logged-marker), so
+            // steady-state cycles skip silently instead of spamming the log.
+            // Orphan adoption above is deliberately budget-exempt: adopting a
+            // crash orphan completes paid work, it does not re-pay a producer.
+            if row.status == store::ReopenableStatus::Failed {
+                let attempts = retry_attempts.entry(row.annotation_id.clone()).or_insert(0);
+                if *attempts >= ANNOTATION_RETRY_CAP {
+                    if *attempts == ANNOTATION_RETRY_CAP {
+                        error!(
+                            event = "annotation_worker.retry_exhausted",
+                            source_id = %source.source_id,
+                            parse_id = %source.active_parse_id,
+                            annotation_id = %row.annotation_id,
+                            producer = producer_label(item.kind),
+                            attempts = ANNOTATION_RETRY_CAP,
+                            "producer retries exhausted for this run; giving up \
+                             (re-armed by restart or producer identity change)"
+                        );
+                        *attempts += 1;
+                    }
+                    counts.exhausted += 1;
+                    continue;
+                }
+                *attempts += 1;
+                // Retry k samples at 0.1 × k, saturating at the ceiling: the
+                // escalation buys the variation retries exist to exploit,
+                // while first attempts everywhere stay at the base. Rounded to
+                // one decimal so the wire value and the durable provenance
+                // stamp read as the intended ladder step (0.1 × k accumulates
+                // f64 noise: 0.1 × 7 = 0.7000000000000001), keeping stored
+                // temperatures exactly comparable.
+                effective_temperature = ((RETRY_TEMPERATURE_STEP * f64::from(*attempts)) * 10.0)
+                    .round()
+                    .min(RETRY_TEMPERATURE_CEILING * 10.0)
+                    / 10.0;
+            }
         }
         counts.missing += 1;
 
@@ -795,6 +900,7 @@ fn build_source(
             source,
             &item,
             reopened,
+            effective_temperature,
             &mut counts,
         )? {
             PreparedItem::Memoized => {}
@@ -907,8 +1013,13 @@ enum PreparedItem {
 /// PRE-PAID phase for one work item, worker-thread serial (mirrors the former
 /// `build_work_item`, minus the producer call). Memo HIT re-mints inline; memo
 /// MISS passes the pre-paid `build_open` boundary and returns a `PendingBuild`
-/// for the concurrent wave. A SQLITE_BUSY at either pre-paid boundary is counted
-/// as `deferred`, logged once (`cycle_deferred`), and returned as `Deferred`.
+/// for the concurrent wave carrying `effective_temperature` (the discovery
+/// gate's base-or-ladder decision; memo re-mints ignore it — no call runs). A
+/// SQLITE_BUSY at either pre-paid boundary is counted as `deferred`, logged
+/// once (`cycle_deferred`), and returned as `Deferred`.
+// Eight positional args after threading the gate's effective temperature;
+// codebase-standard `allow` rather than an unrelated refactor.
+#[allow(clippy::too_many_arguments)]
 fn prepare_work_item(
     index_root: &Path,
     config: &AnnotatorModelConfig,
@@ -916,6 +1027,7 @@ fn prepare_work_item(
     source: &ActiveSource,
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
+    effective_temperature: f64,
     counts: &mut SourceCounts,
 ) -> Result<PreparedItem, ApiError> {
     // Look up the memo cache on a read connection dropped before any write.
@@ -962,6 +1074,7 @@ fn prepare_work_item(
             item: item.clone(),
             request,
             building_id,
+            effective_temperature,
         }))),
         None => {
             counts.deferred += 1;
@@ -1252,6 +1365,7 @@ fn dispatch_and_commit_wave(
                         client,
                         &build.item.invocation,
                         naming_rules,
+                        build.effective_temperature,
                     )
                 })
             })
@@ -1288,6 +1402,7 @@ fn dispatch_and_commit_wave(
                     &build.request,
                     &build.building_id,
                     &produced_items,
+                    build.effective_temperature,
                     shutdown,
                 )? == CompletionOutcome::AbandonedShutdown
                 {
@@ -1322,11 +1437,12 @@ fn dispatch_and_commit_wave(
 /// Phase 2b success: complete item 1 into the building row, insert items 2..N
 /// directly fresh, and record the memo entry — all in ONE transaction, so the
 /// cache row and the annotation rows it caches commit together. Each row's
-/// final provenance records the concrete confidence; the memo entry caches the
+/// final provenance records the concrete confidence plus the effective
+/// sampling temperature the producer call ran at; the memo entry caches the
 /// full item array keyed by the shared memo key.
-// Nine positional args after threading `&ShutdownSignal` for the post-paid
-// contention wait and the CA2-P3 naming rules; codebase-standard `allow`
-// rather than an unrelated refactor.
+// Ten positional args after threading `&ShutdownSignal` for the post-paid
+// contention wait, the CA2-P3 naming rules, and the effective temperature;
+// codebase-standard `allow` rather than an unrelated refactor.
 #[allow(clippy::too_many_arguments)]
 fn complete_build(
     index_root: &Path,
@@ -1337,6 +1453,7 @@ fn complete_build(
     request: &NewAnnotation,
     building_id: &str,
     produced_items: &[ProducedAnnotation],
+    effective_temperature: f64,
     shutdown: &ShutdownSignal,
 ) -> Result<CompletionOutcome, ApiError> {
     // POST-PAID: wait out writer contention for the paid producer output (bounded
@@ -1372,7 +1489,8 @@ fn complete_build(
                 // requires changing ALL THREE consumer skips together, or the
                 // marker becomes a per-cycle rolled-back build-retry poison again.
                 let empty_body = serde_json::Value::Array(Vec::new());
-                let provenance = completed_provenance(&request.provenance, None);
+                let provenance =
+                    completed_provenance(&request.provenance, None, effective_temperature);
                 // CA2 memo-key re-stamp: `item.key` is the running producer's
                 // memo key; a reopened row minted under another identity gets
                 // its cache key corrected here (content key unchanged).
@@ -1385,7 +1503,8 @@ fn complete_build(
             // Item 1 completes the building row; the memo items collect every
             // produced item paired with the annotation id it was minted as, so a
             // later reuse can name the exact per-item memoizedFrom target.
-            let first_provenance = completed_provenance(&request.provenance, first.confidence);
+            let first_provenance =
+                completed_provenance(&request.provenance, first.confidence, effective_temperature);
             // CA2 memo-key re-stamp to the running producer's identity (`item.key`);
             // the same key is recorded on the memo row below, so cache and row agree.
             store::complete_fresh(
@@ -1403,7 +1522,11 @@ fn complete_build(
             }];
 
             for extra in rest {
-                let extra_provenance = completed_provenance(&request.provenance, extra.confidence);
+                let extra_provenance = completed_provenance(
+                    &request.provenance,
+                    extra.confidence,
+                    effective_temperature,
+                );
                 let extra_id = store::insert_fresh(
                     tx,
                     request,
@@ -1519,11 +1642,19 @@ fn new_annotation_request(
 
 /// Derive the final provenance of a freshly-produced (model-run) annotation
 /// from the planned provenance: the model ran, so the memoization fields stay
-/// absent (this row is the ORIGINAL, not a reuse) and only the concrete
-/// confidence is filled in.
-fn completed_provenance(planned: &Provenance, confidence: Option<f64>) -> Provenance {
+/// absent (this row is the ORIGINAL, not a reuse), the concrete confidence is
+/// filled in, and the sampling temperature the call actually ran at is
+/// stamped (base or retry-ladder value — the audit distinction between a
+/// deterministic first attempt and an escalated retry, since temperature is
+/// not producer-identity-bearing).
+fn completed_provenance(
+    planned: &Provenance,
+    confidence: Option<f64>,
+    effective_temperature: f64,
+) -> Provenance {
     let mut provenance = planned.clone();
     provenance.confidence = confidence;
+    provenance.temperature = Some(effective_temperature);
     provenance
 }
 
@@ -1859,6 +1990,7 @@ fn projection_failure_producer() -> Provenance {
         model_name: None,
         model_version: None,
         prompt_hash: None,
+        temperature: None,
         confidence: None,
         memoized: None,
         memoized_from: None,
@@ -1918,6 +2050,7 @@ fn publish_cycle_annotation_health(slot: &Mutex<AnnotationHealth>, report: &Cycl
             projection_failures: totals.projection_failures,
             orphans_adopted: totals.orphans_adopted,
             deferred: totals.deferred,
+            exhausted: totals.exhausted,
         }),
         measured_at: Some(measured_at),
     };

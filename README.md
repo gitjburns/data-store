@@ -212,7 +212,7 @@ Components that publish no counters serialize an empty array.
   `annotation`, and `search_admission`. These are visible for operators but never
   gate readiness. The `fabric` and `annotation` counters (held, serving-stale,
   stuck-building, access-lost, unparseable-mime, verification-halted, annotation
-  freshness, and so on) are surfaced for observation only.
+  freshness, retry exhaustion, and so on) are surfaced for observation only.
 
 ## Known deviations (stated where an operator meets them)
 

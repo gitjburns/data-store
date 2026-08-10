@@ -398,6 +398,10 @@ pub(crate) fn planned_provenance(
         model_name: Some(config.model.clone()),
         model_version: None,
         prompt_hash: Some(kind.prompt_hash(naming_rules)?),
+        // Planned provenance predates the call: the effective sampling
+        // temperature is stamped at completion (`completed_provenance`), and
+        // memo reuses honestly keep None (no call ran).
+        temperature: None,
         confidence: None,
         memoized: None,
         memoized_from: None,
@@ -415,11 +419,18 @@ pub(crate) fn planned_provenance(
 /// invocations; Summary consumes `Document` invocations. A mismatch is a
 /// programming error in the stage-3 routing, surfaced loudly rather than
 /// silently producing wrong-scoped annotations.
+///
+/// `temperature` is the per-call sampling temperature, passed through to the
+/// client verbatim: the base `PRODUCER_TEMPERATURE` for first attempts, or a
+/// retry-escalated value from the worker's ladder. It is deliberately NOT part
+/// of producer identity (the prompt is unchanged); the effective value is
+/// recorded in the completed row's provenance and the call logs instead.
 pub(crate) fn invoke(
     kind: ProducerKind,
     client: &AnnotatorClient,
     invocation: &Invocation,
     naming_rules: &[String],
+    temperature: f64,
 ) -> Result<Vec<ProducedAnnotation>, ApiError> {
     match (kind, &invocation.kind) {
         (ProducerKind::Entity | ProducerKind::Relation, InvocationKind::SectionGroup { .. }) => {}
@@ -448,7 +459,12 @@ pub(crate) fn invoke(
     // — the same function `prompt_hash` reads — so the bytes sent here are the
     // bytes the recorded promptHash/identity cover, by construction (CA2-P3).
     let system_prompt = kind.prompt(naming_rules);
-    let raw = client.complete(kind.request_purpose(), &system_prompt, &user_content)?;
+    let raw = client.complete(
+        kind.request_purpose(),
+        &system_prompt,
+        &user_content,
+        temperature,
+    )?;
     kind.parse_output(&raw)
 }
 

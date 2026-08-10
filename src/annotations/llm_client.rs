@@ -29,12 +29,14 @@ use crate::util::truncate_diagnostic_text;
 /// from reranker calls.
 const ANNOTATOR_HTTP_MODE: &str = "openai_chat_completions";
 
-/// Deterministic-leaning temperature: annotation producers request the most
-/// reproducible output the endpoint will give, so identical inputs tend to
-/// yield identical annotations and memo reuse stays meaningful. It is a code
-/// constant, not config, because it is a producer-contract decision, not an
-/// operator tuning knob.
-const PRODUCER_TEMPERATURE: f64 = 0.0;
+/// Deterministic-leaning BASE temperature: annotation producers request the
+/// most reproducible output the endpoint will give, so identical inputs tend
+/// to yield identical annotations and memo reuse stays meaningful. It is a
+/// code constant, not config, because it is a producer-contract decision, not
+/// an operator tuning knob. First attempts always run at this base; the
+/// worker's retry-escalation ladder (user-ruled 2026-07-21) passes higher
+/// per-call temperatures for failed-row retries via `complete`.
+pub(crate) const PRODUCER_TEMPERATURE: f64 = 0.0;
 
 /// Blocking OpenAI-compatible chat-completions client shared by the three
 /// producers. Holds the configured endpoint/model and an optional bearer key;
@@ -174,15 +176,20 @@ impl AnnotatorClient {
 
     /// Run one chat-completions call and return the first choice's message
     /// content verbatim. `request_purpose` identifies the producer/invocation
-    /// for logs. Every non-success outcome — transport error, timeout, non-2xx
-    /// status, unreadable or malformed body, or a missing choice/content — is
-    /// an `ApiError::AnnotationProducer` carrying endpoint/model/status and a
-    /// bounded body excerpt. Prompt text and model output are never logged.
+    /// for logs; `temperature` is the per-call sampling temperature (the base
+    /// `PRODUCER_TEMPERATURE` for first attempts, retry-escalated values from
+    /// the worker's ladder), logged and sent verbatim so the audit trail
+    /// records what actually ran. Every non-success outcome — transport error,
+    /// timeout, non-2xx status, unreadable or malformed body, or a missing
+    /// choice/content — is an `ApiError::AnnotationProducer` carrying
+    /// endpoint/model/status and a bounded body excerpt. Prompt text and model
+    /// output are never logged.
     pub(crate) fn complete(
         &self,
         request_purpose: &str,
         system_prompt: &str,
         user_content: &str,
+        temperature: f64,
     ) -> Result<String, ApiError> {
         let started_at = Instant::now();
         // Char count is a safe compact shape fact; the content itself is a
@@ -195,11 +202,12 @@ impl AnnotatorClient {
             endpoint = %self.endpoint,
             model = %self.model,
             timeout_seconds = self.timeout_seconds,
+            temperature,
             input_chars,
             "annotator chat-completions call started"
         );
 
-        let result = self.send_and_parse(system_prompt, user_content);
+        let result = self.send_and_parse(system_prompt, user_content, temperature);
 
         match &result {
             Ok(content) => {
@@ -209,6 +217,7 @@ impl AnnotatorClient {
                     request_purpose,
                     endpoint = %self.endpoint,
                     model = %self.model,
+                    temperature,
                     input_chars,
                     // Output length only; content is a forbidden log payload.
                     output_chars = content.chars().count(),
@@ -223,6 +232,7 @@ impl AnnotatorClient {
                     request_purpose,
                     endpoint = %self.endpoint,
                     model = %self.model,
+                    temperature,
                     input_chars,
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     error = %source,
@@ -236,8 +246,14 @@ impl AnnotatorClient {
 
     /// Build the request body, send it, and map every failure mode into a
     /// producer error. Split out from `complete` so the boundary logging in
-    /// `complete` wraps exactly one fallible unit of work.
-    fn send_and_parse(&self, system_prompt: &str, user_content: &str) -> Result<String, ApiError> {
+    /// `complete` wraps exactly one fallible unit of work. `temperature` is
+    /// the caller's per-call sampling temperature (see `complete`).
+    fn send_and_parse(
+        &self,
+        system_prompt: &str,
+        user_content: &str,
+        temperature: f64,
+    ) -> Result<String, ApiError> {
         let request = ChatCompletionRequest {
             model: &self.model,
             messages: vec![
@@ -250,7 +266,7 @@ impl AnnotatorClient {
                     content: user_content,
                 },
             ],
-            temperature: PRODUCER_TEMPERATURE,
+            temperature,
             // Constant for every annotator call: suppress the vLLM thinking
             // trace (see the provider-specific-extension note on
             // `ChatCompletionRequest`). Not threaded through `complete` or

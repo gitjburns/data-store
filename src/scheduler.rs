@@ -2948,6 +2948,7 @@ fn projection_failure_producer() -> Provenance {
         model_name: None,
         model_version: None,
         prompt_hash: None,
+        temperature: None,
         confidence: None,
         memoized: None,
         memoized_from: None,

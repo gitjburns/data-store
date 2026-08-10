@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-use crate::annotations::llm_client::AnnotatorClient;
+use crate::annotations::llm_client::{self, AnnotatorClient};
 use crate::annotations::memo::{self, MemoItem};
 use crate::annotations::producer::{
     self, Invocation, InvocationKind, ProducedAnnotation, ProducerKind,
@@ -388,9 +388,16 @@ fn sample_item(
     };
 
     // Producer call (the only external dependency in this mode). A failure parks
-    // the row failed and counts a failure; it is NOT fatal.
+    // the row failed and counts a failure; it is NOT fatal. Dry-run sampling
+    // has no retry ladder, so every call runs at the base temperature.
     counts.producer_calls += 1;
-    match producer::invoke(kind, client, invocation, naming_rules) {
+    match producer::invoke(
+        kind,
+        client,
+        invocation,
+        naming_rules,
+        llm_client::PRODUCER_TEMPERATURE,
+    ) {
         Ok(produced) => {
             complete_build(
                 index_root,
@@ -649,11 +656,13 @@ fn fail_build(
 }
 
 /// Final provenance of a freshly-produced (model-run) annotation: the model ran,
-/// so the memoization fields stay absent and only the concrete confidence is
-/// filled in. Mirrors `worker::completed_provenance`.
+/// so the memoization fields stay absent, the concrete confidence is filled in,
+/// and the base sampling temperature is stamped (dry-run sampling has no retry
+/// ladder, so every call runs at the base). Mirrors `worker::completed_provenance`.
 fn completed_provenance(planned: &Provenance, confidence: Option<f64>) -> Provenance {
     let mut provenance = planned.clone();
     provenance.confidence = confidence;
+    provenance.temperature = Some(llm_client::PRODUCER_TEMPERATURE);
     provenance
 }
 

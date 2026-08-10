@@ -330,6 +330,20 @@ The worker loads its client **inside** the thread: a bad key file **parks** the
 worker (annotations disabled for the run) instead of failing startup. A parked
 worker is diagnostic-only and never gates readiness.
 
+Failed-row retries are **budgeted per process run** (user-ruled 2026-07-21):
+the worker's discovery gate reopens a `failed` annotation at most
+`ANNOTATION_RETRY_CAP = 10` times per run, then skips it as **exhausted** — one
+ERROR (`annotation_worker.retry_exhausted`) at the crossing, a per-cycle
+`exhausted` count in the annotation health slot, and no further producer spend.
+The budget is deliberately in-memory: a restart or a producer identity change
+re-arms it. Retries also climb a **temperature ladder**: first attempts run at
+the deterministic base (0.0), retry *k* at `min(0.1 × k, 1.0)`, rounded
+one-decimal exact — deliberately buying the output variation the retry
+rationale assumes, which a stable failure mode at temperature 0 defeats. Every
+completed producer call's effective temperature is recorded in the
+annotation's provenance and on the `annotator_http.call.*` logs; it is
+deliberately **not** producer-identity-bearing (the prompt is unchanged).
+
 ### 3.2 Operator policy documents and the auto-versioning registry
 
 Two **operator-editable policy documents** (`src/policy.rs`) sit beside the

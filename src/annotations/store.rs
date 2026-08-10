@@ -411,9 +411,12 @@ pub(crate) fn mark_failed(
 /// Retry rationale (§35, §13.5): LLM/network failures are NON-deterministic,
 /// so the worker's cycle-level retry of a failed annotation does not violate
 /// the §13.5 no-blind-retry rule, which governs DETERMINISTIC failures on
-/// identical input. There is no retry cap or backoff knob (§35): the worker's
-/// cycle cadence is the natural pace, and every retry leaves this event and a
-/// log line, so the retries are bounded by cadence and fully visible.
+/// identical input. Retries are BOUNDED by the caller (user-ruled 2026-07-21):
+/// the worker's discovery gate reopens a failed row at most
+/// `ANNOTATION_RETRY_CAP` times per process run, then skips it as exhausted —
+/// some model failures ARE stable for a given content, and an unbounded loop
+/// is an unbounded paid-call bleed. This function stays cap-oblivious; it
+/// records one reopen. Every retry leaves this event and a log line.
 pub(crate) fn retry_failed(tx: &Transaction<'_>, annotation_id: &str) -> Result<(), ApiError> {
     let updated = tx
         .execute(RETRY_FAILED_SQL, params![annotation_id])

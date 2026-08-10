@@ -785,6 +785,7 @@ fn new_projection(source_id: &str, parse_id: &str, chunks: &[StoredChunk]) -> Ne
         model_name: None,
         model_version: None,
         prompt_hash: None,
+        temperature: None,
         confidence: None,
         memoized: None,
         memoized_from: None,

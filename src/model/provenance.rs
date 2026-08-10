@@ -28,6 +28,15 @@ pub(crate) struct Provenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_hash: Option<String>,
 
+    /// Sampling temperature actually sent on the model call that minted this
+    /// artifact (user-ruled 2026-07-21: retry-escalated annotator calls must
+    /// be distinguishable in the audit record, since temperature is not
+    /// identity-bearing). None for non-sampling producers (parsers, rules,
+    /// embeddings), memo reuses (no call ran), and rows minted before
+    /// temperature recording existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) temperature: Option<f64>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) confidence: Option<f64>,
 
