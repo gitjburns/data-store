@@ -1,0 +1,519 @@
+/* data-store web UI stylesheet (SPEC-web-ui.md §3).
+   Plain CSS, no preprocessor and no build step; embedded in the client binary
+   and served at /style.css.
+
+   Two hooks carry meaning rather than decoration and must keep their contrast:
+     .evidence.anchor  vs  .evidence.context — an anchor unit (score present)
+       must stay visually distinct from an assembly-added context unit.
+     .absent — a protocol field documented as omitted-when-absent. */
+
+:root {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --border: #d8dae0;
+  --text: #1c1e21;
+  --muted: #6b7280;
+  --accent: #1b5e9c;
+  --anchor: #1b5e9c;
+  --anchor-bg: #eaf2fa;
+  --context: #7a6a2f;
+  --context-bg: #f7f2e3;
+  --error: #a01b1b;
+  --error-bg: #fbeceb;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* Header and navigation ---------------------------------------------------- */
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1.25rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 600;
+  font-size: 1.05rem;
+  text-decoration: none;
+}
+
+.app-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-left: auto;
+}
+
+.app-nav a {
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.app-nav a:hover {
+  background: var(--bg);
+}
+
+.app-nav a.active {
+  background: var(--anchor-bg);
+  color: var(--anchor);
+  font-weight: 600;
+}
+
+.app-main {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1.25rem;
+}
+
+.app-footer {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 0 1.25rem 2rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* Panels ------------------------------------------------------------------- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.panel > h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.02rem;
+  font-weight: 600;
+}
+
+.panel-error {
+  border-color: var(--error);
+  background: var(--error-bg);
+}
+
+.panel-error > h2,
+.error-message {
+  color: var(--error);
+}
+
+/* Explanation attached to a 401/403 from a bearer-backed admin route: the
+   failure is about the serving client's token file, not the browser. */
+.auth-note {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--error);
+  background: var(--error-bg);
+  color: var(--text);
+  font-size: 0.88rem;
+}
+
+.loading {
+  color: var(--muted);
+}
+
+/* Key/value tables --------------------------------------------------------- */
+
+table.kv {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.25rem 0 0.5rem;
+}
+
+table.kv th,
+table.kv td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.3rem 0.6rem 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+table.kv th {
+  width: 14rem;
+  font-weight: 600;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.88rem;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+table.data th,
+table.data td {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+table.data th {
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.absent {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.id-link {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+/* Evidence: anchor vs assembly-added context ------------------------------- */
+
+.evidence {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 5px;
+  background: var(--surface);
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.6rem;
+}
+
+.evidence.anchor {
+  border-left-color: var(--anchor);
+  background: var(--anchor-bg);
+}
+
+.evidence.context {
+  border-left-color: var(--context);
+  background: var(--context-bg);
+}
+
+.evidence-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
+.evidence-rank {
+  font-weight: 600;
+}
+
+.evidence-score {
+  font-family: var(--mono);
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.evidence-text {
+  white-space: pre-wrap;
+}
+
+/* Badges ------------------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.badge.anchor {
+  border-color: var(--anchor);
+  color: var(--anchor);
+  background: var(--anchor-bg);
+}
+
+.badge.context {
+  border-color: var(--context);
+  color: var(--context);
+  background: var(--context-bg);
+}
+
+/* A source location that is still current; the counterpart of .badge.error
+   (deleted) and .badge.context (access_lost, which is not deletion). */
+.badge.ok {
+  border-color: #1f6b3a;
+  color: #1f6b3a;
+  background: #e9f4ec;
+}
+
+.badge.error {
+  border-color: var(--error);
+  color: var(--error);
+  background: var(--error-bg);
+}
+
+.badge-readonly {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--anchor-bg);
+}
+
+/* Collapsible JSON tree ---------------------------------------------------- */
+
+.json-tree {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  overflow-x: auto;
+}
+
+.json-branch {
+  border-left: 1px solid var(--border);
+  margin-left: 0.4rem;
+  padding-left: 0.6rem;
+}
+
+.json-branch > summary {
+  cursor: pointer;
+  color: var(--muted);
+  margin-left: -0.6rem;
+}
+
+.json-leaf {
+  margin-left: 0.6rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.json-key {
+  color: var(--accent);
+}
+
+.json-string {
+  color: #1f6b3a;
+}
+
+.json-number,
+.json-boolean {
+  color: #7a3fa0;
+}
+
+.json-null {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* Forms -------------------------------------------------------------------- */
+
+form.lookup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+input[type='text'],
+input[type='number'],
+textarea,
+select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+textarea {
+  width: 100%;
+  min-height: 6rem;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+button {
+  padding: 0.35rem 0.85rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: var(--surface);
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.9rem;
+}
+
+legend {
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 0 0.3rem;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+/* Query console ------------------------------------------------------------ */
+
+.field-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.field-check label {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.field-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.query-form textarea {
+  margin-bottom: 0.75rem;
+}
+
+/* Section heading inside a panel, one level below the panel's own h2. */
+.subhead {
+  margin: 1rem 0 0.35rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.evidence-ids {
+  margin-left: auto;
+}
+
+.evidence-detail {
+  margin-top: 0.5rem;
+}
+
+.evidence-detail > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.trace-group {
+  margin: 0 0 0.9rem;
+}
+
+.trace-group > h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.id-list {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+/* Filter bar above a result table (unit relationships). */
+form.filters {
+  margin-bottom: 0.6rem;
+}
+
+form.filters .field-row {
+  gap: 0.5rem;
+  margin-bottom: 0;
+}
+
+/* Free-form health component diagnostic lines: monospaced because they are
+   verbatim service strings, often paths or ids. */
+.health-details {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.health-details > li {
+  margin: 0.15rem 0;
+  overflow-wrap: anywhere;
+}
+
+/* Admin reads ------------------------------------------------------------- */
+
+/* Control strip above a fetched record (operation viewer: id, manual refresh,
+   last-fetched stamp). */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+/* One `name ×count` pair in a vocabulary group cell; kept on one line so a
+   group's raw forms and per-model counts stay scannable. */
+.count-chip {
+  display: inline-block;
+  white-space: nowrap;
+  margin-right: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}

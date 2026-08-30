@@ -305,6 +305,26 @@ curl -s http://127.0.0.1:8091/v1/health
 data-store --config config.toml --health
 ```
 
+### Web UI
+
+`--serve <host>:<port>` is a startup mode of the same binary, not a verb: it runs
+a local HTTP server in the foreground until the process is terminated, printing
+the bound URL. `--config` still applies — serve mode reuses the client's service
+base URL and admin token file.
+
+```sh
+data-store --config config.toml --serve 127.0.0.1:8092
+```
+
+The UI offers a query console (constraints, `maxFinalEvidenceUnits`, evidence
+toggles, debug) with assembly-trace and debug-diagnostics panels, a unit explorer
+with relationship filters, a source view, a health dashboard, sync status, the
+held-parses list, an operation viewer, and the vocabulary explorer.
+
+v1 is read-only. The browser reaches the service only through a fixed allowlist
+of proxy routes under `/api/*`, which exposes no mutating route; admin reads use
+the client's admin token file, and the UI itself carries no authentication.
+
 ## Configuration
 
 Configuration is a single TOML file (`config.toml`, from `config.example.toml`).

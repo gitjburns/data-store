@@ -10,7 +10,8 @@ route and carries no UI-level authentication.
 - `--serve <host>:<port>` is a startup mode of the client binary, parsed
   alongside `--config` as a `StartupSelection` variant. It is NOT a command
   registry entry and has no REPL spelling; the REPL never touches serve. The
-  argument must parse as a socket address.
+  argument must resolve to a socket address: an IP literal or a resolvable
+  hostname; the first resolved address is bound.
 - Serve mode runs a local HTTP server in the foreground until the process is
   terminated (Ctrl-C; no signal handling of its own), logging the bound URL to
   stdout.

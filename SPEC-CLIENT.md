@@ -18,9 +18,11 @@ the C10f commissioning package; until then it is compile-checked only
 
 ## 1. Client model
 
-The client is a **`reqwest` blocking** HTTP client. There is no async
-runtime and **no streaming**: every request is a single blocking
-request/response, and async server work is followed by polling (§4).
+The client is a **`reqwest` blocking** HTTP client with **no streaming**:
+every request is a single blocking request/response, and async server
+work is followed by polling (§4). The only async runtime in the binary
+belongs to serve mode's HTTP server (§1.6); the transport stays blocking
+there too.
 
 ### 1.1 Shared configuration
 
@@ -45,20 +47,27 @@ config file's directory, matching the server's resolution rule.
 
 Select the config with `--config <path>`; it defaults to `config.toml`.
 
-### 1.2 Two modes
+### 1.2 Three invocation modes
 
 - **One-shot** — invoke a single command via its `--flag` and exit.
   Example: `data-store --config config.toml --health`.
-- **Interactive REPL** — invoke `data-store` with no command flag to
-  enter the read-eval-print loop (`--config <path>` is honored). The
+- **Interactive REPL** — invoke `data-store` with no command flag and no
+  `--serve` to enter the read-eval-print loop (`--config <path>` is honored). The
   prompt is `data-store> `; type `help` for the command list, `exit`
   (or `quit`), or EOF (Ctrl-D), to leave; Ctrl-C interrupts the current
   line and reminds you to use `exit`. Line editing and history are
   provided by rustyline; command history persists to `.data-store.history`
   (resolved against the config file's directory) across sessions.
+- **Serve** — invoke `data-store --serve <host>:<port>` (`--config <path>`
+  is honored) to host the read-only web UI in the foreground (§1.6).
 
-Both modes dispatch through the same command table and the same
-renderers; the only difference is how the command is entered.
+One-shot and REPL dispatch through the same command table and the same
+renderers; the only difference is how the command is entered. Serve is a
+**startup mode of the binary, not a command**: it has no entry in the
+command table (§3) and no REPL spelling, and the REPL never enters it.
+`--serve` is parsed beside `--config`, its value must resolve to a socket
+address (IP literal or resolvable hostname; the first resolved address is
+bound), and it cannot be combined with an operation flag.
 
 ### 1.3 One-shot argv grammar
 
@@ -99,6 +108,65 @@ every protected request** — it is never cached. Each poll of a running
 operation re-reads it as well. The file is read, trimmed, and validated
 non-empty; a missing or empty token file fails the command with a clear
 error. Public commands send no credential.
+
+### 1.6 Serve mode (read-only web UI)
+
+`data-store [--config <path>] --serve <host>:<port>` runs a local HTTP
+server in the foreground that serves an embedded web UI and proxies the
+UI's requests to the service. It occupies the process until terminated
+(Ctrl-C; serve mode installs no signal handling of its own) and prints
+the bound URL to stdout. The design contract is `SPEC-web-ui.md`.
+
+Serve mode reuses the client's configuration and transport unchanged
+(§1.1): same base URL, same per-request timeout, same admin-token file
+read fresh on every protected request (§1.5). It adds no configuration.
+Implementation is `src/bin/data-store/serve.rs`; the async runtime is
+confined to that module and every upstream hop runs the blocking
+`reqwest` transport on a blocking thread.
+
+**Asset routes.** The three files are embedded into the binary at
+compile time, so serve mode depends on no working directory or
+installed asset tree.
+
+| Route | Asset | Content type |
+| --- | --- | --- |
+| `GET /` | `assets/web/index.html` | `text/html; charset=utf-8` |
+| `GET /app.js` | `assets/web/app.js` | `text/javascript; charset=utf-8` |
+| `GET /style.css` | `assets/web/style.css` | `text/css; charset=utf-8` |
+
+**Proxy surface.** A fixed allowlist under `/api/*`; there is no generic
+passthrough. The allowlist is the read-only guarantee — no mutating
+service route is reachable through it.
+
+| Proxy route | Service route | Access |
+| --- | --- | --- |
+| `POST /api/query` | `POST /query` (request envelope forwarded whole) | public |
+| `GET /api/health` | `GET /v1/health` | public |
+| `GET /api/units/{unitId}` | `GET /units/{unitId}` | public |
+| `GET /api/units/{unitId}/relationships` (`direction`, `relationshipType`) | `GET /units/{unitId}/relationships` | public |
+| `GET /api/sources/{sourceId}` | `GET /sources/{sourceId}` | public |
+| `GET /api/sync-status` | `GET /sync/status` | public |
+| `GET /api/held-parses` | `GET /parses?status=held` | protected |
+| `GET /api/operations/{operationId}` | `GET /operations/{operationId}` | protected |
+| `GET /api/vocabulary` (`annotationType`, `scope`) | `GET /annotations/vocabulary` | protected |
+
+Passthrough rules:
+
+- The service's **status code and body are returned verbatim** as
+  `application/json`. The proxy never narrows, reshapes, or summarizes a
+  response, and a service error envelope reaches the browser with its
+  original status — including `401`/`403` on the protected routes.
+- Query parameters listed above are forwarded **unparsed and
+  unvalidated**; filter semantics stay the service's. `/api/held-parses`
+  pins `status=held` and forwards nothing.
+- Only a **transport** failure is proxy-owned — a send failure, an
+  unreadable response body, or a missing/empty admin token file. It
+  becomes `502` with an `{"error": {"status", "kind", "message"}}` body
+  (`kind` = `proxy_transport_failure`) naming the failed hop. A
+  `POST /api/query` body that is not JSON is rejected locally as `400`
+  with `kind` = `invalid_request`, before any request is sent.
+- Every proxied request logs one line: method, proxy path, upstream
+  status (or the failure).
 
 ---
 

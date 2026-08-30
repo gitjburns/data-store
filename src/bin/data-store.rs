@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -10,6 +10,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{StatusCode, blocking::Client};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+// Serve mode (`--serve <host>:<port>`) lives in its own submodule: it is the only
+// async surface of this otherwise fully blocking client, and it reaches the
+// blocking transport helpers above through `super::*`.
+//
+// The explicit `#[path]` is required: a binary crate root resolves submodules
+// beside itself (`src/bin/serve.rs`), which would collide with any other binary's
+// submodules. The attribute keeps this client's submodules in their own
+// `src/bin/data-store/` directory.
+#[path = "data-store/serve.rs"]
+mod serve;
 
 const PROMPT: &str = "data-store> ";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -335,6 +346,14 @@ enum StartupSelection {
     Client {
         config_path: PathBuf,
         command: Option<Command>,
+    },
+    /// Web UI serve mode. It is a startup mode, not a command registry entry:
+    /// it has no REPL spelling and never appears in `COMMAND_SPECS`. `config_path`
+    /// is still required because serve mode reuses the client's service base URL
+    /// and admin token file.
+    Serve {
+        config_path: PathBuf,
+        bind_addr: SocketAddr,
     },
 }
 
@@ -794,33 +813,53 @@ struct ErrorDetail {
     message: String,
 }
 
-/// Start either one command-line operation or the interactive client after resolving config.
+/// Start one command-line operation, the interactive client, or the web UI serve
+/// mode after resolving config.
 fn main() -> Result<()> {
-    let StartupSelection::Client {
-        config_path,
-        command,
-    } = parse_startup_args()?
-    else {
-        render_cli_help();
-        return Ok(());
-    };
-    let config = load_config(&config_path)?;
-    let config_dir = config_parent_dir(&config_path)?;
+    match parse_startup_args()? {
+        StartupSelection::Help => {
+            render_cli_help();
+            Ok(())
+        }
+        StartupSelection::Client {
+            config_path,
+            command,
+        } => {
+            let (context, config_dir) = build_client_context(&config_path)?;
+            match command {
+                Some(command) => {
+                    execute_command(&context, command)?;
+                    Ok(())
+                }
+                None => run_repl(
+                    context,
+                    resolve_config_relative_path(&config_dir, Path::new(HISTORY_FILE_NAME)),
+                ),
+            }
+        }
+        StartupSelection::Serve {
+            config_path,
+            bind_addr,
+        } => {
+            let (context, _config_dir) = build_client_context(&config_path)?;
+            serve::run(context, bind_addr)
+        }
+    }
+}
+
+/// Resolve config into the shared client transport context. The config directory
+/// is returned alongside it because callers resolve further config-relative
+/// paths (REPL history) from the same directory, and every startup mode that
+/// talks to the service must build the context identically.
+fn build_client_context(config_path: &Path) -> Result<(ClientContext, PathBuf)> {
+    let config = load_config(config_path)?;
+    let config_dir = config_parent_dir(config_path)?;
     let context = ClientContext {
         base_url: base_url_for_bind_address(config.server.bind_address),
         token_file_path: resolve_config_relative_path(&config_dir, &config.admin.token_file_path),
         http: build_http_client(&config.client)?,
     };
-    match command {
-        Some(command) => {
-            execute_command(&context, command)?;
-            Ok(())
-        }
-        None => run_repl(
-            context,
-            resolve_config_relative_path(&config_dir, Path::new(HISTORY_FILE_NAME)),
-        ),
-    }
+    Ok((context, config_dir))
 }
 
 /// Parse process arguments into local help, one-shot command, or interactive mode.
@@ -834,12 +873,26 @@ fn parse_startup_arguments(args: &[String]) -> Result<StartupSelection> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut command = None;
     let mut help_requested = false;
+    let mut bind_arg: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if arg == "--config" {
             let value = take_startup_value(args, &mut index, "--config", "path")?;
             config_path = PathBuf::from(value);
+            continue;
+        }
+        // `--serve` is collected here, beside `--config`, precisely because it is a
+        // startup mode rather than a registry command. Only the raw value is taken
+        // during iteration; validating the address is deferred until after the help
+        // check so `--help --serve <bad addr>` still prints usage.
+        if arg == "--serve" {
+            bind_arg = Some(take_startup_value(
+                args,
+                &mut index,
+                "--serve",
+                "<host>:<port> address",
+            )?);
             continue;
         }
         let Some(spec) = find_cli_command_spec(arg) else {
@@ -857,6 +910,32 @@ fn parse_startup_arguments(args: &[String]) -> Result<StartupSelection> {
             bail!("--help cannot be combined with operation flags");
         }
         return Ok(StartupSelection::Help);
+    }
+    // Validated and checked after help so `--help --serve <anything>` still prints
+    // usage without rejecting the address or binding a socket. Serve mode occupies
+    // the process for its lifetime, so pairing it with a one-shot operation flag
+    // has no coherent meaning and is rejected rather than silently preferring one
+    // of the two. The value is resolved through the system resolver
+    // (`ToSocketAddrs`): an IP literal short-circuits without a lookup, and a
+    // hostname such as `localhost` resolves via the hosts file / DNS. The FIRST
+    // resolved address is bound (the startup line prints the concrete URL, so the
+    // choice is visible). Resolution happens here so a typo fails before any
+    // config is read.
+    if let Some(value) = bind_arg {
+        if command.is_some() {
+            bail!("--serve cannot be combined with operation flags");
+        }
+        let bind_addr = value
+            .to_socket_addrs()
+            .with_context(|| {
+                format!("--serve requires a resolvable <host>:<port> address, got `{value}`")
+            })?
+            .next()
+            .with_context(|| format!("--serve address `{value}` resolved to no addresses"))?;
+        return Ok(StartupSelection::Serve {
+            config_path,
+            bind_addr,
+        });
     }
 
     Ok(StartupSelection::Client {
@@ -912,7 +991,9 @@ fn find_cli_command_spec(value: &str) -> Option<&'static CommandSpec> {
 
 /// Identify startup flags so positional command parsing can stop before the next option.
 fn is_startup_flag(value: &str) -> bool {
-    value == "--config" || find_cli_command_spec(value).is_some()
+    // `--serve` is listed explicitly: like `--config`, it is a startup option and
+    // therefore absent from `COMMAND_SPECS`.
+    value == "--config" || value == "--serve" || find_cli_command_spec(value).is_some()
 }
 
 /// Parse REPL arguments by handing the command's trailing tokens to its builder.
@@ -2276,10 +2357,13 @@ fn render_help() {
     }
 }
 
-/// Print executable-level usage for interactive and one-shot command modes.
+/// Print executable-level usage for the interactive, one-shot, and serve startup
+/// modes. Serve is printed by hand because it is a startup mode, not a
+/// `COMMAND_SPECS` entry.
 fn render_cli_help() {
     println!("Usage:");
     println!("  data-store [--config <path>]");
+    println!("  data-store [--config <path>] --serve <host>:<port>");
     for spec in COMMAND_SPECS {
         if let Some(usage) = spec.cli_usage {
             println!("  {usage}");
@@ -2288,6 +2372,9 @@ fn render_cli_help() {
     println!();
     println!("Options:");
     println!("  --config <path>  Service config path; defaults to config.toml");
+    println!(
+        "  --serve <addr>   Serve the read-only web UI on <host>:<port> (e.g. localhost:8092)"
+    );
     println!("  --help, -h       Print this help without reading config");
 }
 

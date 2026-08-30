@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>data-store</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="#/query">data-store</a>
+      <!-- Read-only is a v1 contract of SPEC-web-ui.md: the proxy allowlist
+           reaches no mutating service route. -->
+      <span class="badge badge-readonly">read-only</span>
+      <nav class="app-nav">
+        <!-- data-route holds the first hash segment; the router in app.js marks
+             the active link, so these hrefs stay the single route source. -->
+        <a data-route="query" href="#/query">Query</a>
+        <a data-route="unit" href="#/unit">Unit</a>
+        <a data-route="source" href="#/source">Source</a>
+        <a data-route="health" href="#/health">Health</a>
+        <a data-route="sync" href="#/sync">Sync</a>
+        <a data-route="held" href="#/held">Held parses</a>
+        <a data-route="operation" href="#/operation">Operation</a>
+        <a data-route="vocab" href="#/vocab">Vocabulary</a>
+      </nav>
+    </header>
+
+    <!-- Single mount point: the router replaces this element's content on every
+         hash change. Views never write outside it. -->
+    <main id="main" class="app-main"></main>
+
+    <footer class="app-footer">
+      <span>Served by the <code>data-store</code> client in serve mode.</span>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
