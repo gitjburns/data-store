@@ -159,7 +159,7 @@ failures and are reported as `500`, not `503`. Only `cutover_barrier_active`
 | Method | Path | Auth | Body → Response |
 |--------|------|------|-----------------|
 | GET  | `/v1/health`                                    | public    | — → `HealthResponse` |
-| POST | `/query`                                         | public    | `QueryRequest` → `{ evidencePack }` |
+| POST | `/query`                                         | public    | `QueryRequest` → `{ results, evidencePack, diagnostics? }` |
 | GET  | `/units/{unitId}`                                | public    | — → `ContentUnit` |
 | GET  | `/units/{unitId}/relationships`                  | public    | — → `{ relationships }` |
 | GET  | `/sources/{sourceId}`                            | public    | — → `SourceObject` |
@@ -246,8 +246,8 @@ curl -s http://localhost:PORT/v1/health
 
 ### `POST /query`
 
-Run one synchronous retrieval + assembly query and return the assembled
-EvidencePack. Public.
+Run one synchronous retrieval query and return ranked passages with their
+canonical EvidencePack. Public.
 
 **Request body** — `QueryRequest` (`camelCase`, `deny_unknown_fields`):
 
@@ -277,14 +277,14 @@ intersection yields an empty result, not an error.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `maxFinalEvidenceUnits` | `u32` | Final evidence-unit count. When present must be `1..=max_top_k` of the active retrieval profile; when absent, the profile default is used. |
+| `maxFinalEvidenceUnits` | `u32` | Maximum returned passages, `1..=100`; default `10`. Does not limit candidate generation or raw canonical-unit count. |
 
 `evidencePolicy` (`deny_unknown_fields`):
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `includeSourceLocators` | bool | `true` | Include per-unit source locators. |
-| `includeRelationships` | bool | `false` | Include traversed relationships in the pack. |
+| `includeRelationships` | bool | `false` | Include canonical relationships whose endpoints are both selected units. |
 | `includeAnnotations` | bool | `false` | Include semantic annotations for selected units. |
 
 **Deliberately unsupported fields.** The `QueryRequest` envelope and every nested
@@ -312,11 +312,24 @@ Under capacity saturation the query is rejected with `503`
 (`service_unavailable`). If the targeted source is mid-cutover the query is
 rejected with `503` `cutover_barrier_active` (retryable).
 
-**Response `200`** — `{ "evidencePack": EvidencePack }`, plus `diagnostics` only
+**Response `200`** — `{ "results": [SearchResult], "evidencePack": EvidencePack }`, plus `diagnostics` only
 when the request set `debug: true`:
 
 ```json
 {
+  "results": [
+    {
+      "text": "Retrieved passage text.",
+      "sourceId": "...",
+      "parseId": "...",
+      "unitIds": ["..."],
+      "sourceLocations": [{"nativeUri": "...", "status": "current"}],
+      "sectionPath": ["Section heading"],
+      "pageNumbers": [12],
+      "score": 0.87,
+      "truncated": false
+    }
+  ],
   "evidencePack": {
     "queryId": "...",
     "queryText": "...",
@@ -340,6 +353,24 @@ when the request set `debug: true`:
   }
 }
 ```
+
+`SearchResult` fields (`camelCase`, all present):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `text` | string | Passage text in canonical reading order, bounded to 512 ColBERT tokens. |
+| `sourceId`, `parseId` | string | Captured source and active parse. |
+| `unitIds` | array of string | Canonical units contributing to the passage, in reading order. |
+| `sourceLocations` | array of object | Recorded locations, each with `nativeUri` and availability `status`. |
+| `sectionPath` | array of string | Section headings, or an empty array when unavailable. |
+| `pageNumbers` | array of integer | Physical PDF page positions, not printed page labels; empty when unavailable. |
+| `score` | number | Final passage reranker score. |
+| `truncated` | bool | A single oversized canonical unit was excerpted to fit the passage limit. Its full body remains in `evidencePack`. |
+
+`results` is rank-ordered. `evidencePack` retains exactly their canonical
+constituents, deduplicated by first inclusion, without automatic neighbor or
+container expansion. `includeSourceLocators` controls raw per-unit locators;
+passage citations remain present.
 
 `EvidencePack` top-level fields (`camelCase`):
 
@@ -393,11 +424,17 @@ owning model files.
 | `anchorUnitId` | string | omitted when absent (unit-grained anchor) |
 | `anchorHitId` | string | omitted when absent (hit-grained anchor) |
 | `addedUnitIds` | array of string | always |
-| `reason` | string enum | always — `anchor` \| `required_completion` \| `structural_context` \| `explicit_reference` \| `local_continuity` |
+| `reason` | string enum | always — active policy: `selected_passage`; historical values: `anchor` \| `required_completion` \| `structural_context` \| `explicit_reference` \| `local_continuity` |
 
 `budget` fields (`camelCase`): `maxEvidenceUnits` (`u32`, always), `maxTokens`
 (`u32`, always), `maxExpansionDepth` (`u32`, always), `maxReferencedUnits`
 (`u32`, omitted when absent).
+
+Assembly policy version `2` records one `selected-passage` rule per final
+passage. Its raw safety ceilings are 6,400 canonical units and 3,276,800 text
+tokens, with expansion depth zero. Exceeding a ceiling or failing to resolve a
+selected unit fails the query; no constituent is silently dropped. These
+ceilings are separate from the requested passage count and displayed text limit.
 
 **`diagnostics`** (`camelCase`) — present **only** when the request set
 `debug: true`. Per the code, this is the raw per-stage retrieval diagnostics: a
@@ -405,10 +442,12 @@ serializable projection of the pipeline's in-memory stage outputs.
 
 | Field | Type | Meaning |
 |-------|------|---------|
+| `channelHits` | array of `RetrievalHit` | Dense, lexical, and graph stage outputs before cross-channel fusion. |
 | `fusedPool` | array of `RetrievalHit` | The fused dense+lexical+graph candidate pool the rerankers scored over. |
 | `maxsim` | array | ColBERT MaxSim scores over the fused pool, best-first. Entries: `unitId` (string), `score` (number), `rank` (integer). |
-| `reranked` | array | Final reranker scores over the MaxSim top-N, best-first. Entries: `unitId` (string), `score` (number), `rank` (integer), `logit` (number, omitted when absent), `tokenCount` (integer, omitted when absent). |
-| `latencies` | object | Per-stage wall-clock latencies in milliseconds (all `u64`, always): `openTransactionMs`, `captureMs`, `queryEmbedMs`, `denseLexicalFusionMs`, `graphMs`, `maxsimMs`, `rerankMs`, `assemblyMs`, `snapshotHeldMs`. |
+| `passageCandidates` | array | Passages submitted to final reranking: `anchorUnitId`, `sourceId`, `parseId`, `unitIds`, `text`, `sectionPath`, `truncated`. |
+| `reranked` | array | Final passage reranker scores, best-first. Entries: `unitId` (representative anchor), `score` (number), `rank` (integer), `logit` (number, omitted when absent), `tokenCount` (integer, omitted when absent). |
+| `latencies` | object | Per-stage wall-clock latencies in milliseconds (all `u64`, always): `openTransactionMs`, `captureMs`, `queryEmbedMs`, `denseLexicalFusionMs`, `graphMs`, `maxsimMs`, `passageBuildMs`, `rerankMs`, `assemblyMs`, `snapshotHeldMs`. |
 
 `RetrievalHit` entries (`camelCase`): `hitType` (`chunk` \| `content_unit` \|
 `semantic_annotation` \| `retrieval_projection`, always), `hitId` (string,

@@ -22,19 +22,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, info};
 
 use crate::error::ApiError;
+use crate::model::ContentType;
+use crate::model::body::{TextBlockBody, TextBlockRole};
 use crate::policy::EntityMatchPolicy;
 use crate::primitives::bm25::build_bm25_queries;
-use crate::primitives::fusion::{Bm25Match, DenseMatch, FusedMatch, fuse_matches};
+use crate::primitives::fusion::{Bm25Match, DenseMatch, fuse_matches};
 use crate::projections::dense_cache::DensePlane;
 use crate::projections::graph::{
     entity_names_for_parse, mentions_for_name, normalize_entity_name, one_hop_edges,
 };
 use crate::projections::lexical::match_chunks;
 use crate::query::model::{RetrievalChannel, RetrievalHit, RetrievalHitType};
+use crate::query::profile::RetrievalProfile;
 
 /// One scope-captured active parse the C7d pipeline hands the channels. It
 /// carries both identifiers a `RetrievalHit` needs (`source_id`, `parse_id`)
@@ -371,85 +374,59 @@ fn resolve_lexical_to_units(
         .collect()
 }
 
-/// Build a unit-grained fused `RetrievalHit` from a `FusedMatch`, tagging it
-/// with the fused `channel` and its owning `(source_id, parse_id)`. This is the
-/// single `RetrievalHit`-construction convention for fused hits; C7b-2's graph
-/// channel MUST mirror this shape (see `graph_hit` when it lands) so every hit
-/// the pipeline emits is populated identically.
-///
-/// Population convention for a fused hit:
-/// - `hit_type` = `ContentUnit` (fusion is unit-grained; chunk grain ended at
-///   resolution).
-/// - `hit_id` = the unit id (identity of the targeted artifact for a unit hit).
-/// - `unit_ids` = `[unit_id]` (a fused hit resolves to exactly its one unit).
-/// - `channel` = `RetrievalChannel::Dense` (the fused dense+lexical pool is the
-///   dense/lexical arm; graph hits carry `Graph`).
-/// - `score` = the RRF fused score; `rank` = the fused 1-based rank.
-/// - `matched_projection_id` / `matched_annotation_id` = `None` (fused hits
-///   originate from chunk projections, not a projection/annotation surface).
-fn fused_hit(matched: &FusedMatch, source_id: &str, parse_id: &str) -> RetrievalHit {
+/// Build a unit-grained hit only after canonical ownership has been verified.
+fn unit_hit(
+    unit_id: &str,
+    owner: &CandidateUnit,
+    channel: RetrievalChannel,
+    score: f64,
+    rank: usize,
+) -> RetrievalHit {
     RetrievalHit {
         hit_type: RetrievalHitType::ContentUnit,
-        hit_id: matched.unit_id.clone(),
-        source_id: source_id.to_owned(),
-        parse_id: parse_id.to_owned(),
-        unit_ids: vec![matched.unit_id.clone()],
-        channel: RetrievalChannel::Dense,
-        score: matched.score,
-        rank: Some(matched.rank as u32),
+        hit_id: unit_id.to_owned(),
+        source_id: owner.source_id.clone(),
+        parse_id: owner.parse_id.clone(),
+        unit_ids: vec![unit_id.to_owned()],
+        channel,
+        score,
+        rank: Some(rank as u32),
         matched_projection_id: None,
         matched_annotation_id: None,
         explanation: None,
     }
 }
 
-/// Run the dense and lexical channels over the captured parses, resolve both to
-/// unit grain, and RRF-fuse them into ranked `RetrievalHit`s. This is the
-/// C7b-1 entry point the C7d pipeline calls after it opens the read transaction
-/// and captures the scope-filtered active set.
-///
-/// Contract:
-/// - `conn` is already inside the per-query DEFERRED read transaction (DP1); no
-///   connection is opened here.
-/// - `query_id` is the operation correlation id stamped on every stage log event
-///   this channel and its sub-channels emit.
-/// - `parses` is the scope-captured active set; reading only these parses IS
-///   the scope mechanism (§6, §38) — nothing is post-filtered for scope.
-/// - `query_vector` is the dense query embedding (C7d obtains it via
-///   `embed_query_vector`; this channel takes it, it does not embed).
-/// - `query_text` is the raw query for FTS5 match-string construction.
-/// - `top_k` bounds the fused result; `candidate_limit` bounds each channel's
-///   pre-fusion candidate pool per parse; `rrf_k` is the RRF constant (C7a
-///   profile: 60).
-///
-/// Grain: dense/lexical hits are chunk-grained and resolved to units BEFORE
-/// fusion (fusion keys on `unit_id`). Each fused hit maps `(source_id, parse_id)`
-/// from the chunk→unit mapping's owning parse — a fused unit belongs to exactly
-/// one parse because the captured active set has one active parse per source and
-/// chunk ids are parse-unique.
-// The DP2 explicit-handle discipline plus operation-id correlation force a wide
-// flat signature (mirrors execute.rs's allows); a one-call-site params bundle
-// would be indirection without reuse.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dense_lexical_fusion_channel(
+/// Fused ranking input and the eligible channel records that explain its origin.
+pub(crate) struct ChannelFusionOutcome {
+    pub(crate) pool: Vec<RetrievalHit>,
+    pub(crate) channel_hits: Vec<RetrievalHit>,
+}
+
+/// Fuse all channels on the captured snapshot, independently of final result count.
+/// Explicit headers/footers are excluded before eligible ranks and channel caps;
+/// RRF deduplicates canonical units before applying the ColBERT candidate cap.
+pub(crate) fn fused_channels(
     conn: &Connection,
     query_id: &str,
     parses: &[CapturedParse],
     query_vector: &[f32],
     query_text: &str,
-    top_k: usize,
-    candidate_limit: usize,
-    rrf_k: u32,
-) -> Result<Vec<RetrievalHit>, ApiError> {
+    graph_hits: &[RetrievalHit],
+    profile: &RetrievalProfile,
+) -> Result<ChannelFusionOutcome, ApiError> {
     let started_at = Instant::now();
+    let candidate_limit = profile.default_max_candidates_per_channel as usize;
+    let fused_limit = profile.colbert_candidate_pool_size as usize;
     info!(
         event = "query.fusion.started",
         query_id,
         parse_count = parses.len(),
-        top_k,
+        fused_limit,
         candidate_limit,
-        rrf_k,
-        "dense+lexical fusion started"
+        rrf_k = profile.rrf_k,
+        graph_input_hits = graph_hits.len(),
+        "dense, lexical, and graph fusion started"
     );
 
     let dense_hits = dense_channel(query_id, parses, query_vector, candidate_limit);
@@ -458,69 +435,265 @@ pub(crate) fn dense_lexical_fusion_channel(
     // Grain-change boundary: chunk-grained hits → unit-grained matches. Fusion
     // keys on unit_id, so resolution MUST precede fusion (design rule, §6/§38).
     let chunk_unit_map = load_chunk_unit_map(conn, parses)?;
-    let dense_matches = resolve_dense_to_units(&dense_hits, &chunk_unit_map);
-    let lexical_matches = resolve_lexical_to_units(&lexical_hits, &chunk_unit_map);
-
-    let fused = fuse_matches(&dense_matches, &lexical_matches, top_k, rrf_k);
-
-    // Map each fused unit back to its owning (source_id, parse_id). The unit's
-    // owning parse is the parse of any chunk that resolved to it; because each
-    // captured source contributes exactly one active parse and chunk ids are
-    // parse-unique, this ownership is unambiguous.
-    let unit_owner = build_unit_owner_index(&dense_hits, &lexical_hits, &chunk_unit_map);
-    let hits: Vec<RetrievalHit> = fused
+    let owners = build_unit_owner_index(
+        conn,
+        parses,
+        &dense_hits,
+        &lexical_hits,
+        graph_hits,
+        &chunk_unit_map,
+    )?;
+    let mut dense_matches = resolve_dense_to_units(&dense_hits, &chunk_unit_map);
+    let mut lexical_matches = resolve_lexical_to_units(&lexical_hits, &chunk_unit_map);
+    let dense_units_before_filter = dense_matches.len();
+    let lexical_units_before_filter = lexical_matches.len();
+    // Every resolved unit was checked above; filtering changes eligibility, not scope.
+    dense_matches.retain(|matched| owners[&matched.unit_id].eligible);
+    lexical_matches.retain(|matched| owners[&matched.unit_id].eligible);
+    let dense_excluded = dense_units_before_filter - dense_matches.len();
+    let lexical_excluded = lexical_units_before_filter - lexical_matches.len();
+    dense_matches.truncate(candidate_limit);
+    lexical_matches.truncate(candidate_limit);
+    for (index, matched) in dense_matches.iter_mut().enumerate() {
+        matched.rank = index + 1;
+    }
+    for (index, matched) in lexical_matches.iter_mut().enumerate() {
+        matched.rank = index + 1;
+    }
+    let mut graph_eligible = Vec::new();
+    let mut graph_seen = std::collections::HashSet::new();
+    let mut graph_excluded = 0;
+    for hit in graph_hits {
+        if !owners[&hit.hit_id].eligible {
+            graph_excluded += 1;
+        } else if graph_seen.insert(hit.hit_id.as_str()) && graph_eligible.len() < candidate_limit {
+            graph_eligible.push(hit);
+        }
+    }
+    let graph_matches: Vec<(&str, usize)> = graph_eligible
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| (hit.hit_id.as_str(), index + 1))
+        .collect();
+    let fused = fuse_matches(
+        &dense_matches,
+        &lexical_matches,
+        &graph_matches,
+        fused_limit,
+        profile.rrf_k,
+    );
+    // Keep original channel scores/explanations separately: a fused ordinal score
+    // must not erase the graph traversal evidence or lexical/dense attribution.
+    let mut channel_hits = Vec::new();
+    for matched in &dense_matches {
+        channel_hits.push(unit_hit(
+            &matched.unit_id,
+            &owners[&matched.unit_id],
+            RetrievalChannel::Dense,
+            f64::from(matched.similarity),
+            matched.rank,
+        ));
+    }
+    for matched in &lexical_matches {
+        channel_hits.push(unit_hit(
+            &matched.unit_id,
+            &owners[&matched.unit_id],
+            RetrievalChannel::Lexical,
+            -matched.score,
+            matched.rank,
+        ));
+    }
+    channel_hits.extend(graph_eligible.iter().map(|hit| (*hit).clone()));
+    let pool = fused
         .iter()
         .map(|matched| {
-            let (source_id, parse_id) = unit_owner
-                .get(&matched.unit_id)
-                .map(|(source_id, parse_id)| (source_id.as_str(), parse_id.as_str()))
-                .unwrap_or(("", ""));
-            fused_hit(matched, source_id, parse_id)
+            let channel = if matched.dense_rank.is_some() {
+                RetrievalChannel::Dense
+            } else if matched.bm25_rank.is_some() {
+                RetrievalChannel::Lexical
+            } else {
+                RetrievalChannel::Graph
+            };
+            let mut hit = unit_hit(
+                &matched.unit_id,
+                &owners[&matched.unit_id],
+                channel,
+                matched.score,
+                matched.rank,
+            );
+            if matched.graph_rank.is_some() {
+                hit.explanation = graph_eligible
+                    .iter()
+                    .find(|graph| graph.hit_id == matched.unit_id)
+                    .and_then(|graph| graph.explanation.clone());
+            }
+            hit
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     info!(
         event = "query.fusion.completed",
         query_id,
         dense_units = dense_matches.len(),
         lexical_units = lexical_matches.len(),
-        fused_hits = hits.len(),
+        graph_units = graph_eligible.len(),
+        dense_units_before_filter,
+        lexical_units_before_filter,
+        dense_excluded,
+        lexical_excluded,
+        graph_excluded,
+        candidate_limit,
+        fused_limit,
+        fused_hits = pool.len(),
         elapsed_ms = started_at.elapsed().as_millis() as u64,
-        "dense+lexical fusion completed"
+        "dense, lexical, and graph fusion completed"
     );
-    Ok(hits)
+    Ok(ChannelFusionOutcome { pool, channel_hits })
 }
 
-/// Index each resolved unit to its owning `(source_id, parse_id)` so fused hits
-/// can be tagged with provenance. Built from the chunk hits (which carry their
-/// parse) joined through the chunk→unit map. First writer wins per unit; a unit
-/// resolves to one owning parse (see `dense_lexical_fusion_channel`'s ownership
-/// note), so contention is not expected.
+/// Canonical ownership and role eligibility retained once per candidate unit.
+struct CandidateUnit {
+    source_id: String,
+    parse_id: String,
+    eligible: bool,
+}
+
+/// Validate chunk and graph references against canonical units in the same snapshot.
+/// Broken ownership is corruption, never an empty identifier or a silently lost hit.
 fn build_unit_owner_index(
+    conn: &Connection,
+    parses: &[CapturedParse],
     dense_hits: &[DenseChunkHit],
     lexical_hits: &[LexicalChunkHit],
+    graph_hits: &[RetrievalHit],
     chunk_unit_map: &HashMap<String, Vec<String>>,
-) -> HashMap<String, (String, String)> {
-    let mut owner: HashMap<String, (String, String)> = HashMap::new();
-    for hit in dense_hits {
-        if let Some(unit_ids) = chunk_unit_map.get(&hit.chunk_id) {
-            for unit_id in unit_ids {
-                owner
-                    .entry(unit_id.clone())
-                    .or_insert_with(|| (hit.source_id.clone(), hit.parse_id.clone()));
-            }
+) -> Result<HashMap<String, CandidateUnit>, ApiError> {
+    let mut owners = HashMap::new();
+    let chunks = dense_hits
+        .iter()
+        .map(|hit| (&hit.chunk_id, &hit.source_id, &hit.parse_id))
+        .chain(
+            lexical_hits
+                .iter()
+                .map(|hit| (&hit.chunk_id, &hit.source_id, &hit.parse_id)),
+        );
+    for (chunk_id, source_id, parse_id) in chunks {
+        let unit_ids = chunk_unit_map
+            .get(chunk_id)
+            .ok_or_else(|| ApiError::StorageOperation {
+                message: format!(
+                    "candidate chunk {chunk_id} has no input-unit mapping in parse {parse_id}"
+                ),
+            })?;
+        if unit_ids.is_empty() {
+            return Err(ApiError::StorageOperation {
+                message: format!("candidate chunk {chunk_id} has an empty input-unit mapping"),
+            });
+        }
+        for unit_id in unit_ids {
+            validate_candidate_unit(conn, &mut owners, unit_id, source_id, parse_id)?;
         }
     }
-    for hit in lexical_hits {
-        if let Some(unit_ids) = chunk_unit_map.get(&hit.chunk_id) {
-            for unit_id in unit_ids {
-                owner
-                    .entry(unit_id.clone())
-                    .or_insert_with(|| (hit.source_id.clone(), hit.parse_id.clone()));
-            }
+    for hit in graph_hits {
+        if hit.hit_type != RetrievalHitType::ContentUnit
+            || hit.unit_ids.as_slice() != [hit.hit_id.as_str()]
+            || !parses
+                .iter()
+                .any(|parse| parse.parse_id == hit.parse_id && parse.source_id == hit.source_id)
+        {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "graph candidate {} does not identify one unit in its captured source {} parse {}",
+                    hit.hit_id, hit.source_id, hit.parse_id
+                ),
+            });
         }
+        validate_candidate_unit(
+            conn,
+            &mut owners,
+            &hit.hit_id,
+            &hit.source_id,
+            &hit.parse_id,
+        )?;
     }
-    owner
+    Ok(owners)
+}
+
+/// Read each candidate once and reject cross-parse references before unit-only fusion.
+fn validate_candidate_unit(
+    conn: &Connection,
+    owners: &mut HashMap<String, CandidateUnit>,
+    unit_id: &str,
+    source_id: &str,
+    parse_id: &str,
+) -> Result<(), ApiError> {
+    if let Some(owner) = owners.get(unit_id) {
+        if owner.source_id != source_id || owner.parse_id != parse_id {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "candidate unit {unit_id} has conflicting source/parse ownership: {source_id}/{parse_id} and {}/{}",
+                    owner.source_id, owner.parse_id
+                ),
+            });
+        }
+        return Ok(());
+    }
+    const SELECT_CANDIDATE_SQL: &str = "SELECT source_id, content_type, body_json FROM content_units WHERE id = ?1 AND parse_id = ?2";
+    let row = conn
+        .prepare_cached(SELECT_CANDIDATE_SQL)
+        .and_then(|mut statement| {
+            statement
+                .query_row(params![unit_id, parse_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()
+        })
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!(
+                "failed to read candidate unit {unit_id} of parse {parse_id}: {source}"
+            ),
+        })?;
+    let Some((stored_source, content_type, body_json)) = row else {
+        return Err(ApiError::StorageOperation {
+            message: format!("candidate unit {unit_id} is missing from captured parse {parse_id}"),
+        });
+    };
+    if stored_source != source_id {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "candidate unit {unit_id} belongs to source {stored_source}, expected {source_id}"
+            ),
+        });
+    }
+    let content_type: ContentType = serde_json::from_value(serde_json::Value::String(content_type))
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("invalid content type for candidate unit {unit_id}: {source}"),
+        })?;
+    let eligible = if content_type == ContentType::TextBlock {
+        let body: TextBlockBody =
+            serde_json::from_str(&body_json).map_err(|source| ApiError::StorageOperation {
+                message: format!("invalid text-block body for candidate unit {unit_id}: {source}"),
+            })?;
+        !matches!(
+            body.block_role,
+            Some(TextBlockRole::Header | TextBlockRole::Footer)
+        )
+    } else {
+        true
+    };
+    owners.insert(
+        unit_id.to_owned(),
+        CandidateUnit {
+            source_id: source_id.to_owned(),
+            parse_id: parse_id.to_owned(),
+            eligible,
+        },
+    );
+    Ok(())
 }
 
 /// L2 norm of a vector. Used to normalize the query vector once for cosine
@@ -532,8 +705,8 @@ fn l2_norm(vector: &[f32]) -> f32 {
 // ===========================================================================
 // Graph channel (C7b-2) — D9 semantic-graph traversal with three-tier ordering.
 //
-// This arm is a SIBLING of `dense_lexical_fusion_channel`, not part of it: C7d
-// calls both and concatenates. It reuses C7b-1's scope surface verbatim — it
+// The pipeline generates graph hits before passing them to `fused_channels`.
+// Graph ordering is retained as its ordinal RRF contribution. This channel
 // reads mentions/edges ONLY within the passed `&[CapturedParse]`, so scope is
 // enforced at the entity lookup (§6, §38) with no ranked post-filter — and it
 // runs on the same `&Connection` already inside the per-query DEFERRED read
@@ -971,9 +1144,8 @@ fn record_graph_unit(
 }
 
 /// Graph retrieval channel (§24.3, D9): semantic-graph traversal from
-/// entity-name matches, tiered by the D9 ordering. This is the C7b-2 entry point
-/// the C7d pipeline calls alongside `dense_lexical_fusion_channel`; C7d
-/// concatenates the two arms' hits.
+/// entity-name matches, tiered by the D9 ordering. The pipeline passes these
+/// ranked hits to `fused_channels` alongside dense and lexical candidates.
 ///
 /// Contract (mirrors C7b-1):
 /// - `conn` is already inside the per-query DEFERRED read transaction (DP1,

@@ -181,7 +181,7 @@ lines without reading the config.
 Bracketed arguments (`[...]`) are optional; angle-bracketed arguments
 (`<...>`) are required. A `[requestJson]` argument (`snapshot` only) is a
 raw JSON string passed straight to the request body; invalid JSON is
-rejected locally before any request is sent. `query` takes bare query
+rejected locally before any request is sent. `query` and `query-raw` take bare query
 text (`<queryText...>`): the trailing arguments are joined with single
 spaces and the client constructs the `{"queryText": ...}` body itself
 via serde_json, so the text is JSON-escaped correctly and never parsed
@@ -209,6 +209,7 @@ are cross-checked against the router in `src/http.rs`.
 |---|---|---|---|---|---|
 | `health` | `--health` | — | `GET /v1/health` | public | no |
 | `query` | `--query` | `<queryText...>` | `POST /query` | public | no |
+| `query-raw` | `--query-raw` | `<queryText...>` | `POST /query` | public | no |
 | `ingest` | `--ingest` | `<sourceSystem> <nativeUri>` | `POST /sources` | protected | yes (operation) |
 | `reparse` | `--reparse` | `<sourceId> <sourceSystem> <nativeUri>` | `POST /sources/{sourceId}/parses` | protected | yes (operation) |
 | `activate` | `--activate` | `<sourceId> <parseId>` | `POST /sources/{sourceId}/parses/{parseId}/activate` | protected | yes (operation) |
@@ -309,11 +310,12 @@ are tolerated (no `deny_unknown_fields`), so an unexpected new field does
 not break decoding. Rich/nested shapes (a unit `body`, the assembly
 trace, the conformance report, the fused candidate pool, relationship
 provenance, deletion evidence, location metadata) are kept as raw JSON
-and printed **in full** rather than narrowed. As a consequence,
+and remain available **in full**. Query output uses the passage view by default;
+`query-raw` prints the complete original response. As a consequence,
 **structural drift in those passthrough fields surfaces as raw JSON,
 not as a decode failure.** The claim holds **only** for the
 `serde_json::Value` passthroughs: drift in a typed **required** field
-(e.g. the evidence pack's `queryId`) IS a decode failure, rendered as
+(e.g. a query result's `text`) IS a decode failure, rendered as
 an "unexpected response body" error (§5.10). Errors of every kind
 render per §5.10.
 
@@ -352,22 +354,16 @@ spaces and the client builds the `{"queryText": ...}` request body itself
 via serde_json (never string-formatted). It does not accept a raw JSON
 envelope; a full-envelope query is curl's job.
 
-Renders the evidence pack: `queryId`, `queryText`, `assembledAt`, the
-evidence-unit count, then each unit with its `unitId`, `contentType`,
-`sourceId`/`parseId`, optional `score`, optional `reasons`, an
-**excerpted `textProjection`** (up to **`TEXT_EXCERPT_CHARS` = 800**
-characters, ellipsized when clipped), a `locators` count, and the full
-`body` as pretty JSON. Pack-level `relationships`/`annotations` are
-counted; the full **`assemblyTrace`** is printed as pretty JSON. The
-excerpt is a summary only — the unit `body` is always rendered in full
-alongside it, so nothing is hidden.
+Renders each server-selected passage once, in rank order, with readable source
+locations, section headings, and physical PDF page references. A truncated
+passage is labeled; unavailable source locations retain their status. Canonical
+IDs, scores, bodies, and assembly traces are not printed in the default view.
 
-When the request set `debug`, a `diagnostics:` block follows: a
-per-stage **latency table** (openTransaction, capture, queryEmbed,
-denseLexicalFusion, graph, maxsim, rerank, assembly, snapshotHeld, in
-ms), the **`fusedPool`** count **and** the full fused pool dumped as
-pretty JSON, the `maxsim` ranked lines (`#rank unit … score …`), and the
-`reranked` lines (same, plus `logit` and `tokens` when present).
+`query-raw` / `--query-raw` takes the same bare query text and sends the same
+request. It prints the complete original response JSON, including unknown
+fields, without automatically enabling `debug`. Per-stage diagnostics require
+`debug: true` in an HTTP request or the web query form. The web view presents
+passages by default and retains raw evidence and diagnostics in details panels.
 
 ### 5.4 `held-parses` (`held`)
 

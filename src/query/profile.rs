@@ -17,16 +17,17 @@
 //! The abstract §24.2 shape (`defaultChannels`, `defaultMaxCandidatesPerChannel`,
 //! `defaultMaxFinalEvidenceUnits`, `defaultRerank`, `defaultFusionStrategy?`)
 //! is preserved field-for-field; the concrete C7 MVP tuning knobs the spec's
-//! abstract shape does not name (`rrf_k`, `candidate_overfetch_multiplier`,
+//! abstract shape does not name (`rrf_k`,
 //! `colbert_candidate_pool_size`, `reranker_candidate_pool_size`,
 //! `graph_hop_budget`) are added as additional profile fields and covered by
-//! the same self-hash. Their values are the approved plan values (2026-07-15;
-//! D9 for the hop budget) and must not drift.
+//! the same self-hash. Candidate budgets and passage ranking use the sealed v2
+//! values; the graph hop budget remains one.
 
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::assembly::model::MAX_QUERY_RESULTS;
 use crate::error::ApiError;
 use crate::query::model::{ResolvedScope, ResolvedScopeKind, RetrievalChannel};
 
@@ -75,12 +76,10 @@ pub(crate) struct RetrievalProfile {
     pub(crate) max_top_k: u32,
     /// Reciprocal-rank-fusion rank constant `k` (RRF `1/(k+rank)`).
     pub(crate) rrf_k: u32,
-    /// Multiplier applied when over-fetching per channel so fusion has depth
-    /// beyond the final top-k.
-    pub(crate) candidate_overfetch_multiplier: u32,
     /// Fused-pool size fed to ColBERT MaxSim re-scoring.
     pub(crate) colbert_candidate_pool_size: u32,
-    /// Top-N candidates fed to the final reranker after MaxSim.
+    /// Minimum passage candidate depth for final reranking; requests for more
+    /// results raise it within the fused-candidate ceiling.
     pub(crate) reranker_candidate_pool_size: u32,
     /// Graph channel one-hop traversal budget (D9: hop budget = 1).
     pub(crate) graph_hop_budget: u32,
@@ -116,19 +115,19 @@ pub(crate) fn active_profile() -> Result<&'static RetrievalProfile, ApiError> {
     }
 }
 
-/// Build and seal the MVP §24.2 retrieval profile. The values are the approved
-/// plan values (2026-07-15; D9 fixes `graph_hop_budget = 1`) and must not
-/// drift: they define the fused pool depth, the fusion constant, and the
-/// reranker pool the whole C7 pipeline sizes itself against.
+/// Seal retrieval v2: candidate generation stays independent of result count,
+/// all three channels participate in RRF, and final ranking evaluates passages.
 ///
 /// `created_at` is a FIXED authoring timestamp, not runtime state: this is a
 /// versioned document whose identity (id + version + hash) must be stable
 /// across processes, so it must never be stamped with the current clock —
 /// mirroring `annotations/policy.rs::seal_mvp_policy`.
 fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
+    let default_results = 10;
+    let candidate_pool = 100;
     let mut profile = RetrievalProfile {
         id: "retrieval-profile".to_string(),
-        version: "1".to_string(),
+        version: "2".to_string(),
 
         // MVP channel set: dense, lexical, graph (multi_vector channel deferred
         // post-MVP, 2026-07-15 rescope).
@@ -138,22 +137,21 @@ fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
             RetrievalChannel::Graph,
         ],
         // Per-channel candidate cap = the ColBERT-fed pool size (100).
-        default_max_candidates_per_channel: 100,
-        // Final evidence-unit cap = default top-k (10).
-        default_max_final_evidence_units: 10,
+        default_max_candidates_per_channel: candidate_pool,
+        // The public legacy field now caps final passages, not seed units.
+        default_max_final_evidence_units: default_results,
         default_rerank: true,
         default_fusion_strategy: Some("rrf".to_string()),
 
-        default_top_k: 10,
-        max_top_k: 100,
+        default_top_k: default_results,
+        max_top_k: MAX_QUERY_RESULTS as u32,
         rrf_k: 60,
-        candidate_overfetch_multiplier: 3,
-        colbert_candidate_pool_size: 100,
-        reranker_candidate_pool_size: 10,
+        colbert_candidate_pool_size: candidate_pool,
+        reranker_candidate_pool_size: 30,
         graph_hop_budget: 1,
 
         // Fixed authoring timestamp of this versioned document; see fn comment.
-        created_at: "2026-07-13T00:00:00.000Z".to_string(),
+        created_at: "2026-09-06T00:00:00.000Z".to_string(),
         profile_hash: String::new(),
     };
     // Self-hash over the document minus its own hash field (spec §16.2 rules);

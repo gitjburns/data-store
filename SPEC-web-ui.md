@@ -65,11 +65,16 @@ original status codes.
 
 - **Query console** (the primary view): query text, constraints (`sourceIds`,
   `governanceDomains`), `maxFinalEvidenceUnits`, evidence-policy toggles, debug
-  toggle. Results render simple-first (rank, score, text projection) with
-  anchor units visually distinct from assembly-added context units (score
-  presence is the discriminator); each unit expands to full provenance (ids,
-  content type, locators, body JSON, reasons). Every `unitId` and `sourceId`
-  is a navigation link.
+  toggle. Results render simple-first (rank, role and content-type badges,
+  score, text projection; context units also badge their inclusion reasons)
+  with anchor units visually distinct from assembly-added context units (score
+  presence is the discriminator). A unit without a text projection renders a
+  labelled body-derived summary (section path/heading, table
+  caption/shape/headers/markdown, row position, figure and image-region text,
+  page number) in its place; the raw body JSON in the expansion stays
+  authoritative. Each unit expands to full provenance (ids, content type,
+  locators, body JSON, reasons). Every `unitId` and `sourceId` is a
+  navigation link.
 - **Assembly trace panel** per query: policy id/version/hash, applied rules
   grouped by anchor, rejected hits/units, budget.
 - **Debug diagnostics panel** (only when the request set `debug`): per-stage

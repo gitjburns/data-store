@@ -1,4 +1,4 @@
-//! Reciprocal rank fusion of dense and BM25 candidate lists with a
+//! Reciprocal rank fusion of dense, BM25, and graph candidate lists with a
 //! deterministic tie-break (score `total_cmp`, then unit id ordering). The
 //! dense, BM25, and fused match records live here with the fusion algorithm
 //! that consumes and produces them.
@@ -36,14 +36,16 @@ pub(crate) struct FusedMatch {
     pub(crate) dense_similarity: Option<f32>,
     pub(crate) bm25_rank: Option<usize>,
     pub(crate) bm25_score: Option<f64>,
+    pub(crate) graph_rank: Option<usize>,
 }
 
-/// Fuse dense and BM25 candidates with reciprocal rank fusion.
+/// Fuse unit-deduplicated channel lists; graph scores carry only ordinal meaning.
 ///
 /// The output score is only a fused rank signal, not a semantic similarity score.
 pub(crate) fn fuse_matches(
     dense_matches: &[DenseMatch],
     bm25_matches: &[Bm25Match],
+    graph_matches: &[(&str, usize)],
     top_k: usize,
     rrf_k: u32,
 ) -> Vec<FusedMatch> {
@@ -63,6 +65,13 @@ pub(crate) fn fuse_matches(
         entry.score += reciprocal_rank_score(rrf_k, matched.rank);
         entry.bm25_rank = Some(matched.rank);
         entry.bm25_score = Some(matched.score);
+    }
+    for &(unit_id, rank) in graph_matches {
+        let entry = values
+            .entry(unit_id.to_owned())
+            .or_insert_with(|| empty_fused_match(unit_id));
+        entry.score += reciprocal_rank_score(rrf_k, rank);
+        entry.graph_rank = Some(rank);
     }
 
     let mut fused = values.into_values().collect::<Vec<_>>();
@@ -90,6 +99,7 @@ fn empty_fused_match(unit_id: &str) -> FusedMatch {
         dense_similarity: None,
         bm25_rank: None,
         bm25_score: None,
+        graph_rank: None,
     }
 }
 

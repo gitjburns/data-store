@@ -51,7 +51,7 @@ cadence:
   │  ANNOTATE    │   annotations on its own; annotation freshness is tracked
   └────┬─────────┘
        ▼
-  ┌──────────┐   POST /query assembles an EvidencePack from projections across
+  ┌──────────┐   POST /query returns cited passages and canonical evidence from
   │ RETRIEVE │   the lexical, dense, and graph channels
   └──────────┘
 ```
@@ -127,7 +127,7 @@ PROTOCOL.md is the contract of record. This is the map.
 
 | Method & path | Purpose |
 | --- | --- |
-| `POST /query` | Synchronous retrieval; returns an EvidencePack. |
+| `POST /query` | Synchronous retrieval; returns ranked passages and their canonical EvidencePack. |
 | `GET /v1/health` | Readiness and per-component diagnostics. |
 | `GET /units/{unitId}` | One canonical unit (served only if its parse is active). |
 | `GET /units/{unitId}/relationships` | Unit relationships (direction/type filters). |
@@ -219,8 +219,8 @@ Components that publish no counters serialize an empty array.
 These are recorded MVP narrowings, not defects:
 
 - **`POST /query` omits `queryExecutionRecordId`.** The QueryExecutionRecord
-  audit tier is deferred post-MVP, so no QER is written and the response is the
-  EvidencePack without a `queryExecutionRecordId`. Any per-query id on the pack is
+  audit tier is deferred post-MVP, so no QER is written and the response has no
+  `queryExecutionRecordId`. Any per-query id on the pack is
   a correlation handle, not a QER id.
 - **The `multi_vector` retrieval channel is deferred post-MVP.** The active
   retrieval channels are **lexical**, **dense**, and **graph**. (ColBERT MaxSim is
@@ -247,6 +247,7 @@ Operator verbs (CLI flag / REPL name):
 | --- | --- | --- |
 | `--health` | — | Read `/v1/health`. |
 | `--query` | `<queryText...>` | Run a query; remaining args join into the query text. |
+| `--query-raw` | `<queryText...>` | Run the same query and print the complete response JSON. |
 | `--ingest` | `<sourceSystem> <nativeUri>` | Register/ingest a source. |
 | `--reparse` | `<sourceId> <sourceSystem> <nativeUri>` | Force a parse run. |
 | `--activate` | `<sourceId> <parseId>` | Activate a parse. |
@@ -269,9 +270,9 @@ verdict.
 
 ### Example: query the fabric
 
-`queryText` is the only required field. The rest default (final evidence-unit
-count from the active retrieval profile; locators on, relationships and
-annotations off; `debug` off).
+`queryText` is the only required field. Queries return up to ten passages by
+default; `maxFinalEvidenceUnits` sets the passage limit from 1 to 100. Raw unit
+locators default on; relationships, annotations, and `debug` default off.
 
 ```sh
 curl -s http://127.0.0.1:8091/query \
@@ -285,8 +286,11 @@ curl -s http://127.0.0.1:8091/query \
       }'
 ```
 
-The response is a `QueryResponse` carrying the assembled `evidencePack`; raw
-per-stage retrieval `diagnostics` are attached only when `debug` is `true`.
+The response carries ranked `results` with passage text, source locations,
+section headings, and physical PDF page references, alongside the complete
+canonical constituents in `evidencePack`. Oversized single-unit excerpts are
+labeled `truncated`; their full bodies remain in the pack. Per-stage retrieval
+`diagnostics` are attached only when `debug` is `true`.
 
 Via the CLI, pass bare query text — the client builds the `{"queryText": ...}`
 body itself, so the remaining arguments are the text (quoted or unquoted):
@@ -294,6 +298,10 @@ body itself, so the remaining arguments are the text (quoted or unquoted):
 ```sh
 data-store --config config.toml --query how does activation gating work
 ```
+
+The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
+`query-raw`) with the same query text to print the complete response JSON. Raw
+output does not automatically enable request diagnostics.
 
 ### Example: check readiness
 
@@ -316,8 +324,8 @@ base URL and admin token file.
 data-store --config config.toml --serve 127.0.0.1:8092
 ```
 
-The UI offers a query console (constraints, `maxFinalEvidenceUnits`, evidence
-toggles, debug) with assembly-trace and debug-diagnostics panels, a unit explorer
+The UI offers a query console (constraints, passage limit, evidence toggles,
+debug) showing cited passages with raw evidence and diagnostics in details panels, a unit explorer
 with relationship filters, a source view, a health dashboard, sync status, the
 held-parses list, an operation viewer, and the vocabulary explorer.
 

@@ -19,10 +19,14 @@ use crate::model::relationship::{UnitRelationship, UnitRelationshipType};
 use crate::model::unit::ContentType;
 use crate::model::{Locator, SemanticAnnotation};
 
-/// Spec §25 `AssemblyPolicy`. The versioned, self-hashed document that governs
-/// how reranked hits expand into an `EvidencePack`: which anchors are included
-/// and which structural neighbors each rule pulls in, bounded by the budgets.
-/// The policy is data — no code path decides inclusion outside these rules.
+/// Maximum ranked passages accepted by the query and retained by assembly.
+pub(crate) const MAX_QUERY_RESULTS: usize = 100;
+
+/// Bound canonical membership independently of a passage's displayed token count.
+pub(crate) const MAX_PASSAGE_UNITS: usize = 64;
+
+/// Versioned, self-hashed contract for retaining canonical passage evidence.
+/// The sealed policy records inclusion behavior and raw evidence safety bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssemblyPolicy {
@@ -36,13 +40,11 @@ pub(crate) struct AssemblyPolicy {
 
     /// Hard ceilings the assembler must not exceed (spec `budgets`).
     pub(crate) budgets: AssemblyBudget,
-    /// Ordered inclusion rules evaluated per anchor (spec `rules`).
+    /// Inclusion rules recorded for final passages (spec `rules`).
     pub(crate) rules: Vec<AssemblyRule>,
 
-    /// The relationship types the policy's rules traverse (spec
-    /// `requiresRelationshipTypes?`). Declared as what the rules NEED, which
-    /// may name types no parser currently emits; the R14 dependency check
-    /// surfaces such absences at assembly time. C8a fills this.
+    /// Historical graph-expansion requirements; absent in the active policy,
+    /// which retains selected members without requiring graph expansion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) requires_relationship_types: Option<Vec<UnitRelationshipType>>,
 
@@ -60,8 +62,8 @@ pub(crate) struct AssemblyPolicy {
     pub(crate) policy_hash: String,
 }
 
-/// Spec §25 `AssemblyPolicy.budgets`. Hard ceilings on pack size that assembly
-/// enforces while expanding anchors; expansion stops when any budget is hit.
+/// Raw canonical evidence safety ceilings. Exceeding a ceiling fails assembly;
+/// these do not limit displayed passage text or the requested result count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssemblyBudget {
@@ -70,7 +72,7 @@ pub(crate) struct AssemblyBudget {
     /// Maximum total token budget across the pack's text projections
     /// (spec `maxTokens`).
     pub(crate) max_tokens: u32,
-    /// Maximum graph-expansion depth from any anchor (spec `maxExpansionDepth`).
+    /// Graph-expansion depth; zero for final-passage retention.
     pub(crate) max_expansion_depth: u32,
     /// Optional cap on explicitly-referenced units pulled in by the
     /// `include_explicit_references` operator (spec `maxReferencedUnits?`).
@@ -104,6 +106,8 @@ pub(crate) struct AssemblyRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AssemblyReason {
+    /// The canonical unit contributes to a final ranked passage.
+    SelectedPassage,
     /// The unit is a reranked anchor hit.
     Anchor,
     /// The unit completes a required structure (e.g. a caption's figure).
@@ -152,12 +156,11 @@ pub(crate) enum AssemblyHitTypeCondition {
     RetrievalProjection,
 }
 
-/// Spec §25 `AssemblyRule.apply[]`. One operator invocation with its optional
-/// parameters; the operator names which of the seven §25 graph reads runs.
+/// Serialized inclusion operation and any parameters captured in its policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssemblyOperation {
-    /// The graph operator to run (spec `operator`).
+    /// The inclusion operation represented by this policy rule.
     pub(crate) operator: AssemblyOperator,
     /// Free-form operator parameters, shape defined per operator (spec
     /// `parameters?`).
@@ -165,14 +168,16 @@ pub(crate) struct AssemblyOperation {
     pub(crate) parameters: Option<serde_json::Value>,
 }
 
-/// Spec §25 assembly operator. The closed set of all seven graph operators the
-/// policy can invoke; the operator bodies live in `operators.rs` (C8a).
+/// Serialized inclusion vocabulary. Earlier variants remain readable for
+/// historical policies; the active policy retains only selected passages.
 // The shared `Include` prefix mirrors the normative §25 operator vocabulary
 // (include_anchor, include_parent_container, ...) and must not be renamed.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AssemblyOperator {
+    /// Retain canonical members supplied by final passage selection.
+    IncludeSelectedPassage,
     /// Include the anchor unit itself.
     IncludeAnchor,
     /// Include the anchor's parent container unit.
@@ -206,7 +211,7 @@ pub(crate) struct EvidencePack {
     /// The selected canonical content units, in deterministic pack order
     /// (spec `evidenceUnits`).
     pub(crate) evidence_units: Vec<EvidenceUnit>,
-    /// The structural relationships actually traversed during assembly, present
+    /// Canonical relationships whose endpoints are both selected units, present
     /// only when the request set `includeRelationships` (spec `relationships?`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) relationships: Option<Vec<UnitRelationship>>,
@@ -270,7 +275,8 @@ pub(crate) struct ContextAssemblyTrace {
     pub(crate) assembly_policy_hash: String,
     /// The input hit ids fed to assembly, in rank order (spec `inputHitIds`).
     pub(crate) input_hit_ids: Vec<String>,
-    /// Every rule application that added units (spec `appliedRules`).
+    /// One retention rule application per final passage, including fully
+    /// overlapping passages whose units were already retained.
     pub(crate) applied_rules: Vec<AppliedAssemblyRule>,
     /// The unit ids selected into the pack, in pack order (spec
     /// `selectedUnitIds`).
@@ -279,8 +285,8 @@ pub(crate) struct ContextAssemblyTrace {
     /// (spec `rejectedHitIds?`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rejected_hit_ids: Option<Vec<String>>,
-    /// Units dropped after resolution, e.g. over budget (spec
-    /// `rejectedUnitIds?`).
+    /// Historical rejected members; absent in v2 because missing members and
+    /// exceeded raw safety bounds fail assembly instead of dropping evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rejected_unit_ids: Option<Vec<String>>,
     /// The budget in force for this assembly (spec `budget`).

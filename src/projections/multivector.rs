@@ -584,17 +584,10 @@ fn embed_unit(row: UnitRow) -> Result<EmbedUnit, ApiError> {
 /// text. No normalization or metadata is mixed in beyond selecting the body's
 /// text-bearing field.
 ///
-/// MUST STAY IN STEP (four sites): this is one of four arm-for-arm mirrors of the
-/// per-`ContentType` evidence-text extraction. The others are
-/// `crate::query::rerank::evidence_text` (`src/query/rerank.rs`),
-/// `crate::assembly::evidence::evidence_text` (`src/assembly/evidence.rs`), and
-/// `crate::annotations::producer::evidence_text` (`src/annotations/producer.rs`).
-/// All four select the same field per type — including the `TableCell` fallback
-/// to `normalizedText` — so the text plane the fabric embeds is the same one the
-/// reranker scores, the pack assembles, and the annotation producers read. A
-/// content type gaining or losing a text-bearing field must change ALL FOUR
-/// together. The sites differ only in input shape (`&EmbedUnit` here vs.
-/// `(content_type, body)`), not in the text they resolve.
+/// Keep field selection aligned with `assembly::evidence::evidence_text` and
+/// `annotations::producer::evidence_text`, including TableCell's normalizedText
+/// fallback. Query passages use the assembly extractor, so these three readers
+/// must agree on canonical text when a content type changes.
 fn evidence_text(unit: &EmbedUnit) -> Option<String> {
     match unit.content_type {
         ContentType::TextBlock | ContentType::Caption => unit

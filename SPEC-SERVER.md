@@ -519,8 +519,8 @@ The full wire contract is in **PROTOCOL.md**. Routes split into public
 **Public:**
 
 - `GET /v1/health` — readiness and diagnostics (§7).
-- `POST /query` — the spec §34.1 spec-literal query path; JSON `QueryRequest` in, one
-  JSON response carrying the EvidencePack. The synchronous retrieval + assembly
+- `POST /query` — JSON `QueryRequest` in, one JSON response carrying ranked
+  passages and their canonical EvidencePack. The synchronous retrieval + assembly
   pipeline runs on a blocking thread.
 - `GET /units/{unitId}`, `GET /units/{unitId}/relationships` — unit reads, gated
   so a non-active parse's units are never served.
@@ -1004,10 +1004,10 @@ an immediate 503. (§7.)
    never captured, so no later stage sees them.
 2. **Cutover-barrier probe** over the captured sources, before any retrieval
    stage (§11.4).
-3. **Dense + lexical candidate generation**, then **RRF fusion** — fusion is
-   **rank-only**: the fused score is a reciprocal-rank signal, never a
-   semantic similarity.
-4. **Graph channel appended** to the fused pool: entity-name entry, then a
+3. **Dense + lexical candidate generation**, with independent candidate limits
+   of 100 per channel. Resolve chunks to canonical units and exclude explicit
+   header/footer units before they consume ranking slots.
+4. **Graph candidate generation**: entity-name entry, then a
    semantic-only one-hop traversal over annotation-derived mentions/edges, no
    LLM in the query path. Entry matching (the D9 amendment) has an always-on
    **exact** class plus two policy-gated fuzzy classes drawn from the
@@ -1023,18 +1023,29 @@ an immediate 503. (§7.)
    disabled (the shipped default) the path is byte-identical to the prior
    exact-only behavior:** no per-parse name enumeration runs at all, so every
    match is `exact` and the class component of the order is constant.
-5. **ColBERT MaxSim over the fused pool** — **retained at MVP.** The deferred
+5. **RRF across dense, lexical, and graph candidates**, deduplicated to 100
+   canonical units, then **ColBERT MaxSim over that pool**. RRF is rank-only;
+   its score is not a semantic similarity. The deferred
    `multi_vector` *retrieval channel* (§19) is candidate generation; this
    stage is late-interaction re-scoring of the already-fused pool and is
    built and live. Document matrices are the persisted ones (recomputing
    document vectors at search time is forbidden); only the query is embedded
    live.
-6. **Final reranker** over the MaxSim top-N via the config-selected backend —
+6. **Passage construction** from MaxSim-ranked units: canonical reading order
+   within one source, parse, and logical section, at most 64 constituent units
+   and 512 ColBERT tokens. Overlapping passages merge when they fit; structured
+   content retains its boundaries. An oversized single unit becomes a marked
+   excerpt, with its full canonical body retained in the EvidencePack.
+7. **Final reranker** scores up to 30 passages, or the requested count if larger
+   (maximum 100), including their section headings, via the config-selected backend —
    exclusive local ModernBERT or HTTP Cohere-compatible, **no cross-backend
    fallback** (§2.9).
-7. **Deterministic assembly**: the EvidencePack is built from the reranked
-   anchors under the sealed AssemblyPolicy, inside the same read transaction,
-   with its auditable assembly trace.
+8. **Final selection and evidence**: `maxFinalEvidenceUnits` caps returned
+   passages (default 10, maximum 100). Resolve citations and retain exactly the
+   selected canonical constituents under AssemblyPolicy v2, inside the same
+   read transaction. No automatic neighbor/container expansion follows selection;
+   raw safety-limit failures are errors, never partial packs. The response carries
+   `results`, `evidencePack`, and optional request-enabled `diagnostics`.
 
 ### 14.4 Model-call gate discipline
 
@@ -1052,9 +1063,9 @@ because their identity (`id` + `version` + hash over their canonical
 serialization) must be stable and auditable across processes:
 
 - **RetrievalProfile** (spec §24.2) — channels, candidate pool sizes, RRF
-  constant, overfetch, hop budget, final-evidence caps.
-- **AssemblyPolicy** (spec §25) — how reranked hits expand into an
-  EvidencePack.
+  constant, overfetch, hop budget, final-passage caps.
+- **AssemblyPolicy** (spec §25) — retention of selected canonical passage
+  constituents and explicit raw evidence safety ceilings.
 - **Required-annotation-set policy** (spec §21.4) — which annotation types
   gate activation (MVP: none).
 

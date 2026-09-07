@@ -44,15 +44,16 @@ use std::time::Instant;
 use rusqlite::{Connection, params, params_from_iter};
 use tracing::{error, info, warn};
 
-use crate::assembly::evidence::{Anchor, EvidenceOptions, build_evidence_pack};
+use crate::assembly::evidence::{EvidenceOptions, PassageEvidence, build_evidence_pack};
 use crate::assembly::model::EvidencePack;
 use crate::assembly::policy::{CapturedParseRef, active_policy};
 use crate::error::ApiError;
 use crate::inference::{ColbertCandidateScore, InferenceRuntime, RerankerCandidateScore};
 use crate::policy::EntityMatchPolicy;
 use crate::projections::dense_cache::DenseCache;
-use crate::query::channels::{CapturedParse, dense_lexical_fusion_channel, graph_channel};
+use crate::query::channels::{CapturedParse, fused_channels, graph_channel};
 use crate::query::model::{ResolvedScope, ResolvedScopeKind, RetrievalHit};
+use crate::query::passages::{PassageCandidate, SearchResult, build_passages};
 use crate::query::profile::RetrievalProfile;
 use crate::query::request::EvidenceOptions as RequestEvidenceOptions;
 use crate::query::rerank::{RerankStageContext, run_maxsim_stage, run_reranker_stage};
@@ -94,6 +95,8 @@ pub(crate) struct QueryStageLatencies {
     pub(crate) graph_ms: u64,
     /// ColBERT MaxSim over the fused pool (persisted matrices; gated colbert role).
     pub(crate) maxsim_ms: u64,
+    /// Canonical passage construction and overlap merging, before final scoring.
+    pub(crate) passage_build_ms: u64,
     /// Final reranker scoring (gated only on the local backend).
     pub(crate) rerank_ms: u64,
     /// Context-assembly stage: EvidencePack construction from the reranked
@@ -113,20 +116,21 @@ pub(crate) struct QueryStageLatencies {
 /// deferred, so traces stay in the diagnostics log rather than a persisted QER
 /// (recorded deviation).
 pub(crate) struct QueryPipelineOutcome {
-    /// The §26 EvidencePack the assembly stage built from the reranked anchors:
-    /// this is the query's primary result, carrying the selected canonical
-    /// ContentUnits and the auditable §27 assembly trace.
+    /// Ranked passages and citations, ready for presentation without client logic.
+    pub(crate) results: Vec<SearchResult>,
+    /// Canonical constituent records and their selection trace for raw inspection.
     pub(crate) evidence_pack: EvidencePack,
-    /// The concatenated candidate pool the reranker stages scored over: the
-    /// RRF-fused dense+lexical hits followed by the graph channel's D9-ordered
-    /// hits (graph is a separate channel joining the fused pool downstream).
-    /// Retained for `debug` diagnostics only; the pack is the primary result.
+    /// The deduplicated three-channel RRF pool that ColBERT scored.
     pub(crate) fused_pool: Vec<RetrievalHit>,
+    /// Eligible channel records before fusion, preserving their individual scores.
+    pub(crate) channel_hits: Vec<RetrievalHit>,
+    /// Complete passage candidates offered to the final reranker, including those
+    /// outside the requested final result count.
+    pub(crate) passage_candidates: Vec<PassageCandidate>,
     /// ColBERT MaxSim scores over the fused pool, best-first (empty when the pool
     /// had no unit with a persisted ColBERT matrix). `debug`-only.
     pub(crate) maxsim: Vec<ColbertCandidateScore>,
-    /// Final reranker scores over the MaxSim top-N, best-first. `debug`-only
-    /// (also the anchors the pack was assembled from).
+    /// Final passage scores, best-first, including candidates beyond the result cap.
     pub(crate) reranked: Vec<RerankerCandidateScore>,
     /// Per-stage timings, including the DP1 snapshot-held duration.
     pub(crate) latencies: QueryStageLatencies,
@@ -151,9 +155,7 @@ struct ActiveParse {
 /// never consults it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueryRequestContext {
-    /// Final evidence-unit cap the request resolved against the profile
-    /// (`1..=max_top_k`, default `default_top_k`). Sizes the pipeline's `top_k`
-    /// so the request's requested count drives fusion/rerank depth.
+    /// Maximum final passages; never used to shrink early candidate generation.
     pub(crate) max_final_evidence_units: u32,
     /// Resolved evidence-output options (locators/relationships/annotations)
     /// mapped into the assembly-layer `EvidenceOptions` at the assembly stage.
@@ -229,9 +231,7 @@ pub(crate) fn execute_query(
         event = "query.execute.started",
         query_id,
         scope_kind = ?scope.kind,
-        // The effective pipeline top_k is the request's resolved final-evidence-unit
-        // cap (set below and passed into the fusion channel), so the start boundary
-        // logs it under `top_k` too — matching the `query.fusion.started` field.
+        // Keep the established log field; it now caps final passages only.
         top_k = request_ctx.max_final_evidence_units as usize,
         colbert_candidate_pool_size = profile.colbert_candidate_pool_size,
         reranker_candidate_pool_size = profile.reranker_candidate_pool_size,
@@ -412,32 +412,8 @@ fn run_pipeline_body(
     };
     latencies.query_embed_ms = embed_started_at.elapsed().as_millis() as u64;
 
-    // === Dense+lexical fusion channel (C7b-1). Over-fetch each channel beyond
-    // the final top_k so fusion has depth (candidate_overfetch_multiplier), then
-    // fuse to top_k via RRF. ===
-    let fusion_started_at = Instant::now();
-    // The request's resolved final-evidence-unit cap drives the pipeline top_k
-    // (R6): validation already clamped it to `1..=profile.max_top_k` and defaulted
-    // it to `profile.default_top_k`, so it is a safe pool depth here.
-    let top_k = request_ctx.max_final_evidence_units as usize;
-    let candidate_limit = top_k
-        .saturating_mul(profile.candidate_overfetch_multiplier as usize)
-        .max(top_k);
-    let mut pool = dense_lexical_fusion_channel(
-        conn,
-        query_id,
-        &captured,
-        &query_vector,
-        query_text,
-        top_k,
-        candidate_limit,
-        profile.rrf_k,
-    )?;
-    latencies.dense_lexical_fusion_ms = fusion_started_at.elapsed().as_millis() as u64;
-
-    // === Graph channel (C7b-2): a separate channel whose D9-tiered hits join the
-    // fused pool downstream. C7d concatenates the two arms' hits into one pool
-    // the reranker stages score over. ===
+    // Generate graph hits before fusion so they compete in the same bounded
+    // three-channel pool instead of being appended after its cutoff.
     let graph_started_at = Instant::now();
     let graph_hits = graph_channel(
         conn,
@@ -448,9 +424,23 @@ fn run_pipeline_body(
         entity_match_policy,
     )?;
     latencies.graph_ms = graph_started_at.elapsed().as_millis() as u64;
-    pool.extend(graph_hits);
+    // Candidate depth is independent of the requested final passage count.
+    let fusion_started_at = Instant::now();
+    let top_k = request_ctx.max_final_evidence_units as usize;
+    let fusion = fused_channels(
+        conn,
+        query_id,
+        &captured,
+        &query_vector,
+        query_text,
+        &graph_hits,
+        profile,
+    )?;
+    latencies.dense_lexical_fusion_ms = fusion_started_at.elapsed().as_millis() as u64;
 
-    // === Build the parse-of-unit index the reranker stage needs to resolve unit
+    let pool = fusion.pool;
+
+    // === Build the parse-of-unit index passage construction needs to resolve unit
     // content parse-scoped. A pool can span several active parses (a query in
     // scope over several sources), so each hit's units map to that hit's parse.
     // First writer wins per unit (a unit belongs to one active parse). ===
@@ -481,40 +471,70 @@ fn run_pipeline_body(
     )?;
     latencies.maxsim_ms = maxsim_started_at.elapsed().as_millis() as u64;
 
-    // === Final reranker over the MaxSim top-N (C7c): the local backend is gated
-    // by the stage; the HTTP backend holds no gate across network I/O — both
-    // handled inside `run_reranker_stage`, so C7d does NOT gate here either. ===
-    let rerank_started_at = Instant::now();
-    let reranked = run_reranker_stage(
-        &ctx,
-        &inference.reranker,
+    // Form distinct passages before final scoring. Larger requested result sets
+    // raise passage candidate depth without exceeding the already-bounded seeds.
+    let passage_started_at = Instant::now();
+    let passage_limit = (profile.reranker_candidate_pool_size as usize)
+        .max(top_k)
+        .min(profile.colbert_candidate_pool_size as usize);
+    let passage_candidates = build_passages(
+        conn,
         &maxsim,
         &parse_of_unit,
-        profile.reranker_candidate_pool_size as usize,
+        inference.colbert.tokenizer(),
+        passage_limit,
+        query_id,
     )?;
+    latencies.passage_build_ms = passage_started_at.elapsed().as_millis() as u64;
+
+    // The final model evaluates the same passage and section context that will
+    // be presented. Gate ownership remains inside the reranking boundary.
+    let rerank_started_at = Instant::now();
+    let reranked = run_reranker_stage(&ctx, &inference.reranker, &passage_candidates)?;
     latencies.rerank_ms = rerank_started_at.elapsed().as_millis() as u64;
 
-    // === R4 ASSEMBLY STAGE (§25–§27): build the EvidencePack from the reranked
-    // anchors, INSIDE this read transaction (before `conn`'s snapshot drops) so
-    // the assembler's parse-scoped unit/relationship reads share the query's one
-    // WAL snapshot (DP1). Runs AFTER rerank; a failure here propagates via `?` to
-    // `execute_query`, which still logs `snapshot_released` on the error path. ===
+    // Final count applies here, after passage ranking. A score with an unknown
+    // candidate identity is a protocol fault, never silently dropped evidence.
+    let selected = reranked
+        .iter()
+        .take(top_k)
+        .map(|score| {
+            let candidate = passage_candidates
+                .iter()
+                .find(|candidate| candidate.anchor_unit_id == score.unit_id)
+                .ok_or_else(|| ApiError::StorageOperation {
+                    message: format!("reranker returned unknown passage {}", score.unit_id),
+                })?;
+            Ok((candidate, f64::from(score.score)))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    // Canonical evidence and source citations are resolved before releasing this
+    // snapshot, so the two response surfaces cannot disagree across a cutover.
     let assembly_started_at = Instant::now();
     let evidence_pack = assemble_evidence_pack(
         conn,
         inference,
         &captured,
-        &reranked,
-        &parse_of_unit,
+        &selected,
         request_ctx.evidence_options,
         query_id,
         query_text,
     )?;
+    // Candidates are retained for debug inspection; clone only the final
+    // passages to produce independently owned presentation records.
+    let results = selected
+        .into_iter()
+        .map(|(candidate, score)| candidate.clone().into_result(conn, score))
+        .collect::<Result<Vec<_>, _>>()?;
     latencies.assembly_ms = assembly_started_at.elapsed().as_millis() as u64;
 
     Ok(QueryPipelineOutcome {
+        results,
         evidence_pack,
         fused_pool: pool,
+        channel_hits: fusion.channel_hits,
+        passage_candidates,
         maxsim,
         reranked,
         // Filled by `execute_query` once the snapshot-held time is known.
@@ -522,31 +542,13 @@ fn run_pipeline_body(
     })
 }
 
-/// Assemble the §26 EvidencePack from the reranked anchors: bridge the query
-/// pipeline's in-memory types to C8b's decoupled borrowed-primitive contract
-/// (R11) and build the R10 token-count closure.
-///
-/// The `captured`/`reranked`/`parse_of_unit` values are the pipeline's own
-/// types; here they are projected into the borrowed `CapturedParseRef`/`Anchor`
-/// slices `build_evidence_pack` takes, so `assembly/` never imports from
-/// `execute.rs`. Anchors are passed in RANK ORDER (the reranker's best-first
-/// output), which is the pack's outer ordering (R13). Each anchor's originating
-/// parse is looked up in `parse_of_unit`; an anchor whose unit is not in the map
-/// is skipped (it cannot be resolved parse-scoped, §14).
-///
-/// The `EvidenceOptions` seam: the request-layer `RequestEvidenceOptions` (from
-/// `ValidatedQuery`) and the assembly-layer `EvidenceOptions` (C8b's contract)
-/// are two identically-shaped types owned by two layers; they are mapped
-/// field-by-field HERE, at the one boundary where the request options enter
-/// assembly, rather than unified — keeping the request DTO and the assembly
-/// contract layer-decoupled (R11).
-#[allow(clippy::too_many_arguments)]
+/// Bridge ranked passage selections to canonical evidence assembly. Membership
+/// is explicit and ordered; assembly adds no further neighbors after ranking.
 fn assemble_evidence_pack(
     conn: &Connection,
     inference: &InferenceRuntime,
     captured: &[CapturedParse],
-    reranked: &[RerankerCandidateScore],
-    parse_of_unit: &std::collections::BTreeMap<String, String>,
+    selected: &[(&PassageCandidate, f64)],
     request_options: RequestEvidenceOptions,
     query_id: &str,
     query_text: &str,
@@ -562,21 +564,13 @@ fn assemble_evidence_pack(
         })
         .collect();
 
-    // Reranked candidates → anchors in rank order, each mapped to its parse. A
-    // candidate whose unit id is absent from the parse-of-unit map cannot be
-    // resolved parse-scoped (§14), so it is dropped from the anchor set rather
-    // than assembled against an unknown parse. The reranker's `score: f32`
-    // widens to the anchor's `f64`.
-    let anchors: Vec<Anchor<'_>> = reranked
+    let passages: Vec<PassageEvidence<'_>> = selected
         .iter()
-        .filter_map(|candidate| {
-            parse_of_unit
-                .get(&candidate.unit_id)
-                .map(|parse_id| Anchor {
-                    unit_id: &candidate.unit_id,
-                    parse_id,
-                    score: f64::from(candidate.score),
-                })
+        .map(|(candidate, score)| PassageEvidence {
+            anchor_unit_id: &candidate.anchor_unit_id,
+            parse_id: &candidate.parse_id,
+            unit_ids: &candidate.unit_ids,
+            score: *score,
         })
         .collect();
 
@@ -609,7 +603,7 @@ fn assemble_evidence_pack(
         conn,
         &captured_refs,
         policy,
-        &anchors,
+        &passages,
         options,
         count_tokens,
         query_id,
@@ -883,7 +877,7 @@ fn clone_dense_planes(
 }
 
 /// Map each candidate unit id in the pool to its originating `parse_id`, so the
-/// reranker stage can resolve unit content parse-scoped even when the pool spans
+/// passage builder can resolve unit content parse-scoped even when the pool spans
 /// several active parses. First writer wins per unit: a unit belongs to exactly
 /// one active parse (the captured active set has one active parse per source and
 /// unit ids are parse-unique), so contention is not expected.

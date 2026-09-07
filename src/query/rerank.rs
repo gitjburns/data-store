@@ -15,7 +15,7 @@
 //!    the scoring call — mirroring the scheduler's colbert acquire
 //!    (`scheduler.rs`).
 //!
-//! 2. **Final reranker** scores the MaxSim top-N via the config-selected
+//! 2. **Final reranker** scores passages built from MaxSim-ranked units via the config-selected
 //!    reranker backend. The gate discipline is CALLER-SIDE and backend-aware:
 //!    the Local backend is a live accelerator call and MUST run under the
 //!    model-call gate; the Http backend is network I/O and MUST NOT hold the
@@ -27,8 +27,7 @@
 //! channel. The `multi_vector` retrieval channel is deferred post-MVP
 //! (2026-07-15 rescope); this stage is retained.
 //!
-//! DP1: every hot-plane read a stage performs (loading persisted matrices,
-//! resolving unit content) runs on the caller-supplied connection that is
+//! DP1: persisted-matrix reads run on the caller-supplied connection that is
 //! already inside the per-query read transaction. Stage functions never open a
 //! connection or begin a transaction of their own.
 
@@ -36,18 +35,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
-use tracing::info;
+use rusqlite::Connection;
+use tracing::{error, info};
 
 use crate::error::ApiError;
 use crate::inference::{
     ColbertCandidateScore, ColbertRuntime, RerankerBackend, RerankerCandidateInput,
     RerankerCandidateScore,
 };
-use crate::model::ContentType;
 use crate::projections::multivector;
 use crate::query::model::RetrievalHit;
+use crate::query::passages::PassageCandidate;
 use crate::state::{ExclusiveGate, acquire_model_call_gate_on};
 
 /// Model-call-gate identities for the two local model calls this stage may make.
@@ -78,16 +76,6 @@ pub(crate) struct RerankStageContext<'a> {
     pub(crate) query: &'a str,
     pub(crate) query_id: &'a str,
 }
-
-/// Ordered SELECT of one unit's stored fields for reranker content resolution.
-/// `content_units` is the canonical hot-plane unit store; the read is scoped to
-/// the active parse (§14) and keyed on `id` (the unit id). `content_type` and
-/// `body_json` drive the same text extraction the multi-vector builder uses, so
-/// the reranker sees the same evidence text the fabric embeds and annotates.
-const SELECT_UNIT_CONTENT_SQL: &str = "
-SELECT content_type, body_json
-FROM content_units
-WHERE parse_id = ?1 AND id = ?2";
 
 /// ColBERT MaxSim over the fused candidate pool.
 ///
@@ -180,11 +168,9 @@ pub(crate) fn run_maxsim_stage(
     Ok(scores)
 }
 
-/// Final reranker over the MaxSim top-N candidates.
-///
-/// Takes the MaxSim-ranked candidates (best first), keeps the top
-/// `reranker_candidate_pool_size`, resolves each unit's content parse-scoped on
-/// the caller's connection, and scores them via the config-selected backend.
+/// Score the caller-bounded passages, including their section headings, using
+/// the configured backend. Scores belong to complete passages; the representative
+/// anchor id is only the stable join key used to attach each returned score.
 ///
 /// Gate discipline (CALLER-SIDE, §1.5 pinned; mirrors the scheduler's local
 /// acquire). `uses_local_model_gate()` is a PREDICATE that returns `true` for
@@ -194,40 +180,26 @@ pub(crate) fn run_maxsim_stage(
 /// it is `false`, the caller must NEVER hold the gate across the HTTP request:
 /// the Http branch below does not acquire the gate at all, so no code path holds
 /// the gate across network I/O.
-///
-/// `parse_of_unit` maps each candidate unit id to its originating `parse_id` so
-/// content resolution stays parse-scoped even when the pool spans parses.
 pub(crate) fn run_reranker_stage(
     ctx: &RerankStageContext<'_>,
     reranker: &RerankerBackend,
-    maxsim_ranked: &[ColbertCandidateScore],
-    parse_of_unit: &BTreeMap<String, String>,
-    reranker_candidate_pool_size: usize,
+    passages: &[PassageCandidate],
 ) -> Result<Vec<RerankerCandidateScore>, ApiError> {
     let started_at = Instant::now();
 
-    // MaxSim already ranked best-first; keep the top-N for the final reranker.
-    let top: Vec<&ColbertCandidateScore> = maxsim_ranked
+    // Passage construction already resolved canonical content on the query snapshot.
+    // Do not reload the representative unit and accidentally score a fragment again.
+    let inputs: Vec<RerankerCandidateInput> = passages
         .iter()
-        .take(reranker_candidate_pool_size)
+        .map(|passage| RerankerCandidateInput {
+            unit_id: passage.anchor_unit_id.clone(),
+            content: passage.ranking_text(),
+        })
         .collect();
-
-    // Resolve each candidate's content parse-scoped on the caller's connection.
-    // A candidate whose parse is unknown or whose unit/text is missing cannot be
-    // scored and is dropped from the reranker input rather than silently sent as
-    // empty text.
-    let mut inputs = Vec::with_capacity(top.len());
-    for candidate in &top {
-        let Some(parse_id) = parse_of_unit.get(&candidate.unit_id) else {
-            continue;
-        };
-        if let Some(content) = resolve_unit_content(ctx.conn, parse_id, &candidate.unit_id)? {
-            inputs.push(RerankerCandidateInput {
-                unit_id: candidate.unit_id.clone(),
-                content,
-            });
-        }
-    }
+    let input_char_count: usize = inputs
+        .iter()
+        .map(|input| input.content.chars().count())
+        .sum();
 
     let uses_gate = reranker.uses_local_model_gate();
     info!(
@@ -236,28 +208,47 @@ pub(crate) fn run_reranker_stage(
         backend = reranker.kind(),
         uses_local_model_gate = uses_gate,
         candidate_count = inputs.len(),
-        reranker_candidate_pool_size,
+        input_char_count,
         "final reranker stage started"
     );
 
     // Gate boundary: acquire ONLY for the local accelerator path. The Http
     // branch performs no acquire, so the gate is never held across network I/O.
-    let scores = if uses_gate {
-        let permit = acquire_model_call_gate_on(
-            ctx.gate,
-            ctx.query_id,
-            RERANKER_MODEL_ROLE,
-            RERANKER_CALL_PURPOSE,
-        )?;
-        let scores = reranker.score_candidates(ctx.query, &inputs)?;
-        // `permit` drops here: the local reranker gate release follows scoring.
-        drop(permit);
-        scores
-    } else {
-        // Http backend: no gate. Holding the model-call gate across the HTTP
-        // request would serialize a network round-trip behind the exclusive
-        // local-accelerator gate — forbidden (§1.5 gate discipline).
-        reranker.score_candidates(ctx.query, &inputs)?
+    let scoring_result = (|| {
+        if uses_gate {
+            let permit = acquire_model_call_gate_on(
+                ctx.gate,
+                ctx.query_id,
+                RERANKER_MODEL_ROLE,
+                RERANKER_CALL_PURPOSE,
+            )?;
+            let scores = reranker.score_candidates(ctx.query, &inputs);
+            // `permit` drops here: the local reranker gate release follows scoring.
+            drop(permit);
+            scores
+        } else {
+            // Http backend: no gate. Holding the model-call gate across the HTTP
+            // request would serialize a network round-trip behind the exclusive
+            // local-accelerator gate — forbidden (§1.5 gate discipline).
+            reranker.score_candidates(ctx.query, &inputs)
+        }
+    })();
+    let scores = match scoring_result {
+        Ok(scores) => scores,
+        Err(source) => {
+            error!(
+                event = "rerank.final.failed",
+                query_id = ctx.query_id,
+                backend = reranker.kind(),
+                uses_local_model_gate = uses_gate,
+                candidate_count = inputs.len(),
+                input_char_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %source,
+                "passage reranking failed"
+            );
+            return Err(source);
+        }
     };
 
     info!(
@@ -267,7 +258,7 @@ pub(crate) fn run_reranker_stage(
         uses_local_model_gate = uses_gate,
         candidate_count = inputs.len(),
         scored = scores.len(),
-        reranker_candidate_pool_size,
+        input_char_count,
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "final reranker stage completed"
     );
@@ -306,94 +297,4 @@ fn capped_pool_units(
         }
     }
     by_parse
-}
-
-/// Resolve one candidate unit's evidence text, parse-scoped on the caller's
-/// connection. Returns `None` when the unit has no row (e.g. hard-deleted by hot
-/// cleanup between capture and this read) or carries no text-bearing body
-/// (container/structural types). The text field selected per `content_type`
-/// mirrors the multi-vector builder's `evidence_text`, so the reranker scores
-/// the same evidence text the fabric embeds.
-fn resolve_unit_content(
-    conn: &Connection,
-    parse_id: &str,
-    unit_id: &str,
-) -> Result<Option<String>, ApiError> {
-    let row = conn
-        .query_row(SELECT_UNIT_CONTENT_SQL, params![parse_id, unit_id], |row| {
-            Ok(UnitContentRow {
-                content_type: row.get::<_, String>(0)?,
-                body_json: row.get::<_, String>(1)?,
-            })
-        })
-        .optional()
-        .map_err(|source| ApiError::StorageOperation {
-            message: format!(
-                "failed to read content for unit {unit_id} of parse {parse_id}: {source}"
-            ),
-        })?;
-
-    let Some(row) = row else { return Ok(None) };
-
-    // Re-type the persisted content_type through the model enum: a value outside
-    // the schema CHECK set fails loudly here with the unit's identity rather than
-    // being silently mis-read.
-    let content_type: ContentType = serde_json::from_value(Value::String(row.content_type.clone()))
-        .map_err(|source| ApiError::StorageOperation {
-            message: format!(
-                "persisted content unit {unit_id} type {:?} is not a known variant: {source}",
-                row.content_type
-            ),
-        })?;
-    let body: Value =
-        serde_json::from_str(&row.body_json).map_err(|source| ApiError::StorageOperation {
-            message: format!("persisted body of content unit {unit_id} is unparseable: {source}"),
-        })?;
-
-    Ok(evidence_text(content_type, &body))
-}
-
-/// One unit's content-resolution row: the type discriminant and the JSON body
-/// the text field is selected from.
-struct UnitContentRow {
-    content_type: String,
-    body_json: String,
-}
-
-/// Extract the evidence-bearing text a unit contributes to reranking, returning
-/// `None` for container/structural types that carry no direct text.
-///
-/// MUST STAY IN STEP (four sites): this is one of four arm-for-arm mirrors of the
-/// per-`ContentType` evidence-text extraction. The others are
-/// `crate::projections::multivector::evidence_text` (`src/projections/multivector.rs`),
-/// `crate::assembly::evidence::evidence_text` (`src/assembly/evidence.rs`), and
-/// `crate::annotations::producer::evidence_text` (`src/annotations/producer.rs`).
-/// All four select the same field per type — including the `TableCell` fallback
-/// to `normalizedText` — so the reranker, the embedded plane, the assembled pack,
-/// and the annotation producers agree on a unit's text. A content type gaining or
-/// losing a text-bearing field must change ALL FOUR together. The sites differ
-/// only in input shape (`(content_type, body)` here vs. a `&Unit`), not in the
-/// text they resolve.
-fn evidence_text(content_type: ContentType, body: &Value) -> Option<String> {
-    match content_type {
-        ContentType::TextBlock | ContentType::Caption => body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::TableCell => body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .or_else(|| body.get("normalizedText").and_then(|value| value.as_str()))
-            .map(str::to_string),
-        ContentType::CodeBlock => body
-            .get("code")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::Page
-        | ContentType::TextSection
-        | ContentType::Table
-        | ContentType::TableRow
-        | ContentType::Figure
-        | ContentType::ImageRegion => None,
-    }
 }

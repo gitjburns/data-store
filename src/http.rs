@@ -23,6 +23,7 @@ use crate::model::{
 };
 use crate::query::execute::{QueryPipelineOutcome, QueryRequestContext, execute_query};
 use crate::query::model::RetrievalHit;
+use crate::query::passages::{PassageCandidate, SearchResult};
 use crate::query::profile::{ScopeInput, active_profile, resolve_scope};
 use crate::query::request::{QueryRequest, ValidatedQuery};
 
@@ -259,7 +260,9 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryResponse {
-    /// The §26 EvidencePack — the query's primary result.
+    /// Ranked, cited passages ready for presentation by any client.
+    results: Vec<SearchResult>,
+    /// Canonical records underlying the selected passages, for inspection.
     evidence_pack: EvidencePack,
     /// Raw stage diagnostics, present only when the request set `debug` (R6).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,11 +277,15 @@ struct QueryResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryDiagnostics {
+    /// Individual eligible channel records before rank fusion.
+    channel_hits: Vec<RetrievalHit>,
+    /// Passage text and membership offered to the final reranker.
+    passage_candidates: Vec<PassageCandidate>,
     /// The fused dense+lexical+graph candidate pool the rerankers scored over.
     fused_pool: Vec<RetrievalHit>,
     /// ColBERT MaxSim scores over the fused pool, best-first.
     maxsim: Vec<MaxsimScoreView>,
-    /// Final reranker scores over the MaxSim top-N, best-first.
+    /// Final passage reranker scores, keyed by representative anchor, best-first.
     reranked: Vec<RerankerScoreView>,
     /// Per-stage wall-clock latencies (milliseconds).
     latencies: StageLatencyView,
@@ -318,30 +325,30 @@ struct StageLatencyView {
     dense_lexical_fusion_ms: u64,
     graph_ms: u64,
     maxsim_ms: u64,
+    passage_build_ms: u64,
     rerank_ms: u64,
     assembly_ms: u64,
     snapshot_held_ms: u64,
 }
 
 impl QueryDiagnostics {
-    /// Project a pipeline outcome's raw stage outputs into the debug diagnostics
-    /// DTO. Consumes the outcome's raw pools (moved, not cloned) since the pack
-    /// has already been separated out for the primary response.
-    fn from_outcome(outcome: QueryPipelineOutcome) -> Self {
+    /// Copy stage records only when debug output was requested, allowing the
+    /// larger canonical evidence pack to move into the response without cloning.
+    fn from_outcome(outcome: &QueryPipelineOutcome) -> Self {
         let maxsim = outcome
             .maxsim
-            .into_iter()
-            .map(|score: ColbertCandidateScore| MaxsimScoreView {
-                unit_id: score.unit_id,
+            .iter()
+            .map(|score: &ColbertCandidateScore| MaxsimScoreView {
+                unit_id: score.unit_id.clone(),
                 score: score.score,
                 rank: score.rank,
             })
             .collect();
         let reranked = outcome
             .reranked
-            .into_iter()
-            .map(|score: RerankerCandidateScore| RerankerScoreView {
-                unit_id: score.unit_id,
+            .iter()
+            .map(|score: &RerankerCandidateScore| RerankerScoreView {
+                unit_id: score.unit_id.clone(),
                 score: score.score,
                 rank: score.rank,
                 logit: score.logit,
@@ -355,12 +362,15 @@ impl QueryDiagnostics {
             dense_lexical_fusion_ms: outcome.latencies.dense_lexical_fusion_ms,
             graph_ms: outcome.latencies.graph_ms,
             maxsim_ms: outcome.latencies.maxsim_ms,
+            passage_build_ms: outcome.latencies.passage_build_ms,
             rerank_ms: outcome.latencies.rerank_ms,
             assembly_ms: outcome.latencies.assembly_ms,
             snapshot_held_ms: outcome.latencies.snapshot_held_ms,
         };
         Self {
-            fused_pool: outcome.fused_pool,
+            channel_hits: outcome.channel_hits.clone(),
+            passage_candidates: outcome.passage_candidates.clone(),
+            fused_pool: outcome.fused_pool.clone(),
             maxsim,
             reranked,
             latencies,
@@ -469,9 +479,8 @@ async fn post_query(
     // Split the pack out for the primary response; attach raw diagnostics only
     // under `debug` (R6). `queryExecutionRecordId` is omitted (R1 — see
     // `QueryResponse`).
-    let evidence_pack = outcome.evidence_pack.clone();
     let diagnostics = if debug_requested {
-        Some(QueryDiagnostics::from_outcome(outcome))
+        Some(QueryDiagnostics::from_outcome(&outcome))
     } else {
         None
     };
@@ -481,14 +490,16 @@ async fn post_query(
         route,
         stage = "result_ready",
         status = 200_u16,
-        evidence_units = evidence_pack.evidence_units.len(),
+        evidence_units = outcome.evidence_pack.evidence_units.len(),
+        results = outcome.results.len(),
         debug_requested,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "HTTP route result ready"
     );
 
     Ok(Json(QueryResponse {
-        evidence_pack,
+        results: outcome.results,
+        evidence_pack: outcome.evidence_pack,
         diagnostics,
     }))
 }

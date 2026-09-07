@@ -551,38 +551,30 @@ there is no separate scope enforcement pass. Each captured parse carries its
 dense plane as an `Arc<DensePlane>` clone taken under the same snapshot.
 
 ```
-open read-only tx  ─▶  capture scope-filtered active set (+ dense Arc clones)  [DP1]
-       │                        │
-       │            reject_if_active probe per captured source (cutover barrier)
-       ▼
- dense channel ┐
- lexical channel┤─ chunk→unit resolution ─ RRF fusion ─▶ fused (dense+lexical) pool
-                                                              │
- graph channel (D9: entity-name match, one semantic hop,     │  appended
-  tiered order) ────────────────────────────────────────────▶│  downstream
-                                                              ▼
-                                        concatenated fused_pool
-                                                              │
-                                   ColBERT MaxSim over the pool (persisted matrices)
-                                                              │
-                                   final reranker over the MaxSim top-N
-                                                              │
-                              context assembly ─▶ EvidencePack (inside the read tx)
+open read-only transaction → capture scoped active parses → cutover-barrier probe
+       ↓
+dense + lexical chunks → canonical units ┐
+graph entity matches + one semantic hop ─┴→ rank fusion (100 units)
+       ↓
+ColBERT MaxSim (persisted unit matrices)
+       ↓
+bounded same-section passages → final passage reranker → requested result count
+       ↓
+citations + full canonical constituents → { results, evidencePack, diagnostics? }
 ```
 
 ### Stages
 
 - **Channels** (`src/query/channels.rs`). The **dense** and **lexical** channels
-  generate chunk-grained candidates, resolve chunk → unit, and are **fused by
-  RRF** into a unit-grained pool (the fused hit is tagged `RetrievalChannel::Dense`
-  as the fused pool's channel). The **graph** channel is a **separate channel**
-  (D9): entity-name match of query text against stored entity-annotation names,
+  generate chunk-grained candidates and resolve chunk → unit, excluding units
+  explicitly marked as headers or footers. The **graph** channel (D9) performs
+  entity-name matching of query text against stored entity-annotation names and
   one semantic relational hop over
-  `graph_entity_mentions`/`graph_entity_edges` (structural UnitRelationships are
-  never walked at query time), tiered deterministically (multi-entity units,
+  `graph_entity_mentions`/`graph_entity_edges`, tiered deterministically (multi-entity units,
   then direct mentions, then one-hop related). No LLM call is made in the query
-  path. The graph hits are **appended downstream** to the RRF-fused pool to form
-  the candidate pool.
+  path. Each channel supplies up to 100 candidates independently of the requested
+  result count. **RRF across all three channels** deduplicates canonical units
+  into a 100-unit pool before ColBERT scoring.
 
   Entry matching is **policy-threaded** (the D9 amendment). `graph_channel`
   receives the `EntityMatchPolicy` (Section 3.2), threaded from startup through
@@ -604,49 +596,54 @@ open read-only tx  ─▶  capture scope-filtered active set (+ dense Arc clones
   pool** from persisted C6e matrices; the loader decodes stored blobs and never
   re-embeds. This is a rerank/scoring stage, not candidate generation — see the
   deferred `multi_vector` channel in Section 9.
-- **Reranker** (`src/query/rerank.rs`). Scores the MaxSim top-N via the
+- **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked units,
+  construct same-section passages in canonical reading order, bounded to 512
+  ColBERT tokens and 64 contributing units. Merge overlapping passages when they
+  fit; preserve structured-content boundaries. Oversized single-unit prefixes
+  carry `truncated: true`, while raw evidence retains the full canonical body.
+- **Reranker** (`src/query/rerank.rs`). Scores up to 30 passages, or the requested
+  count if larger (maximum 100), with their section headings via the
   config-selected backend. Model-call gating is **caller-side and
   backend-aware**: the shared model-call gate is acquired only when a local
   accelerator-backed model is invoked; a remote HTTP reranker is not gated behind
   the local runtime lock.
-- **Assembly** (`src/assembly/`). The reranked anchors are expanded into an
-  `EvidencePack` of canonical ContentUnits, governed by the **versioned,
-  self-hashed `AssemblyPolicy`** (`src/assembly/policy.rs`) — one of the three
-  sealed policy documents below. Assembly runs inside the read transaction; a
-  `ContextAssemblyTrace` is embedded in every pack.
+- **Final results and assembly** (`src/query/passages.rs`, `src/assembly/`).
+  Apply the requested passage count (default 10, maximum 100), resolve source
+  locations and physical PDF page references, and retain exactly the selected
+  canonical constituents in `evidencePack`. AssemblyPolicy v2 adds no neighbors
+  or containers; raw safety-limit failures are errors. Citation and evidence
+  reads share the query transaction, and every pack includes an assembly trace.
 
 ### Sealed policy documents
 
-Every tuning value the pipeline consumes comes from one of **three
-compile-sealed, versioned, self-hashed policy documents** — one shared
-mechanism, named as a family in `src/assembly/policy.rs`. Each is sealed once
-from build-time constants, self-hashes over its canonical serialization with
-its hash field excluded, and is read through an `active_*()` accessor — so its
-identity (id + version + hash) is fixed and auditable across processes, and a
-future document version changes behavior without touching any consumer.
+Three compile-sealed policy documents capture retrieval, evidence-retention,
+and annotation requirements. Each has a stable version and self-hash over its
+canonical serialization, excluding the hash field, and an `active_*()` accessor.
 
 - The **`RetrievalProfile`** (`src/query/profile.rs`, `active_profile` /
-  `seal_mvp_profile`) is the source of EVERY query-tuning value: the RRF
-  fusion constant (`rrf_k = 60`), the per-channel candidate overfetch
-  multiplier (`3`), the MaxSim candidate pool size (`100`), the reranker
-  candidate pool size (`10`), and the D9 graph hop budget (`1`). These are
+  `seal_mvp_profile`) supplies the RRF
+  fusion constant (`rrf_k = 60`), per-channel and MaxSim candidate pool sizes
+  (`100`), the reranker
+  passage pool size (`30`, raised to the requested count up to `100`), and the D9 graph hop budget (`1`). These are
   deliberately NOT config keys: the D3 ruling moved
   every retrieval knob out of operational config into this hashed document,
   because a mutable config surface cannot guarantee a stable, auditable
   retrieval identity.
-- The **`AssemblyPolicy`** (`src/assembly/policy.rs`) governs evidence-pack
-  expansion — the Assembly stage above.
+- The **`AssemblyPolicy`** (`src/assembly/policy.rs`) records selected-passage
+  retention and raw safety ceilings — the Assembly stage above.
 - The **§21.4 required-annotation-set policy** (`src/annotations/policy.rs`,
   `RequiredAnnotationSetPolicy`) rules which annotation types must be fresh
   BEFORE activation (empty in the MVP document: nothing blocks activation)
   and which build AFTER activation with visible freshness; the annotation
   worker's discovery reads it (Section 3.1).
 
-The response is the EvidencePack as JSON (`POST /query`, §34.1).
+The JSON response contains ranked `results` and `evidencePack`, plus `diagnostics`
+only when requested with `debug: true` (`POST /query`).
 `queryExecutionRecordId` is **omitted** — a recorded narrowing pending the QER
 audit tier (Section 9), addable additively. `QueryStageLatencies` records
-per-stage timings, including the wall-clock duration the WAL read snapshot was
-held.
+per-stage timings, including passage construction and the duration the WAL read
+snapshot was held. Diagnostics also retain `channelHits`, `fusedPool`, `maxsim`,
+`passageCandidates`, and `reranked` stage outputs.
 
 ## 7. Health and admission internals
 

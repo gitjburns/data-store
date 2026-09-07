@@ -80,6 +80,8 @@ enum Command {
     /// stay curl's job and this field is never itself JSON.
     Query {
         query_text: String,
+        /// Raw output bypasses presentation decoding so additive server fields survive.
+        raw: bool,
     },
     IngestSource {
         source_system: String,
@@ -180,6 +182,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_usage: "query <queryText...>",
         cli_usage: Some("data-store [--config <path>] --query <queryText...>"),
         build: build_query_command,
+    },
+    CommandSpec {
+        repl_name: "query-raw",
+        repl_aliases: &[],
+        cli_flag: Some("--query-raw"),
+        cli_aliases: &[],
+        repl_usage: "query-raw <queryText...> (complete response JSON)",
+        cli_usage: Some("data-store [--config <path>] --query-raw <queryText...>"),
+        build: build_raw_query_command,
     },
     CommandSpec {
         repl_name: "ingest",
@@ -468,108 +479,42 @@ impl OperationStatus {
 //
 // Every response mirror below is `Deserialize` WITHOUT `deny_unknown_fields`: a
 // client must tolerate additive server fields (a new response field must never
-// break decoding). Rich nested shapes the operator rarely needs field-by-field
-// (`body`, the full conformance report, the assembly trace, per-hit pools) are
-// kept as `serde_json::Value` so they survive losslessly and the renderer can
-// print them in full rather than silently narrowing them (rendering honesty).
+// break decoding). Read renderers retain rich nested shapes as JSON. Query
+// presentation uses only passage fields; `query-raw` prints the original JSON
+// before decoding so every diagnostic and additive field remains accessible.
 
-/// Client mirror of the §34.1 `POST /query` response: the §26 EvidencePack plus
-/// optional debug diagnostics (present only when the request set `debug`).
+/// Presentation fields from `POST /query`; raw output bypasses this mirror.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryResponse {
-    evidence_pack: EvidencePackView,
-    #[serde(default)]
-    diagnostics: Option<QueryDiagnostics>,
+    evidence_pack: QueryContextView,
+    results: Vec<QueryResultView>,
 }
 
-/// Client mirror of the operator-salient §26 EvidencePack fields. The rich
-/// `relationships`/`annotations`/`assemblyTrace` shapes are kept as raw JSON so
-/// nothing is dropped; the renderer summarizes the units and keeps the full
-/// trace reachable.
+/// The authoritative query text accompanying the ranked passages.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EvidencePackView {
-    query_id: String,
+struct QueryContextView {
     query_text: String,
-    evidence_units: Vec<EvidenceUnitView>,
-    #[serde(default)]
-    relationships: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    annotations: Option<Vec<serde_json::Value>>,
-    assembly_trace: serde_json::Value,
-    created_at: String,
 }
 
-/// Client mirror of one §26 EvidenceUnit. `body` is the arbitrary §18 payload,
-/// kept as raw JSON; `textProjection` is the ranking/answering plain text the
-/// renderer excerpts.
+/// Server-assembled passage and citations, rendered without regrouping or clipping.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EvidenceUnitView {
-    unit_id: String,
-    source_id: String,
-    parse_id: String,
-    content_type: String,
-    body: serde_json::Value,
-    #[serde(default)]
-    text_projection: Option<String>,
-    #[serde(default)]
-    locators: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    score: Option<f64>,
-    #[serde(default)]
-    reasons: Option<Vec<String>>,
+struct QueryResultView {
+    text: String,
+    source_locations: Vec<QueryLocationView>,
+    section_path: Vec<String>,
+    page_numbers: Vec<u64>,
+    truncated: bool,
 }
 
-/// Client mirror of the §24.3 debug diagnostics block. The fused candidate pool
-/// is kept as raw JSON (a rich §24.4 hit shape the renderer counts and does not
-/// narrow); the ranked views and latencies are typed for a readable summary.
+/// Citation status prevents a deleted or inaccessible source appearing current.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct QueryDiagnostics {
-    fused_pool: Vec<serde_json::Value>,
-    maxsim: Vec<RankedScore>,
-    reranked: Vec<RerankedScore>,
-    latencies: StageLatencies,
-}
-
-/// Client mirror of one ranked MaxSim score in the debug diagnostics.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RankedScore {
-    unit_id: String,
-    score: f64,
-    rank: u64,
-}
-
-/// Client mirror of one final-reranker score; `logit`/`tokenCount` are present
-/// only when the backend supplied them.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RerankedScore {
-    unit_id: String,
-    score: f64,
-    rank: u64,
-    #[serde(default)]
-    logit: Option<f64>,
-    #[serde(default)]
-    token_count: Option<u64>,
-}
-
-/// Client mirror of the §24 per-stage wall-clock latencies (milliseconds).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StageLatencies {
-    open_transaction_ms: u64,
-    capture_ms: u64,
-    query_embed_ms: u64,
-    dense_lexical_fusion_ms: u64,
-    graph_ms: u64,
-    maxsim_ms: u64,
-    rerank_ms: u64,
-    assembly_ms: u64,
-    snapshot_held_ms: u64,
+struct QueryLocationView {
+    native_uri: String,
+    status: String,
 }
 
 /// Client mirror of the §13.4 `GET /parses?status=held` envelope.
@@ -1032,6 +977,18 @@ fn build_query_command(args: &[String]) -> Result<Command> {
     }
     Ok(Command::Query {
         query_text: args.join(" "),
+        raw: false,
+    })
+}
+
+/// Use the same bare query-text syntax while requesting the complete response display.
+fn build_raw_query_command(args: &[String]) -> Result<Command> {
+    if args.is_empty() {
+        bail!("usage: query-raw <queryText...>");
+    }
+    Ok(Command::Query {
+        query_text: args.join(" "),
+        raw: true,
     })
 }
 
@@ -1414,18 +1371,21 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
             let health: HealthResponse = get_public(context, HEALTH_PATH)?;
             render_health(health);
         }
-        Command::Query { query_text } => {
+        Command::Query { query_text, raw } => {
             // The client owns the request envelope: the operator supplies bare
             // query text and we construct `{"queryText": ...}` with serde_json so
             // the text is JSON-escaped correctly (never string-formatted). Raw
             // envelopes are curl's job, so there is no JSON-passthrough path here.
             let body = serde_json::json!({ "queryText": query_text });
             let value = post_public_json(context, "/query", &body)?;
-            // Decode the raw transport value into the typed mirror at the dispatch
-            // seam so the transport layer stays byte-unchanged; a decode failure
-            // still surfaces the full payload rather than dropping it.
-            let response: QueryResponse = decode_value("/query", value)?;
-            render_query(&response);
+            if raw {
+                // Preserve every response field, including future fields that the
+                // presentation mirror does not know about.
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let response: QueryResponse = decode_value("/query", value)?;
+                render_query(&response);
+            }
         }
         Command::IngestSource {
             source_system,
@@ -1834,11 +1794,9 @@ fn format_error_detail(error: &ErrorDetail) -> String {
 //
 // `render_health` and `render_operation` are FINAL for the transport's terminal
 // reporting — the latter carries the mandatory Operation-succeeded-vs-parse-
-// outcome rule. The remaining renderers are typed per-route DTO renderers: each
-// summarizes the operator-salient fields and keeps the rich/nested payload
-// reachable in full (via `print_labeled_json`) so no field is silently dropped
-// (rendering honesty). `excerpt_text` bounds long text projections; the full
-// content stays visible because the unit `body` is always rendered alongside.
+// outcome rule. Read renderers keep rich payloads alongside their summaries.
+// Query rendering presents the server's passages; `query-raw` exposes the full
+// response separately without applying the presentation mirror.
 
 /// Print service readiness and component diagnostics in a compact form. FINAL —
 /// `GET /v1/health` has a stable typed mirror.
@@ -1941,109 +1899,42 @@ fn operation_status_label(status: OperationStatus) -> &'static str {
     }
 }
 
-// Character budget for excerpting long text projections in the query result.
-// Bounds terminal output; the full text stays reachable because `body` is always
-// rendered in full below the excerpt (nothing is hidden, only summarized).
-const TEXT_EXCERPT_CHARS: usize = 800;
-
-/// Render the §34.1 query result: the EvidencePack's units human-readably, with
-/// the full pack detail (body, relationships, annotations, assembly trace) kept
-/// reachable as pretty JSON, plus the optional debug diagnostics summary. The
-/// per-unit `body` and the trace are rendered IN FULL so the rich pack is never
-/// silently narrowed (rendering honesty); the summary supplements, not replaces.
+/// Present ranked passages once, with server-provided citations in the same order.
+/// Detailed evidence and diagnostics remain available through `query-raw`.
 fn render_query(response: &QueryResponse) {
-    let pack = &response.evidence_pack;
-    println!("Query: {}", pack.query_id);
-    println!("  text: {}", pack.query_text);
-    println!("  assembledAt: {}", pack.created_at);
-    println!("  evidenceUnits: {}", pack.evidence_units.len());
-    for (position, unit) in pack.evidence_units.iter().enumerate() {
-        println!(
-            "  [{}] unit {} ({})",
-            position, unit.unit_id, unit.content_type
-        );
-        println!("      source: {} parse: {}", unit.source_id, unit.parse_id);
-        if let Some(score) = unit.score {
-            println!("      score: {score}");
+    println!("Query: {}", response.evidence_pack.query_text);
+    if response.results.is_empty() {
+        println!("No results.");
+        return;
+    }
+    println!("Results: {}", response.results.len());
+    for (position, result) in response.results.iter().enumerate() {
+        println!();
+        println!("[{}]", position + 1);
+        if result.source_locations.is_empty() {
+            println!("  Source location unavailable");
         }
-        if let Some(reasons) = &unit.reasons
-            && !reasons.is_empty()
-        {
-            println!("      reasons: {}", reasons.join(", "));
-        }
-        if let Some(text) = &unit.text_projection {
-            println!("      text: {}", excerpt_text(text, TEXT_EXCERPT_CHARS));
-        }
-        if let Some(locators) = &unit.locators {
-            println!("      locators: {}", locators.len());
-        }
-        // The §18 body is arbitrary JSON; render it in full so nothing is lost.
-        print_labeled_json("      body:", &unit.body);
-    }
-    if let Some(relationships) = &pack.relationships {
-        println!("  relationships: {}", relationships.len());
-    }
-    if let Some(annotations) = &pack.annotations {
-        println!("  annotations: {}", annotations.len());
-    }
-    // The §27 assembly trace makes selection auditable; keep it fully reachable.
-    print_labeled_json("  assemblyTrace:", &pack.assembly_trace);
-    if let Some(diagnostics) = &response.diagnostics {
-        render_query_diagnostics(diagnostics);
-    }
-}
-
-/// Render the §24.3 debug diagnostics: per-stage latencies and the ranked score
-/// tables, with the fused candidate pool counted (its rich §24.4 hit shape stays
-/// reachable in full rather than being narrowed to a summary line only).
-fn render_query_diagnostics(diagnostics: &QueryDiagnostics) {
-    println!("  diagnostics:");
-    let latencies = &diagnostics.latencies;
-    println!("    latencies (ms):");
-    println!("      openTransaction: {}", latencies.open_transaction_ms);
-    println!("      capture: {}", latencies.capture_ms);
-    println!("      queryEmbed: {}", latencies.query_embed_ms);
-    println!(
-        "      denseLexicalFusion: {}",
-        latencies.dense_lexical_fusion_ms
-    );
-    println!("      graph: {}", latencies.graph_ms);
-    println!("      maxsim: {}", latencies.maxsim_ms);
-    println!("      rerank: {}", latencies.rerank_ms);
-    println!("      assembly: {}", latencies.assembly_ms);
-    println!("      snapshotHeld: {}", latencies.snapshot_held_ms);
-    println!("    fusedPool: {} candidates", diagnostics.fused_pool.len());
-    if !diagnostics.fused_pool.is_empty() {
-        // The pool carries the rich §24.4 hit shape; render it in full so the
-        // debug surface is lossless, not just a count.
-        print_labeled_json(
-            "    fusedPoolDetail:",
-            &serde_json::json!(diagnostics.fused_pool),
-        );
-    }
-    if !diagnostics.maxsim.is_empty() {
-        println!("    maxsim:");
-        for score in &diagnostics.maxsim {
-            println!(
-                "      #{} unit {} score {}",
-                score.rank, score.unit_id, score.score
-            );
-        }
-    }
-    if !diagnostics.reranked.is_empty() {
-        println!("    reranked:");
-        for score in &diagnostics.reranked {
-            let mut line = format!(
-                "      #{} unit {} score {}",
-                score.rank, score.unit_id, score.score
-            );
-            if let Some(logit) = score.logit {
-                line.push_str(&format!(" logit {logit}"));
+        for location in &result.source_locations {
+            if location.status == "current" {
+                println!("  {}", location.native_uri);
+            } else {
+                println!("  {} ({})", location.native_uri, location.status);
             }
-            if let Some(token_count) = score.token_count {
-                line.push_str(&format!(" tokens {token_count}"));
-            }
-            println!("{line}");
+        }
+        if !result.section_path.is_empty() {
+            println!("  {}", result.section_path.join(" › "));
+        }
+        if result.page_numbers.is_empty() {
+            println!("  Page information unavailable");
+        } else {
+            // These are physical PDF pages; never imply they are printed labels.
+            let pages: Vec<String> = result.page_numbers.iter().map(u64::to_string).collect();
+            println!("  PDF pages: {}", pages.join(", "));
+        }
+        println!();
+        println!("{}", result.text);
+        if result.truncated {
+            println!("[Passage truncated]");
         }
     }
 }
@@ -2323,18 +2214,6 @@ fn render_sync_status(status: &SyncStatusView) {
     if let Some(last_success_at) = &status.last_success_at {
         println!("  lastSuccessAt: {last_success_at}");
     }
-}
-
-/// Excerpt long text to a character budget, appending an ellipsis when clipped,
-/// so a long text projection does not flood the terminal. The excerpt is a
-/// summary only — the full unit `body` is always rendered alongside it, so no
-/// content is hidden by the clip.
-fn excerpt_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max_chars).collect();
-    format!("{clipped}…")
 }
 
 /// Print a labeled block of pretty-printed JSON so rich/nested payloads are

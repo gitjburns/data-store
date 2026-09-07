@@ -13,6 +13,7 @@
 pub(crate) mod channels; // C7b: dense/lexical/graph candidate generation + RRF fusion.
 pub(crate) mod execute; // C7d: the synchronous execute_query pipeline.
 pub(crate) mod model; // C7s: shared §24 contract types (this package).
+pub(crate) mod passages; // Canonical passage construction before final reranking.
 pub(crate) mod profile; // C7a: sealed RetrievalProfile + scope resolution.
 pub(crate) mod request; // C8d-1: §24.3 QueryRequest MVP envelope + validation.
 pub(crate) mod rerank; // C7c: ColBERT MaxSim over the fused pool + final reranker.

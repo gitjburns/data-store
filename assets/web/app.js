@@ -458,7 +458,7 @@ const queryForm = {
 
 /**
  * Outcome of the most recent submission: `idle` (never run), `running`,
- * `done` (`response` holds the parsed `{ evidencePack, diagnostics? }` body), or
+ * `done` (`response` retains the complete parsed body, including results), or
  * `error` (`error` holds an ApiError from the service or a local validation
  * Error). Updated even when the user has navigated away, so returning to the
  * console shows the finished result.
@@ -558,7 +558,7 @@ function buildQueryRequest(state) {
   const cap = String(state.maxFinalEvidenceUnits || '').trim();
   if (cap !== '') {
     if (!/^\d+$/.test(cap) || Number(cap) < 1) {
-      throw new Error('maxFinalEvidenceUnits must be a positive integer.');
+      throw new Error('Maximum results must be a positive integer.');
     }
     request.retrievalPolicy = { maxFinalEvidenceUnits: Number(cap) };
   }
@@ -608,7 +608,7 @@ function queryFormMarkup() {
     <fieldset>
       <legend>Policy</legend>
       <div class="field-row">
-        <label for="query-max-units">maxFinalEvidenceUnits</label>
+        <label for="query-max-units">Maximum results</label>
         <input id="query-max-units" name="maxFinalEvidenceUnits" type="number" min="1" step="1"
           placeholder="profile default" value="${esc(queryForm.maxFinalEvidenceUnits)}"${disabled} />
       </div>
@@ -637,9 +637,9 @@ function checkboxMarkup(name, label, on, running) {
 }
 
 /**
- * The three result panels for the current run state. Nothing is rendered before
- * the first submission; the trace and diagnostics panels render only when the
- * response actually carried them.
+ * Show server-ranked passages by default, retaining the original response and
+ * detailed evidence behind disclosure. Missing results is a protocol error,
+ * never a reason to reconstruct passages from the evidence pack in the browser.
  */
 function queryResultMarkup() {
   if (queryRun.status === 'running') return loadingMarkup('Running query');
@@ -647,11 +647,44 @@ function queryResultMarkup() {
   if (queryRun.status !== 'done') return '';
   const body = queryRun.response;
   const pack = body && typeof body === 'object' ? body.evidencePack : null;
-  if (!pack || typeof pack !== 'object') {
-    return panel('Response', jsonTree(body, 'response'), 'panel-error');
+  if (!pack || typeof pack !== 'object' || !Array.isArray(body.results)) {
+    return panel('Response', '<p>Query response is missing results or evidence pack.</p>' + jsonTree(body, 'response'), 'panel-error');
   }
   const diagnostics = body && typeof body === 'object' ? body.diagnostics : null;
-  return evidencePackMarkup(pack) + assemblyTraceMarkup(pack.assemblyTrace) + debugPanelMarkup(diagnostics);
+  const results = body.results.length === 0
+    ? '<p class="absent">No results.</p>'
+    : body.results.map((result, index) => queryPassageMarkup(result, index + 1)).join('');
+  const details = `<details class="evidence-detail">
+    <summary>Evidence and diagnostics</summary>
+    ${evidencePackMarkup(pack)}${assemblyTraceMarkup(pack.assemblyTrace)}${debugPanelMarkup(diagnostics)}
+    ${jsonTree(body, 'Complete response JSON', 0)}
+  </details>`;
+  return panel(`Results (${body.results.length})`, `<p>${esc(pack.queryText)}</p>${results}${details}`);
+}
+
+/** Render one complete server passage; citation metadata never becomes a separate hit. */
+function queryPassageMarkup(result, rank) {
+  const locations = Array.isArray(result.sourceLocations) ? result.sourceLocations : [];
+  const source = locations.length === 0
+    ? '<div class="absent">Source location unavailable</div>'
+    : locations.map((location) => {
+      // Display locations as text: local paths need not be browser-accessible URLs.
+      const status = location.status === 'current' ? '' : ` (${esc(location.status)})`;
+      return `<div>${esc(location.nativeUri)}${status}</div>`;
+    }).join('');
+  const section = Array.isArray(result.sectionPath) && result.sectionPath.length > 0
+    ? `<div>${result.sectionPath.map(esc).join(' › ')}</div>`
+    : '';
+  // Physical PDF page numbers are authoritative; printed page labels can differ.
+  const pages = Array.isArray(result.pageNumbers) && result.pageNumbers.length > 0
+    ? `<div>PDF pages: ${result.pageNumbers.map(esc).join(', ')}</div>`
+    : '<div class="absent">Page information unavailable</div>';
+  const truncated = result.truncated === true ? '<p class="field-note">[Passage truncated]</p>' : '';
+  return `<article class="evidence">
+    <div class="evidence-head"><span class="evidence-rank">#${esc(rank)}</span>${source}</div>
+    ${section}${pages}
+    <div class="evidence-text">${esc(result.text)}</div>${truncated}
+  </article>`;
 }
 
 /**
@@ -688,23 +721,33 @@ function evidencePackMarkup(pack) {
 }
 
 /**
- * One evidence unit: simple-first head (rank, role, score, text projection) with
- * full provenance behind a <details> so the pack stays readable. Every id in the
- * block is a navigation link.
+ * One evidence unit: simple-first head (rank, role/content-type/reason badges,
+ * score) over the text projection — or, for projection-less container units, a
+ * labelled body-derived summary — with full provenance behind a <details> so
+ * the pack stays readable. Every id in the block is a navigation link.
  */
 function evidenceUnitMarkup(unit, rank) {
   const anchor = isAnchorUnit(unit);
   const role = anchor ? 'anchor' : 'context';
   const scoreCell = anchor ? `<span class="evidence-score">score ${formatScore(unit.score)}</span>` : '';
+  // Context units badge their inclusion reasons in the head: "why is this card
+  // here" must be visible without expanding Provenance. Anchors skip the
+  // reason badges — the role badge already says "anchor".
+  const reasonBadges =
+    !anchor && Array.isArray(unit.reasons)
+      ? unit.reasons.map((reason) => badge(reason, 'reason')).join('')
+      : '';
   const head = `<div class="evidence-head">
     <span class="evidence-rank">#${esc(rank)}</span>
     ${badge(role, role)}
+    ${unit.contentType ? badge(unit.contentType, 'content-type') : ''}
+    ${reasonBadges}
     ${scoreCell}
     <span class="evidence-ids">${unitLink(unit.unitId)} · ${sourceLink(unit.sourceId)}</span>
   </div>`;
   const projection =
     unit.textProjection === null || unit.textProjection === undefined
-      ? '<p class="absent">No text projection.</p>'
+      ? derivedBodyMarkup(unit)
       : `<div class="evidence-text">${esc(unit.textProjection)}</div>`;
   const reasons =
     Array.isArray(unit.reasons) && unit.reasons.length > 0
@@ -725,6 +768,90 @@ function evidenceUnitMarkup(unit, rank) {
     ${provenance}${locators}${body}
   </details>`;
   return `<article class="evidence ${role}">${head}${projection}${detail}</article>`;
+}
+
+/**
+ * Stand-in shown where the text projection would render, for units that have
+ * none (the container/structural content types). Everything shown is read from
+ * the unit's own `body` in the response — a derived display supplementing the
+ * raw body JSON still in Provenance, never replacing it — and the block is
+ * labelled "derived from body" so it cannot be mistaken for server-provided
+ * text. A body with none of the expected fields falls back to an absence line
+ * that at least names the content type.
+ */
+function derivedBodyMarkup(unit) {
+  const body = unit.body;
+  const parts =
+    body !== null && typeof body === 'object' && !Array.isArray(body)
+      ? derivedBodyParts(unit.contentType, body)
+      : [];
+  if (parts.length === 0) {
+    return `<p class="absent">${esc(unit.contentType || 'unit')} — no text content.</p>`;
+  }
+  return `<div class="evidence-derived"><span class="derived-label">derived from body</span>${parts.join('')}</div>`;
+}
+
+/**
+ * Per-content-type extraction behind derivedBodyMarkup(): pick the
+ * human-useful fields out of a §18 body (PROTOCOL.md body shapes). Types with
+ * a server-side text projection never reach this switch in practice; they and
+ * unknown types return no parts, triggering the caller's fallback line.
+ */
+function derivedBodyParts(contentType, body) {
+  const parts = [];
+  switch (contentType) {
+    case 'text_section':
+      // sectionPath is the full heading ancestry and subsumes the bare
+      // heading, so prefer it when present.
+      if (Array.isArray(body.sectionPath) && body.sectionPath.length > 0) {
+        parts.push(derivedLine('section', body.sectionPath.map(esc).join(' › ')));
+      } else if (body.headingText) {
+        const level = body.headingLevel === undefined ? '' : ` (h${esc(body.headingLevel)})`;
+        parts.push(derivedLine('heading', `${esc(body.headingText)}${level}`));
+      }
+      if (body.normalizedText) parts.push(derivedText(body.normalizedText));
+      break;
+    case 'table':
+      if (body.caption) parts.push(derivedLine('caption', esc(body.caption)));
+      parts.push(derivedLine('shape', `${esc(body.rowCount)} rows × ${esc(body.columnCount)} columns`));
+      if (Array.isArray(body.headers) && body.headers.length > 0) {
+        parts.push(derivedLine('headers', body.headers.map((header) => esc(header.text)).join(' · ')));
+      }
+      if (body.normalizedMarkdown) {
+        parts.push(`<pre class="derived-pre">${esc(body.normalizedMarkdown)}</pre>`);
+      }
+      break;
+    case 'table_row':
+      parts.push(derivedLine('row', `${esc(body.rowIndex)}${body.role ? ` (${esc(body.role)})` : ''}`));
+      break;
+    case 'figure':
+      if (body.figureType) parts.push(derivedLine('type', esc(body.figureType)));
+      if (body.caption) parts.push(derivedLine('caption', esc(body.caption)));
+      if (body.altText) parts.push(derivedLine('alt text', esc(body.altText)));
+      if (body.ocrText) parts.push(derivedText(body.ocrText));
+      break;
+    case 'image_region':
+      if (body.label) parts.push(derivedLine('label', esc(body.label)));
+      if (body.confidence !== undefined) parts.push(derivedLine('confidence', esc(body.confidence)));
+      if (body.ocrText) parts.push(derivedText(body.ocrText));
+      break;
+    case 'page':
+      parts.push(derivedLine('page', esc(body.pageNumber)));
+      break;
+    default:
+      break;
+  }
+  return parts;
+}
+
+/** One "key: value" line of a derived-body summary; `html` is pre-escaped. */
+function derivedLine(label, html) {
+  return `<div class="derived-line"><span class="derived-key">${esc(label)}</span> ${html}</div>`;
+}
+
+/** Free-form derived text (OCR, normalized text), whitespace preserved. */
+function derivedText(text) {
+  return `<div class="evidence-text">${esc(text)}</div>`;
 }
 
 /**

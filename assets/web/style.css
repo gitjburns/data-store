@@ -238,6 +238,35 @@ table.data th {
   white-space: pre-wrap;
 }
 
+/* Body-derived summary shown in place of a missing text projection. The label
+   marks it as a client-side derivation from the unit body, distinct from the
+   server-provided textProjection rendered as plain .evidence-text. */
+.evidence-derived {
+  border-left: 2px solid var(--border);
+  padding-left: 0.6rem;
+}
+
+.derived-label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+
+.derived-key {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.derived-pre {
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  margin: 0.3rem 0 0;
+}
+
 /* Badges ------------------------------------------------------------------- */
 
 .badge {

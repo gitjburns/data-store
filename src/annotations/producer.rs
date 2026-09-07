@@ -517,17 +517,10 @@ fn owning_section<'units>(
 /// is the pure producer input (ruling 2); no normalization or metadata is
 /// mixed in beyond selecting the body's text-bearing field.
 ///
-/// MUST STAY IN STEP (four sites): this is one of four arm-for-arm mirrors of the
-/// per-`ContentType` evidence-text extraction. The others are
-/// `crate::query::rerank::evidence_text` (`src/query/rerank.rs`),
-/// `crate::projections::multivector::evidence_text` (`src/projections/multivector.rs`),
-/// and `crate::assembly::evidence::evidence_text` (`src/assembly/evidence.rs`).
-/// All four select the same field per type — including the `TableCell` fallback
-/// to `normalizedText` — so a content type gaining or losing a text-bearing field
-/// must change ALL FOUR together. This copy spells `TextBlock` and `Caption` as
-/// two arms while the others group them, but both resolve to the body `text`
-/// field identically: that is a cosmetic difference, not a divergence in the text
-/// resolved.
+/// Keep field selection aligned with `projections::multivector::evidence_text`
+/// and `assembly::evidence::evidence_text`, including TableCell's normalizedText
+/// fallback. Query passages use the assembly extractor, so these three readers
+/// must agree on canonical text when a content type changes.
 fn evidence_text(unit: &ContentUnit) -> Option<String> {
     match unit.content_type {
         ContentType::TextBlock => unit
