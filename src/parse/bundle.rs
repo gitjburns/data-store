@@ -331,6 +331,9 @@ pub(crate) struct ParserOutputBundle {
     pub(crate) candidate_relationships: Vec<CandidateUnitRelationship>,
     pub(crate) warnings: Vec<CandidateWarning>,
     pub(crate) metrics: ParseMetrics,
+    /// Original parser output and cleanup reports, keyed by bundle-relative path.
+    /// These are the exact bytes already checked against the staged manifest.
+    pub(crate) parser_raw_files: BTreeMap<String, Vec<u8>>,
 }
 
 /// Why a bundle read failed, discriminated by which side of the trust
@@ -892,6 +895,12 @@ fn read_bundle_inner(bundle_dir: &Path) -> Result<ParserOutputBundle, BundleRead
     let candidate_relationships =
         parse_jsonl_records(BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME, &record_bytes)?;
     let warnings = parse_jsonl_records(BUNDLE_WARNINGS_FILE_NAME, &record_bytes)?;
+    // Transfer verified bytes to the importer; reopening staging paths after
+    // digest validation would archive potentially different, unverified data.
+    let parser_raw_files = record_bytes
+        .into_iter()
+        .filter(|(path, _)| is_parser_raw_path(path))
+        .collect();
 
     Ok(ParserOutputBundle {
         bundle_dir: bundle_dir.to_path_buf(),
@@ -901,6 +910,7 @@ fn read_bundle_inner(bundle_dir: &Path) -> Result<ParserOutputBundle, BundleRead
         candidate_relationships,
         warnings,
         metrics,
+        parser_raw_files,
     })
 }
 
@@ -944,8 +954,8 @@ fn load_manifest(bundle_dir: &Path) -> Result<ParserOutputManifest, BundleReadEr
 /// directions: every listed file must exist with matching recomputed
 /// SHA-256 and size, and every on-disk file (except the manifest itself)
 /// must be listed — an unlisted file is unaccounted producer content and
-/// fails verification. Returns the raw bytes of the record files the
-/// caller deserializes, so each file is read exactly once.
+/// fails verification. Retains record files and parser_raw/ bytes so deserialization
+/// and archival both consume the exact bytes checked here, with one read per file.
 fn verify_listed_files(
     bundle_dir: &Path,
     manifest: &ParserOutputManifest,
@@ -966,8 +976,8 @@ fn verify_listed_files(
         }
     }
 
-    // Files whose verified bytes the caller still needs; everything else
-    // (logs, parser_raw, artifacts) is verified and dropped.
+    // Record files feed canonical import; parser_raw/ files feed lossless archival.
+    // Logs and optional artifacts retain their existing verification-only behavior.
     let retained: [&str; 5] = [
         BUNDLE_PARSER_RESULT_FILE_NAME,
         BUNDLE_METRICS_FILE_NAME,
@@ -1002,11 +1012,17 @@ fn verify_listed_files(
                 digest.sha256
             )));
         }
-        if retained.contains(&rel_path.as_str()) {
+        if retained.contains(&rel_path.as_str()) || is_parser_raw_path(rel_path) {
             record_bytes.insert(rel_path.clone(), bytes);
         }
     }
     Ok(record_bytes)
+}
+
+/// Match only descendants of the dedicated raw-output directory, not sibling names.
+fn is_parser_raw_path(path: &str) -> bool {
+    path.strip_prefix(BUNDLE_PARSER_RAW_DIR_NAME)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Deserialize one singular JSON record file out of the verified bytes; a

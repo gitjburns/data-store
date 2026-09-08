@@ -806,6 +806,29 @@ skip is self-healing — the changed bytes are re-detected, re-staged, and
 re-parsed under their own new SourceObject by the next scan. The residual
 instant between this check and the worker's own read is a recorded residual.
 
+### 10.8 Cleanup and original extraction
+
+PDF and plain-text workers apply `src/parse/cleanup.rs` before finalizing candidate
+bundles. Cleanup v2 repairs conservative prose spacing and contractions, preserves
+recognized code/math and structured content, and removes explicitly marked leaf
+headers/footers. PDF paragraph reflow preserves hard hyphens; only discretionary
+soft hyphens are removed. Cross-page joins require matching parents, consecutive
+page endpoints, aligned columns, and lowercase continuation. Plain-text line
+breaks remain intact. Merges retain original locators and rebuild sibling order.
+Whitespace-only lines do not trigger indentation protection; nonblank indented
+lines and nonblank lines containing tabs remain protected.
+
+`parser_raw/` contains original extractor output, `pre_cleanup.json` (units and
+relationships), and `cleanup.json` (version, counts, removals, and merge aliases).
+The importer archives verified raw bytes before either a ready or verified-failure
+commit; `parse_runs.parser_raw_output_uri` points to their artifact manifest.
+Unverified bundles retain the existing staged-failure handling.
+
+Both parser workers use version 2 and include `cleanupVersion` in their config
+hash. Existing documents require explicit reparsing to receive cleanup; startup
+does not rewrite stored content. Snapshot references retain raw artifacts, but
+the existing snapshot verifier does not recursively verify their nested blobs.
+
 ---
 
 ## 11. Activation contract

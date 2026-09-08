@@ -6,12 +6,17 @@ service as built. The service is first exercised at C10f commissioning; nothing
 in this repository has been production-run before then, so the steps below state
 what the code does at startup, not runtime-observed behavior.
 
-The build produces two operator-facing binaries. `data-store-service` is the
+The service has two primary binaries. `data-store-service` is the
 service itself (`start.sh` runs `./target/release/data-store-service`);
 `data-store` is the separate CLI client, which also provides the interactive
 REPL (see `SPEC-CLIENT.md`).
 
 ## 1. Prerequisites and configuration
+
+The `mupdf` dependency builds bundled native sources and generates bindings with
+libclang. Unix builds require `make` and a C/C++ toolchain. MuPDF uses AGPL-3.0
+licensing. Its standalone evaluation tool is described in section 4; production
+PDF routing still uses Docling.
 
 ### Copy the example configuration
 
@@ -208,6 +213,29 @@ check as the first live confirmation of the install rather than a re-run of
 previously verified behavior.
 
 For interactive use of the service, see `SPEC-CLIENT.md`.
+
+### Native PDF extraction evaluation
+
+Build the standalone evaluator from the repository root:
+
+```sh
+cargo build --release --features metal --bin pdf-extract-diagnostic
+```
+
+Run `target/release/pdf-extract-diagnostic <input.pdf> <new-output-directory>`.
+Both paths must resolve inside this repository. Use a stable input PDF and a new
+output directory whose parent already exists; existing directories are rejected.
+
+The evaluator writes `raw.json` (text, fonts, block/line/span bounds),
+`extracted.md`, `cleaned.md`, and `report.json` (timings, counts, and terminal
+status). JSON publication uses sibling `.json.tmp` files, which may remain after
+interruption. It reads the PDF without changing it and does not open the database.
+The cleaned preview applies shared prose normalization while preserving native
+line order. It does not run OCR, infer headings, or remove furniture. Image
+categories/bounds are recorded, but pixels and per-character quads are not exported.
+MuPDF's default ligature/whitespace handling applies; native dehyphenation is not
+requested. The report records the extraction flags and compiled dependency-lock hash.
+On macOS, `/usr/bin/time -l` can wrap the command to measure peak memory separately.
 
 ## 5. Annotation dry-run mode (authoring rulesets on a fresh corpus)
 

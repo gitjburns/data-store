@@ -34,6 +34,7 @@ use crate::parse::bundle::{
     BundleIdentity, BundleWriter, CandidateContentUnit, CandidateUnitRelationship,
     ParserExecutionStatus, ParserResult, parse_staging_root,
 };
+use crate::parse::cleanup::{self, CleanupKind};
 use crate::primitives::utc_now;
 use crate::util::truncate_persisted_detail;
 
@@ -44,7 +45,7 @@ pub(crate) const PLAIN_TEXT_PARSER_NAME: &str = "plain_text";
 /// Parser implementation version. Bump when splitting or emission behavior
 /// changes in a way the importer or activation can observe (a version bump
 /// creates net-new canonical graphs, spec §12 rule 3).
-pub(crate) const PLAIN_TEXT_PARSER_VERSION: &str = "1";
+pub(crate) const PLAIN_TEXT_PARSER_VERSION: &str = "2";
 
 /// Structural ceiling on candidate text blocks from one source (spec §12.1
 /// rule 5: parser execution has explicit resource bounds; §13.1: exceeded
@@ -59,13 +60,12 @@ pub(crate) const MAX_CANDIDATE_TEXT_BLOCKS: u64 = 999_999;
 /// serde `kind` tag of `Locator::CharRange`.
 const LOCATOR_KIND_CHAR_RANGE: &str = "char_range";
 
-/// Canonical hash of this parser's effective configuration. The parser has
-/// no tunable settings today, but the split policy is still versioned
-/// configuration: hashing `{"paragraphSplit":"blank_line"}` means a future
-/// policy change produces a different `parserConfigHash` instead of
-/// silently reusing the old identity.
+/// Bind splitting and cleanup rules to parse identity so changed text cannot
+/// silently reuse a parse produced under an older cleanup version.
 fn plain_text_config_hash() -> Result<String, ApiError> {
-    canonical::canonical_sha256_hex(&serde_json::json!({ "paragraphSplit": "blank_line" }))
+    canonical::canonical_sha256_hex(&serde_json::json!({
+        "paragraphSplit": "blank_line", "cleanupVersion": cleanup::CLEANUP_VERSION
+    }))
 }
 
 /// Build this parser's statically declared capability profile (spec §12.4)
@@ -266,7 +266,8 @@ fn run_text_parse_inner(
     // Emit one text_block per paragraph in reading order, chained by
     // precedes relationships (no pages or sections exist in plain text, so
     // units have no parent and the chain is the whole structure).
-    let unit_count = paragraphs.len() as u64;
+    let mut units = Vec::with_capacity(paragraphs.len());
+    let mut relationships = Vec::with_capacity(paragraphs.len().saturating_sub(1));
     for (index, paragraph) in paragraphs.into_iter().enumerate() {
         let body = TextBlockBody {
             text: paragraph.text,
@@ -279,7 +280,7 @@ fn run_text_parse_inner(
         let body = serde_json::to_value(&body).map_err(|source| ApiError::InternalIo {
             message: format!("failed to serialize text block body: {source}"),
         })?;
-        writer.append_candidate_unit(&CandidateContentUnit {
+        units.push(CandidateContentUnit {
             local_id: text_block_local_id(index),
             content_type: ContentType::TextBlock,
             body,
@@ -289,18 +290,43 @@ fn run_text_parse_inner(
                 start: paragraph.char_start,
                 end: paragraph.char_end,
             })],
-        })?;
+        });
         if index > 0 {
-            writer.append_candidate_relationship(&CandidateUnitRelationship {
+            relationships.push(CandidateUnitRelationship {
                 from_local_id: text_block_local_id(index - 1),
                 to_local_id: text_block_local_id(index),
                 relationship_type: UnitRelationshipType::Precedes,
                 relationship_role: None,
                 sequence_index: (index - 1) as u64,
-            })?;
+            });
         }
     }
-    let relationship_count = unit_count.saturating_sub(1);
+
+    // Original character ranges keep pointing into this retained source even
+    // when cleanup changes body text length. Plain-text line breaks are preserved.
+    let raw_dir = writer.parser_raw_dir()?;
+    let input_path = raw_dir.join("input.txt");
+    fs::write(&input_path, text.as_bytes()).map_err(|source| ApiError::InternalIo {
+        message: format!(
+            "failed to retain raw text extraction {}: {source}",
+            input_path.display()
+        ),
+    })?;
+    cleanup::stage_cleanup(
+        &raw_dir,
+        &mut units,
+        &mut relationships,
+        CleanupKind::PlainText,
+        source_id,
+    )?;
+    let unit_count = units.len() as u64;
+    let relationship_count = relationships.len() as u64;
+    for unit in &units {
+        writer.append_candidate_unit(unit)?;
+    }
+    for relationship in &relationships {
+        writer.append_candidate_relationship(relationship)?;
+    }
 
     let parser_result = ParserResult {
         status: ParserExecutionStatus::Succeeded,
@@ -311,8 +337,7 @@ fn run_text_parse_inner(
         // In-process parser: no external tool ran, so no identity facts.
         tool_identity: BTreeMap::new(),
     };
-    // No external process ran, so both captured log streams are empty; the
-    // parser preserves no raw output (the source itself is the raw input).
+    // No external process ran; original text and cleanup records are in parser_raw.
     let bundle_dir = writer.finish(
         &parser_result,
         &text_parse_metrics(unit_count, relationship_count),
@@ -388,9 +413,8 @@ fn text_parse_metrics(unit_count: u64, relationship_count: u64) -> ParseMetrics 
     }
 }
 
-/// One paragraph carved out of the source text. Invariant: `text` is the
-/// exact source slice covered by `[char_start, char_end)`, so the locator
-/// and the body text can never disagree.
+/// Exact source paragraph before cleanup. Its original character range remains
+/// the citation after body normalization; pre-cleanup text is retained separately.
 struct ParagraphSpan {
     /// Char offset (not byte offset) of the paragraph's first character in
     /// the source text — the locator kind is `char_range` (§17).

@@ -4,7 +4,7 @@ sources
 sources.old
 index/
 logs/
-config.toml
+config.toml*
 .data-store-admin-token
 .data-store.history
 .annotator-api-key

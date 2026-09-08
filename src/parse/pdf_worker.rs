@@ -25,6 +25,7 @@ use std::{
     time::Instant,
 };
 
+use crate::parse::cleanup::{self, CleanupKind};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -54,7 +55,7 @@ pub(crate) const PDF_PARSER_NAME: &str = "docling_pdf";
 /// Version of this worker's mapping logic (not the Docling tool version,
 /// which is an observed tool-identity fact). Bump when the mapping rules
 /// change; a bump makes re-parses a new parse identity.
-pub(crate) const PDF_PARSER_VERSION: &str = "1";
+pub(crate) const PDF_PARSER_VERSION: &str = "2";
 
 /// Docling output format this worker consumes (decision D6); folded into
 /// the parser configuration hash because the output mode shapes the
@@ -182,7 +183,7 @@ pub(crate) fn run_pdf_parse(
         );
     }
 
-    let mapped = match map_document(&document) {
+    let mut mapped = match map_document(&document) {
         Ok(mapped) => mapped,
         Err(mapping_error) => {
             return finish_failed(
@@ -196,6 +197,25 @@ pub(crate) fn run_pdf_parse(
             );
         }
     };
+
+    // Cleanup precedes canonical IDs/hashes and model work. The raw Docling JSON
+    // and pre-cleanup graph remain in parser_raw; warnings follow merged local IDs.
+    let cleanup_report = cleanup::stage_cleanup(
+        &raw_dir,
+        &mut mapped.units,
+        &mut mapped.relationships,
+        CleanupKind::Pdf,
+        source_id,
+    )?;
+    for warning in &mut mapped.warnings {
+        warning.unit_local_id = warning
+            .unit_local_id
+            .as_deref()
+            .and_then(|id| cleanup_report.remap_local_id(id))
+            .map(str::to_string);
+    }
+    mapped.metrics.unit_count = Some(mapped.units.len() as u64);
+    mapped.metrics.relationship_count = Some(mapped.relationships.len() as u64);
 
     // Streaming the mapped records is a staging-infrastructure boundary:
     // an append failure propagates as Err. A create/append fault leaves a
@@ -326,6 +346,7 @@ fn pdf_parser_config_hash(options: &ResolvedDoclingOptions) -> Result<String, Ap
         "pageBatchSize": options.page_batch_size,
         "documentTimeoutSeconds": options.document_timeout_seconds,
         "outputFormat": PDF_PARSER_OUTPUT_FORMAT,
+        "cleanupVersion": cleanup::CLEANUP_VERSION,
     });
     canonical::canonical_sha256_hex(&value)
 }

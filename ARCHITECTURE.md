@@ -226,6 +226,14 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   or gate breach becomes a durable failed `parse_runs` row (`Ok` with a failed
   status); `Err` is reserved for faults of the canonical side itself.
 
+  Before staging candidates, both workers run versioned Rust cleanup
+  (`src/parse/cleanup.rs`): conservative prose repair, explicit furniture removal,
+  and geometry-supported PDF paragraph reflow. Original locators survive merges;
+  reading-order links are rebuilt before canonical hashing. Original extraction,
+  pre-cleanup candidates, and the cleanup report are archived through the existing
+  artifact store and `parser_raw_output_uri`, including verified failed parses.
+  Cleanup changes parser identity; existing sources receive it through reparse.
+
   Worker dispatch is guarded three ways, in order (`src/scheduler.rs`):
 
   1. **§13.5 no-blind-retry guard** (`evaluate_no_retry_guard` →

@@ -6,6 +6,7 @@
 //! Activation and dispatch wiring are C5.
 
 pub(crate) mod bundle;
+pub(crate) mod cleanup;
 pub(crate) mod conformance;
 pub(crate) mod importer;
 pub(crate) mod pdf_worker;

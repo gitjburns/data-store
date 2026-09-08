@@ -20,6 +20,7 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 getrandom = "0.3.4"
+mupdf = "0.8.0"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustyline = "17.0.2"

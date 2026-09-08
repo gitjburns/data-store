@@ -111,6 +111,11 @@ const CANONICAL_RELATIONSHIPS_FILE_NAME: &str = "unit_relationships.jsonl";
 const CANONICAL_WARNINGS_FILE_NAME: &str = "warnings.jsonl";
 const CANONICAL_METRICS_FILE_NAME: &str = "metrics.json";
 
+/// Raw manifest is a sibling of parser_raw/ so no staged raw filename can collide.
+const CANONICAL_PARSER_RAW_MANIFEST_FILE_NAME: &str = "parser_raw_manifest.json";
+/// Version of the raw path-to-immutable-artifact reference document.
+const PARSER_RAW_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
 /// Record ordering rules recorded in the bundle manifest per JSONL artifact
 /// (spec §16.3: record-set hashes are order-significant, so the ordering
 /// rule must be a recorded fact). Unit and relationship records are written
@@ -147,7 +152,7 @@ INSERT INTO parse_runs (
 /// surfaced by the caller's affected-row check.
 const UPDATE_PARSE_RUN_FAILED_SQL: &str = "
 UPDATE parse_runs
-SET status = 'failed', completed_at = ?2, error = ?3
+SET status = 'failed', completed_at = ?2, error = ?3, parser_raw_output_uri = ?4
 WHERE id = ?1 AND status = 'building'";
 
 /// Terminal success update: ready status plus the measured conformance
@@ -158,7 +163,7 @@ const UPDATE_PARSE_RUN_READY_SQL: &str = "
 UPDATE parse_runs
 SET status = 'ready', completed_at = ?2, conformance_report_json = ?3,
     artifact_bundle_uri = ?4, artifact_bundle_hash = ?5,
-    warnings_json = ?6, metrics_json = ?7
+    warnings_json = ?6, metrics_json = ?7, parser_raw_output_uri = ?8
 WHERE id = ?1 AND status = 'building'";
 
 /// Inserts one canonical ContentUnit row (spec §15). structure_hash is
@@ -237,6 +242,8 @@ struct ReadyState<'a> {
     warnings: &'a [ParseWarning],
     metrics: &'a ParseMetrics,
     bundle_ref: &'a ArtifactRef,
+    /// Already archived before this transaction; None means no staged raw files.
+    parser_raw_output_uri: Option<&'a str>,
 }
 
 /// Validate and import one staged parser output bundle (spec §12.1 rule 2:
@@ -368,6 +375,7 @@ fn run_attributed_import(
                 parse_run_id,
                 &claims.source_id,
                 &detail,
+                None,
                 started,
             );
         }
@@ -388,12 +396,19 @@ fn run_attributed_import(
             parse_run_id,
             &claims.source_id,
             "staged bundle manifest changed between the claims read and the verified read",
+            None,
             started,
         );
     }
 
+    // Verification and identity checks must precede archival. Preserve raw bytes
+    // before either terminal path: even a rejected parse needs its originals.
+    // Archival faults remain infrastructure errors; no dangling URI is committed.
+    let store = ArtifactStore::open(index_root)?;
+    let raw_archive = archive_parser_raw(&store, parse_run_id, &bundle.parser_raw_files)?;
+
     // A failed parser execution stages a complete bundle for diagnostics
-    // (spec §12.2); the import records the failure and imports nothing.
+    // (spec §12.2); record its original failure and raw URI without canonical units.
     if bundle.parser_result.status == ParserExecutionStatus::Failed {
         let detail = bundle
             .parser_result
@@ -405,6 +420,9 @@ fn run_attributed_import(
             parse_run_id,
             &bundle.manifest.source_id,
             detail,
+            raw_archive
+                .as_ref()
+                .map(|archive| archive.manifest.uri.as_str()),
             started,
         );
     }
@@ -417,6 +435,9 @@ fn run_attributed_import(
             parse_run_id,
             &bundle.manifest.source_id,
             &detail,
+            raw_archive
+                .as_ref()
+                .map(|archive| archive.manifest.uri.as_str()),
             started,
         );
     }
@@ -461,7 +482,7 @@ fn run_attributed_import(
     // sealed before the ready commit), and warnings/metrics live in the
     // authoritative sibling artifacts, so those fields are absent here. The
     // hot-plane row is the authoritative terminal record.
-    let run_snapshot = ParseRun {
+    let mut run_snapshot = ParseRun {
         id: parse_run_id.to_owned(),
         source_id: bundle.manifest.source_id.clone(),
         parser_name: bundle.manifest.parser_name.clone(),
@@ -489,7 +510,11 @@ fn run_attributed_import(
     // content-addressed and write-once idempotent, so a crash between these
     // writes and the commit leaves only orphan blobs a re-import of the same
     // content reuses — never a committed row whose bundle reference dangles.
-    let store = ArtifactStore::open(index_root)?;
+    // Raw output is already immutable before its URI enters either the canonical
+    // run snapshot or the ready transaction. No staged path is persisted.
+    run_snapshot.parser_raw_output_uri = raw_archive
+        .as_ref()
+        .map(|archive| archive.manifest.uri.clone());
     let bundle_ref = write_canonical_parse_bundle(
         &store,
         &run_snapshot,
@@ -497,6 +522,7 @@ fn run_attributed_import(
         &rows,
         &warnings,
         &bundle.metrics,
+        raw_archive.as_ref(),
     )?;
 
     commit_ready(
@@ -509,6 +535,7 @@ fn run_attributed_import(
             warnings: &warnings,
             metrics: &bundle.metrics,
             bundle_ref: &bundle_ref,
+            parser_raw_output_uri: run_snapshot.parser_raw_output_uri.as_deref(),
         },
     )?;
 
@@ -651,11 +678,14 @@ fn create_building_run(
 /// This function owns detail bounding so no caller can persist unbounded
 /// producer output. Returns the failed `ImportedParse` — a recorded outcome,
 /// not an error; the staged bundle stays on disk for diagnostics.
+/// A raw URI is supplied only after verified bytes have been archived, so the
+/// original failure and its raw evidence commit together without dangling refs.
 fn fail_parse_run(
     connection: &mut Connection,
     parse_run_id: &str,
     source_id: &str,
     detail: &str,
+    parser_raw_output_uri: Option<&str>,
     started: Instant,
 ) -> Result<ImportedParse, ApiError> {
     let detail = truncate_persisted_detail(detail);
@@ -666,7 +696,7 @@ fn fail_parse_run(
         let updated = tx
             .execute(
                 UPDATE_PARSE_RUN_FAILED_SQL,
-                params![parse_run_id, completed_at, detail],
+                params![parse_run_id, completed_at, detail, parser_raw_output_uri],
             )
             .map_err(|source| ApiError::StorageOperation {
                 message: format!("failed to mark parse run {parse_run_id} failed: {source}"),
@@ -708,6 +738,7 @@ fn fail_parse_run(
         source_id,
         detail,
         bundle_kept = true,
+        parser_raw_output_uri,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "parse failed validation; failure recorded, staged bundle kept for diagnostics"
     );
@@ -1089,6 +1120,91 @@ fn canonical_warnings(candidates: &[CandidateWarning]) -> Vec<ParseWarning> {
         .collect()
 }
 
+/// Immutable raw files and the manifest that the ready parse row points to.
+struct ArchivedParserRaw {
+    manifest: ArtifactRef,
+    files: BTreeMap<String, ArtifactRef>,
+}
+
+/// Path-preserving raw-output index; its content hash is supplied by ArtifactStore.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParserRawManifest<'a> {
+    schema_version: u32,
+    parse_run_id: &'a str,
+    files: &'a BTreeMap<String, ArtifactRef>,
+}
+
+/// Archive only verified in-memory bytes, then publish their manifest last.
+/// Empty historical bundles retain None; archival faults remain infrastructure errors.
+fn archive_parser_raw(
+    store: &ArtifactStore,
+    parse_run_id: &str,
+    raw_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Option<ArchivedParserRaw>, ApiError> {
+    let started = Instant::now();
+    let raw_bytes: u64 = raw_files.values().map(|bytes| bytes.len() as u64).sum();
+    info!(
+        event = "parse.parser_raw_archive_started",
+        parse_run_id,
+        file_count = raw_files.len(),
+        raw_bytes,
+        "verified parser raw-output archival started"
+    );
+    let archived = (|| {
+        if raw_files.is_empty() {
+            return Ok(None);
+        }
+        let mut files = BTreeMap::new();
+        for (path, bytes) in raw_files {
+            // put_bytes preserves the original extraction encoding and byte order;
+            // canonical JSON serialization is reserved for the manifest itself.
+            let artifact = store.put_bytes(bytes).map_err(|source| ApiError::InternalIo {
+                message: format!(
+                    "failed to archive verified raw file {path} for parse {parse_run_id}: {source}"
+                ),
+            })?;
+            files.insert(path.clone(), artifact);
+        }
+        let manifest = store.put_json(&json_value_of(
+            &ParserRawManifest {
+                schema_version: PARSER_RAW_MANIFEST_SCHEMA_VERSION,
+                parse_run_id,
+                files: &files,
+            },
+            "parser raw-output manifest",
+        )?)?;
+        Ok::<_, ApiError>(Some(ArchivedParserRaw { manifest, files }))
+    })();
+    match archived {
+        Ok(archive) => {
+            info!(
+                event = "parse.parser_raw_archive_completed",
+                parse_run_id,
+                file_count = raw_files.len(),
+                raw_bytes,
+                manifest_uri = archive.as_ref().map(|value| value.manifest.uri.as_str()),
+                manifest_hash = archive.as_ref().map(|value| value.manifest.hash.as_str()),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "verified parser raw-output archival completed"
+            );
+            Ok(archive)
+        }
+        Err(source) => {
+            error!(
+                event = "parse.parser_raw_archive_failed",
+                parse_run_id,
+                file_count = raw_files.len(),
+                raw_bytes,
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "verified parser raw-output archival failed"
+            );
+            Err(source)
+        }
+    }
+}
+
 /// One artifact entry in the canonical bundle manifest: content-addressed
 /// reference plus the artifact type, and — for JSONL record sets — the
 /// record ordering rule the hash depends on (§16.3 requires ordering to be
@@ -1119,7 +1235,7 @@ struct CanonicalParseBundleManifest {
     parser_config_hash: String,
     capability_profile_hash: String,
     created_at: String,
-    files: BTreeMap<&'static str, CanonicalBundleFile>,
+    files: BTreeMap<String, CanonicalBundleFile>,
     /// Serialized as an empty placeholder, removed from the hash input, and
     /// filled with the computed hash before the manifest blob is stored.
     manifest_hash: String,
@@ -1155,6 +1271,7 @@ fn write_canonical_parse_bundle(
     rows: &CanonicalRows,
     warnings: &[ParseWarning],
     metrics: &ParseMetrics,
+    raw_archive: Option<&ArchivedParserRaw>,
 ) -> Result<ArtifactRef, ApiError> {
     let started = Instant::now();
     info!(
@@ -1165,24 +1282,24 @@ fn write_canonical_parse_bundle(
         "canonical parse bundle write starting"
     );
 
-    let mut files: BTreeMap<&'static str, CanonicalBundleFile> = BTreeMap::new();
+    let mut files: BTreeMap<String, CanonicalBundleFile> = BTreeMap::new();
 
     let run_artifact = store.put_json(&json_value_of(run, "parse run snapshot")?)?;
     files.insert(
-        CANONICAL_PARSE_RUN_FILE_NAME,
+        CANONICAL_PARSE_RUN_FILE_NAME.to_owned(),
         bundle_file("parse_run", &run_artifact, None),
     );
 
     let report_artifact = store.put_json(&json_value_of(report, "conformance report")?)?;
     files.insert(
-        CANONICAL_CONFORMANCE_FILE_NAME,
+        CANONICAL_CONFORMANCE_FILE_NAME.to_owned(),
         bundle_file("conformance_report", &report_artifact, None),
     );
 
     let unit_values = json_values_of(&rows.units, "content unit")?;
     let units_artifact = store.put_jsonl(&unit_values)?;
     files.insert(
-        CANONICAL_UNITS_FILE_NAME,
+        CANONICAL_UNITS_FILE_NAME.to_owned(),
         bundle_file(
             "content_units",
             &units_artifact,
@@ -1193,7 +1310,7 @@ fn write_canonical_parse_bundle(
     let relationship_values = json_values_of(&rows.relationships, "unit relationship")?;
     let relationships_artifact = store.put_jsonl(&relationship_values)?;
     files.insert(
-        CANONICAL_RELATIONSHIPS_FILE_NAME,
+        CANONICAL_RELATIONSHIPS_FILE_NAME.to_owned(),
         bundle_file(
             "unit_relationships",
             &relationships_artifact,
@@ -1204,7 +1321,7 @@ fn write_canonical_parse_bundle(
     let warning_values = json_values_of(warnings, "parse warning")?;
     let warnings_artifact = store.put_jsonl(&warning_values)?;
     files.insert(
-        CANONICAL_WARNINGS_FILE_NAME,
+        CANONICAL_WARNINGS_FILE_NAME.to_owned(),
         bundle_file(
             "warnings",
             &warnings_artifact,
@@ -1214,9 +1331,25 @@ fn write_canonical_parse_bundle(
 
     let metrics_artifact = store.put_json(&json_value_of(metrics, "parse metrics")?)?;
     files.insert(
-        CANONICAL_METRICS_FILE_NAME,
+        CANONICAL_METRICS_FILE_NAME.to_owned(),
         bundle_file("metrics", &metrics_artifact, None),
     );
+
+    // List every raw blob directly as well as its manifest so the canonical
+    // bundle is a complete reference index. Snapshot refs keep this bundle
+    // reachable; their current verifier does not recursively hash these children.
+    if let Some(raw) = raw_archive {
+        for (path, artifact) in &raw.files {
+            files.insert(
+                path.clone(),
+                bundle_file("parser_raw_output", artifact, None),
+            );
+        }
+        files.insert(
+            CANONICAL_PARSER_RAW_MANIFEST_FILE_NAME.to_owned(),
+            bundle_file("parser_raw_manifest", &raw.manifest, None),
+        );
+    }
 
     let artifact_count = files.len();
     let mut manifest = CanonicalParseBundleManifest {
@@ -1322,6 +1455,7 @@ fn ready_transaction_body(tx: &Transaction<'_>, state: &ReadyState<'_>) -> Resul
                 state.bundle_ref.hash,
                 warnings_json,
                 metrics_json,
+                state.parser_raw_output_uri,
             ],
         )
         .map_err(|source| ApiError::StorageOperation {
