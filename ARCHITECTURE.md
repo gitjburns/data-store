@@ -364,19 +364,22 @@ The worker loads its client **inside** the thread: a bad key file **parks** the
 worker (annotations disabled for the run) instead of failing startup. A parked
 worker is diagnostic-only and never gates readiness.
 
-Failed-row retries are **budgeted per process run** (user-ruled 2026-07-21):
-the worker's discovery gate reopens a `failed` annotation at most
-`ANNOTATION_RETRY_CAP = 10` times per run, then skips it as **exhausted** — one
-ERROR (`annotation_worker.retry_exhausted`) at the crossing, a per-cycle
-`exhausted` count in the annotation health slot, and no further producer spend.
-The budget is deliberately in-memory: a restart or a producer identity change
-re-arms it. Retries also climb a **temperature ladder**: first attempts run at
-the deterministic base (0.0), retry *k* at `min(0.1 × k, 1.0)`, rounded
-one-decimal exact — deliberately buying the output variation the retry
-rationale assumes, which a stable failure mode at temperature 0 defeats. Every
-completed producer call's effective temperature is recorded in the
-annotation's provenance and on the `annotator_http.call.*` logs; it is
-deliberately **not** producer-identity-bearing (the prompt is unchanged).
+Rejected model output is **budgeted per invocation per process run**: one
+initial attempt plus `ANNOTATION_RETRY_CAP = 10` output retries. Accounting
+advances only after received output fails annotation validation, never when a
+failed row is reopened. Exhaustion emits one
+`annotation_worker.retry_exhausted` ERROR and a per-cycle `exhausted` health
+count; restart, rebuild-all, or producer identity change re-arms the budget.
+Temperature is `min(0.1 × prior invalid outputs, 1.0)`, starting at 0.0;
+call and internal failures neither consume output retries nor raise temperature.
+Effective temperature remains in completed provenance and call logs, outside
+producer identity.
+
+Network, HTTP, and completion-envelope failures are **call failures**. After
+one, the worker commits every result from the current wave and ends the cycle.
+The next cycle retries after the existing 30-second delay, subject to the shared
+60-second ceiling. Persistent call failures remain retry-eligible indefinitely.
+Failure logs retain the original error plus its class and output-failure count.
 
 ### 3.2 Operator policy documents and the auto-versioning registry
 

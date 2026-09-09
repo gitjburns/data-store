@@ -86,6 +86,39 @@ pub(crate) struct ProducedAnnotation {
     pub(crate) confidence: Option<f64>,
 }
 
+/// Preserve the failed boundary so only rejected model output consumes the
+/// worker's output retry budget; call and routing faults do not change sampling.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InvocationFailure {
+    /// The endpoint did not return a usable completion envelope.
+    #[error(transparent)]
+    Call(ApiError),
+    /// A received completion failed the producer's annotation contract.
+    #[error(transparent)]
+    InvalidOutput(ApiError),
+    /// Local invocation routing violated the producer contract.
+    #[error(transparent)]
+    Internal(ApiError),
+}
+
+impl InvocationFailure {
+    /// Supply stable diagnostic labels without parsing provider error text.
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Self::Call(_) => "call_failure",
+            Self::InvalidOutput(_) => "invalid_output",
+            Self::Internal(_) => "internal_error",
+        }
+    }
+
+    /// Expose the original error for existing persistence and API boundaries.
+    pub(crate) fn error(&self) -> &ApiError {
+        match self {
+            Self::Call(error) | Self::InvalidOutput(error) | Self::Internal(error) => error,
+        }
+    }
+}
+
 /// The three MVP producers. Each maps to one annotation type, a stable
 /// producer name/version, its prompt, and its strict output parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,17 +464,17 @@ pub(crate) fn invoke(
     invocation: &Invocation,
     naming_rules: &[String],
     temperature: f64,
-) -> Result<Vec<ProducedAnnotation>, ApiError> {
+) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     match (kind, &invocation.kind) {
         (ProducerKind::Entity | ProducerKind::Relation, InvocationKind::SectionGroup { .. }) => {}
         (ProducerKind::Summary, InvocationKind::Document { .. }) => {}
         (kind, other) => {
-            return Err(ApiError::AnnotationProducer {
+            return Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
                 message: format!(
                     "producer {} cannot consume invocation kind {other:?}",
                     kind.producer_name()
                 ),
-            });
+            }));
         }
     }
 
@@ -459,13 +492,18 @@ pub(crate) fn invoke(
     // — the same function `prompt_hash` reads — so the bytes sent here are the
     // bytes the recorded promptHash/identity cover, by construction (CA2-P3).
     let system_prompt = kind.prompt(naming_rules);
-    let raw = client.complete(
-        kind.request_purpose(),
-        &system_prompt,
-        &user_content,
-        temperature,
-    )?;
+    // Call/envelope failures provide no annotation output to judge. Only the
+    // strict parser below can charge a rejected response to the output budget.
+    let raw = client
+        .complete(
+            kind.request_purpose(),
+            &system_prompt,
+            &user_content,
+            temperature,
+        )
+        .map_err(InvocationFailure::Call)?;
     kind.parse_output(&raw)
+        .map_err(InvocationFailure::InvalidOutput)
 }
 
 /// Choose which invocations a producer consumes. Exposed so the stage-3 worker

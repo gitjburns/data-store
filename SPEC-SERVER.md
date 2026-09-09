@@ -66,8 +66,9 @@ A separate **annotation worker** thread runs beside the scheduler. It is
 discovery-based: each cycle it examines active sources and builds the MVP
 semantic annotation types (entity, relation, summary) for units that lack them,
 reusing memoized producer output (`annotation_memo`) on a memo-key hit and
-retrying previously failed rows under a bounded per-run budget with an
-escalating sampling temperature (§13). Annotation producers call an external
+retrying previously failed rows under the failure-class policy in §13. Only
+invalid output consumes the per-run budget and escalates sampling temperature.
+Annotation producers call an external
 OpenAI-compatible chat-completions endpoint (`[models.annotator]`).
 
 The annotation worker is **deliberately not readiness-critical.** A bad key or
@@ -257,7 +258,7 @@ and can trigger dominance gating on change.
 
 `[models.annotator]` — the external OpenAI-compatible chat-completions endpoint
 for the annotation producers. **Exclusive**: producer failures park annotations
-as failed for later bounded retry (§13); there is no fallback model or endpoint.
+as failed for later retry under §13; there is no fallback model or endpoint.
 
 | Key | Meaning |
 | --- | --- |
@@ -981,12 +982,21 @@ activation or the sync pipeline (the §21.4 policy's MVP blocking set is
 empty).
 
 - **Freshness state machine.** `building` → `fresh`, with `failed` (producer
-  failure; retried by later worker passes at most **10 times per process
-  run**, retry *k* sampling at temperature `min(0.1 × k, 1.0)` against the
-  deterministic base 0.0, then skipped as **exhausted** — ERROR-logged once,
-  counted per cycle in annotation health, re-armed by restart or producer
-  identity change) and `stale`. Transitions are status-guarded and append
-  `annotation.*` events atomically.
+  failure, retried by later worker passes) and `stale`. Transitions are
+  status-guarded and append `annotation.*` events atomically.
+- **Output retry budget.** Each invocation allows one initial attempt plus
+  **10 output retries per process run**. Only received output rejected by
+  annotation validation spends the budget; reopening a failed row does not.
+  Temperature is `min(0.1 × prior invalid outputs, 1.0)`, starting at 0.0.
+  Call and internal failures neither spend output retries nor raise temperature.
+  Exhausted invocations are skipped, ERROR-logged once, and counted per cycle
+  in annotation health. Restart, rebuild-all, or producer identity change
+  re-arms the budget.
+- **Call recovery.** Network, HTTP, and completion-envelope failures end the
+  cycle after every current-wave result is committed. The next cycle retries
+  after the existing 30-second delay, subject to the shared 60-second ceiling;
+  persistent call failures remain retry-eligible indefinitely. Failure logs
+  preserve the original error plus failure class and output-failure count.
 - **Parse-scoped readability.** Annotations are parse-scoped and readable only
   for the source's **current active parse**, enforced in the read SQL itself.
 - **Eligibility: pure function of target content.** A producer's model input
@@ -1029,7 +1039,7 @@ empty).
   retry-ladder value); temperature is deliberately not identity-bearing.
 - **Exclusive external endpoint.** Producer calls go to the single configured
   OpenAI-compatible endpoint (§2.9); a failure parks the annotation `failed`
-  for a later bounded retry pass — no fallback model or endpoint.
+  for a later retry under the policy above — no fallback model or endpoint.
 
 ---
 

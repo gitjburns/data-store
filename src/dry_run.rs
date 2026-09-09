@@ -419,7 +419,7 @@ fn sample_item(
             );
         }
         Err(source) => {
-            fail_build(index_root, &building_id, &source)?;
+            fail_build(index_root, &building_id, source.error())?;
             counts.failures += 1;
             warn!(
                 event = "dry_run.build_failed",
@@ -427,6 +427,7 @@ fn sample_item(
                 parse_id = %ready.parse_run_id,
                 producer = kind.producer_name(),
                 annotation_id = %building_id,
+                failure_class = source.class(),
                 error = %source,
                 "dry-run producer invocation failed; annotation parked failed"
             );

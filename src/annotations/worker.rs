@@ -93,7 +93,9 @@ use tracing::{debug, error, info, warn};
 use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
 use crate::annotations::memo::{self, MemoItem};
 use crate::annotations::policy;
-use crate::annotations::producer::{self, Invocation, ProducedAnnotation, ProducerKind};
+use crate::annotations::producer::{
+    self, Invocation, InvocationFailure, ProducedAnnotation, ProducerKind,
+};
 use crate::annotations::store::{self, NewAnnotation};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
@@ -121,18 +123,29 @@ const CYCLE_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 /// memo, freshness, INSERT, park-failed) stays serial on the worker thread.
 const ANNOTATOR_CONCURRENT_CALLS: usize = 32;
 
-/// Maximum failed-row reopens per annotation per PROCESS RUN (user-ruled
-/// 2026-07-21, amending the §35 unbounded-retry stance). A code constant,
-/// never config (§35). The budget is deliberately in-memory, not durable:
-/// the bound exists to stop unbounded paid producer calls against content the
-/// model fails on deterministically, and restarts are rare, deliberate
-/// operator actions — so a restart re-arming the budget is the intended
-/// recovery lever (a naming-policy edit requires one anyway). Durable
-/// evidence is unaffected: every attempt still logs and appends its
-/// `annotation.failed` event, and exhaustion logs once at ERROR.
+/// Invalid-output retries allowed after the initial attempt per annotation per
+/// process run. Call failures spend none of this budget; restart/rebuild clears
+/// it. Eleven rejected outputs therefore exhaust one initial attempt plus ten retries.
 const ANNOTATION_RETRY_CAP: u32 = 10;
 
-/// Temperature added per failed-row retry (user-ruled 2026-07-21). First
+/// Per-invocation output failures, owned by the serial worker after wave joins.
+/// The notification flag keeps reporting separate from the exact failure count.
+#[derive(Default)]
+struct OutputRetryState {
+    invalid_outputs: u32,
+    exhaustion_reported: bool,
+}
+
+/// Output budgets span cycles; the call-failure flag belongs to one cycle.
+/// Keeping that flag through source-level write errors prevents further calls
+/// after an endpoint failure already observed in a joined wave.
+#[derive(Default)]
+struct RetryState {
+    outputs: HashMap<String, OutputRetryState>,
+    call_failed_in_cycle: bool,
+}
+
+/// Temperature added per previously rejected model output. First
 /// attempts run at the base `PRODUCER_TEMPERATURE` (0.0, maximum memo-friendly
 /// reproducibility); retry k samples at `0.1 × k`, deliberately introducing
 /// the output variation the §35 retry rationale assumes — a stable failure
@@ -306,11 +319,9 @@ fn run_worker(
         }
     };
 
-    // Per-run retry budget: annotation_id → failed-row reopens issued this
-    // run (`ANNOTATION_RETRY_CAP`). Owned here — across cycles, never across
-    // restarts or successful rebuilds — as the ONE exception to cycle
-    // statelessness; entries only accumulate for failing annotations.
-    let mut retry_attempts: HashMap<String, u32> = HashMap::new();
+    // Only received invalid outputs accumulate budget debt, across cycles but
+    // never across restarts or rebuilds. Historical failure text is not classified.
+    let mut output_retries = RetryState::default();
     let mut generation = 0;
     let mut delay = Duration::ZERO;
 
@@ -349,7 +360,7 @@ fn run_worker(
             generation = permit.generation();
             // Old annotation IDs may recur after rebuilding identical content;
             // their previous retry budget must not limit this fresh corpus.
-            retry_attempts.clear();
+            output_retries = RetryState::default();
         }
         // One cycle failing is never fatal: the error is logged with context
         // and the next cycle re-discovers from the hot plane (statelessness).
@@ -364,7 +375,7 @@ fn run_worker(
             &naming_policy.rules,
             &client,
             &shutdown,
-            &mut retry_attempts,
+            &mut output_retries,
         ) {
             Ok(report) => publish_cycle_annotation_health(&health_slot, &report),
             Err(source) => error!(
@@ -396,16 +407,17 @@ fn run_worker(
 /// so `Err` is reserved for a cycle-wide fault (e.g. the active-source read
 /// itself failing). On success it returns the cycle's freshness `CycleReport`
 /// for the C10b health publish (the same counts the completion log carries).
-/// `retry_attempts` is the thread-owned per-run reopen budget threaded down to
-/// each source's discovery gate (see `ANNOTATION_RETRY_CAP`).
+/// `output_retries` tracks rejected model outputs, not failed-row reopens;
+/// call failures end scheduling after the current wave finishes committing.
 fn run_cycle(
     index_root: &Path,
     config: &AnnotatorModelConfig,
     naming_rules: &[String],
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
-    retry_attempts: &mut HashMap<String, u32>,
+    output_retries: &mut RetryState,
 ) -> Result<CycleReport, ApiError> {
+    output_retries.call_failed_in_cycle = false;
     let started = Instant::now();
     debug!(
         event = "annotation_worker.cycle_started",
@@ -426,10 +438,15 @@ fn run_cycle(
             client,
             source,
             shutdown,
-            retry_attempts,
+            output_retries,
         ) {
             Ok((source_counts, flow)) => {
                 totals.add(&source_counts);
+                if flow == BuildFlow::CallFailed {
+                    // The wave has recorded all successes/failures. Stop here
+                    // rather than multiplying an endpoint outage across sources.
+                    break;
+                }
                 if flow == BuildFlow::Deferred {
                     // A pre-paid annotation boundary hit writer contention. The
                     // lock is typically held for a multi-minute scheduler
@@ -484,11 +501,11 @@ fn run_cycle(
                     }
                     // Structurally unreachable: the projection build contains
                     // only the pre-paid `projection_build` boundary, and
-                    // `ShutdownAbort` is produced solely by the post-paid
-                    // completion boundaries. Treated as Continue (a no-op)
+                    // `ShutdownAbort` and `CallFailed` originate in producer
+                    // waves, not this projection boundary. Treated as Continue (a no-op)
                     // rather than a fault so a future refactor cannot turn this
                     // arm into silent work loss without touching this match.
-                    Ok(BuildFlow::Continue | BuildFlow::ShutdownAbort) => {}
+                    Ok(BuildFlow::Continue | BuildFlow::ShutdownAbort | BuildFlow::CallFailed) => {}
                     Err(projection_error) => {
                         totals.projection_failures += 1;
                         error!(
@@ -504,15 +521,20 @@ fn run_cycle(
             }
             Err(source_error) => {
                 // A per-source fault (e.g. its parse units became unreadable)
-                // is recorded and skipped; the cycle continues with the rest.
+                // is recorded and skipped unless a joined wave also observed a
+                // call failure: persistence errors must not erase cycle-stop intent.
                 totals.source_failures += 1;
                 error!(
                     event = "annotation_worker.source_failed",
                     source_id = %source.source_id,
                     parse_id = %source.active_parse_id,
                     error = %source_error,
-                    "annotation build failed for one source; continuing with remaining sources"
+                    call_failure_cycle_ended = output_retries.call_failed_in_cycle,
+                    "annotation build failed for one source"
                 );
+                if output_retries.call_failed_in_cycle {
+                    break;
+                }
             }
         }
     }
@@ -605,7 +627,7 @@ struct CycleTotals {
     /// projection build). Deferred work is re-discovered next cycle; nothing is
     /// lost. Folded from each source's `SourceCounts`.
     deferred: u64,
-    /// Failed rows skipped this cycle because their per-run reopen budget
+    /// Failed rows skipped this cycle because their per-run output retry budget
     /// (`ANNOTATION_RETRY_CAP`) is spent. Exhausted work stays `failed` in the
     /// hot plane and is re-armed only by a restart or a producer identity
     /// change. Folded from each source's `SourceCounts`.
@@ -642,7 +664,7 @@ struct SourceCounts {
     /// cycle.
     deferred: u64,
     /// Failed rows skipped for this source this cycle because their per-run
-    /// reopen budget (`ANNOTATION_RETRY_CAP`) is spent.
+    /// output retry budget (`ANNOTATION_RETRY_CAP`) is spent.
     exhausted: u64,
 }
 
@@ -679,6 +701,9 @@ struct WorkItem {
 enum BuildFlow {
     Continue,
     Deferred,
+    /// A call failed; the complete wave has been recorded, and the next cycle
+    /// owns retrying it. Distinct from SQLite contention and output exhaustion.
+    CallFailed,
     /// A post-paid completion wait was abandoned because shutdown was requested
     /// (the `completion_abandoned_shutdown` WARN was already emitted at the
     /// boundary). Ends the cycle's build work immediately: no NEW paid producer
@@ -840,9 +865,9 @@ struct PendingBuild {
 /// NEW wave starts after a shutdown request: `dispatch_and_commit_wave` probes
 /// shutdown before dispatching, and the caller probes between waves.
 ///
-/// `retry_attempts` is the per-run failed-row reopen budget: a failed row is
-/// reopened at most `ANNOTATION_RETRY_CAP` times per run, then skipped as
-/// exhausted at this discovery gate (never reaching a paid producer call).
+/// `output_retries` permits an initial model-output attempt plus
+/// `ANNOTATION_RETRY_CAP` invalid-output retries. Reopening a failed row or
+/// deferring on contention never spends this budget.
 fn build_source(
     index_root: &Path,
     config: &AnnotatorModelConfig,
@@ -850,7 +875,7 @@ fn build_source(
     client: &AnnotatorClient,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
-    retry_attempts: &mut HashMap<String, u32>,
+    output_retries: &mut RetryState,
 ) -> Result<(SourceCounts, BuildFlow), ApiError> {
     let mut counts = SourceCounts::default();
 
@@ -903,6 +928,42 @@ fn build_source(
             // skipping the building-insert. A crash orphan is adopted where a
             // prior crash abandoned it; leave durable evidence of that recovery
             // so the orphaned row's history is explained.
+            // Reopens merely inspect the budget. Only InvalidOutput results
+            // charge it after wave dispatch; endpoint failures keep the same
+            // temperature. Eleven invalid outputs exhaust initial + ten retries.
+            {
+                let retry = output_retries
+                    .outputs
+                    .entry(row.annotation_id.clone())
+                    .or_default();
+                if retry.invalid_outputs > ANNOTATION_RETRY_CAP {
+                    if !retry.exhaustion_reported {
+                        error!(
+                            event = "annotation_worker.retry_exhausted",
+                            source_id = %source.source_id,
+                            parse_id = %source.active_parse_id,
+                            annotation_id = %row.annotation_id,
+                            producer = producer_label(item.kind),
+                            attempts = ANNOTATION_RETRY_CAP,
+                            failure_class = "invalid_output",
+                            output_failures = retry.invalid_outputs,
+                            "producer retries exhausted for this run; giving up \
+                             (re-armed by restart or producer identity change)"
+                        );
+                        retry.exhaustion_reported = true;
+                    }
+                    counts.exhausted += 1;
+                    continue;
+                }
+                // Round to one decimal so recorded temperatures are stable;
+                // call failures preserve the last temperature, including 0.0
+                // when no invalid output has been observed in this run.
+                effective_temperature =
+                    ((RETRY_TEMPERATURE_STEP * f64::from(retry.invalid_outputs)) * 10.0)
+                        .round()
+                        .min(RETRY_TEMPERATURE_CEILING * 10.0)
+                        / 10.0;
+            }
             if row.status == store::ReopenableStatus::OrphanedBuilding {
                 // Count the adoption for the C10b per-cycle health surface, in
                 // step with the durable log below.
@@ -915,46 +976,6 @@ fn build_source(
                     producer = producer_label(item.kind),
                     "crash-orphaned building annotation adopted for completion"
                 );
-            }
-            // Per-run reopen budget (user-ruled 2026-07-21): each failed-row
-            // reopen spends one attempt; a row observed failed with its budget
-            // spent is EXHAUSTED — skipped, counted for health, and left
-            // `failed` in the hot plane. The crossing logs ERROR exactly once
-            // (the count is then bumped past the cap as the logged-marker), so
-            // steady-state cycles skip silently instead of spamming the log.
-            // Orphan adoption above is deliberately budget-exempt: adopting a
-            // crash orphan completes paid work, it does not re-pay a producer.
-            if row.status == store::ReopenableStatus::Failed {
-                let attempts = retry_attempts.entry(row.annotation_id.clone()).or_insert(0);
-                if *attempts >= ANNOTATION_RETRY_CAP {
-                    if *attempts == ANNOTATION_RETRY_CAP {
-                        error!(
-                            event = "annotation_worker.retry_exhausted",
-                            source_id = %source.source_id,
-                            parse_id = %source.active_parse_id,
-                            annotation_id = %row.annotation_id,
-                            producer = producer_label(item.kind),
-                            attempts = ANNOTATION_RETRY_CAP,
-                            "producer retries exhausted for this run; giving up \
-                             (re-armed by restart or producer identity change)"
-                        );
-                        *attempts += 1;
-                    }
-                    counts.exhausted += 1;
-                    continue;
-                }
-                *attempts += 1;
-                // Retry k samples at 0.1 × k, saturating at the ceiling: the
-                // escalation buys the variation retries exist to exploit,
-                // while first attempts everywhere stay at the base. Rounded to
-                // one decimal so the wire value and the durable provenance
-                // stamp read as the intended ladder step (0.1 × k accumulates
-                // f64 noise: 0.1 × 7 = 0.7000000000000001), keeping stored
-                // temperatures exactly comparable.
-                effective_temperature = ((RETRY_TEMPERATURE_STEP * f64::from(*attempts)) * 10.0)
-                    .round()
-                    .min(RETRY_TEMPERATURE_CEILING * 10.0)
-                    / 10.0;
             }
         }
         counts.missing += 1;
@@ -986,6 +1007,7 @@ fn build_source(
                         source,
                         &mut pending,
                         &mut counts,
+                        output_retries,
                         shutdown,
                     )?;
                     if flow != BuildFlow::Continue {
@@ -1005,13 +1027,13 @@ fn build_source(
                     source,
                     &mut pending,
                     &mut counts,
+                    output_retries,
                     shutdown,
                 )?;
-                if flow == BuildFlow::ShutdownAbort {
-                    // A flush that abandoned on shutdown overrides the deferral:
-                    // no new paid work may start, and the shutdown outcome is the
-                    // one the cycle acts on.
-                    return Ok((counts, BuildFlow::ShutdownAbort));
+                if flow != BuildFlow::Continue {
+                    // Preserve a flushed wave's shutdown or call-failure signal
+                    // rather than relabeling it as the earlier SQLite deferral.
+                    return Ok((counts, flow));
                 }
                 return Ok((counts, BuildFlow::Deferred));
             }
@@ -1027,17 +1049,19 @@ fn build_source(
         source,
         &mut pending,
         &mut counts,
+        output_retries,
         shutdown,
     )?;
     Ok((counts, flow))
 }
 
 /// Flush a non-empty pending wave (dispatch + commit), returning `Continue` when
-/// the wave is empty or fully committed and `ShutdownAbort` when a POST-PAID
+/// the wave is empty or fully committed without call failures, `CallFailed`
+/// after recording a wave with call failures, or `ShutdownAbort` when a POST-PAID
 /// commit was abandoned on shutdown. A pre-paid deferral cannot occur here (the
 /// buffered items already passed `build_open`), so `Deferred` is never returned.
-// Eight positional args after threading the CA2-P3 naming rules alongside the
-// model config; codebase-standard `allow` rather than an unrelated refactor.
+// The source-scoped wave inputs include worker-owned retry state; keep the
+// existing explicit boundary rather than introduce a pass-through context.
 #[allow(clippy::too_many_arguments)]
 fn flush_pending_wave(
     index_root: &Path,
@@ -1047,6 +1071,7 @@ fn flush_pending_wave(
     source: &ActiveSource,
     pending: &mut Vec<PendingBuild>,
     counts: &mut SourceCounts,
+    output_retries: &mut RetryState,
     shutdown: &ShutdownSignal,
 ) -> Result<BuildFlow, ApiError> {
     if pending.is_empty() {
@@ -1060,6 +1085,7 @@ fn flush_pending_wave(
         source,
         pending,
         counts,
+        output_retries,
         shutdown,
     )
 }
@@ -1384,8 +1410,8 @@ fn open_producer_build(
 /// writer contention bounded by shutdown, and the FIRST commit abandoned on
 /// shutdown ends the wave with `ShutdownAbort` (remaining committed-nothing
 /// targets are likewise left as crash orphans).
-// Eight positional args after threading the CA2-P3 naming rules alongside the
-// model config; codebase-standard `allow` rather than an unrelated refactor.
+// The source-scoped wave inputs include worker-owned retry state; keep the
+// existing explicit boundary rather than introduce a pass-through context.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_and_commit_wave(
     index_root: &Path,
@@ -1395,6 +1421,7 @@ fn dispatch_and_commit_wave(
     source: &ActiveSource,
     pending: &mut Vec<PendingBuild>,
     counts: &mut SourceCounts,
+    output_retries: &mut RetryState,
     shutdown: &ShutdownSignal,
 ) -> Result<BuildFlow, ApiError> {
     if pending.is_empty() {
@@ -1421,41 +1448,88 @@ fn dispatch_and_commit_wave(
 
     // Phase 2a fan-out: ONLY the pure producer HTTP call runs off-thread. Results
     // are collected in dispatch order so each maps back to its `PendingBuild`.
-    let produced: Vec<Result<Vec<ProducedAnnotation>, ApiError>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = wave
-            .iter()
-            .map(|build| {
-                // Shared `&client` crosses the scope boundary by reference (Sync);
-                // `item.kind`/`item.invocation` are borrowed for this scope only,
-                // as is the shared `naming_rules` slice (immutable, Sync).
-                scope.spawn(move || {
-                    producer::invoke(
-                        build.item.kind,
-                        client,
-                        &build.item.invocation,
-                        naming_rules,
-                        build.effective_temperature,
-                    )
+    let produced: Vec<Result<Vec<ProducedAnnotation>, InvocationFailure>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|build| {
+                    // Shared `&client` crosses the scope boundary by reference (Sync);
+                    // `item.kind`/`item.invocation` are borrowed for this scope only,
+                    // as is the shared `naming_rules` slice (immutable, Sync).
+                    scope.spawn(move || {
+                        producer::invoke(
+                            build.item.kind,
+                            client,
+                            &build.item.invocation,
+                            naming_rules,
+                            build.effective_temperature,
+                        )
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(result) => result,
-                // A panicked producer thread becomes a producer error so its
-                // target parks `failed` (retried next cycle) rather than
-                // unwinding into and poisoning the whole wave/worker.
-                Err(_) => Err(ApiError::AnnotationProducer {
-                    message: "annotation producer thread panicked".to_string(),
-                }),
-            })
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    // A panicked producer thread becomes a producer error so its
+                    // target parks `failed` (retried next cycle) rather than
+                    // unwinding into and poisoning the whole wave/worker.
+                    Err(payload) => {
+                        Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
+                            message: format!(
+                                "annotation producer thread panicked: {}",
+                                panic_payload_message(payload.as_ref())
+                            ),
+                        }))
+                    }
+                })
+                .collect()
+        });
 
-    // Phase 2b commit: serial on the worker thread, one target at a time,
-    // preserving per-target success/failure attribution.
-    for (build, outcome) in wave.into_iter().zip(produced) {
+    // Classify every joined result before any fallible persistence. Otherwise
+    // an earlier SQL failure could hide later invalid outputs or call failures.
+    let mut call_failures = 0;
+    let produced: Vec<_> = wave
+        .iter()
+        .zip(produced)
+        .map(|(build, outcome)| {
+            let output_failures = if let Err(source_error) = &outcome {
+                // Account for the observed result, never for scheduling a retry.
+                // This state stays on the worker; no model thread mutates it.
+                let retry = output_retries
+                    .outputs
+                    .entry(build.building_id.clone())
+                    .or_default();
+                if matches!(&source_error, InvocationFailure::InvalidOutput(_)) {
+                    retry.invalid_outputs += 1;
+                }
+                if matches!(&source_error, InvocationFailure::Call(_)) {
+                    call_failures += 1;
+                    output_retries.call_failed_in_cycle = true;
+                }
+                warn!(
+                    event = "annotation_worker.producer_failed",
+                    source_id = %source.source_id,
+                    parse_id = %source.active_parse_id,
+                    producer = producer_label(build.item.kind),
+                    annotation_id = %build.building_id,
+                    failure_class = source_error.class(),
+                    output_failures = retry.invalid_outputs,
+                    temperature = build.effective_temperature,
+                    error = %source_error,
+                    "producer failure observed before persistence"
+                );
+                retry.invalid_outputs
+            } else {
+                0
+            };
+            (outcome, output_failures)
+        })
+        .collect();
+
+    // A call failure stops FUTURE waves only; record this wave's results using
+    // the existing storage-failure and shutdown boundaries.
+    for (build, (outcome, output_failures)) in wave.into_iter().zip(produced) {
         match outcome {
             Ok(produced_items) => {
                 // POST-PAID: producer output in hand. `complete_build` waits out
@@ -1491,6 +1565,7 @@ fn dispatch_and_commit_wave(
                     &build.item,
                     &build.building_id,
                     &source_error,
+                    output_failures,
                     shutdown,
                 )? == CompletionOutcome::AbandonedShutdown
                 {
@@ -1500,7 +1575,19 @@ fn dispatch_and_commit_wave(
             }
         }
     }
-    Ok(BuildFlow::Continue)
+    if call_failures > 0 {
+        warn!(
+            event = "annotation_worker.call_failure_cycle_ended",
+            source_id = %source.source_id,
+            parse_id = %source.active_parse_id,
+            call_failures,
+            retry_delay_ms = CYCLE_IDLE_INTERVAL.min(Duration::from_millis(MAX_BACKOFF_MS)).as_millis() as u64,
+            "wave results recorded; ending cycle after call failure before scheduling more work"
+        );
+        Ok(BuildFlow::CallFailed)
+    } else {
+        Ok(BuildFlow::Continue)
+    }
 }
 
 /// Phase 2b success: complete item 1 into the building row, insert items 2..N
@@ -1644,14 +1731,15 @@ fn complete_build(
 /// Phase 2b failure: park the building row failed with bounded detail in one
 /// transaction. The producer error is also warn-logged with endpoint context
 /// (which rides in the error text); prompt content and model output never
-/// enter the log. The failed row stays visible (§21 rule 3) and is retried
-/// next cycle via the failed-only discovery path.
+/// enter the log. Failure class and output count explain whether the next
+/// cycle may retry without inferring policy from the error text.
 fn fail_build(
     index_root: &Path,
     source: &ActiveSource,
     item: &WorkItem,
     building_id: &str,
-    producer_error: &ApiError,
+    producer_error: &InvocationFailure,
+    output_failures: u32,
     shutdown: &ShutdownSignal,
 ) -> Result<CompletionOutcome, ApiError> {
     let detail = truncate_persisted_detail(&producer_error.to_string());
@@ -1674,7 +1762,10 @@ fn fail_build(
         producer = producer_label(item.kind),
         annotation_id = %building_id,
         error = %producer_error,
-        "producer invocation failed; annotation parked failed and will be retried next cycle"
+        failure_class = producer_error.class(),
+        output_failures,
+        output_retry_limit = ANNOTATION_RETRY_CAP,
+        "producer invocation failed; annotation parked failed for retry-policy evaluation"
     );
     Ok(CompletionOutcome::Committed)
 }
