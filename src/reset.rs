@@ -32,8 +32,13 @@ pub(crate) fn reserve(state: &AppState) -> Result<String, ApiError> {
     state.maintenance().begin()?;
     let started = Instant::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // Record observed state after begin, not merely the intent to cancel.
+        // This stays on the drain event so a stalled rebuild carries its evidence.
+        let annotation_cancel_reason = state.maintenance().annotation_cancellation().reason();
         info!(
             event = "rebuild_all.drain_started",
+            annotation_cancel_requested = annotation_cancel_reason.is_some(),
+            annotation_cancel_reason = ?annotation_cancel_reason.map(|reason| reason.label()),
             "waiting for admitted storage work to finish before accepting rebuild-all"
         );
         state.maintenance().drain()?;

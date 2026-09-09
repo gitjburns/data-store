@@ -248,8 +248,14 @@ impl AnnotatorClient {
         // Char count is a safe compact shape fact; the content itself is a
         // forbidden log payload.
         let input_chars = system_prompt.chars().count() + user_content.chars().count();
+        // Snapshot the client's own receiver before polling HTTP. Comparing this
+        // with the drain event distinguishes observed cancellation from intent;
+        // this record does not assert that a request reached the remote server.
+        let annotation_cancel_reason = self.cancellation.reason();
         info!(
             event = "annotator_http.call.started",
+            annotation_cancel_requested = annotation_cancel_reason.is_some(),
+            annotation_cancel_reason = ?annotation_cancel_reason.map(|reason| reason.label()),
             adapter_mode = ANNOTATOR_HTTP_MODE,
             request_purpose,
             endpoint = %self.endpoint,
