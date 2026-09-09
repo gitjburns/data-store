@@ -1065,8 +1065,8 @@ impl Ord for MatchedName {
 /// (a unit reached several ways keeps its strongest classification); `matched`
 /// is the set of matched STORED entity names (each tagged with its match class)
 /// by which this unit was reached (a set so a unit reached twice under the same
-/// name+class is not double-counted, and so tier-1 membership — reached via MORE
-/// THAN ONE matched entity — is computed from distinct NAMES below);
+/// name+class is not double-counted). This full set determines within-tier
+/// strength; direct reach records determine tier-1 membership separately.
 /// `source_id`/`parse_id` are the owning parse the unit was reached in.
 ///
 /// Within-tier strength (RULED 2026-07-15; D9-amended 2026-07-19 to lead with
@@ -1078,7 +1078,7 @@ struct GraphUnitCandidate {
     unit_id: String,
     tier: GraphTier,
     matched: std::collections::BTreeSet<MatchedName>,
-    // Path evidence never participates in the existing candidate ranking key.
+    // Reach kinds distinguish direct mentions from relational matches for tier promotion.
     graph_matches: std::collections::BTreeSet<GraphMatch>,
     source_id: String,
     parse_id: String,
@@ -1100,16 +1100,15 @@ fn candidate_strength_key(
         .expect("a graph candidate is always reached via at least one matched entity")
 }
 
-/// The count of DISTINCT matched entity NAMES a candidate was reached under,
-/// regardless of match class. Tier-1 membership (D9) is "direct mention of MORE
-/// THAN ONE distinct matched entity", and entity identity is the normalized name
-/// (not the class), so a unit reached under the same stored name via two classes
-/// is ONE entity here — the count keys on distinct names only.
-fn distinct_matched_name_count(candidate: &GraphUnitCandidate) -> usize {
+/// Count distinct query-matched names mentioned directly by this unit. Related
+/// entities cannot promote a direct match; different match classes for the same
+/// normalized name still count as one entity.
+fn distinct_direct_matched_name_count(candidate: &GraphUnitCandidate) -> usize {
     candidate
-        .matched
+        .graph_matches
         .iter()
-        .map(|matched| matched.name.as_str())
+        .filter(|matched| matches!(&matched.reach, GraphReach::DirectMention))
+        .map(|matched| matched.matched_entity.as_str())
         .collect::<std::collections::BTreeSet<&str>>()
         .len()
 }
@@ -1363,11 +1362,10 @@ fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> Retriev
 /// Accumulate one reached unit into the global candidate map, recording its
 /// tier and the matched entity (stored name + its match class) it was reached
 /// under. A unit reached several ways KEEPS ITS STRONGEST tier (`min` over
-/// `GraphTier`, where `Tier1 < Tier2 < Tier3`) and UNIONS its matched set — this
-/// is exactly how a unit that is a direct mention of two matched entities lands
-/// in tier 1 (two distinct matched NAMES in its set — see
-/// `distinct_matched_name_count`), while its within-tier strength uses its
-/// strongest matched entry (strongest class, then longest name). Keyed by
+/// `GraphTier`, where `Tier1 < Tier2 < Tier3`) and UNIONS its matched set for
+/// within-tier strength (strongest class, then longest name). Reach records
+/// retain directness for `distinct_direct_matched_name_count`; relational names
+/// never count toward the later multi-direct-entity promotion. Keyed by
 /// `(parse_id, unit_id)` across all parses.
 ///
 /// The SAME stored name may be recorded under two different classes only across
@@ -1464,11 +1462,9 @@ fn record_graph_unit(
 ///      entity's class (the class that reached them), keeping within-tier
 ///      strength keyed on the query-matched evidence.
 ///   3. Tier 1: a unit is upgraded to tier 1 iff it is a DIRECT mention (tier 2)
-///      of MORE THAN ONE distinct matched entity — detected because such a unit
-///      accumulates two distinct matched NAMES in its set
-///      (`distinct_matched_name_count`, class-independent since entity identity
-///      is the normalized name). Computed by recording every direct mention
-///      first, then upgrading units with more than one distinct matched name.
+///      of MORE THAN ONE distinct matched entity. `distinct_direct_matched_name_count`
+///      filters reach records to direct mentions and deduplicates normalized
+///      names, independently of match class and relational traversal order.
 ///
 /// Ordering IS the score (D9 amendment): fusion is rank-only, so the emitted
 /// ORDER is the entire meaning of a graph result. Candidates are sorted by
@@ -1632,16 +1628,10 @@ pub(crate) fn graph_channel(
         }
     }
 
-    // Pass 3 — tier-1 upgrade: a unit reached as a DIRECT mention of MORE THAN
-    // ONE distinct matched entity is tier 1. Such a unit is currently tier 2 with
-    // two-or-more distinct matched NAMES; upgrade it. A tier-3-only unit is never
-    // upgraded here (it is not a direct mention), even if it was reached via
-    // several matched names, because tier 1 is a multi-entity DIRECT-mention
-    // property per D9. Distinct-NAME count (not matched-entry count) so a single
-    // stored name reached under two classes is still ONE entity. Runs once over
-    // the global candidate set.
+    // Only distinct direct mentions qualify for tier 1. The full matched set
+    // also contains relational names, which must not inflate this count.
     for candidate in candidates.values_mut() {
-        if candidate.tier == GraphTier::Tier2 && distinct_matched_name_count(candidate) > 1 {
+        if candidate.tier == GraphTier::Tier2 && distinct_direct_matched_name_count(candidate) > 1 {
             candidate.tier = GraphTier::Tier1;
         }
     }
