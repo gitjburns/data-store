@@ -84,6 +84,8 @@ pub(crate) enum OperationType {
     Restore,
     Drill,
     SourceIngest,
+    /// Explicit destructive corpus reset; succeeds when automatic ingestion resumes.
+    RebuildAll,
     // Recorded additive extension of the §34.6 closed set (see the enum doc
     // comment): the held-parse discard disposition's async-operation handle.
     ParseDiscard,

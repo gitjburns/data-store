@@ -144,6 +144,34 @@ existing schema rather than recreating it.
 
 The command prints `fabric storage schema ready at <path>` and exits on success.
 
+### Rebuild the current corpus
+
+With the service running, use the client from the project root:
+
+```sh
+data-store --config config.toml --rebuild-all
+```
+
+The REPL command is `rebuild-all`; neither form takes arguments. It clears all
+stored corpus data, snapshots, annotation caches, and prior operation history,
+then resumes automatic ingestion with fresh parses, embeddings, and annotations.
+The database schema, original corpus files, models, configuration, and service
+logs remain intact. No storage setup or migration is required.
+
+The command waits for current storage work to drain before receiving an
+Operation ID. This initial request uses `[client].operation_timeout_seconds`;
+a timeout or disconnect does not cancel server work. If acceptance was not
+received, consult health and the service log for the last known state.
+
+Storage-dependent requests return `503` while existing work drains and storage
+is cleared. Health, Operation polling, and shutdown remain available. Command
+success means automatic rebuilding resumed; queries then see the progressively
+rebuilt corpus. If clearing fails or is interrupted, storage remains paused,
+including after restart. After durable acceptance, shutdown before resumption
+also leaves an incomplete rebuild; annotation dry-run mode refuses that state.
+Resolve the reported error and rerun `--rebuild-all` against the normally started
+service.
+
 ## 3. Startup and admin-token handoff
 
 Start the service:

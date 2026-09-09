@@ -15,6 +15,7 @@ use crate::{
     error::ApiError,
     identity::ApplicationIdentity,
     inference::InferenceRuntime,
+    maintenance::MaintenanceGate,
     policy::EntityMatchPolicy,
     projections::dense_cache::DenseCache,
     types::{HealthComponent, HealthCount, HealthResponse},
@@ -67,6 +68,8 @@ pub struct AppState {
     model_call_gate: Arc<ExclusiveGate>,
     admin_shutdown_token: String,
     shutdown_signal: Arc<ShutdownSignal>,
+    // Shared by HTTP work and both worker threads; rebuild-all drains this gate.
+    maintenance: Arc<MaintenanceGate>,
     // Written every cycle by the sync scheduler thread, read by health();
     // the Arc/Mutex exist because those are different threads sharing one
     // small snapshot slot.
@@ -466,6 +469,7 @@ impl AppState {
             model_call_gate,
             admin_shutdown_token,
             shutdown_signal,
+            maintenance: Arc::new(MaintenanceGate::default()),
             sync_health,
             fabric_health,
             annotation_health,
@@ -475,6 +479,47 @@ impl AppState {
             application_identity,
             entity_match_policy,
         }
+    }
+
+    /// Provide the same admission gate to HTTP handlers and worker threads.
+    pub(crate) fn maintenance(&self) -> &Arc<MaintenanceGate> {
+        &self.maintenance
+    }
+
+    /// Discard published state only after all storage leases drain. Workers
+    /// reset their local cadence/retry state on the next generation's admission.
+    pub(crate) fn clear_rebuild_state(&self) -> Result<(), ApiError> {
+        self.dense_cache.clear();
+        self.cutover_registry
+            .barriers
+            .lock()
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("cannot clear cutover registry after rebuild-all: {source}"),
+            })?
+            .clear();
+        *self
+            .sync_health
+            .lock()
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("cannot clear sync health after rebuild-all: {source}"),
+            })? = SyncHealth::startup_pending();
+        *self
+            .fabric_health
+            .lock()
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("cannot clear fabric health after rebuild-all: {source}"),
+            })? = FabricHealth::default();
+        // Retain a disabled annotator's parked reason: reset does not reload its
+        // client or resurrect a worker that failed initialization.
+        let mut annotations =
+            self.annotation_health
+                .lock()
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("cannot clear annotation health after rebuild-all: {source}"),
+                })?;
+        annotations.last_cycle = None;
+        annotations.measured_at = None;
+        Ok(())
     }
 
     /// The shared active dense cache the C7 dense retrieval channel scores
@@ -605,6 +650,7 @@ impl AppState {
             stage = "signal_requesting",
             "shutdown signal requested"
         );
+        self.maintenance.stop()?;
         match self.shutdown_signal.request() {
             Ok(true) => {
                 info!(
@@ -718,10 +764,17 @@ impl AppState {
                 poisoned.into_inner().clone()
             }
         };
+        // Maintenance is a sync readiness constraint, not a stale worker count.
+        // Read it independently of the slots so an in-flight cycle cannot hide it.
+        let maintenance_detail = self.maintenance.detail();
+        let mut sync_details = sync_health_details(&sync_snapshot);
+        if let Some(detail) = &maintenance_detail {
+            sync_details.push(detail.clone());
+        }
         let sync_component = HealthComponent {
             name: "sync".to_string(),
-            ready: sync_snapshot.fabric_ready,
-            details: readiness_details("readiness-critical", sync_health_details(&sync_snapshot)),
+            ready: sync_snapshot.fabric_ready && maintenance_detail.is_none(),
+            details: readiness_details("readiness-critical", sync_details),
             counts: Vec::new(),
         };
         // C10b diagnostic-only components. Each is assembled from an in-memory

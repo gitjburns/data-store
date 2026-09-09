@@ -217,6 +217,7 @@ are cross-checked against the router in `src/http.rs`.
 | `discard` | `--discard` | `<parseId>` | `POST /parses/{parseId}/discard` | protected | yes (operation) |
 | `snapshot` | `--snapshot` | `[requestJson]` | `POST /snapshots` | protected | yes (operation) |
 | `restore` | `--restore` | `<sourceId> <parseId>` | `POST /restore` | protected | yes (operation) |
+| `rebuild-all` | `--rebuild-all` | — | `POST /rebuild-all` | protected | yes (operation) |
 | `shutdown` | `--shutdown` | — | `POST /shutdown` | protected | no (control action) |
 | `held-parses` (`held`) | `--held-parses` | — | `GET /parses?status=held` | protected | no |
 | `operation` | `--operation` | `<operationId>` | `GET /operations/{operationId}` | protected | no (single read) |
@@ -240,6 +241,10 @@ Notes on individual commands:
   omitted, the empty JSON object body `{}` is sent.
 - **`restore <sourceId> <parseId>`** — POSTs `{sourceId, parseId}` to
   `/restore`.
+- **`rebuild-all`** — POSTs with no body to `/rebuild-all`, clearing stored
+  corpus data and resuming automatic ingestion, including fresh embeddings and
+  annotations. Corpus files remain intact. See PROTOCOL.md for maintenance and
+  failure behavior.
 - **`operation <operationId>`** — a **single** protected read of the
   operation record; it does **not** poll. (The async admin commands poll
   internally; this command is the standalone snapshot read.)
@@ -258,8 +263,8 @@ Notes on individual commands:
 
 ## 4. Polling model for async admin mutations
 
-The seven async admin commands (`ingest`, `reparse`, `activate`,
-`accept`, `discard`, `snapshot`, `restore`) drive server-side work that
+The eight async admin commands (`ingest`, `reparse`, `activate`,
+`accept`, `discard`, `snapshot`, `restore`, `rebuild-all`) drive server-side work that
 runs asynchronously. The client:
 
 1. Prints a **progress line** `<METHOD> <url>` to stdout (visible as
@@ -271,6 +276,13 @@ runs asynchronously. The client:
    **`OPERATION_POLL_INTERVAL` = 1 second** (a code constant) until the
    operation reaches a terminal status (`succeeded` or `failed`).
 4. Renders the terminal operation record (§5.2).
+
+`rebuild-all` first prints `Waiting for current storage work to finish before
+acceptance...`. The server drains admitted work before persisting the Operation
+and returning `202`; clearing then runs asynchronously. The initial POST uses
+the existing `[client].operation_timeout_seconds`. A timeout or disconnect does
+not cancel server work; if acceptance was not received, consult health and the
+service log for the last known state.
 
 Each poll re-reads the admin token and is itself bounded by
 `[client].operation_timeout_seconds` (the per-request timeout). The poll
@@ -344,8 +356,9 @@ operator action, lives in the **parse run row**, not in
 `Operation.status`. So on `succeeded` for those types the renderer prints
 an explicit `note:` directing the operator to check the parse run row
 for the domain verdict, and to run **`held-parses`** for a held result.
-For non-parse-producing operation types, `succeeded` prints without the
-note.
+For `rebuild_all`, `succeeded` prints a note that storage was cleared and
+automatic rebuilding resumed; corpus ingestion and annotation generation
+continue in the background. Other operation types print without a note.
 
 ### 5.3 `query`
 

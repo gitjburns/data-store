@@ -38,6 +38,7 @@ an asynchronous **Operation** you poll (see [Operations](#operations)).
   - [`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard)
   - [`POST /snapshots`](#post-snapshots)
   - [`POST /restore`](#post-restore)
+  - [`POST /rebuild-all`](#post-rebuild-all)
   - [`POST /shutdown`](#post-shutdown)
   - [`GET /parses`](#get-parses)
   - [`GET /operations/{operationId}`](#get-operationsoperationid)
@@ -132,7 +133,7 @@ The full set of error kinds and their HTTP statuses, as emitted by the service:
 | `payload_too_large`             | 413 | Request body exceeds the global size limit. |
 | `docling_conversion`            | 422 | Document conversion failure during ingest/parse. |
 | `not_found`                     | 404 | Addressed resource absent (or, for unit reads, not served — see below). |
-| `service_unavailable`           | 503 | Capacity/admission saturation or a subsystem temporarily unavailable. |
+| `service_unavailable`           | 503 | Capacity/admission saturation, rebuild maintenance, or a subsystem temporarily unavailable. |
 | `cutover_barrier_active`        | 503 | Query rejected because the targeted source is mid-cutover. **Retryable** — the barrier holds only for the last milliseconds of a cutover; retry the request. |
 | `config_read`                   | 500 | |
 | `config_parse`                  | 500 | |
@@ -171,6 +172,7 @@ failures and are reported as `500`, not `503`. Only `cutover_barrier_active`
 | POST | `/parses/{parseId}/discard`                      | protected | — → `202 { operationId }` |
 | POST | `/snapshots`                                     | protected | `SnapshotRequest` → `202 { operationId }` |
 | POST | `/restore`                                       | protected | `RestoreRequest` → `202 { operationId }` |
+| POST | `/rebuild-all`                                   | protected | — → `202 { operationId }` |
 | POST | `/shutdown`                                       | protected | — → `202` (no body) |
 | GET  | `/parses?status=held`                            | protected | — → `{ parses }` |
 | GET  | `/operations/{operationId}`                      | protected | — → `Operation` |
@@ -673,14 +675,15 @@ curl -s http://localhost:PORT/sync/status
 ## Protected routes
 
 All routes in this section require the bearer token (see
-[Authentication](#authentication)). The seven mutating admin routes below each
-return `202 Accepted` with `{ "operationId": "..." }` and run the actual work
-**asynchronously**. Poll the returned id at
+[Authentication](#authentication)). The eight asynchronous admin routes below
+return `202 Accepted` with `{ "operationId": "..." }`. `POST /rebuild-all`
+drains current storage work before recording acceptance; clearing then runs
+asynchronously. Poll the returned id at
 [`GET /operations/{operationId}`](#get-operationsoperationid); see
 [Operations](#operations) for the polling model and the important
 `succeeded`-is-not-a-verdict caveat.
 
-The `202` acceptance body is the same for all seven (`camelCase`):
+The `202` acceptance body is the same for all eight (`camelCase`):
 
 ```json
 { "operationId": "op_..." }
@@ -863,6 +866,40 @@ curl -s -X POST http://localhost:PORT/restore \
 
 ---
 
+### `POST /rebuild-all`
+
+Clear the corpus's stored state and resume automatic ingestion. Protected.
+**Request body** — none. **Response `202`** — `{ operationId }`, with
+`operationType: rebuild_all` and target `corpus`.
+
+The service rejects new storage-dependent requests with `503`
+`service_unavailable`, drains admitted requests and admin tasks, and parks
+ingestion and annotation workers after their current cycles. Health, Operation
+polling, and shutdown remain available. An overlapping rebuild returns `503`.
+Only after draining finishes does the service persist the pending Operation and
+return `202`; clearing runs on a detached task. A client timeout or disconnect
+does not cancel server work. If acceptance was not received, the outcome may be
+unknown; health and the service log expose the last known state.
+
+The operation clears application data and the lexical index, preserving the
+schema and its own Operation row; deletes `fabric/artifacts/` and
+`fabric/staging/` under `storage.index_root`; re-registers loaded policies; and
+clears caches and worker bookkeeping. Original corpus files, models,
+configuration, and service logs remain intact. Prior snapshots and operation
+history are erased along with parses, projections, embeddings, annotations, and
+memoization.
+
+`succeeded` means storage was cleared and automatic rebuilding resumed. Queries
+then see the progressively rebuilt corpus; ingestion and annotation generation
+are still background work. On failure, the Operation exposes the specific error
+and storage access stays paused until an explicit `POST /rebuild-all` retry.
+After durable acceptance, shutdown before resumption leaves a failed or
+interrupted rebuild requiring an explicit retry. Normal startup with an
+incomplete rebuild leaves storage paused; annotation dry-run mode refuses to
+start against that state.
+
+---
+
 ### `POST /shutdown`
 
 Signal the service to shut down. Protected. This is a **control action, not an
@@ -981,11 +1018,12 @@ Read one Operation row by id (§34.6). Protected.
 ```
 acquisition, parser_execution, parse_build, parse_import_validation,
 parse_activation, projection_build, snapshot_creation, restore,
-drill, source_ingest, parse_discard
+drill, source_ingest, parse_discard, rebuild_all
 ```
 
-`parse_discard` is an additive extension of the spec's closed set (see
-[`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard)).
+`parse_discard` and `rebuild_all` extend the spec's closed set (see
+[`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard) and
+[`POST /rebuild-all`](#post-rebuild-all)).
 
 `status` values (wire names, `snake_case`): `pending`, `running`, `succeeded`,
 `failed`.
@@ -1083,8 +1121,10 @@ Every mutating admin route ([`POST /sources`](#post-sources),
 [`POST /parses/{parseId}/accept`](#post-parsesparseidaccept),
 [`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard),
 [`POST /snapshots`](#post-snapshots),
-[`POST /restore`](#post-restore)) returns `202 { "operationId": "op_..." }`
-**before** the work completes. The work runs asynchronously.
+[`POST /restore`](#post-restore),
+[`POST /rebuild-all`](#post-rebuild-all)) returns `202 { "operationId": "op_..." }`
+**before** the work completes. `POST /rebuild-all` first drains current storage
+work, then records acceptance and starts asynchronous clearing.
 
 To observe progress and outcome, poll
 [`GET /operations/{operationId}`](#get-operationsoperationid). The `status` walks

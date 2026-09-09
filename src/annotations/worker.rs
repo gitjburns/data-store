@@ -190,6 +190,7 @@ pub(crate) fn start(
     config_root: PathBuf,
     naming_policy: AnnotatorNamingPolicy,
     shutdown: Arc<ShutdownSignal>,
+    maintenance: Arc<crate::maintenance::MaintenanceGate>,
     // C10b diagnostic-only health slot the worker publishes into each cycle (and
     // on the parked path). Same cross-thread Arc/Mutex slot discipline as the
     // scheduler's; `AppState::health()` reads it poison-recovered.
@@ -211,6 +212,7 @@ pub(crate) fn start(
                     config_root,
                     naming_policy,
                     shutdown,
+                    maintenance,
                     health_slot,
                 )
             }));
@@ -260,6 +262,7 @@ fn run_worker(
     config_root: PathBuf,
     naming_policy: AnnotatorNamingPolicy,
     shutdown: Arc<ShutdownSignal>,
+    maintenance: Arc<crate::maintenance::MaintenanceGate>,
     health_slot: Arc<Mutex<AnnotationHealth>>,
 ) {
     info!(
@@ -305,11 +308,49 @@ fn run_worker(
 
     // Per-run retry budget: annotation_id → failed-row reopens issued this
     // run (`ANNOTATION_RETRY_CAP`). Owned here — across cycles, never across
-    // restarts — as the ONE exception to cycle statelessness; entries only
-    // accumulate for failing annotations, so the map stays tiny.
+    // restarts or successful rebuilds — as the ONE exception to cycle
+    // statelessness; entries only accumulate for failing annotations.
     let mut retry_attempts: HashMap<String, u32> = HashMap::new();
+    let mut generation = 0;
+    let mut delay = Duration::ZERO;
 
     loop {
+        // Keep admission through the cycle's health publication so clearing
+        // cannot race a model result, database write, or stale count publish.
+        let permit = match maintenance.worker_permit("annotations", delay, generation, &shutdown) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => break,
+            Err(source) => {
+                error!(
+                    event = "annotation_worker.maintenance_wait_failed",
+                    error = %source,
+                    "annotation worker could not acquire storage admission"
+                );
+                publish_annotation_health(
+                    &health_slot,
+                    &AnnotationHealth {
+                        parked: true,
+                        parked_detail: Some(truncate_persisted_detail(&format!(
+                            "maintenance admission failed: {source}"
+                        ))),
+                        last_cycle: None,
+                        measured_at: None,
+                    },
+                );
+                info!(
+                    event = "annotation_worker.thread_stopped",
+                    reason = "maintenance_wait_failed",
+                    "annotation worker thread stopped"
+                );
+                return;
+            }
+        };
+        if permit.generation() != generation {
+            generation = permit.generation();
+            // Old annotation IDs may recur after rebuilding identical content;
+            // their previous retry budget must not limit this fresh corpus.
+            retry_attempts.clear();
+        }
         // One cycle failing is never fatal: the error is logged with context
         // and the next cycle re-discovers from the hot plane (statelessness).
         // A completed cycle returns its freshness report, published diagnostic-
@@ -333,12 +374,10 @@ fn run_worker(
             ),
         }
 
-        // Shutdown-aware idle: wakes immediately on shutdown, otherwise waits
-        // out the cadence. The in-flight work item already finished (build
-        // steps are not interruptible mid-item), so this is a clean boundary.
-        if shutdown.wait_timeout(CYCLE_IDLE_INTERVAL) {
-            break;
-        }
+        // Idle without admission; successful maintenance wakes the next cycle
+        // immediately instead of waiting out the normal annotation cadence.
+        drop(permit);
+        delay = CYCLE_IDLE_INTERVAL;
     }
 
     info!(

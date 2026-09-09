@@ -18,6 +18,7 @@ mod identity;
 mod ids;
 mod inference;
 mod logging;
+mod maintenance;
 mod model;
 mod operations;
 mod parse;
@@ -25,6 +26,7 @@ mod policy;
 mod primitives;
 mod projections;
 mod query;
+mod reset;
 mod restore;
 mod scheduler;
 mod snapshot;
@@ -636,6 +638,34 @@ async fn run_http_service(
         // query pipeline's graph channel is its only runtime consumer.
         entity_match_policy.document,
     ));
+    let maintenance = Arc::clone(state.maintenance());
+    // The reset marker survives row clearing. Never let a process restart turn
+    // a partially cleared store into normal ingestion without explicit retry.
+    if fabric_ready_at_startup {
+        let recovery_root = state.config.storage.index_root.clone();
+        let recovery =
+            tokio::task::spawn_blocking(move || operations::unresolved_rebuild(&recovery_root))
+                .await
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("rebuild-all recovery inspection failed to join: {source}"),
+                })
+                .and_then(|result| result);
+        match recovery {
+            Ok(Some(operation_id)) => {
+                error!(
+                    event = "rebuild_all.recovery_required",
+                    operation_id,
+                    "incomplete rebuild-all found; storage admission remains paused until explicit retry"
+                );
+                maintenance.fail(format!("operation {operation_id} did not complete"));
+            }
+            Ok(None) => {}
+            Err(source) => {
+                error!(event = "rebuild_all.recovery_check_failed", %source, "storage admission paused because recovery state is unknown");
+                maintenance.fail(source.to_string());
+            }
+        }
+    }
     // The projection runtime's model-call gate is the SAME process-global gate
     // AppState holds (`model_call_gate_handle`), so scheduler-thread model calls
     // and HTTP-path model calls serialize on one instance (§1.5). Constructed
@@ -661,6 +691,7 @@ async fn run_http_service(
         scheduler_projection_runtime,
         application_identity,
         Arc::clone(&shutdown_signal),
+        Arc::clone(&maintenance),
         sync_health,
         fabric_health,
     ) {
@@ -693,6 +724,7 @@ async fn run_http_service(
         // here — its content hash was already folded into identity capture.
         annotator_naming_policy.document,
         Arc::clone(&shutdown_signal),
+        Arc::clone(&maintenance),
         annotation_health,
     );
     let app = build_router(state).layer(TraceLayer::new_for_http());
@@ -708,17 +740,18 @@ async fn run_http_service(
     let health_url = format!("http://{bind_address}/v1/health");
     // Top-level readiness is inference plus the sync component: inference is
     // true by construction here (its failure returns above), so the
-    // pre-checked fabric state decides the reported flag.
+    // fabric state and any interrupted rebuild decide the reported flag.
+    let ready_at_startup = fabric_ready_at_startup && maintenance.detail().is_none();
     reporter.report(format!(
-        "data-store startup ready={fabric_ready_at_startup} inference=true sync={fabric_ready_at_startup} health_url={health_url}"
+        "data-store startup ready={ready_at_startup} inference=true sync={ready_at_startup} health_url={health_url}"
     ))?;
     info!(
         event = "startup.ready",
         %bind_address,
         health_url = %health_url,
-        ready = fabric_ready_at_startup,
+        ready = ready_at_startup,
         inference_ready = true,
-        sync_ready = fabric_ready_at_startup,
+        sync_ready = ready_at_startup,
         elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
         "startup readiness completed"
     );
@@ -726,9 +759,9 @@ async fn run_http_service(
     info!(
         event = "service.listening",
         %bind_address,
-        ready = fabric_ready_at_startup,
+        ready = ready_at_startup,
         inference_ready = true,
-        sync_ready = fabric_ready_at_startup,
+        sync_ready = ready_at_startup,
         "data store service listening"
     );
     let serve_result = axum::serve(listener, app)
@@ -740,6 +773,9 @@ async fn run_http_service(
     // scheduler and annotation worker may be mid-sleep; request shutdown
     // explicitly so the joins below are bounded by one wait_timeout wakeup
     // instead of a full idle sleep.
+    if let Err(source) = maintenance.stop() {
+        error!(event = "rebuild_all.shutdown_gate_failed", %source, "could not close maintenance admission during shutdown");
+    }
     if let Err(reason) = shutdown_signal.request() {
         error!(
             event = "scheduler.shutdown_request_failed",
@@ -759,6 +795,13 @@ async fn run_http_service(
             "annotation worker thread panicked before shutdown"
         );
     }
+    // An accepted rebuild owns filesystem deletion independently of its HTTP
+    // response. Drain it before terminating the runtime, even during shutdown.
+    tokio::task::spawn_blocking(move || maintenance.wait_for_rebuild())
+        .await
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("rebuild-all shutdown wait failed to join: {source}"),
+        })??;
     serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
@@ -864,6 +907,26 @@ async fn run_annotation_dry_run_mode(
     crate::hot_plane::open_read(&config.storage.index_root)
         .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
         .inspect_err(|source| dry_run_fatal("fabric_plane_validation", source))?;
+    // Dry-run also writes corpus state; it cannot bypass the recovery marker
+    // left by an interrupted normal-mode rebuild-all.
+    let recovery_root = config.storage.index_root.clone();
+    let recovery =
+        tokio::task::spawn_blocking(move || operations::unresolved_rebuild(&recovery_root))
+            .await
+            .map_err(|source| ApiError::InternalIo {
+                message: format!("dry-run rebuild recovery inspection failed to join: {source}"),
+            })
+            .and_then(|result| result)
+            .inspect_err(|source| dry_run_fatal("rebuild_recovery", source))?;
+    if let Some(operation_id) = recovery {
+        let source = ApiError::ServiceUnavailable {
+            message: format!(
+                "rebuild-all {operation_id} did not complete; start normally and explicitly retry rebuild-all before annotation dry-run"
+            ),
+        };
+        dry_run_fatal("rebuild_recovery", &source);
+        return Err(source.into());
+    }
     register_policy_versions(
         &config.storage.index_root,
         &entity_match_policy.content_hash,

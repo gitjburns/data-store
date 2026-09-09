@@ -1,18 +1,21 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, Path, Query, State,
+        DefaultBodyLimit, MatchedPath, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+
+use crate::maintenance::MaintenancePermit;
 
 use crate::assembly::model::EvidencePack;
 use crate::inference::{ColbertCandidateScore, RerankerCandidateScore};
@@ -73,6 +76,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/parses/{parseId}/discard", post(post_discard))
         .route("/snapshots", post(post_snapshots))
         .route("/restore", post(post_restore))
+        .route("/rebuild-all", post(post_rebuild_all))
         // Control action (§34): immediate confirmation then signal; NOT an
         // Operation row (it is not async work). Protected.
         .route("/shutdown", post(post_shutdown))
@@ -89,6 +93,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sync/status", get(get_sync_status))
         // Operation polling (§34.6). Protected.
         .route("/operations/{operationId}", get(get_operation))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            storage_admission,
+        ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
@@ -128,6 +136,109 @@ pub fn build_dry_run_router(state: Arc<AppState>) -> Router {
         .route("/operations/{operationId}", get(get_operation))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
+}
+
+/// Retain admission through the complete handler even if its client disconnects:
+/// spawn_blocking work cannot be cancelled by dropping the HTTP future. Detached
+/// admin tasks additionally inherit the request's lease through Extension.
+async fn storage_admission(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str())
+        .unwrap_or("<unmatched>")
+        .to_owned();
+    let control = matches!(
+        (request.method(), route.as_str()),
+        (&Method::GET, "/v1/health" | "/operations/{operationId}")
+            | (&Method::POST, "/shutdown" | "/rebuild-all")
+    );
+    let permit = if control {
+        None
+    } else {
+        match state.maintenance().enter() {
+            Ok(permit) => {
+                request.extensions_mut().insert(permit.clone());
+                Some(permit)
+            }
+            Err(mut failure) => {
+                // Preserve protected-route auth precedence during maintenance.
+                let public = matches!(
+                    (request.method(), route.as_str()),
+                    (&Method::POST, "/query")
+                        | (
+                            &Method::GET,
+                            "/units/{unitId}"
+                                | "/units/{unitId}/relationships"
+                                | "/sources/{sourceId}"
+                                | "/sync/status"
+                        )
+                );
+                if !public
+                    && let Err(auth_error) = bearer_token_from_headers(request.headers())
+                        .and_then(|token| state.authorize_admin_token(token))
+                {
+                    failure = auth_error;
+                }
+                warn!(event = "http.maintenance_rejected", route,
+                    error = %failure, status = failure.status_u16(), "request rejected before storage admission");
+                return failure.into_response();
+            }
+        }
+    };
+    let task_route = route.clone();
+    match tokio::spawn(async move {
+        let _permit = permit;
+        let response = next.run(request).await;
+        info!(
+            event = "http.admitted_task_finished",
+            route = task_route,
+            status = response.status().as_u16(),
+            "admitted HTTP task finished"
+        );
+        response
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            error!(event = "http.admitted_task_failed", route, %source, "HTTP task failed to join");
+            ApiError::InternalIo {
+                message: format!("HTTP task failed to join: {source}"),
+            }
+            .into_response()
+        }
+    }
+}
+
+/// Drain and accept rebuild-all on a blocking boundary, then detach clearing.
+/// The middleware shields the initial wait from client cancellation. Acceptance
+/// waits for existing writers before persisting an Operation; health remains live.
+async fn post_rebuild_all(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
+    let route = "/rebuild-all";
+    let started = log_route_started(route, "authorizing");
+    authorize_request(&state, &headers, route, &started)?;
+    let reserve_state = Arc::clone(&state);
+    let operation_id = tokio::task::spawn_blocking(move || crate::reset::reserve(&reserve_state))
+        .await
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("rebuild-all acceptance task failed to join: {source}"),
+        })?
+        .inspect_err(|source| log_route_failed(route, "accepting", source, &started))?;
+    let task_id = operation_id.clone();
+    tokio::task::spawn_blocking(move || crate::reset::run(&state, &task_id));
+    log_operation_accepted(route, "rebuild_all", &operation_id, &started);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(OperationAcceptedBody { operation_id }),
+    ))
 }
 
 /// Return service readiness and startup diagnostics.
@@ -615,7 +726,7 @@ fn authorize_request(
     Ok(())
 }
 
-/// The immediate acceptance body for an async admin Operation (§34.6): the
+/// The acceptance body for an async admin Operation (§34.6): the
 /// caller polls `GET /operations/{operationId}` with this id. Returned under
 /// HTTP 202 (Accepted) — the work has NOT completed when this returns.
 #[derive(Debug, Serialize)]
@@ -667,6 +778,7 @@ async fn insert_pending_operation(
 /// dropped: the task cannot surface them anywhere, and the row's last durable
 /// state plus this log line are the record.
 fn spawn_admin_operation<F>(
+    permit: MaintenancePermit,
     index_root: std::path::PathBuf,
     operation_id: String,
     operation_type: &'static str,
@@ -675,6 +787,9 @@ fn spawn_admin_operation<F>(
     F: FnOnce() -> Result<(), ApiError> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
+        // The HTTP response may already be gone; retain admission through the
+        // terminal Operation write so rebuild-all cannot erase this task's data.
+        let _permit = permit;
         let started = Instant::now();
         // pending → running. A failure here means the row vanished or was already
         // advanced; there is nowhere to surface it (detached task), so log and stop
@@ -1108,7 +1223,7 @@ async fn enqueue_ingest(
     };
     if let Err(error) = &result {
         log_route_failed(route, "enqueue", error, started);
-        fail_orphaned_operation(index_root, operation_id, &error.to_string());
+        fail_orphaned_operation(index_root, operation_id, &error.to_string()).await;
     }
     result
 }
@@ -1118,10 +1233,12 @@ async fn enqueue_ingest(
 /// on its own blocking boundary: a store fault here is logged and dropped — the
 /// enqueue error is already the client's response, and the durable record is the
 /// Operation row's last state plus this log.
-fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &str, detail: &str) {
+async fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &str, detail: &str) {
     let operation_id = operation_id.to_owned();
     let detail = detail.to_owned();
-    tokio::task::spawn_blocking(move || {
+    // Await within the cancellation-shielded HTTP task so its storage lease
+    // also covers this last orphan-repair write.
+    let join = tokio::task::spawn_blocking(move || {
         // mark_failed is `running`-guarded, so advance through `running` first —
         // the same sequence the drain's fail path uses for a still-pending row.
         if let Err(error) = crate::operations::mark_running(&index_root, &operation_id) {
@@ -1141,7 +1258,11 @@ fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &str, d
                 "could not fail orphaned operation after enqueue failure"
             );
         }
-    });
+    })
+    .await;
+    if let Err(source) = join {
+        error!(event = "operation.enqueue_orphan.join_failed", %source, "orphan repair task failed to join");
+    }
 }
 
 /// Handle `POST /sources/{sourceId}/parses/{parseId}/activate` (§34,
@@ -1151,6 +1272,7 @@ fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &str, d
 /// inside the detached task.
 async fn post_activate(
     State(state): State<Arc<AppState>>,
+    Extension(permit): Extension<MaintenancePermit>,
     Path((source_id, parse_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
@@ -1170,6 +1292,7 @@ async fn post_activate(
     let state_for_task = Arc::clone(&state);
     let task_index_root = index_root.clone();
     spawn_admin_operation(
+        permit,
         index_root,
         operation_id.clone(),
         "parse_activation",
@@ -1200,6 +1323,7 @@ async fn post_activate(
 /// run is never in `superseded_held_ids`.
 async fn post_accept(
     State(state): State<Arc<AppState>>,
+    Extension(permit): Extension<MaintenancePermit>,
     Path(parse_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
@@ -1219,6 +1343,7 @@ async fn post_accept(
     let state_for_task = Arc::clone(&state);
     let task_index_root = index_root.clone();
     spawn_admin_operation(
+        permit,
         index_root,
         operation_id.clone(),
         "parse_activation",
@@ -1252,6 +1377,7 @@ async fn post_accept(
 /// itself, gating over its own pre_activation snapshot.
 async fn post_discard(
     State(state): State<Arc<AppState>>,
+    Extension(permit): Extension<MaintenancePermit>,
     Path(parse_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
@@ -1270,6 +1396,7 @@ async fn post_discard(
 
     let task_index_root = index_root.clone();
     spawn_admin_operation(
+        permit,
         index_root,
         operation_id.clone(),
         "parse_discard",
@@ -1318,6 +1445,7 @@ struct SnapshotRequest {
 /// corpus-wide manual or incident snapshot via `request_snapshot`.
 async fn post_snapshots(
     State(state): State<Arc<AppState>>,
+    Extension(permit): Extension<MaintenancePermit>,
     headers: HeaderMap,
     payload: Result<Json<SnapshotRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
@@ -1344,6 +1472,7 @@ async fn post_snapshots(
     let state_for_task = Arc::clone(&state);
     let task_index_root = index_root.clone();
     spawn_admin_operation(
+        permit,
         index_root,
         operation_id.clone(),
         "snapshot_creation",
@@ -1388,6 +1517,7 @@ struct RestoreRequest {
 /// semantics live inside the restore and are unchanged.
 async fn post_restore(
     State(state): State<Arc<AppState>>,
+    Extension(permit): Extension<MaintenancePermit>,
     headers: HeaderMap,
     payload: Result<Json<RestoreRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
@@ -1409,23 +1539,29 @@ async fn post_restore(
 
     let state_for_task = Arc::clone(&state);
     let task_index_root = index_root.clone();
-    spawn_admin_operation(index_root, operation_id.clone(), "restore", move || {
-        let dense_dimension = state_for_task.config.models.dense.dimension as usize;
-        // One source of truth for the restore completion end state: this shared
-        // path restores AND clears `deactivated_at` + appends `source.reactivated`,
-        // so the HTTP rollback and the autonomous §11.4 reappearance leave the
-        // same durable state. Domain Err propagates → spawn_admin_operation marks
-        // the Operation failed (lifecycle unchanged).
-        crate::deletion::restore_and_reactivate_source(
-            &task_index_root,
-            state_for_task.cutover_registry(),
-            state_for_task.dense_cache(),
-            dense_dimension,
-            &source_id,
-            &parse_id,
-            "operator_rollback_restore",
-        )
-    });
+    spawn_admin_operation(
+        permit,
+        index_root,
+        operation_id.clone(),
+        "restore",
+        move || {
+            let dense_dimension = state_for_task.config.models.dense.dimension as usize;
+            // One source of truth for the restore completion end state: this shared
+            // path restores AND clears `deactivated_at` + appends `source.reactivated`,
+            // so the HTTP rollback and the autonomous §11.4 reappearance leave the
+            // same durable state. Domain Err propagates → spawn_admin_operation marks
+            // the Operation failed (lifecycle unchanged).
+            crate::deletion::restore_and_reactivate_source(
+                &task_index_root,
+                state_for_task.cutover_registry(),
+                state_for_task.dense_cache(),
+                dense_dimension,
+                &source_id,
+                &parse_id,
+                "operator_rollback_restore",
+            )
+        },
+    );
 
     log_operation_accepted(route, "restore", &operation_id, &started);
     Ok((

@@ -107,6 +107,28 @@ filesystem) fails the Operation.
 signals `request_shutdown`, and returns 202 with no Operation row (extra-spec,
 recorded additive).
 
+### 1.2 Rebuild maintenance
+
+`POST /rebuild-all` closes a shared admission gate, drains admitted HTTP requests
+and detached admin tasks, and parks both workers at cycle boundaries. Only then
+does it persist the pending `rebuild_all` Operation and return `202`. Draining
+and detached clearing run synchronously behind `spawn_blocking`. Client timeout
+or disconnect does not cancel the work. Health, Operation polling, and shutdown
+remain available.
+
+With storage users drained, the operation clears application data while
+preserving schema and its own Operation, deletes the artifact and staging trees,
+re-registers loaded policies, and resets in-memory caches, worker bookkeeping,
+cadence, and health counts. Resuming the existing pipeline rebuilds the corpus,
+including all embeddings and annotations. Operation success marks resumption;
+queries then see the progressively rebuilt corpus.
+
+The rebuild Operation is also the durable recovery marker. A clearing failure
+keeps storage paused; after durable acceptance, shutdown before resumption leaves
+failed or interrupted work. Normal startup detects these rebuilds and requires
+an explicit retry; annotation dry-run mode refuses them. This protects the boundary between
+transactional database clearing and filesystem deletion.
+
 ## 2. Storage planes (D1)
 
 Two physical planes live under `{index_root}/fabric/`.

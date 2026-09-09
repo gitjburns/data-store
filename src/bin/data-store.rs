@@ -109,6 +109,7 @@ enum Command {
         source_id: String,
         parse_id: String,
     },
+    RebuildAll,
     Shutdown,
     HeldParses,
     /// Annotation vocabulary inspection (CA2 ruling 8): the entity names or
@@ -256,6 +257,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_usage: "restore <sourceId> <parseId>",
         cli_usage: Some("data-store [--config <path>] --restore <sourceId> <parseId>"),
         build: build_restore_command,
+    },
+    CommandSpec {
+        repl_name: "rebuild-all",
+        repl_aliases: &[],
+        cli_flag: Some("--rebuild-all"),
+        cli_aliases: &[],
+        repl_usage: "rebuild-all (clear storage and restart automatic ingestion)",
+        cli_usage: Some("data-store [--config <path>] --rebuild-all"),
+        build: build_rebuild_all_command,
     },
     CommandSpec {
         repl_name: "shutdown",
@@ -423,7 +433,7 @@ struct RestoreRequest {
     parse_id: String,
 }
 
-/// Client mirror of the §34.6 immediate acceptance body returned under HTTP 202
+/// Client mirror of the §34.6 acceptance body returned under HTTP 202
 /// by every async admin route. The transport depends on this shape to obtain the
 /// operation id it then polls, so it is a typed mirror rather than raw JSON.
 #[derive(Debug, Deserialize)]
@@ -1059,6 +1069,12 @@ fn build_restore_command(args: &[String]) -> Result<Command> {
     })
 }
 
+/// Request a complete corpus rebuild through the server-owned maintenance operation.
+fn build_rebuild_all_command(args: &[String]) -> Result<Command> {
+    require_arg_count(args, 0, "rebuild-all")?;
+    Ok(Command::RebuildAll)
+}
+
 /// Build the `shutdown` command targeting `POST /shutdown`.
 fn build_shutdown_command(args: &[String]) -> Result<Command> {
     require_arg_count(args, 0, "shutdown")?;
@@ -1437,6 +1453,12 @@ fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
                 parse_id,
             };
             run_admin_operation(context, "POST", "/restore", Some(&to_body(&request)?))?;
+        }
+        Command::RebuildAll => {
+            // The server drains current storage users before it can persist
+            // acceptance; keep that potentially long initial wait visible.
+            println!("Waiting for current storage work to finish before acceptance...");
+            run_admin_operation(context, "POST", "/rebuild-all", None)?;
         }
         Command::Shutdown => {
             // §34: shutdown is NOT an Operation — 202 with no body, an immediate
@@ -1866,7 +1888,13 @@ fn render_operation(record: &OperationRecord) {
             println!("  error: {detail}");
         }
         OperationStatus::Succeeded => {
-            if is_parse_producing_operation(&record.operation_type) {
+            // Rebuild completion releases maintenance; background ingestion continues afterward.
+            if record.operation_type == "rebuild_all" {
+                println!(
+                    "  note: storage cleared; automatic rebuilding resumed. Corpus ingestion \
+                     and annotation generation continue in the background."
+                );
+            } else if is_parse_producing_operation(&record.operation_type) {
                 println!(
                     "  note: the operation lifecycle completed, but this does NOT confirm the \
                      domain outcome. Check the parse run row for the domain verdict; for a held \

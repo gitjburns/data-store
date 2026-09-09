@@ -174,6 +174,15 @@ impl DenseCache {
         }
     }
 
+    /// Drop all planes after rebuild-all has drained every query and publisher.
+    pub(crate) fn clear(&self) {
+        self.with_planes(|planes| planes.clear());
+        info!(
+            event = "dense_cache.cleared",
+            "all active dense planes cleared for rebuild-all"
+        );
+    }
+
     /// Load (or reload) the active dense plane for `parse_id` from the durable
     /// `chunk_dense_vectors` rows through C6c-1's `load_dense_vectors_for_parse`
     /// reader, then atomically swap it into the cache map.

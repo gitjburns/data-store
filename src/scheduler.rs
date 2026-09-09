@@ -1050,6 +1050,7 @@ pub(crate) fn start(
     // snapshot-minting site rather than read from a global.
     identity: ApplicationIdentity,
     shutdown: Arc<ShutdownSignal>,
+    maintenance: Arc<crate::maintenance::MaintenanceGate>,
     health_slot: Arc<Mutex<SyncHealth>>,
     // C10b diagnostic-only fabric-counts slot, published every cycle alongside
     // the readiness-critical sync summary. A separate slot from `health_slot`
@@ -1077,6 +1078,7 @@ pub(crate) fn start(
                     projections,
                     identity,
                     shutdown,
+                    maintenance,
                     health_slot,
                     fabric_slot,
                 )
@@ -1129,6 +1131,7 @@ fn run_scheduler(
     projections: ProjectionRuntime,
     identity: ApplicationIdentity,
     shutdown: Arc<ShutdownSignal>,
+    maintenance: Arc<crate::maintenance::MaintenanceGate>,
     health_slot: Arc<Mutex<SyncHealth>>,
     fabric_slot: Arc<Mutex<FabricHealth>>,
 ) {
@@ -1142,6 +1145,38 @@ fn run_scheduler(
     // The thread keeps its own snapshot and publishes whole copies, so the
     // slot always holds an internally consistent SyncHealth.
     let mut health = SyncHealth::startup_pending();
+
+    // Startup validation and staging cleanup use storage too; an interrupted
+    // rebuild must park this thread before either can inspect partial state.
+    let startup_permit = match maintenance.worker_permit("scheduler", Duration::ZERO, 0, &shutdown)
+    {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            info!(
+                event = "scheduler.thread_stopped",
+                reason = "shutdown_requested",
+                "sync scheduler stopped before storage validation"
+            );
+            return;
+        }
+        Err(source) => {
+            error!(
+                event = "scheduler.maintenance_wait_failed",
+                stage = "startup",
+                error = %source,
+                "sync scheduler could not acquire storage admission"
+            );
+            health.detail = Some(format!("maintenance admission failed: {source}"));
+            publish_health(&health_slot, &health);
+            publish_fabric_health(&fabric_slot, &FabricHealth::default());
+            info!(
+                event = "scheduler.thread_stopped",
+                reason = "maintenance_wait_failed",
+                "sync scheduler thread stopped"
+            );
+            return;
+        }
+    };
 
     // Fabric-plane gate: the hot plane must exist with the exact expected
     // schema before any queue or acquisition work. Failure is terminal for
@@ -1242,8 +1277,45 @@ fn run_scheduler(
         identity,
     };
 
+    let mut generation = startup_permit.generation();
+    drop(startup_permit);
     let mut cadence = CadenceState::new();
+    let mut delay = Duration::ZERO;
     loop {
+        // A permit covers the full cycle, including its final storage reads and
+        // health publication, so no old-generation counters survive a reset.
+        let permit = match maintenance.worker_permit("scheduler", delay, generation, &shutdown) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => break,
+            Err(source) => {
+                error!(
+                    event = "scheduler.maintenance_wait_failed",
+                    stage = "cycle",
+                    error = %source,
+                    "sync scheduler could not acquire storage admission"
+                );
+                health.fabric_ready = false;
+                health.detail = Some(format!("maintenance admission failed: {source}"));
+                publish_health(&health_slot, &health);
+                publish_fabric_health(&fabric_slot, &FabricHealth::default());
+                info!(
+                    event = "scheduler.thread_stopped",
+                    reason = "maintenance_wait_failed",
+                    "sync scheduler thread stopped"
+                );
+                return;
+            }
+        };
+        if permit.generation() != generation {
+            generation = permit.generation();
+            cadence = CadenceState::new();
+            health = SyncHealth::startup_pending();
+            health.fabric_ready = true;
+            health.detail = None;
+            // Rebuilding is background work; do not keep readiness at startup
+            // pending until an entire fresh-corpus cycle finishes.
+            publish_health(&health_slot, &health);
+        }
         let cycle_started = Instant::now();
         // Spacing between cycle STARTS is the churn-measurement basis; the
         // first cycle has no predecessor, so its own duration is the only
@@ -1367,11 +1439,10 @@ fn run_scheduler(
         // adaptive cadence.
         publish_cycle_fabric_health(&index_root, connector.source_system(), &fabric_slot);
 
-        // Shutdown-aware sleep: wakes immediately on shutdown, otherwise
-        // waits out the adaptive cadence.
-        if shutdown.wait_timeout(Duration::from_millis(delay_ms)) {
-            break;
-        }
+        // Idle without a permit so maintenance can drain; a new generation
+        // bypasses this delay and starts with fresh cadence state next cycle.
+        drop(permit);
+        delay = Duration::from_millis(delay_ms);
     }
 
     info!(

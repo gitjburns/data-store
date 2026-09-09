@@ -182,6 +182,20 @@ pub(crate) fn mark_failed(
     )
 }
 
+/// Find durable evidence of an incomplete destructive reset before starting workers.
+/// A successful retry deletes earlier markers, so any remaining non-success blocks admission.
+pub(crate) fn unresolved_rebuild(index_root: &Path) -> Result<Option<String>, ApiError> {
+    let connection = hot_plane::open_read(index_root)?;
+    let kind = enum_wire_name(&OperationType::RebuildAll, "operation type")?;
+    connection.query_row(
+        "SELECT id FROM operations WHERE operation_type = ?1 AND status != 'succeeded' ORDER BY created_at DESC LIMIT 1",
+        params![kind],
+        |row| row.get(0),
+    ).optional().map_err(|source| ApiError::StorageOperation {
+        message: format!("failed to inspect rebuild-all recovery marker: {source}"),
+    })
+}
+
 /// Read one Operation by id, re-typed into the model shape, for
 /// `GET /operations/{operationId}`. Returns `None` when the id is absent so
 /// the handler maps that to a 404. Opens a fresh read-only connection.

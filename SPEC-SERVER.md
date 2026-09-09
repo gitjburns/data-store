@@ -405,8 +405,8 @@ degraded diagnostic never makes a running service report unavailable.
 Shutdown is driven **only** by `POST /shutdown` → `AppState::request_shutdown`,
 which signals a cross-thread latch. **There is no OS-signal handling.** On the
 signal (or on a transport error in the serve loop) the service requests shutdown,
-then joins the scheduler and annotation worker (bounded by one wakeup), cleans up
-the token file, and stops.
+then joins the scheduler and annotation worker, waits for any accepted rebuild
+owner to reach a terminal boundary, cleans up the token file, and stops.
 
 ### 4.6 Daemonization handoff
 
@@ -486,17 +486,17 @@ inspectable.
 ## 5. Async-operation administrative model
 
 Every **mutating** admin route executes as an asynchronous **Operation**. The
-route inserts a durable `operations` row, returns an Operation id immediately,
+route inserts a durable `operations` row and returns an Operation id,
 and runs the work either **queue-coupled** (via the scheduler drain) or on a
 **detached `spawn_blocking`** task. The task transitions the Operation to
 `succeeded` on `Ok` or `failed` on `Err`/panic. Clients poll with
-`GET /operations/{operationId}`.
+`GET /operations/{operationId}`. `POST /rebuild-all` drains current storage work
+before inserting its Operation and returning acceptance (§5.1).
 
 The Operation `status` set is closed: **`pending`** (on insert) →
 **`running`** (once the worker starts it) → terminal **`succeeded`** or
 **`failed`**. The `operationType` set is the spec §34.6 closed enumeration plus
-one recorded additive extension: **`parse_discard`**, the held-parse discard
-disposition's async-operation handle (§16).
+**`parse_discard`** (held-parse discard, §16) and **`rebuild_all`** (§5.1).
 
 **No NDJSON anywhere** (D2 ruling): there is no streamed progress on
 administrative operations, and no streamed query transport. Administration is
@@ -510,6 +510,34 @@ state. It does **not** encode the domain verdict of a parse. The domain outcome
 needs the domain verdict must read the parse run, not just the Operation status.
 
 ---
+
+### 5.1 Rebuild all
+
+`POST /rebuild-all` pauses storage admission, drains admitted HTTP and detached
+admin work, and parks the ingestion and annotation workers at cycle boundaries.
+New storage-dependent requests and overlapping rebuilds return `503`; health,
+Operation polling, and shutdown remain available.
+After draining, the service persists the pending rebuild Operation and returns
+`202`; clearing continues on a detached blocking task. Client timeout or
+disconnect does not cancel server work. Health and the service log preserve the
+last known state when the client does not receive acceptance.
+
+The operation clears application tables and the lexical index, retaining the
+schema and current rebuild Operation; deletes `fabric/artifacts/` and
+`fabric/staging/` under `storage.index_root`; re-registers loaded policies; and
+resets caches, worker bookkeeping, cadence, and health counts. Corpus files,
+model files, configuration, and service logs remain intact. Normal ingestion
+then rebuilds parses, projections, embeddings, and annotations without retained
+producer output or memoization.
+
+Success means storage was cleared and workers resumed, not that ingestion has
+finished. Requests then use the progressively rebuilt corpus. Failed or
+interrupted clearing leaves storage paused, including after restart, until an
+explicit rebuild retry. After durable acceptance, shutdown before resumption
+also leaves a failed or interrupted rebuild; annotation dry-run mode refuses
+incomplete rebuild state.
+The preserved Operation row is the durable recovery marker; SQLite clearing and
+filesystem deletion are separate boundaries.
 
 ## 6. HTTP route surface
 
@@ -537,6 +565,8 @@ The full wire contract is in **PROTOCOL.md**. Routes split into public
 - `POST /snapshots` — mint a forensic snapshot (async).
 - `POST /restore` — restore + reactivate a source (async; shares the autonomous
   completion path).
+- `POST /rebuild-all` — clear stored corpus state and resume automatic rebuilding
+  (async Operation; §5.1).
 - `POST /shutdown` — immediate confirmation, then signals shutdown. **Not** an
   Operation row (not async work).
 - `GET /parses?status=held` — held-parse listing (spec §13.4 disposition surface).
