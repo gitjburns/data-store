@@ -3,6 +3,8 @@
 [server]
 # Socket address where the standalone HTTP service binds.
 bind_address = "127.0.0.1:8091"
+# Seconds to hold ordinary corpus access while rebuild-all remains available; 0 disables the wait.
+startup_delay_seconds = 10
 # Maximum accepted HTTP request body size before Axum returns 413.
 max_request_body_bytes = 16384
 # Maximum corpus-relative source reference length accepted by ingest operations.

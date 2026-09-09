@@ -240,6 +240,14 @@ other components (`logging`, `fabric`, `annotation`, `search_admission`) are
 diagnostic-only and do not gate top-level readiness. `GET /v1/health` is the single aggregation
 surface for corpus/fabric counts.
 
+During the configured `server.startup_delay_seconds` window, `ready` is false
+and health reports the startup delay. `GET /v1/health`,
+`GET /operations/{operationId}`, `POST /rebuild-all`, and `POST /shutdown`
+remain available; other storage-dependent requests return `503`
+`service_unavailable`. Rebuild-all ends the countdown immediately. After
+successful clearing, ordinary corpus initialization continues without any
+remaining delay; failed rebuilds keep storage paused. Shutdown cancels the wait.
+
 ```bash
 curl -s http://localhost:PORT/v1/health
 ```
@@ -946,11 +954,13 @@ configuration, and service logs remain intact. Prior snapshots and operation
 history are erased along with parses, projections, embeddings, annotations, and
 memoization.
 
-`succeeded` means storage was cleared and automatic rebuilding resumed. Queries
-then see the progressively rebuilt corpus; ingestion and annotation generation
-are still background work. On failure, the Operation exposes the specific error
+`succeeded` means storage was cleared and rebuild maintenance released. A rebuild
+during startup ends the countdown immediately; corpus initialization and worker
+handoff proceed after clearing without any remaining delay. Once admitted, queries see
+the progressively rebuilt corpus; ingestion and annotation generation remain
+background work. On failure, the Operation exposes the specific error
 and storage access stays paused until an explicit `POST /rebuild-all` retry.
-After durable acceptance, shutdown before resumption leaves a failed or
+After durable acceptance, shutdown before maintenance release leaves a failed or
 interrupted rebuild requiring an explicit retry. Normal startup with an
 incomplete rebuild leaves storage paused; annotation dry-run mode refuses to
 start against that state.

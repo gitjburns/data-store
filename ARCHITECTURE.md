@@ -120,6 +120,19 @@ recorded additive).
 
 ### 1.2 Rebuild maintenance
 
+Normal service startup holds the same storage admission gate while serving HTTP
+for `server.startup_delay_seconds` (nonnegative integer seconds; `0` skips the
+wait). Inference and policy-file loading precede HTTP serving; ordinary corpus
+initialization, staging cleanup, policy registration, cache loading, and workers
+wait until afterward. Startup logging and admin-token publication remain active.
+Health, Operation polling, rebuild-all, and shutdown bypass the startup hold;
+other storage requests return `503` and readiness stays false. Deferred corpus
+initialization runs synchronously behind a blocking task. Rebuild-all ends the
+countdown immediately; successful clearing allows startup initialization and
+worker handoff to proceed without any remaining delay. Failed rebuilds keep
+storage paused. Shutdown cancels the wait; setup-storage and annotation dry-run
+modes do not use it.
+
 `POST /rebuild-all` closes a shared admission gate and signals annotation
 cancellation. The annotation worker stops dispatch, cancels outstanding HTTP
 waits, discards unfinished results, and rolls back uncommitted writes. Its lease
@@ -137,12 +150,14 @@ advances. `DIAGNOSTICS.md` documents the cancellation fields and terminal events
 With storage users drained, the operation clears application data while
 preserving schema and its own Operation, deletes the artifact and staging trees,
 re-registers loaded policies, and resets in-memory caches, worker bookkeeping,
-cadence, and health counts. Resuming the existing pipeline rebuilds the corpus,
-including all embeddings and annotations. Operation success marks resumption;
-queries then see the progressively rebuilt corpus.
+cadence, and health counts. Operation success marks clearing completion and
+release of rebuild maintenance. During startup, the rebuild ends the countdown
+and supplies registered policies and empty caches; worker handoff proceeds
+without another wait. Resuming the pipeline rebuilds the corpus, including
+all embeddings and annotations; queries see the progressively rebuilt corpus.
 
 The rebuild Operation is also the durable recovery marker. A clearing failure
-keeps storage paused; after durable acceptance, shutdown before resumption leaves
+keeps storage paused; after durable acceptance, shutdown before maintenance release leaves
 failed or interrupted work. Normal startup detects these rebuilds and requires
 an explicit retry; annotation dry-run mode refuses them. This protects the boundary between
 transactional database clearing and filesystem deletion.
@@ -318,6 +333,14 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   `section_dense::build_section_dense` →
   `multivector::build_multivectors` → `view::build_derived_view`. Each carries a
   `retrieval_projections` envelope with a freshness status.
+
+  The fine chunker (`src/projections/chunk.rs`) measures normalized targeting
+  text with a per-build ColBERT tokenizer copy, disabling truncation and padding
+  while retaining special tokens. Oversized words split at measured UTF-8
+  boundaries; their final suffix can join following words. Every retained chunk
+  is recounted and checked against 512 tokens before persistence. The
+  400-character minimum applies to normalized fragments, including split
+  remainders. The chunker name, version, and limits determine `chunkerConfigHash`.
 
   Section windows retain the existing passage vectors and add heading-prefixed
   canonical text, capped at 2,048 tokens measured with the local ColBERT

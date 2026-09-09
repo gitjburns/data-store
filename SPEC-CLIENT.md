@@ -363,8 +363,8 @@ operator action, lives in the **parse run row**, not in
 an explicit `note:` directing the operator to check the parse run row
 for the domain verdict, and to run **`held-parses`** for a held result.
 For `rebuild_all`, `succeeded` prints a note that storage was cleared and
-automatic rebuilding resumed; corpus ingestion and annotation generation
-continue in the background. Other operation types print without a note.
+automatic rebuilding resumed; corpus ingestion and annotation generation run in
+the background. Other operation types print without a note.
 
 ### 5.3 `query`
 

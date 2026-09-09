@@ -132,6 +132,7 @@ The sections below document each `[section]` and its keys as external facts. See
 | Key | Meaning |
 | --- | --- |
 | `bind_address` | Socket address where the HTTP service binds (e.g. `127.0.0.1:8091`). |
+| `startup_delay_seconds` | Required nonnegative integer seconds before ordinary corpus initialization on normal service startup. `0` disables the wait; supplied configurations use `10`. HTTP serves during the window (§4.2). |
 | `max_request_body_bytes` | HTTP body limit applied before request JSON is accepted (over-limit → 413). Must be > 0. |
 | `max_ingest_source_chars` | Maximum length of an ingest source reference after JSON parsing. Must be > 0. |
 | `max_search_query_chars` | Maximum length of a search query after JSON parsing. Must be > 0. |
@@ -391,10 +392,10 @@ An unknown argument is a fatal CLI error.
 on success it prints the database path and exits. It builds at a temp path and
 atomic-renames, so a crashed setup is recoverable.
 
-### 4.2 Bind-before-init
+### 4.2 Startup ordering and delay
 
-On a normal start the service **binds HTTP before lengthy dependency
-initialization**, so a launcher observes the listener early. Ordering:
+On a normal start the listener binds before inference initialization, but HTTP
+request handling begins after inference is ready. Ordering:
 
 1. Bootstrap: load config, initialize file logging (bootstrap diagnostics to
    stdout).
@@ -403,16 +404,25 @@ initialization**, so a launcher observes the listener early. Ordering:
 3. Bind the TCP listener. A bind failure is fatal.
 4. **Publish the admin token file** (§4.3). Failure is fatal.
 5. Initialize inference. Failure is fatal (and cleans up the token file).
-6. Fabric hot-plane **pre-check** (reporting only): a synchronous read-only open
-   + schema validation predicts sync readiness for the startup handoff. It is
-   **not** the health source of truth — `/v1/health` reads the
-   scheduler-published sync slot, which starts pending. A missing/invalid fabric
-   plane here is **not fatal**: the service serves with `ready=false`.
-7. Capture the §30.2 application identity once (fatal on failure — a service that
-   cannot pin the identity its snapshots stamp has nothing valid to record).
-8. Construct shared state and spawn the scheduler (fatal on spawn failure, since
-   sync gates readiness) and the annotation worker (not readiness-critical).
-9. Serve until shutdown.
+6. Load and validate policy documents and capture application identity (§15.3).
+   Construct shared state with ordinary storage admission held.
+7. Serve HTTP and wait `server.startup_delay_seconds`. Health, Operation polling,
+   rebuild-all, and shutdown remain available; other storage-dependent requests
+   return `503`. Readiness stays false and health reports the startup delay.
+8. When the delay expires, register policy versions and load caches through a
+   blocking task. A successful rebuild already provides registered policies and
+   empty caches, so startup skips those steps. Start the scheduler and annotation
+   worker and release the startup hold; the scheduler performs staging cleanup
+   after gaining storage admission. A missing/invalid fabric plane leaves
+   readiness false with health diagnostics.
+9. Continue serving until shutdown.
+
+Rebuild-all ends the countdown immediately and clears storage. Successful
+clearing allows startup to continue without any remaining delay; an active or
+failed rebuild keeps storage paused. Shutdown cancels the wait. Startup output
+announces the configured delay; the service log records
+its start, completion or cancellation, and corpus initialization outcome. The
+delay does not apply to `--setup-storage` or annotation dry-run mode.
 
 ### 4.3 Admin token handoff
 
@@ -572,10 +582,12 @@ model files, configuration, and service logs remain intact. Normal ingestion
 then rebuilds parses, projections, embeddings, and annotations without retained
 producer output or memoization.
 
-Success means storage was cleared and workers resumed, not that ingestion has
-finished. Requests then use the progressively rebuilt corpus. Failed or
+Success means storage was cleared and rebuild maintenance released. A rebuild
+during startup ends the countdown; corpus initialization and worker handoff
+continue immediately after clearing. Ingestion is background work and requests
+use the progressively rebuilt corpus once admitted. Failed or
 interrupted clearing leaves storage paused, including after restart, until an
-explicit rebuild retry. After durable acceptance, shutdown before resumption
+explicit rebuild retry. After durable acceptance, shutdown before maintenance release
 also leaves a failed or interrupted rebuild; annotation dry-run mode refuses
 incomplete rebuild state.
 The preserved Operation row is the durable recovery marker; SQLite clearing and
@@ -1020,6 +1032,15 @@ hashed code document folded into `chunkerConfigHash`, not configuration.
 Chunks exist to be found — lexical and dense targets that resolve back to
 canonical units. **A chunk is never served as evidence**; evidence is always
 canonical ContentUnits (§14.3 step 7).
+
+The chunker measures the exact whitespace-normalized
+`targeting_text` for boundary decisions and stored `token_count`. Counts include
+ColBERT special tokens, with truncation and padding disabled on a per-build
+tokenizer copy. Every retained chunk is checked against the 512-token cap before
+persistence. Individually oversized words split at valid UTF-8 boundaries and
+retain their canonical unit ID; the fitting final suffix can join subsequent
+words. Chunks below 400 normalized characters are discarded, including split
+remainders.
 
 ---
 

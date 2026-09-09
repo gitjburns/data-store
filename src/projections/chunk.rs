@@ -474,7 +474,14 @@ fn split_units_into_chunks(
     // Both emission paths normalize text. Recount their exact output and enforce
     // the cap before any chunk rows are persisted by the caller's transaction.
     for chunk in &mut chunks {
-        chunk.token_count = count_tokens(tokenizer, &chunk.targeting_text)?;
+        chunk.token_count = count_tokens(tokenizer, &chunk.targeting_text).map_err(|source| {
+            ApiError::UnitSplitting {
+                message: format!(
+                    "failed to count normalized chunk starting at unit {:?}: {source}",
+                    chunk.input_unit_ids.first()
+                ),
+            }
+        })?;
         if chunk.token_count > max_tokens {
             return Err(ApiError::UnitSplitting {
                 message: format!(

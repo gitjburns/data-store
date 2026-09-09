@@ -85,6 +85,9 @@ struct GateState {
     rebuilding: bool,
     stopped: bool,
     detail: Option<String>,
+    // Startup and rebuild have independent owners. Completing either hold must
+    // never reopen admission while the other still protects corpus state.
+    startup_detail: Option<String>,
     generation: u64,
 }
 
@@ -99,6 +102,92 @@ struct Lease {
 }
 
 impl MaintenanceGate {
+    /// Hold ordinary access before publishing HTTP or starting corpus workers.
+    pub(crate) fn begin_startup(&self, delay_seconds: u64) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        state.startup_detail = Some(format!(
+            "startup: waiting {delay_seconds} seconds before corpus initialization"
+        ));
+        Ok(())
+    }
+
+    /// Wait for the startup delay or a rebuild request, then admit initialization
+    /// once maintenance allows it. Rebuild ends the timer; its completion wakes
+    /// this same condvar, so no remaining delay postpones normal work.
+    pub(crate) fn startup_permit(
+        self: &Arc<Self>,
+        delay_seconds: u64,
+        shutdown: &ShutdownSignal,
+    ) -> Result<Option<MaintenancePermit>, ApiError> {
+        let started = Instant::now();
+        let delay = Duration::from_secs(delay_seconds);
+        let mut delay_pending = true;
+        info!(
+            event = "startup.delay_started",
+            delay_seconds, "HTTP controls available; waiting before ordinary corpus work"
+        );
+        let mut state = self.lock()?;
+        loop {
+            if state.stopped || shutdown.wait_timeout(Duration::ZERO) {
+                info!(
+                    event = "startup.delay_cancelled",
+                    reason = "shutdown",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "startup wait cancelled"
+                );
+                return Ok(None);
+            }
+            // Generation catches a rebuild that finished before this task ran;
+            // a failed/interrupted rebuild also takes over startup's pause.
+            let rebuild_seen = state.rebuilding || state.generation != 0;
+            let remaining = delay.saturating_sub(started.elapsed());
+            if delay_pending && (remaining.is_zero() || rebuild_seen || state.detail.is_some()) {
+                delay_pending = false;
+                let reason = if rebuild_seen {
+                    "rebuild_all"
+                } else if state.detail.is_some() {
+                    "storage_paused"
+                } else {
+                    "elapsed"
+                };
+                info!(
+                    event = "startup.delay_completed",
+                    reason,
+                    delay_seconds,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "startup delay ended; corpus admission follows maintenance state"
+                );
+            }
+            if !delay_pending && state.detail.is_none() {
+                state.startup_detail = Some("startup: initializing corpus".into());
+                return Ok(Some(self.admit(&mut state)));
+            }
+            // Poll shutdown's separate latch without building an Instant deadline
+            // from the unbounded configured seconds. Rebuild wakes this wait directly.
+            let interval = if delay_pending {
+                remaining.min(Duration::from_millis(100))
+            } else {
+                Duration::from_millis(100)
+            };
+            state = self
+                .changed
+                .wait_timeout(state, interval)
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("startup admission wait poisoned: {source}"),
+                })?
+                .0;
+        }
+    }
+
+    /// Release startup alone; a concurrently accepted or failed rebuild retains
+    /// its own hold and keeps both workers and ordinary HTTP requests paused.
+    pub(crate) fn complete_startup(&self) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        state.startup_detail = None;
+        self.changed.notify_all();
+        Ok(())
+    }
+
     /// Subscribe without taking a storage lease; admitted work owns its lease separately.
     pub(crate) fn annotation_cancellation(&self) -> AnnotationCancellation {
         AnnotationCancellation {
@@ -116,11 +205,12 @@ impl MaintenanceGate {
     /// Admit a new HTTP operation only while normal storage access is enabled.
     pub(crate) fn enter(self: &Arc<Self>) -> Result<MaintenancePermit, ApiError> {
         let mut state = self.lock()?;
-        if state.stopped || state.detail.is_some() {
+        if state.stopped || state.detail.is_some() || state.startup_detail.is_some() {
             return Err(ApiError::ServiceUnavailable {
                 message: state
                     .detail
                     .clone()
+                    .or_else(|| state.startup_detail.clone())
                     .unwrap_or_else(|| "service is shutting down".into()),
             });
         }
@@ -153,6 +243,7 @@ impl MaintenanceGate {
                 return Ok(None);
             }
             if state.detail.is_none()
+                && state.startup_detail.is_none()
                 && (state.generation != generation || started.elapsed() >= delay)
             {
                 if parked {
@@ -166,18 +257,18 @@ impl MaintenanceGate {
                 }
                 return Ok(Some(self.admit(&mut state)));
             }
-            if state.detail.is_some() && !parked {
+            if (state.detail.is_some() || state.startup_detail.is_some()) && !parked {
                 info!(
                     event = "maintenance.worker_parked",
                     worker,
                     generation = state.generation,
                     active_storage_leases = state.active,
-                    reason = state.detail.as_deref(),
+                    reason = state.detail.as_deref().or(state.startup_detail.as_deref()),
                     "worker parked between cycles"
                 );
                 parked = true;
             }
-            let interval = if state.detail.is_some() {
+            let interval = if state.detail.is_some() || state.startup_detail.is_some() {
                 Duration::from_millis(100)
             } else {
                 delay
@@ -265,6 +356,20 @@ impl MaintenanceGate {
         Ok(())
     }
 
+    /// Pause after a startup storage failure while the caller holds its lease.
+    /// An accepted rebuild may already be draining that lease: it owns recovery,
+    /// and startup must never clear or replace its exclusive ownership.
+    pub(crate) fn fail_startup_storage(&self, detail: String) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        if !state.rebuilding && !state.stopped {
+            state.detail = Some(format!("rebuild-all requires explicit retry: {detail}"));
+            self.annotation_cancellation
+                .send_replace(Some(AnnotationCancelReason::StoragePaused));
+        }
+        self.changed.notify_all();
+        Ok(())
+    }
+
     /// Retain a failed or interrupted rebuild as a closed gate until an explicit retry.
     pub(crate) fn fail(&self, detail: String) {
         let mut state = match self.state.lock() {
@@ -285,10 +390,14 @@ impl MaintenanceGate {
         self.changed.notify_all();
     }
 
-    /// Expose maintenance without accessing the storage being cleared.
+    /// Expose the controlling hold without accessing storage. Rebuild/failure
+    /// details take precedence over startup so operators know what blocks resume.
     pub(crate) fn detail(&self) -> Option<String> {
         match self.lock() {
-            Ok(state) => state.detail.clone(),
+            Ok(state) => state
+                .detail
+                .clone()
+                .or_else(|| state.startup_detail.clone()),
             Err(error) => Some(error.to_string()),
         }
     }

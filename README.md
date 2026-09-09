@@ -61,9 +61,17 @@ so a non-active parse's units are never served.
 
 ## Operating model
 
-**Start the service.** The server binary is `data-store-service`; it binds HTTP
-before lengthy dependency initialization, so it is reachable early and reports
-its own readiness through `/v1/health`.
+**Start the service.** The server binary is `data-store-service`. After inference
+initialization, it serves HTTP during the configured
+`server.startup_delay_seconds` window before initializing corpus storage or
+starting workers. The supplied configuration uses 10 seconds; `0` disables the
+wait. Send `data-store --config config.toml --rebuild-all` during this window to
+clear the old corpus before ordinary startup can modify it. Health, Operation
+polling, rebuild-all, and shutdown remain available; other storage-dependent
+requests return `503` and readiness stays false. Rebuild-all ends the countdown
+immediately; after successful clearing, normal startup continues without waiting
+out the remaining delay. Failed rebuilds keep storage paused. Startup logging
+and admin-token publication remain active.
 
 **Set up storage once.** Run the server with `--setup-storage` to build the
 fabric hot plane (the only durable store). This is one deliberate operator
@@ -145,6 +153,7 @@ PROTOCOL.md is the contract of record. This is the map.
 | `POST /parses/{parseId}/discard` | Discard a held parse (async Operation). |
 | `POST /snapshots` | Create a forensic snapshot (async Operation). |
 | `POST /restore` | Restore a source from a snapshot (async Operation). |
+| `POST /rebuild-all` | Clear indexed corpus state and schedule automatic rebuilding (async Operation). |
 | `POST /shutdown` | Graceful shutdown (immediate confirmation, then signal). |
 | `GET /parses?status=held` | List parses awaiting disposition. |
 | `GET /operations/{operationId}` | Poll an async Operation's status. |
@@ -255,6 +264,7 @@ Operator verbs (CLI flag / REPL name):
 | `--discard` | `<parseId>` | Discard a held parse. |
 | `--snapshot` | `[requestJson]` | Create a snapshot. |
 | `--restore` | `<sourceId> <parseId>` | Restore from a snapshot. |
+| `--rebuild-all` | — | Clear indexed state and artifacts, then automatically reingest the corpus. Available during the startup delay. |
 | `--held-parses` | — | List held parses awaiting disposition. |
 | `--operation` | `<operationId>` | Read an Operation once. |
 | `--vocabulary` (`--vocab`) | `<entity\|relation> [active\|all]` | Inspect the annotation vocabulary (scope defaults to `active`). |
@@ -312,6 +322,9 @@ project root: this clears indexed state and artifacts and reingests the corpus.
 Until rebuilt, queries against old parses report that section embeddings are
 missing. Pre-feature snapshots cannot restore the new dense representation.
 
+Fine retrieval chunks are capped at 512 ColBERT tokens, measured from the
+normalized indexed text. Oversized words are split to fit this limit.
+
 The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
 `query-raw`) with the same query text to print the complete response JSON. Raw
 output does not automatically enable request diagnostics.
@@ -353,7 +366,7 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 
 | Section | Purpose |
 | --- | --- |
-| `[server]` | HTTP bind address and request-shape limits. |
+| `[server]` | HTTP bind address, required nonnegative integer `startup_delay_seconds` (`0` disables the wait), and request-shape limits. |
 | `[logging]` | File-backed service logging. |
 | `[admin]` | Admin token file location. |
 | `[client]` | Bundled CLI settings (server validates, never reads at runtime). |

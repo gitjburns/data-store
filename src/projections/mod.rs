@@ -62,7 +62,7 @@ pub(crate) const CHUNKER_NAME: &str = "fabric-chunker";
 /// when the splitting algorithm changes in a way that alters chunk boundaries,
 /// so a version change is a visible rebuild trigger rather than a silent
 /// change in what got indexed.
-pub(crate) const CHUNKER_VERSION: &str = "2";
+pub(crate) const CHUNKER_VERSION: &str = "1";
 
 /// The identity-bearing chunker configuration whose canonical hash is the
 /// `chunkerConfigHash` stamped on every chunk (spec §22). Serializing the real

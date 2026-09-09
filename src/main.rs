@@ -39,6 +39,7 @@ mod util;
 use std::{
     env,
     fs::{self, OpenOptions},
+    future::{Future, IntoFuture},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         fs::OpenOptionsExt,
@@ -487,26 +488,20 @@ async fn run_http_service(
         }
     };
 
-    // Fabric hot-plane pre-check, reporting only: the scheduler thread owns
-    // the runtime validation gate and re-validates before its first cycle;
-    // this synchronous check gives the startup handoff a truthful prediction
-    // of the sync component's readiness. It is a prediction, not the health
-    // source of truth: /v1/health reads the scheduler-published sync slot,
-    // which starts pending, so a probe in the brief window before the
-    // scheduler's first publish reports ready=false even after this line
-    // printed ready=true. A missing or invalid fabric plane is not fatal —
-    // the service serves with ready=false and health explains why.
-    reporter.report("data-store startup sync=validating")?;
+    // Read-only schema preflight is not readiness. The startup hold stays closed
+    // until delayed initialization; the scheduler then validates and owns health.
+    // Missing or invalid storage remains a health-visible setup condition.
+    reporter.report("data-store startup sync_schema=validating")?;
     let fabric_ready_at_startup = match crate::hot_plane::open_read(&config.storage.index_root)
         .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
     {
         Ok(()) => {
-            reporter.report("data-store startup sync=ready")?;
+            reporter.report("data-store startup sync_schema=valid")?;
             true
         }
         Err(source) => {
             reporter.report(format!(
-                "data-store startup sync=not_ready error=\"{source}\""
+                "data-store startup sync_schema=invalid error=\"{source}\""
             ))?;
             warn!(
                 event = "startup.fabric_not_ready",
@@ -551,35 +546,6 @@ async fn run_http_service(
             return Err(source.into());
         }
     };
-    // System-assigned policy versioning (CA2 ruling 5): hash-change detection
-    // appends to the append-only policy_versions registry, atomically with its
-    // policy.changed event, under one IMMEDIATE transaction. Runs ONLY when
-    // the fabric pre-check passed: with the plane absent (commissioning
-    // state), the load logs above already carry the hashes and registration
-    // defers to the next valid-plane startup — versions are audit labels;
-    // behavior keys on the hashes everywhere. A registration failure on a
-    // VALID plane is fatal for the same reason identity-capture failure is:
-    // the registry is the audit record of the ruleset the service runs under.
-    if fabric_ready_at_startup {
-        let registration = register_policy_versions(
-            &config.storage.index_root,
-            &entity_match_policy.content_hash,
-            &annotator_naming_policy.content_hash,
-        );
-        if let Err(source) = registration {
-            error!(
-                event = "startup.fatal",
-                stage = "policy_version_registration",
-                %bind_address,
-                error = %source,
-                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-                "startup failed registering policy versions"
-            );
-            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
-            admin_token_file.cleanup_if_current();
-            return Err(source.into());
-        }
-    }
     // The scheduler owns clones of its inputs because `config` moves into
     // AppState next; the shared health slot is the only channel between the
     // scheduler thread and health reporting.
@@ -662,6 +628,7 @@ async fn run_http_service(
         entity_match_policy.document,
     ));
     let maintenance = Arc::clone(state.maintenance());
+    maintenance.begin_startup(state.config.server.startup_delay_seconds)?;
     // The reset marker survives row clearing. Never let a process restart turn
     // a partially cleared store into normal ingestion without explicit retry.
     if fabric_ready_at_startup {
@@ -684,31 +651,7 @@ async fn run_http_service(
                 );
                 maintenance.fail(format!("operation {operation_id} did not complete"));
             }
-            Ok(None) => {
-                // Restore both immutable dense representations before workers
-                // or query routing can observe the newly initialized state.
-                let cache_root = state.config.storage.index_root.clone();
-                let startup_cache = Arc::clone(&dense_cache);
-                let loaded =
-                    tokio::task::spawn_blocking(util::LogContext::current().wrap(move || {
-                        load_startup_dense_cache(
-                            &cache_root,
-                            &startup_cache,
-                            scheduler_dense_dimension,
-                        )
-                    }))
-                    .await
-                    .map_err(|source| ApiError::InternalIo {
-                        message: format!("startup dense cache loading failed to join: {source}"),
-                    })
-                    .and_then(|result| result);
-                if let Err(source) = loaded {
-                    error!(event = "startup.dense_cache_failed", error = %source,
-                        "storage admission paused because dense cache loading failed");
-                    dense_cache.clear();
-                    maintenance.fail(source.to_string());
-                }
-            }
+            Ok(None) => {}
             Err(source) => {
                 error!(event = "rebuild_all.recovery_check_failed", %source, "storage admission paused because recovery state is unknown");
                 maintenance.fail(source.to_string());
@@ -728,56 +671,7 @@ async fn run_http_service(
         gate: state.model_call_gate_handle(),
         dense_cache: Arc::clone(&dense_cache),
     };
-    // Spawn the acquisition scheduler once shared state exists. Spawn failure
-    // is fatal: the sync component gates readiness, so a service whose
-    // scheduler can never run would sit permanently unready with no operator
-    // signal beyond this boundary.
-    let scheduler_handle = match scheduler::start(
-        scheduler_corpus_root,
-        scheduler_index_root,
-        scheduler_governance_domain,
-        scheduler_docling,
-        Arc::clone(&cutover_registry),
-        scheduler_projection_runtime,
-        application_identity,
-        Arc::clone(&shutdown_signal),
-        Arc::clone(&maintenance),
-        sync_health,
-        fabric_health,
-    ) {
-        Ok(handle) => handle,
-        Err(source) => {
-            error!(
-                event = "startup.fatal",
-                stage = "scheduler_spawn",
-                %bind_address,
-                error = %source,
-                elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-                "startup failed spawning the sync scheduler thread"
-            );
-            reporter.report(format!("data-store startup fatal=\"{source}\""))?;
-            admin_token_file.cleanup_if_current();
-            return Err(source.into());
-        }
-    };
-    // Spawn the annotation worker (CA) beside the scheduler: discovery-based
-    // post-activation annotation builds. Deliberately NOT readiness-critical —
-    // an unreachable annotator endpoint or a parked worker degrades
-    // annotations visibly (freshness rows, worker logs, and the diagnostic-only
-    // annotation health slot) without gating service readiness.
-    let annotation_worker_handle = annotations::worker::start(
-        annotation_index_root,
-        annotation_annotator,
-        annotation_config_root,
-        // CA2-P3: the operator-loaded naming rules compose into the entity/
-        // relation producer prompts (identity-bearing); the document moves
-        // here — its content hash was already folded into identity capture.
-        annotator_naming_policy.document,
-        Arc::clone(&shutdown_signal),
-        Arc::clone(&maintenance),
-        annotation_health,
-    );
-    let app = build_router(state).layer(TraceLayer::new_for_http());
+    let app = build_router(Arc::clone(&state)).layer(TraceLayer::new_for_http());
     reporter.report(format!(
         "data-store startup http=listening bind_address={bind_address}"
     ))?;
@@ -788,10 +682,13 @@ async fn run_http_service(
         "startup HTTP listener is ready"
     );
     let health_url = format!("http://{bind_address}/v1/health");
-    // Top-level readiness is inference plus the sync component: inference is
-    // true by construction here (its failure returns above), so the
-    // fabric state and any interrupted rebuild decide the reported flag.
-    let ready_at_startup = fabric_ready_at_startup && maintenance.detail().is_none();
+    // HTTP controls are usable while the independent startup hold keeps corpus
+    // readiness false. The scheduler publishes readiness after initialization.
+    let ready_at_startup = false;
+    reporter.report(format!(
+        "data-store startup corpus=paused startup_delay_seconds={} controls=rebuild-all,health,operation,shutdown",
+        state.config.server.startup_delay_seconds
+    ))?;
     reporter.report(format!(
         "data-store startup ready={ready_at_startup} inference=true sync={ready_at_startup} health_url={health_url}"
     ))?;
@@ -803,7 +700,7 @@ async fn run_http_service(
         inference_ready = true,
         sync_ready = ready_at_startup,
         elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
-        "startup readiness completed"
+        "HTTP startup complete; corpus initialization pending"
     );
     reporter.close();
     info!(
@@ -814,15 +711,126 @@ async fn run_http_service(
         sync_ready = ready_at_startup,
         "data store service listening"
     );
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(Arc::clone(&shutdown_signal)))
-        .await;
+    let (http_started, http_waiting) = oneshot::channel();
+    let serve_task = tokio::spawn(util::LogContext::current().instrument(serve_during_startup(
+        listener,
+        app,
+        Arc::clone(&shutdown_signal),
+        http_started,
+    )));
+    // Retain every successfully spawned worker until common shutdown cleanup,
+    // even if a later startup stage fails or panics.
+    let mut scheduler_handle = None;
+    let mut annotation_worker_handle = None;
+    let startup_result: Result<(), ApiError> = async {
+        http_waiting.await.map_err(|source| ApiError::InternalIo {
+            message: format!("HTTP startup handoff failed: {source}"),
+        })?;
+        let startup_state = Arc::clone(&state);
+        let startup_shutdown = Arc::clone(&shutdown_signal);
+        let permit = tokio::task::spawn_blocking(util::LogContext::current().wrap(move || {
+            initialize_startup_corpus(&startup_state, fabric_ready_at_startup, &startup_shutdown)
+        }))
+        .await
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("corpus startup task failed to join: {source}"),
+        })??;
+        let Some(permit) = permit else {
+            return Ok(());
+        };
+        // Spawn the acquisition scheduler once shared state exists. Spawn failure
+        // is fatal: the sync component gates readiness, so a service whose
+        // scheduler can never run would sit permanently unready with no operator
+        // signal beyond this boundary.
+        scheduler_handle = Some(
+            match scheduler::start(
+                scheduler_corpus_root,
+                scheduler_index_root,
+                scheduler_governance_domain,
+                scheduler_docling,
+                Arc::clone(&cutover_registry),
+                scheduler_projection_runtime,
+                application_identity,
+                Arc::clone(&shutdown_signal),
+                Arc::clone(&maintenance),
+                sync_health,
+                fabric_health,
+            ) {
+                Ok(handle) => handle,
+                Err(source) => {
+                    error!(
+                        event = "startup.fatal",
+                        stage = "scheduler_spawn",
+                        %bind_address,
+                        error = %source,
+                        elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+                        "startup failed spawning the sync scheduler thread"
+                    );
+                    return Err(source);
+                }
+            },
+        );
+        // Spawn the annotation worker (CA) beside the scheduler: discovery-based
+        // post-activation annotation builds. Deliberately NOT readiness-critical —
+        // an unreachable annotator endpoint or a parked worker degrades
+        // annotations visibly (freshness rows, worker logs, and the diagnostic-only
+        // annotation health slot) without gating service readiness.
+        // Its spawn API panics on OS failure. Preserve the scheduler handle and run
+        // common shutdown cleanup if the second worker cannot be created.
+        annotation_worker_handle = Some(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                annotations::worker::start(
+                    annotation_index_root,
+                    annotation_annotator,
+                    annotation_config_root,
+                    // CA2-P3: the operator-loaded naming rules compose into the entity/
+                    // relation producer prompts (identity-bearing); the document moves
+                    // here — its content hash was already folded into identity capture.
+                    annotator_naming_policy.document,
+                    Arc::clone(&shutdown_signal),
+                    Arc::clone(&maintenance),
+                    annotation_health,
+                )
+            }))
+            .map_err(|payload| ApiError::InternalIo {
+                message: format!(
+                    "annotation worker startup panicked: {}",
+                    util::panic_payload_message(payload.as_ref())
+                ),
+            })?,
+        );
+        maintenance.complete_startup()?;
+        drop(permit);
+        info!(
+            event = "startup.workers_started",
+            ready = state.health().ready,
+            elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+            "startup hold released; worker readiness is available through health"
+        );
+        Ok(())
+    }
+    .await;
+    if let Err(source) = &startup_result {
+        error!(event = "startup.fatal", stage = "deferred_corpus_startup", error = %source,
+            elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+            "startup failed; shutting down the HTTP service");
+        if let Err(shutdown_error) = state.request_shutdown() {
+            error!(event = "startup.shutdown_failed", error = %shutdown_error,
+                "could not signal shutdown after startup failure");
+            // Closing the maintenance gate may fail before request_shutdown
+            // reaches the independent latch. Still wake HTTP so cleanup can run.
+            if let Err(signal_error) = shutdown_signal.request() {
+                error!(event = "startup.shutdown_signal_failed", error = %signal_error,
+                    "could not wake HTTP after startup failure");
+            }
+        }
+    }
+    let serve_result = serve_task.await.map_err(|source| ApiError::InternalIo {
+        message: format!("HTTP serving task failed to join: {source}"),
+    });
     admin_token_file.cleanup_if_current();
-    // Serve has returned — gracefully or with a transport error. On the
-    // error path nothing has tripped the shutdown signal yet, and the
-    // scheduler and annotation worker may be mid-sleep; request shutdown
-    // explicitly so the joins below are bounded by one wait_timeout wakeup
-    // instead of a full idle sleep.
+    // Complete cleanup after every serve outcome, including task join failure.
+    // Close admission and wake any workers before waiting for their termination.
     if let Err(source) = maintenance.stop() {
         error!(event = "rebuild_all.shutdown_gate_failed", %source, "could not close maintenance admission during shutdown");
     }
@@ -833,13 +841,13 @@ async fn run_http_service(
             "failed to signal scheduler shutdown before join"
         );
     }
-    if scheduler_handle.join().is_err() {
+    if scheduler_handle.is_some_and(|handle| handle.join().is_err()) {
         error!(
             event = "scheduler.join_panicked",
             "sync scheduler thread panicked before shutdown"
         );
     }
-    if annotation_worker_handle.join().is_err() {
+    if annotation_worker_handle.is_some_and(|handle| handle.join().is_err()) {
         error!(
             event = "annotation_worker.join_panicked",
             "annotation worker thread panicked before shutdown"
@@ -854,10 +862,127 @@ async fn run_http_service(
     .map_err(|source| ApiError::InternalIo {
         message: format!("rebuild-all shutdown wait failed to join: {source}"),
     })??;
-    serve_result?;
+    startup_result?;
+    serve_result??;
     info!(event = "service.stopped", "data store service stopped");
 
     Ok(())
+}
+
+/// Poll the HTTP accept loop before releasing startup, and wake initialization
+/// on every terminal serve outcome. Poll panic containment prevents a failed
+/// server task from leaving startup waiting indefinitely for a rebuild command.
+async fn serve_during_startup(
+    listener: TcpListener,
+    app: axum::Router,
+    shutdown: Arc<ShutdownSignal>,
+    started: oneshot::Sender<()>,
+) -> io::Result<()> {
+    let mut serving = std::pin::pin!(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown_signal(Arc::clone(&shutdown)))
+            .into_future()
+    );
+    let mut started = Some(started);
+    let result = std::future::poll_fn(|context| {
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serving.as_mut().poll(context)
+        }));
+        if let Some(sender) = started.take()
+            && sender.send(()).is_err()
+        {
+            error!(
+                event = "startup.http_handoff_failed",
+                "startup stopped waiting for HTTP serving"
+            );
+        }
+        match polled {
+            Ok(result) => result,
+            Err(payload) => std::task::Poll::Ready(Err(io::Error::other(format!(
+                "HTTP serving panicked: {}",
+                util::panic_payload_message(payload.as_ref())
+            )))),
+        }
+    })
+    .await;
+    match &result {
+        Ok(()) => info!(event = "http.serve_completed", "HTTP serving completed"),
+        Err(source) => error!(event = "http.serve_failed", error = %source, "HTTP serving failed"),
+    }
+    if let Err(source) = shutdown.request() {
+        error!(event = "http.serve_shutdown_failed", error = %source,
+            "could not wake startup and workers after HTTP serving stopped");
+    }
+    result
+}
+
+/// Wait after HTTP starts, then initialize corpus storage under a counted lease.
+/// Only this initializer bypasses the startup hold; rebuild/failure holds still
+/// apply. The caller retains the lease through worker startup and gate release.
+fn initialize_startup_corpus(
+    state: &AppState,
+    fabric_ready_at_startup: bool,
+    shutdown: &ShutdownSignal,
+) -> Result<Option<maintenance::MaintenancePermit>, ApiError> {
+    let delay_seconds = state.config.server.startup_delay_seconds;
+    let started = Instant::now();
+    let maintenance = state.maintenance();
+    let Some(permit) = maintenance.startup_permit(delay_seconds, shutdown)? else {
+        info!(
+            event = "startup.corpus_cancelled",
+            "shutdown cancelled startup admission"
+        );
+        return Ok(None);
+    };
+    info!(
+        event = "startup.corpus_started",
+        generation = permit.generation(),
+        "initializing corpus before ordinary storage access opens"
+    );
+    // Successful rebuild already registered policies and emptied the cache.
+    // Its new generation needs only worker handoff, with no remaining delay or
+    // repeated initialization of the old corpus. Ordinary startup initializes
+    // under this lease; registration failure remains fatal.
+    let load_existing_corpus = fabric_ready_at_startup && permit.generation() == 0;
+    if load_existing_corpus {
+        let registration = register_policy_versions(
+            &state.config.storage.index_root,
+            &state.application_identity().entity_match_policy_hash,
+            &state.application_identity().annotator_naming_policy_hash,
+        );
+        if let Err(source) = registration {
+            error!(
+                event = "startup.fatal",
+                stage = "policy_version_registration",
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "startup failed registering policy versions"
+            );
+            return Err(source);
+        }
+    }
+    if load_existing_corpus {
+        // Cache loading can create artifact directories. Keep it inside
+        // the same delayed, blocking storage boundary as registration.
+        let loaded = load_startup_dense_cache(
+            &state.config.storage.index_root,
+            state.dense_cache(),
+            state.config.models.dense.dimension as usize,
+        );
+        if let Err(source) = loaded {
+            error!(event = "startup.dense_cache_failed", error = %source,
+                        "storage admission paused because dense cache loading failed");
+            state.dense_cache().clear();
+            maintenance.fail_startup_storage(source.to_string())?;
+        }
+    }
+    info!(
+        event = "startup.corpus_completed",
+        generation = permit.generation(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "corpus initialization finished; startup lease retained for worker handoff"
+    );
+    Ok(Some(permit))
 }
 
 /// Populate the active cache from persisted data in one read snapshot. Legacy

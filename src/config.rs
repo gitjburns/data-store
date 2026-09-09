@@ -11,7 +11,7 @@ use crate::error::ApiError;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
-    /// HTTP bind address and request-shape limits.
+    /// HTTP bind address, startup hold, and request-shape limits.
     pub server: ServerConfig,
     /// File-backed service logging settings used after bootstrap stdout output.
     pub logging: LoggingConfig,
@@ -66,6 +66,9 @@ pub struct CliOptions {
 pub struct ServerConfig {
     /// Socket address where Axum binds the standalone service.
     pub bind_address: SocketAddr,
+    /// Seconds to hold ordinary corpus access while rebuild-all remains available;
+    /// zero disables the startup wait.
+    pub startup_delay_seconds: u64,
     /// HTTP body limit applied before request JSON is accepted.
     pub max_request_body_bytes: usize,
     /// Maximum length of an ingest source reference after JSON parsing.

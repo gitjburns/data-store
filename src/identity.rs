@@ -148,6 +148,7 @@ pub(crate) fn configuration_hash(config: &ServiceConfig) -> Result<String, ApiEr
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigurationIdentity {
+    startup_delay_seconds: u64,
     max_request_body_bytes: usize,
     max_ingest_source_chars: u32,
     max_search_query_chars: u32,
@@ -259,6 +260,7 @@ impl ConfigurationIdentity {
     /// behavior are captured, credential files as resolved paths only.
     fn from_config(config: &ServiceConfig) -> Self {
         ConfigurationIdentity {
+            startup_delay_seconds: config.server.startup_delay_seconds,
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_ingest_source_chars: config.server.max_ingest_source_chars,
             max_search_query_chars: config.server.max_search_query_chars,
