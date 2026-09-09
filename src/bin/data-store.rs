@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[path = "data-store/serve.rs"]
 mod serve;
 
+// Share only the wire contract with the service; attribution remains server-owned.
+#[path = "../query/provenance.rs"]
+mod provenance;
+use provenance::{
+    AnnotationContribution, GraphMatch, GraphReach, MatchClass, RetrievalChannel,
+    RetrievalProvenance,
+};
+
 const PROMPT: &str = "data-store> ";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
@@ -553,6 +561,8 @@ struct QueryResultView {
     section_path: Vec<String>,
     page_numbers: Vec<u64>,
     truncated: bool,
+    /// Absence from an older server is shown explicitly, never treated as no match.
+    retrieval_provenance: Option<RetrievalProvenance>,
 }
 
 /// Citation status prevents a deleted or inaccessible source appearing current.
@@ -2033,7 +2043,71 @@ fn render_query(response: &QueryResponse) {
         if result.truncated {
             println!("[Passage truncated]");
         }
+        render_retrieval_provenance(result.retrieval_provenance.as_ref());
     }
+}
+
+/// Present server attribution without deriving membership or exclusivity locally.
+fn render_retrieval_provenance(provenance: Option<&RetrievalProvenance>) {
+    let Some(provenance) = provenance else {
+        println!("  Retrieval provenance unavailable");
+        return;
+    };
+    let channels: Vec<&str> = provenance.channels.iter().map(channel_label).collect();
+    println!("  Matched by: {}", channels.join(" · "));
+    let contribution = match provenance.annotation_contribution {
+        AnnotationContribution::None => "No annotation-based candidate matches in this passage",
+        AnnotationContribution::Overlap => {
+            "Annotation matches also found by keyword or semantic search"
+        }
+        AnnotationContribution::AdditionalMatches => {
+            "Annotations supplied candidate matches absent from keyword and semantic search"
+        }
+    };
+    println!("  Contribution: {contribution}");
+    // A merged passage may repeat the same path on several units. Deduplicate
+    // display only; query-raw retains every unit membership and support reference.
+    let matches: std::collections::BTreeSet<&GraphMatch> = provenance
+        .matched_units
+        .iter()
+        .flat_map(|unit| &unit.graph_matches)
+        .collect();
+    for matched in matches {
+        println!("  Annotation: {}", graph_match_description(matched));
+    }
+    if !provenance.context_unit_ids.is_empty() {
+        println!("  Includes surrounding context beyond the retrieved matches");
+    }
+}
+
+/// Translate the shared channel enum into reader-facing search names.
+fn channel_label(channel: &RetrievalChannel) -> &'static str {
+    match channel {
+        RetrievalChannel::Dense => "Semantic search",
+        RetrievalChannel::Lexical => "Keyword search",
+        RetrievalChannel::Graph => "Annotations",
+    }
+}
+
+/// Describe the recorded reach, preserving stored relationship direction.
+fn graph_match_description(matched: &GraphMatch) -> String {
+    let match_kind = match matched.match_class {
+        MatchClass::Exact => "exact match",
+        MatchClass::Acronym => "acronym match",
+        MatchClass::TokenPrefix => "token-prefix match",
+    };
+    let entry = format!("\"{}\" ({match_kind})", matched.matched_entity);
+    let (relationship, reach) = match &matched.reach {
+        GraphReach::DirectMention => return format!("Direct mention of {entry}"),
+        GraphReach::RelationSupport { relationship } => (relationship, "relation evidence"),
+        GraphReach::RelatedEntityMention { relationship } => {
+            (relationship, "related entity mention")
+        }
+    };
+    format!(
+        "{entry}: {} → {} → {} ({reach})",
+        relationship.subject, relationship.predicate, relationship.object
+    )
 }
 
 /// Render the §13.4 held-parses listing. The operator-salient fields are shown

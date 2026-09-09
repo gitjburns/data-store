@@ -17,6 +17,10 @@ use crate::error::ApiError;
 use crate::inference::ColbertCandidateScore;
 use crate::model::{ContentType, Locator, SourceLocationStatus};
 use crate::projections::MAX_UNIT_TOKENS;
+use crate::query::model::RetrievalHit;
+use crate::query::provenance::{
+    AnnotationContribution, RetrievalChannel, RetrievalProvenance, UnitRetrievalMatch,
+};
 
 // Bound cells before bringing them into Rust. Oversized authoritative data is
 // an explicit error, never a silently shortened raw evidence record.
@@ -76,6 +80,7 @@ pub(crate) struct SearchResult {
     pub(crate) score: f64,
     /// True only when a single oversized canonical unit had to be excerpted.
     pub(crate) truncated: bool,
+    pub(crate) retrieval_provenance: RetrievalProvenance,
 }
 
 /// One canonical text contribution; the raw body is retained by evidence assembly.
@@ -119,7 +124,10 @@ impl PassageCandidate {
         self,
         conn: &Connection,
         score: f64,
+        pool: &[RetrievalHit],
+        channel_hits: &[RetrievalHit],
     ) -> Result<SearchResult, ApiError> {
+        let retrieval_provenance = self.retrieval_provenance(pool, channel_hits)?;
         let source_locations = read_locations(conn, &self.source_id)?;
         let page_numbers = self
             .parts
@@ -138,6 +146,74 @@ impl PassageCandidate {
             page_numbers,
             score,
             truncated: self.truncated,
+            retrieval_provenance,
+        })
+    }
+
+    /// Attribute final membership after all merges. Only admitted candidate units
+    /// count as retrieved matches; expanded context must not acquire a channel
+    /// merely because another unit in the passage matched. Covered candidates do
+    /// retain their own matches, without claiming they caused passage formation.
+    fn retrieval_provenance(
+        &self,
+        pool: &[RetrievalHit],
+        channel_hits: &[RetrievalHit],
+    ) -> Result<RetrievalProvenance, ApiError> {
+        let mut matched_units = Vec::new();
+        let mut context_unit_ids = Vec::new();
+        let mut channels = Vec::new();
+        let mut has_graph = false;
+        let mut has_graph_only = false;
+        for unit_id in &self.unit_ids {
+            let owns_unit = |hit: &&RetrievalHit| {
+                hit.source_id == self.source_id
+                    && hit.parse_id == self.parse_id
+                    && hit.unit_ids.contains(unit_id)
+            };
+            if !pool.iter().any(|hit| owns_unit(&hit)) {
+                context_unit_ids.push(unit_id.clone());
+                continue;
+            }
+            let mut unit_channels = Vec::new();
+            let mut graph_matches = BTreeSet::new();
+            for hit in channel_hits.iter().filter(owns_unit) {
+                if !unit_channels.contains(&hit.channel) {
+                    unit_channels.push(hit.channel);
+                }
+                if !channels.contains(&hit.channel) {
+                    channels.push(hit.channel);
+                }
+                graph_matches.extend(hit.graph_matches.iter().cloned());
+            }
+            if unit_channels.is_empty() {
+                return Err(failure(format!(
+                    "admitted passage unit {unit_id} in {} has no channel provenance",
+                    self.parse_id
+                )));
+            }
+            let graph = unit_channels.contains(&RetrievalChannel::Graph);
+            has_graph |= graph;
+            has_graph_only |= graph && unit_channels.len() == 1;
+            matched_units.push(UnitRetrievalMatch {
+                unit_id: unit_id.clone(),
+                channels: unit_channels,
+                graph_matches: graph_matches.into_iter().collect(),
+            });
+        }
+        // Exclusivity is per unit against this query's capped channel lists,
+        // never a counterfactual claim about the whole passage or answer quality.
+        let annotation_contribution = if has_graph_only {
+            AnnotationContribution::AdditionalMatches
+        } else if has_graph {
+            AnnotationContribution::Overlap
+        } else {
+            AnnotationContribution::None
+        };
+        Ok(RetrievalProvenance {
+            channels,
+            annotation_contribution,
+            matched_units,
+            context_unit_ids,
         })
     }
 }

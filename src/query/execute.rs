@@ -543,7 +543,11 @@ fn run_pipeline_body(
     *stage = "result_citations";
     let results = selected
         .into_iter()
-        .map(|(candidate, score)| candidate.clone().into_result(conn, score))
+        .map(|(candidate, score)| {
+            candidate
+                .clone()
+                .into_result(conn, score, &pool, &fusion.channel_hits)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     latencies.assembly_ms = assembly_started_at.elapsed().as_millis() as u64;
 

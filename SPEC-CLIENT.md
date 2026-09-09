@@ -372,11 +372,21 @@ locations, section headings, and physical PDF page references. A truncated
 passage is labeled; unavailable source locations retain their status. Canonical
 IDs, scores, bodies, and assembly traces are not printed in the default view.
 
+Both clients show server-provided retrieval provenance beneath each passage:
+channel names, annotation contribution, direct entity matches, and directed
+relationship paths. Contribution describes candidate-list overlap, not a
+measured improvement in results. Missing provenance is explicitly unavailable.
+The CLI deduplicates repeated paths for display; raw output preserves unit
+mappings. The web view previews three distinct explanations and retains all
+matches, support references, and context units in expandable retrieval details.
+
 `query-raw` / `--query-raw` takes the same bare query text and sends the same
 request. It prints the complete original response JSON, including unknown
 fields, without automatically enabling `debug`. Per-stage diagnostics require
 `debug: true` in an HTTP request or the web query form. The web view presents
 passages by default and retains raw evidence and diagnostics in details panels.
+Web diagnostics include `channelHits`; a fused hit's channel is labeled
+representative because it does not capture all contributing channels.
 
 ### 5.4 `held-parses` (`held`)
 

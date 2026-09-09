@@ -238,6 +238,29 @@ table.data th {
   white-space: pre-wrap;
 }
 
+/* Attribution follows the passage; expanded unit mappings stay visually inside
+   its result so context units are not mistaken for independently retrieved hits. */
+.retrieval-provenance {
+  border-top: 1px solid var(--border);
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.retrieval-provenance p {
+  margin: 0.35rem 0;
+}
+
+.retrieval-matches {
+  margin: 0.35rem 0;
+  padding-left: 1.3rem;
+}
+
+.retrieval-matches li + li {
+  margin-top: 0.3rem;
+}
+
 /* Body-derived summary shown in place of a missing text projection. The label
    marks it as a client-side derivation from the unit body, distinct from the
    server-provided textProjection rendered as plain .evidence-text. */

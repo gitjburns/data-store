@@ -329,7 +329,13 @@ when the request set `debug: true`:
       "sectionPath": ["Section heading"],
       "pageNumbers": [12],
       "score": 0.87,
-      "truncated": false
+      "truncated": false,
+      "retrievalProvenance": {
+        "channels": ["dense"],
+        "annotationContribution": "none",
+        "matchedUnits": [{"unitId": "...", "channels": ["dense"], "graphMatches": []}],
+        "contextUnitIds": []
+      }
     }
   ],
   "evidencePack": {
@@ -368,11 +374,35 @@ when the request set `debug: true`:
 | `pageNumbers` | array of integer | Physical PDF page positions, not printed page labels; empty when unavailable. |
 | `score` | number | Final passage reranker score. |
 | `truncated` | bool | A single oversized canonical unit was excerpted to fit the passage limit. Its full body remains in `evidencePack`. |
+| `retrievalProvenance` | object | Server-computed candidate attribution, present independently of `debug` and evidence toggles. |
 
 `results` is rank-ordered. `evidencePack` retains exactly their canonical
 constituents, deduplicated by first inclusion, without automatic neighbor or
 container expansion. `includeSourceLocators` controls raw per-unit locators;
 passage citations remain present.
+
+`retrievalProvenance` fields (all present):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `channels` | array of `dense`, `lexical`, `graph` | Union of the retained matches' channel memberships. |
+| `annotationContribution` | `none`, `overlap`, `additional_matches` | No retained graph match; every retained graph match also occurs in another channel; or at least one retained unit occurs only in graph. |
+| `matchedUnits` | array | Final-passage units admitted to the fused pool, each with `unitId`, `channels`, and `graphMatches`. |
+| `contextUnitIds` | array of string | Remaining passage units, added as surrounding context. |
+
+Membership is checked against this query's eligible, capped channel lists and
+the final merged passage. It does not establish which passages would survive
+with a channel disabled or measure answer-quality improvement.
+
+Each `graphMatches` entry has `matchedEntity` (normalized name), `matchClass`
+(`exact`, `acronym`, `token_prefix`), and `kind` (`direct_mention`,
+`relation_support`, `related_entity_mention`). The latter two include
+`relationship`: `subject`, `predicate`, `object` (normalized stored triple),
+and `supportingUnitIds`. The triple always retains subject-to-object direction,
+including incoming traversals. Relation support identifies the relation's own
+evidence; related-entity mention identifies a far entity's mention reached via
+that relation. Identical paths are deduplicated per unit; supporting units need
+not be included in the final passage.
 
 `EvidencePack` top-level fields (`camelCase`):
 
@@ -457,7 +487,10 @@ always), `sourceId` (string, always), `parseId` (string, always), `unitIds`
 (array of string, always), `channel` (`dense` \| `lexical` \| `graph`, always),
 `score` (number, always), `rank` (integer, omitted when absent),
 `matchedProjectionId` (string, omitted when absent), `matchedAnnotationId`
-(string, omitted when absent), `explanation` (string, omitted when absent).
+(string, omitted when absent), `explanation` (string, omitted when absent),
+`graphMatches` (array, always; the same path records used in result provenance).
+A fused record's `channel` is representative; `channelHits` preserves every
+eligible channel membership.
 
 **Recorded deviation:** the §34.1 spec-literal response is "the EvidencePack plus
 the `queryExecutionRecordId`". `queryExecutionRecordId` is **omitted** here — the

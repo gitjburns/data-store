@@ -299,6 +299,12 @@ body itself, so the remaining arguments are the text (quoted or unquoted):
 data-store --config config.toml --query how does activation gating work
 ```
 
+The CLI and web console show each passage's matching search channels and
+annotation contribution, including matched entities and directed relationships.
+This attribution is available without `debug`; it describes candidate matches,
+not a measured improvement in retrieval quality. Web retrieval details retain
+unit mappings and supporting references.
+
 The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
 `query-raw`) with the same query text to print the complete response JSON. Raw
 output does not automatically enable request diagnostics.

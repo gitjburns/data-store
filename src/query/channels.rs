@@ -33,11 +33,12 @@ use crate::primitives::bm25::build_bm25_queries;
 use crate::primitives::fusion::{Bm25Match, DenseMatch, fuse_matches};
 use crate::projections::dense_cache::DensePlane;
 use crate::projections::graph::{
-    entity_names_for_parse, mentions_for_name, normalize_entity_name, one_hop_edges,
+    EdgeDirection, entity_names_for_parse, mentions_for_name, normalize_entity_name, one_hop_edges,
 };
 use crate::projections::lexical::match_chunks;
 use crate::query::model::{RetrievalChannel, RetrievalHit, RetrievalHitType};
 use crate::query::profile::RetrievalProfile;
+use crate::query::provenance::{GraphMatch, GraphReach, GraphRelationship, MatchClass};
 
 /// One scope-captured active parse the C7d pipeline hands the channels. It
 /// carries both identifiers a `RetrievalHit` needs (`source_id`, `parse_id`)
@@ -394,6 +395,7 @@ fn unit_hit(
         matched_projection_id: None,
         matched_annotation_id: None,
         explanation: None,
+        graph_matches: Vec::new(),
     }
 }
 
@@ -530,11 +532,13 @@ pub(crate) fn fused_channels(
                     matched.score,
                     matched.rank,
                 );
-                if matched.graph_rank.is_some() {
-                    hit.explanation = graph_eligible
+                if matched.graph_rank.is_some()
+                    && let Some(graph) = graph_eligible
                         .iter()
                         .find(|graph| graph.hit_id == matched.unit_id)
-                        .and_then(|graph| graph.explanation.clone());
+                {
+                    hit.explanation = graph.explanation.clone();
+                    hit.graph_matches = graph.graph_matches.clone();
                 }
                 hit
             })
@@ -750,29 +754,6 @@ enum GraphTier {
     Tier3,
 }
 
-/// How a query matched a stored NORMALIZED entity name (D9 amendment, CA2-P2
-/// 2026-07-19). Strength order is RULED: `Exact` is strongest, then `Acronym`,
-/// then `TokenPrefix`. `#[derive(Ord)]` makes `Exact < Acronym < TokenPrefix`
-/// (declaration order), i.e. "stronger first" — a plain ascending sort places
-/// exact-derived matches before fuzzy ones, and acronym before token-prefix,
-/// exactly as the ruled ordering key requires. This ordinal ranks WITHIN a D9
-/// tier, strictly BELOW the tier discriminator and strictly ABOVE matched-name
-/// length (ordering key = tier, class, matched-name length, unitId).
-///
-/// Never double-classify: a stored name a query matches EXACTLY is `Exact` and
-/// is never also recorded as a fuzzy class (the fuzzy scan skips names already
-/// matched exactly — see `fuzzy_matched_names`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchClass {
-    /// Normalized query n-gram == stored name (existing behavior, always on).
-    Exact,
-    /// A normalized query token == the first-letter acronym of a stored name.
-    Acronym,
-    /// Each normalized query token is a prefix of the corresponding stored-name
-    /// token, in order (a leading-subsequence prefix match).
-    TokenPrefix,
-}
-
 /// A stable, bounded label for a match class — used in the debug explanation and
 /// (as class keys) in the fuzzy diagnostics. Safe to log: a fixed enum label,
 /// never operator or entity content.
@@ -843,6 +824,8 @@ struct GraphUnitCandidate {
     unit_id: String,
     tier: GraphTier,
     matched: std::collections::BTreeSet<MatchedName>,
+    // Path evidence never participates in the existing candidate ranking key.
+    graph_matches: std::collections::BTreeSet<GraphMatch>,
     source_id: String,
     parse_id: String,
 }
@@ -1118,6 +1101,7 @@ fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> Retriev
         matched_projection_id: None,
         matched_annotation_id: None,
         explanation: Some(explanation),
+        graph_matches: candidate.graph_matches.iter().cloned().collect(),
     }
 }
 
@@ -1143,7 +1127,13 @@ fn record_graph_unit(
     matched_name: &MatchedName,
     source_id: &str,
     parse_id: &str,
+    reach: GraphReach,
 ) {
+    let graph_match = GraphMatch {
+        matched_entity: matched_name.name.clone(),
+        match_class: matched_name.class,
+        reach,
+    };
     candidates
         .entry((parse_id.to_owned(), unit_id.to_owned()))
         .and_modify(|existing| {
@@ -1151,6 +1141,7 @@ fn record_graph_unit(
                 existing.tier = tier;
             }
             existing.matched.insert(matched_name.clone());
+            existing.graph_matches.insert(graph_match.clone());
         })
         .or_insert_with(|| {
             let mut matched = std::collections::BTreeSet::new();
@@ -1159,6 +1150,7 @@ fn record_graph_unit(
                 unit_id: unit_id.to_owned(),
                 tier,
                 matched,
+                graph_matches: std::collections::BTreeSet::from([graph_match.clone()]),
                 source_id: source_id.to_owned(),
                 parse_id: parse_id.to_owned(),
             }
@@ -1318,6 +1310,7 @@ pub(crate) fn graph_channel(
                     matched,
                     &parse.source_id,
                     &parse.parse_id,
+                    GraphReach::DirectMention,
                 );
             }
         }
@@ -1331,6 +1324,18 @@ pub(crate) fn graph_channel(
             for matched in &parse_matches {
                 let edges = one_hop_edges(conn, &parse.parse_id, &matched.name)?;
                 for edge in edges {
+                    // Render the stored subject→object assertion, not traversal
+                    // direction: incoming lookups must not reverse the predicate.
+                    let (subject, object) = match edge.direction {
+                        EdgeDirection::Out => (&matched.name, &edge.far_normalized_name),
+                        EdgeDirection::In => (&edge.far_normalized_name, &matched.name),
+                    };
+                    let relationship = GraphRelationship {
+                        subject: subject.clone(),
+                        predicate: edge.relation_type.clone(),
+                        object: object.clone(),
+                        supporting_unit_ids: edge.target_unit_ids.clone(),
+                    };
                     // The edge's own supporting units are one-hop related; the
                     // matched entity that reached them is the near (query-matched)
                     // entity, so within-tier strength keys on the near matched
@@ -1343,6 +1348,9 @@ pub(crate) fn graph_channel(
                             matched,
                             &parse.source_id,
                             &parse.parse_id,
+                            GraphReach::RelationSupport {
+                                relationship: relationship.clone(),
+                            },
                         );
                     }
                     // Follow the far entity back to ITS mention units (D9:
@@ -1359,6 +1367,9 @@ pub(crate) fn graph_channel(
                             matched,
                             &parse.source_id,
                             &parse.parse_id,
+                            GraphReach::RelatedEntityMention {
+                                relationship: relationship.clone(),
+                            },
                         );
                     }
                 }

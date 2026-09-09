@@ -684,7 +684,93 @@ function queryPassageMarkup(result, rank) {
     <div class="evidence-head"><span class="evidence-rank">#${esc(rank)}</span>${source}</div>
     ${section}${pages}
     <div class="evidence-text">${esc(result.text)}</div>${truncated}
+    ${retrievalProvenanceMarkup(result.retrievalProvenance)}
   </article>`;
+}
+
+/** Translate channel identifiers for readers while preserving unknown values. */
+function retrievalChannelsMarkup(channels) {
+  if (!Array.isArray(channels) || channels.length === 0) return escOr(null);
+  const labels = { dense: 'Semantic search', lexical: 'Keyword search', graph: 'Annotations' };
+  return channels.map((channel) => badge(labels[channel] || channel)).join(' ');
+}
+
+/**
+ * Explain the recorded traversal in its original subject/object direction.
+ * The query-matched entity can be either endpoint; it is named separately so
+ * walking an incoming edge does not reverse the annotation's meaning.
+ */
+function graphMatchMarkup(match) {
+  const matchLabels = { acronym: 'acronym match', token_prefix: 'token-prefix match' };
+  const matchClass = match.matchClass && match.matchClass !== 'exact'
+    ? ` (${esc(matchLabels[match.matchClass] || match.matchClass)})` : '';
+  const entity = `“${esc(match.matchedEntity)}”${matchClass}`;
+  if (match.kind === 'direct_mention') return `Direct entity match: ${entity}`;
+  const relationship = match.relationship;
+  const path = relationship
+    ? `“${esc(relationship.subject)}” → ${esc(relationship.predicate)} → “${esc(relationship.object)}”`
+    : '<span class="absent">Relationship unavailable</span>';
+  const kinds = {
+    relation_support: 'Reached relationship evidence',
+    related_entity_mention: 'Reached a related entity mention',
+  };
+  return `${path} — ${esc(kinds[match.kind] || match.kind)} via ${entity}`;
+}
+
+/**
+ * Present server-owned candidate attribution without deriving contribution from
+ * merged passage channels. Preview deduplication affects display only: the unit
+ * table and JSON retain every match and its relationship-support references.
+ */
+function retrievalProvenanceMarkup(provenance) {
+  if (!provenance || typeof provenance !== 'object') {
+    return '<div class="retrieval-provenance absent">Retrieval provenance unavailable</div>';
+  }
+  const contributionLabels = {
+    none: 'No annotation-based candidate matches.',
+    overlap: 'All annotation-matched units also matched keyword or semantic search.',
+    additional_matches: 'Annotations matched units absent from keyword and semantic candidate lists.',
+  };
+  const contribution = contributionLabels[provenance.annotationContribution]
+    || 'Annotation contribution unavailable.';
+  const matchedUnits = Array.isArray(provenance.matchedUnits) ? provenance.matchedUnits : [];
+  const contextUnits = Array.isArray(provenance.contextUnitIds) ? provenance.contextUnitIds : [];
+  const explanations = new Set();
+  const unitRows = matchedUnits.map((unit) => {
+    const matches = Array.isArray(unit.graphMatches) ? unit.graphMatches : [];
+    const matchMarkup = matches.map((match) => {
+      const explanation = graphMatchMarkup(match);
+      explanations.add(explanation);
+      const support = match.relationship && Array.isArray(match.relationship.supportingUnitIds)
+        ? `<div>Relationship evidence: ${idListMarkup(match.relationship.supportingUnitIds, unitLink)}</div>`
+        : '';
+      return `<li>${explanation}${support}</li>`;
+    }).join('');
+    return [
+      unitLink(unit.unitId),
+      retrievalChannelsMarkup(unit.channels),
+      matchMarkup ? `<ul class="retrieval-matches">${matchMarkup}</ul>` : escOr(null),
+    ];
+  });
+  const preview = Array.from(explanations).slice(0, 3)
+    .map((explanation) => `<li>${explanation}</li>`).join('');
+  const additional = explanations.size > 3
+    ? `<p>${esc(explanations.size - 3)} more annotation matches in retrieval details.</p>` : '';
+  const contextNote = contextUnits.length > 0
+    ? `<p>${esc(contextUnits.length)} passage units added as context; no retrieval match is attributed to them.</p>`
+    : '';
+  return `<div class="retrieval-provenance">
+    <div><strong>Matched by:</strong> ${retrievalChannelsMarkup(provenance.channels)}</div>
+    <p><strong>Annotation contribution:</strong> ${esc(contribution)}</p>
+    ${preview ? `<ul class="retrieval-matches">${preview}</ul>` : ''}${additional}${contextNote}
+    <details class="evidence-detail">
+      <summary>Retrieval details</summary>
+      <p>Candidate matches describe how units entered retrieval, not whether annotations improved the result.</p>
+      ${dataTable(['Matched unit', 'Matched by', 'Annotation matches'], unitRows)}
+      ${contextUnits.length > 0 ? `<p>Context units: ${idListMarkup(contextUnits, unitLink)}</p>` : ''}
+      ${jsonTree(provenance, 'Complete retrieval provenance', 0)}
+    </details>
+  </div>`;
 }
 
 /**
@@ -939,7 +1025,8 @@ function debugPanelMarkup(diagnostics) {
   return panel(
     'Debug diagnostics',
     latencyMarkup(diagnostics.latencies) +
-      fusedPoolMarkup(diagnostics.fusedPool) +
+      retrievalHitsMarkup(diagnostics.channelHits, 'channelHits', 'channel') +
+      retrievalHitsMarkup(diagnostics.fusedPool, 'fusedPool', 'representative channel') +
       maxsimMarkup(diagnostics.maxsim) +
       rerankedMarkup(diagnostics.reranked)
   );
@@ -953,10 +1040,11 @@ function latencyMarkup(latencies) {
 }
 
 /**
- * The fused dense/lexical/graph candidate pool with its per-channel provenance.
- * `notes` folds the three omitted-when-absent explanation fields into one cell.
+ * Preserve each candidate record's fields in both retrieval diagnostic tables.
+ * A fused record keeps one representative channel; it cannot describe overlap.
+ * Optional graph paths supplement the original notes rather than replacing them.
  */
-function fusedPoolMarkup(pool) {
+function retrievalHitsMarkup(pool, title, channelHeading) {
   if (!Array.isArray(pool) || pool.length === 0) return '';
   const rows = pool.map((hit) => {
     const notes = [
@@ -967,6 +1055,8 @@ function fusedPoolMarkup(pool) {
       .filter(Boolean)
       .map((note) => esc(note))
       .join('<br />');
+    const matches = Array.isArray(hit.graphMatches) && hit.graphMatches.length > 0
+      ? jsonTree(hit.graphMatches, 'Graph matches', 0) : '';
     return [
       escOr(hit.rank),
       badge(hit.channel || 'unknown'),
@@ -975,11 +1065,11 @@ function fusedPoolMarkup(pool) {
       formatScore(hit.score),
       sourceLink(hit.sourceId),
       idListMarkup(hit.unitIds, unitLink),
-      notes === '' ? escOr(null) : notes,
+      notes === '' && matches === '' ? escOr(null) : notes + matches,
     ];
   });
-  return `<h3 class="subhead">fusedPool</h3>${dataTable(
-    ['rank', 'channel', 'hitType', 'hitId', 'score', 'sourceId', 'unitIds', 'notes'],
+  return `<h3 class="subhead">${esc(title)}</h3>${dataTable(
+    ['rank', channelHeading, 'hitType', 'hitId', 'score', 'sourceId', 'unitIds', 'notes'],
     rows
   )}`;
 }

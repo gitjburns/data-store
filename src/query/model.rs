@@ -12,26 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Spec §24.3 `RetrievalChannel`. The candidate-generation channel a hit came
-/// from. The spec's full string set is
-/// `"lexical" | "learned_sparse" | "dense" | "multi_vector" | "graph" |
-/// "semantic" | "temporal"`; the C7 MVP retrieves over exactly three channels
-/// — dense, lexical, graph — so only those variants are defined here. This
-/// keeps every match on the channel exhaustive with no phantom arms for
-/// channels the MVP never emits (`multi_vector` channel deferred post-MVP,
-/// 2026-07-15 rescope; the remaining spec channels are unimplemented). The
-/// wire form is the spec's snake_case string literals, so a future channel is
-/// added by name without a serde rename.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RetrievalChannel {
-    /// Exact-cosine dense retrieval over the per-parse dense plane.
-    Dense,
-    /// FTS5/BM25 lexical retrieval over chunk targeting text.
-    Lexical,
-    /// Semantic-graph traversal from entity-name matches (D9).
-    Graph,
-}
+use super::provenance::GraphMatch;
+pub(crate) use super::provenance::RetrievalChannel;
 
 /// Spec §24.4 `hitType`. What kind of artifact a hit targets. Closed set; the
 /// C7 channels emit `chunk`/`content_unit`-grained hits, and annotation- and
@@ -93,6 +75,8 @@ pub(crate) struct RetrievalHit {
     /// surfaces (spec `explanation?`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) explanation: Option<String>,
+    /// Actual graph paths, independent of the candidate's strongest ranking tier.
+    pub(crate) graph_matches: Vec<GraphMatch>,
 }
 
 /// Spec §24.2 `ResolvedScope.kind`. Whether a query targets all sources, an
