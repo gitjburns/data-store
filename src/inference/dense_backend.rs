@@ -16,6 +16,7 @@ use crate::{
         DenseEmbeddingRuntime, InferenceProgress,
         dense::{DENSE_SMOKE_TEXT, format_dense_passage_text, format_dense_query_text},
     },
+    util::MAX_BACKOFF_MS,
 };
 
 /// Stable adapter-mode label carried in this client's boundary logs, mirroring
@@ -453,7 +454,10 @@ impl HttpDenseClient {
                     // `attempt - 1` prior 429s indexes the backoff schedule; once
                     // it reaches DENSE_HTTP_RETRY_LIMIT the bound is exhausted.
                     if attempt <= DENSE_HTTP_RETRY_LIMIT {
-                        let delay = DENSE_HTTP_RETRY_BACKOFF[attempt - 1];
+                        // Preserve shorter scheduled waits while enforcing the
+                        // shared ceiling before both logging and sleeping.
+                        let delay = DENSE_HTTP_RETRY_BACKOFF[attempt - 1]
+                            .min(Duration::from_millis(MAX_BACKOFF_MS));
                         warn!(
                             event = "model_call.http_retry",
                             model_role = "dense",

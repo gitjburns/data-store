@@ -1,9 +1,13 @@
 //! Small cross-module helpers with no domain or transport dependencies
 //! (C1c seam cut). Currently hosts panic-payload rendering shared by the
 //! transport shell, operation pipelines, and inference device setup, plus
-//! the bounded-text helpers shared by diagnostics and persisted details.
+//! bounded-text helpers and the shared ceiling on retry/cycle backoff delays.
 
 use std::any::Any;
+
+/// Maximum sleep between retry attempts or background cycles. This ceiling
+/// bounds backoff, not request timeouts, work duration, or total retry lifetime.
+pub(crate) const MAX_BACKOFF_MS: u64 = 60_000;
 
 /// Upper bound on diagnostic text carried into API errors and logs.
 pub(crate) const MAX_DIAGNOSTIC_CHARS: usize = 16_000;

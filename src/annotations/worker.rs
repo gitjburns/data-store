@@ -105,7 +105,7 @@ use crate::policy::AnnotatorNamingPolicy;
 use crate::primitives::utc_now;
 use crate::projections::{envelope, graph, view};
 use crate::state::{AnnotationCycleCounts, AnnotationHealth, ShutdownSignal};
-use crate::util::{panic_payload_message, truncate_persisted_detail};
+use crate::util::{MAX_BACKOFF_MS, panic_payload_message, truncate_persisted_detail};
 
 /// Idle interval between discovery cycles. A code constant, never config
 /// (§35): the cadence is internal pacing for a non-critical background build,
@@ -377,7 +377,9 @@ fn run_worker(
         // Idle without admission; successful maintenance wakes the next cycle
         // immediately instead of waiting out the normal annotation cadence.
         drop(permit);
-        delay = CYCLE_IDLE_INTERVAL;
+        // Failed-row retries share this cycle delay; keep any shorter interval
+        // while enforcing the application-wide backoff ceiling.
+        delay = CYCLE_IDLE_INTERVAL.min(Duration::from_millis(MAX_BACKOFF_MS));
     }
 
     info!(

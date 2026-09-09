@@ -728,12 +728,16 @@ stale wreckage from a crash, never live work.
 
 The detection cadence is **knob-free** (spec §35): no cadence, interval, or
 backlog configuration key exists anywhere in the config surface. Growth
-factors and smoothing weights are code constants; quiet cycles grow the
-interval multiplicatively (deliberately no ceiling — that would be a policy
-knob), observed changes pull it back down toward the measured inter-change
-rate (floored at the scan's own duration), and undrained backlog at cycle end
-throttles detection further. The effective `cadence_ms` is published per cycle
-into sync health (§7) as measured truth.
+factors and smoothing weights are code constants. Quiet cycles grow the delay
+multiplicatively, observed changes pull it down, and undrained backlog or failed
+cycles increase it. All paths, including the scan-duration floor, obey the shared
+60-second backoff ceiling (`src/util.rs::MAX_BACKOFF_MS`). Cadence logs report
+changes after applying the ceiling; `cadence_ms` publishes the effective delay.
+
+The same ceiling applies to dense HTTP retry sleeps and annotation cycle/retry
+delays; their shorter 2/4/8-second and 30-second waits remain shorter. This bounds
+sleep between attempts/cycles, not work duration, request timeouts, or total
+retry lifetime. Long-running cycle work can still delay the next scan.
 
 ### 9.3 Backpressure events
 

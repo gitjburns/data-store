@@ -76,7 +76,7 @@ use crate::{
         CutoverRegistry, ExclusiveGate, FabricHealth, FabricSourceCounts, ShutdownSignal,
         SyncCycleStats, SyncHealth, acquire_model_call_gate_on,
     },
-    util::{panic_payload_message, truncate_persisted_detail},
+    util::{MAX_BACKOFF_MS, panic_payload_message, truncate_persisted_detail},
 };
 
 /// Looks up the row owning one coalescing key (UNIQUE source_key); state is
@@ -1794,8 +1794,8 @@ fn handle_cycle_error(
 /// Counters and cadence signals of one completed cycle.
 struct CycleOutcome {
     stats: SyncCycleStats,
-    /// Scan duration alone — the cadence floor (a scan cannot run more
-    /// often than it takes), distinct from the whole cycle's elapsed_ms.
+    /// Scan duration alone supplies the capped cadence floor, distinct from
+    /// the whole cycle's elapsed_ms.
     scan_elapsed_ms: u64,
     /// Observed change count feeding the inter-change-interval EMA: items
     /// staged (new or changed content) plus locations evidenced deleted.
@@ -3416,7 +3416,7 @@ impl CadenceState {
     }
 
     /// Fold one successful cycle's signals into the cadence. Returns the
-    /// delay to sleep and the backpressure transition, if one occurred
+    /// bounded delay to sleep and the backpressure transition, if one occurred
     /// (Some(true) = entered, Some(false) = exited).
     fn adapt(
         &mut self,
@@ -3425,21 +3425,20 @@ impl CadenceState {
         spacing_ms: u64,
         backlog: u64,
     ) -> (u64, Option<bool>) {
-        // The scan-duration floor: a scan cannot run more often than it
-        // takes (spec §9.5 source-system pushback). max(1) keeps a
-        // sub-millisecond scan from busy-looping the thread.
-        let floor_ms = scan_elapsed_ms.max(1);
+        // Pace from scan cost, but the shared sleep ceiling takes precedence
+        // even when scanning itself takes longer. The cap bounds idle waiting,
+        // not scan/work duration; the 1 ms floor prevents a zero-delay loop.
+        let floor_ms = scan_elapsed_ms.clamp(1, MAX_BACKOFF_MS);
 
         let mut delay_ms = match self.next_delay_ms {
             Some(current) => current,
             None => {
-                // First measured signal: the cadence starts at the first
-                // scan's own duration.
+                // First measured signal: start at the bounded scan-duration floor.
                 info!(
                     event = "scheduler.cadence_adapted",
                     cause = "first_scan_duration",
                     new_delay_ms = floor_ms,
-                    "cadence initialized to the first scan's duration"
+                    "cadence initialized to the bounded scan-duration floor"
                 );
                 floor_ms
             }
@@ -3473,15 +3472,11 @@ impl CadenceState {
                 delay_ms = target;
             }
         } else {
-            // Quiet cycle: unbounded multiplicative growth, so idle
-            // capacity never accelerates sampling beyond observed change
-            // rates (spec §9.5). There is deliberately no cadence ceiling —
-            // that would be a policy knob — and growth is self-correcting:
-            // the EMA pull-down above shrinks the delay as soon as changes
-            // reappear. Round upward so the 1 ms floor grows instead of
-            // truncating 1.5 back to 1 forever. The f64→u64 cast saturates
-            // at the representation limit without introducing a policy ceiling.
-            let grown = ((delay_ms as f64) * QUIET_CYCLE_GROWTH).ceil() as u64;
+            // Round upward so 1 ms grows instead of truncating 1.5 back to 1.
+            // Apply the ceiling before comparing/logging: a saturated backoff
+            // must not claim further growth or postpone detection indefinitely.
+            let grown =
+                (((delay_ms as f64) * QUIET_CYCLE_GROWTH).ceil() as u64).min(MAX_BACKOFF_MS);
             if grown != delay_ms {
                 info!(
                     event = "scheduler.cadence_adapted",
@@ -3496,11 +3491,9 @@ impl CadenceState {
 
         let mut transition = None;
         if backlog > 0 {
-            // Pipeline backpressure: undrained work at cycle end throttles
-            // detection so coalescing can shed load (spec §9.5). Growth is
-            // unbounded (no cadence ceiling) and the saturating f64→u64
-            // cast bounds only the representation, never the policy.
-            let grown = ((delay_ms as f64) * BACKPRESSURE_GROWTH) as u64;
+            // Undrained work slows detection, subject to the same shared cap
+            // as quiet/error backoff. Clamp before publishing the adjustment.
+            let grown = (((delay_ms as f64) * BACKPRESSURE_GROWTH) as u64).min(MAX_BACKOFF_MS);
             if grown != delay_ms {
                 info!(
                     event = "scheduler.cadence_adapted",
@@ -3521,8 +3514,8 @@ impl CadenceState {
             transition = Some(false);
         }
 
-        // Floor enforcement last: no adaptation may schedule scans faster
-        // than the last scan actually ran.
+        // Restore the bounded scan-cost floor after adaptation. Because the
+        // floor itself is capped, a slow scan cannot bypass the sleep ceiling.
         if delay_ms < floor_ms {
             info!(
                 event = "scheduler.cadence_adapted",
@@ -3541,21 +3534,23 @@ impl CadenceState {
     /// Back the cadence off after a failed cycle (spec §9.5 source-system
     /// pushback: errors throttle). Growth is multiplicative from the last
     /// delay — or the base retry delay when no scan has run yet — so the
-    /// scheduler never crash-loops against a broken dependency. Growth is
-    /// unbounded (no cadence ceiling; the saturating f64→u64 cast is a
-    /// representation limit only) and self-corrects via the EMA pull-down
-    /// once cycles succeed again.
+    /// scheduler never crash-loops against a broken dependency. The shared
+    /// ceiling bounds each retry sleep; cycle failures remain logged even when
+    /// the effective delay no longer changes at the ceiling.
     fn back_off_after_error(&mut self) -> u64 {
         let old_delay_ms = self.next_delay_ms.unwrap_or(ERROR_RETRY_BASE_MS);
-        let new_delay_ms =
-            ((old_delay_ms as f64) * ERROR_CYCLE_GROWTH).max(ERROR_RETRY_BASE_MS as f64) as u64;
-        info!(
-            event = "scheduler.cadence_adapted",
-            cause = "cycle_error",
-            old_delay_ms,
-            new_delay_ms,
-            "cadence backed off after a failed cycle"
-        );
+        let new_delay_ms = (((old_delay_ms as f64) * ERROR_CYCLE_GROWTH)
+            .max(ERROR_RETRY_BASE_MS as f64) as u64)
+            .min(MAX_BACKOFF_MS);
+        if new_delay_ms != old_delay_ms {
+            info!(
+                event = "scheduler.cadence_adapted",
+                cause = "cycle_error",
+                old_delay_ms,
+                new_delay_ms,
+                "cadence backed off after a failed cycle"
+            );
+        }
         self.next_delay_ms = Some(new_delay_ms);
         new_delay_ms
     }

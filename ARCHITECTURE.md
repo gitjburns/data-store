@@ -217,6 +217,10 @@ The scheduler (`src/scheduler.rs`) drives one `std::thread` scan/drain loop at a
 detection is what re-pends a failed row. Cadence is an internal EMA with no
 operator knob — it backs off multiplicatively after change-free cycles, when the
 queue will not drain, and after failed cycles, and tightens when work appears.
+The shared `MAX_BACKOFF_MS` in `src/util.rs` caps every backoff sleep at 60 seconds,
+including the scan-duration floor, dense HTTP retries, and annotation cycle/retry
+delays. Shorter waits remain shorter. The ceiling bounds sleep, not work duration,
+request timeouts, or total retry lifetime; cadence logs report only delay changes.
 
 ```
 detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ gate / activate
