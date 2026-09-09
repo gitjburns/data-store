@@ -30,6 +30,20 @@ Avoid vague activity logs. A line such as `operation failed` is insufficient
 unless it includes the operation, operation ID, stage, error, relevant safe
 identifiers, and elapsed time when measurable.
 
+## Log Levels
+
+- INFO records startup/shutdown, queries and admin operations, actual ingestion
+  and state changes, and meaningful stage completions with counts and elapsed time.
+- DEBUG records routine scans, empty successful cycles, health/Operation polling,
+  successful internal transaction mechanics, expected contention, individual
+  diagnostic details, and task completion already covered by an operation outcome.
+- WARN/ERROR retain failures and their specific source and boundary context.
+
+The default INFO log must explain real work and failures without DEBUG enabled.
+Cycle summaries use INFO when work occurred or problems were encountered, and
+DEBUG when empty and successful. Aggregate repetitive non-error diagnostics at
+the owning stage; retain individual details at DEBUG.
+
 ## Boundary Rule
 
 Before adding or changing code, identify the diagnostic boundaries the code
@@ -71,10 +85,10 @@ Every operation must log accepted, validation failure when applicable, each
 meaningful stage start and success/checkpoint, terminal result ready, terminal
 error ready, operation task finish, and panic or cancellation when detectable.
 
-Every storage transaction must log begin attempt, begin success or failure,
-each persistence phase, each phase failure with local identifiers, commit
-attempt, commit success or failure, rollback or abort when directly visible,
-and post-commit publish start/success/failure when applicable.
+Successful transaction mechanics use DEBUG. The owning operation records durable
+outcomes for real work at INFO after commit, including post-commit publication
+when applicable. Transaction failures and visible rollback/abort retain the
+operation, phase, local identifiers, and source error at WARN/ERROR.
 
 Every model call and startup smoke check must log model role, call purpose,
 start, success, normal error, elapsed milliseconds, compact input shape facts,

@@ -43,7 +43,7 @@ use std::path::Path;
 
 use rusqlite::{Transaction, params};
 use serde_json::Map;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::error::ApiError;
 use crate::events::{append_event, entry, new_system_event};
@@ -179,7 +179,7 @@ pub(crate) fn propagate_deletions(
     source_system: &str,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let started = std::time::Instant::now();
-    info!(
+    debug!(
         event = "deletion.propagation_started",
         source_system, "scanning for sources whose last current location is gone"
     );
@@ -201,13 +201,23 @@ pub(crate) fn propagate_deletions(
         deactivated.push((source_id, active_parse_id));
     }
 
-    info!(
-        event = "deletion.propagation_completed",
-        source_system,
-        deactivated_count = deactivated.len() as u64,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "deletion propagation finished"
-    );
+    if deactivated.is_empty() {
+        debug!(
+            event = "deletion.propagation_completed",
+            source_system,
+            deactivated_count = deactivated.len() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "deletion propagation finished"
+        );
+    } else {
+        info!(
+            event = "deletion.propagation_completed",
+            source_system,
+            deactivated_count = deactivated.len() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "deletion propagation finished"
+        );
+    }
     Ok(deactivated)
 }
 
@@ -398,7 +408,7 @@ pub(crate) fn restore_reappeared_sources(
     source_system: &str,
 ) -> Result<u64, ApiError> {
     let started = std::time::Instant::now();
-    info!(
+    debug!(
         event = "deletion.reappearance_started",
         source_system, "scanning for deactivated sources whose content reappeared"
     );
@@ -420,13 +430,23 @@ pub(crate) fn restore_reappeared_sources(
         reactivated += 1;
     }
 
-    info!(
-        event = "deletion.reappearance_completed",
-        source_system,
-        reactivated_count = reactivated,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "reappearance restore finished"
-    );
+    if reactivated == 0 {
+        debug!(
+            event = "deletion.reappearance_completed",
+            source_system,
+            reactivated_count = reactivated,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "reappearance restore finished"
+        );
+    } else {
+        info!(
+            event = "deletion.reappearance_completed",
+            source_system,
+            reactivated_count = reactivated,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "reappearance restore finished"
+        );
+    }
     Ok(reactivated)
 }
 

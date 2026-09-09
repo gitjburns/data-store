@@ -49,7 +49,7 @@ use std::time::Instant;
 
 use rusqlite::{Connection, Transaction, params};
 use serde_json::Value;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use unicode_normalization::UnicodeNormalization;
 
 use super::envelope::{self, NewProjection, ProjectionType};
@@ -289,6 +289,7 @@ pub(crate) fn build_graph_projection(
     let AccumulatedMentions {
         mentions,
         skipped_markers: skipped_entity_markers,
+        entity_type_divergences,
     } = accumulate_mentions(&entity_annotations)?;
     let DerivedEdges {
         edges,
@@ -354,6 +355,7 @@ pub(crate) fn build_graph_projection(
         relation_annotation_count = relation_annotations.len(),
         skipped_entity_markers,
         skipped_relation_markers,
+        entity_type_divergences,
         mention_rows,
         edge_rows,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -372,13 +374,12 @@ struct DerivedEdge {
     target_unit_ids: Vec<String>,
 }
 
-/// The accumulated mentions plus the count of empty-marker entity annotations
-/// skipped while accumulating. The count is threaded out (rather than logged
-/// inside the helper) so the build-success log carries it alongside the other
-/// per-build facts; see `build_graph_projection`.
+/// Mentions and diagnostic counts for one build; individual annotation details
+/// stay at DEBUG while the completion event carries the aggregate facts.
 struct AccumulatedMentions {
     mentions: BTreeMap<String, MentionAccumulator>,
     skipped_markers: usize,
+    entity_type_divergences: usize,
 }
 
 /// Accumulate entity annotations into per-normalized-name mentions. For each
@@ -409,6 +410,7 @@ fn accumulate_mentions(
     // order (name ascending) independent of annotation read order.
     let mut mentions: BTreeMap<String, MentionAccumulator> = BTreeMap::new();
     let mut skipped_markers: usize = 0;
+    let mut entity_type_divergences = 0;
 
     for annotation in entity_annotations {
         // Skip the empty-marker row (body is EXACTLY `[]`) before extraction; it
@@ -435,10 +437,11 @@ fn accumulate_mentions(
         // an identity fork (D9). Compared on the NORMALIZED type, so a pure
         // case/spacing variant of the same type is no longer reported as
         // divergence — only a genuine post-normalization difference is. Logged
-        // without contents so the divergence is observable without leaking
-        // annotation bodies.
+        // without contents at DEBUG; count each divergent annotation once for
+        // the INFO build summary, without changing first-seen identity behavior.
         if accumulator.entity_type != entity_type {
-            info!(
+            entity_type_divergences += 1;
+            debug!(
                 event = "graph.entity_type_divergence",
                 annotation_id = %annotation.id,
                 "entity name seen with a differing entityType; keeping first-seen \
@@ -453,6 +456,7 @@ fn accumulate_mentions(
     Ok(AccumulatedMentions {
         mentions,
         skipped_markers,
+        entity_type_divergences,
     })
 }
 

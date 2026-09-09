@@ -16,7 +16,7 @@ use std::{
     time::{Instant, UNIX_EPOCH},
 };
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     canonical,
@@ -206,7 +206,7 @@ impl FilesystemConnector {
         known: &BTreeMap<String, KnownLocationState>,
     ) -> Result<FullScanOutcome, ScanError> {
         let scan_started = Instant::now();
-        info!(
+        debug!(
             event = "connector.filesystem.scan_started",
             corpus_root = %self.corpus_root.display(),
             known_locations = known.len(),
@@ -215,7 +215,7 @@ impl FilesystemConnector {
 
         match self.run_full_scan(known, scan_started) {
             Ok(outcome) => {
-                info!(
+                debug!(
                     event = "connector.filesystem.scan_completed",
                     corpus_root = %self.corpus_root.display(),
                     enumerated = outcome.enumerated_native_uris.len(),

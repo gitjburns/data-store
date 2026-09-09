@@ -40,7 +40,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Map, Value};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     // Parse routing matches on the same mime constants acquisition writes
@@ -541,7 +541,18 @@ pub(crate) fn enqueue_coalesced(
             source,
         ));
     }
-    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "enqueue_coalesced")
+    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "enqueue_coalesced")?;
+    // The preceding enqueue/coalesce record describes the write attempt;
+    // confirm durability here while generic transaction mechanics use DEBUG.
+    info!(
+        event = "scheduler.queue_committed",
+        source_system,
+        native_uri,
+        reason,
+        operation_id = operation_id.unwrap_or("none"),
+        "sync queue submission committed"
+    );
+    Ok(())
 }
 
 /// Claim every pending entry — plus every stale in_flight entry — for one
@@ -592,7 +603,7 @@ pub(crate) fn claim_pending(index_root: &Path) -> Result<Vec<SyncQueueEntry>, Ap
     };
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "claim_pending")?;
 
-    info!(
+    debug!(
         event = "scheduler.queue_claimed",
         claimed = entries.len(),
         "pending (and stale in-flight) sync queue entries claimed for drain"
@@ -1810,7 +1821,7 @@ fn run_cycle(
     dispatch: &ParseDispatchContext,
 ) -> Result<CycleOutcome, ApiError> {
     let cycle_started = Instant::now();
-    info!(event = "scheduler.cycle_started", "sync cycle starting");
+    debug!(event = "scheduler.cycle_started", "sync cycle starting");
 
     // Change-observed boundary: prescreen state, then one full scan (which
     // also stages — the acquired boundary — for new/changed items).
@@ -1897,7 +1908,7 @@ fn run_cycle(
         // acquisition record (nothing was learned about the source).
         Err(ScanError::Internal(source)) => return Err(source),
     };
-    info!(
+    debug!(
         event = "scheduler.changes_observed",
         enumerated = scan.enumerated_native_uris.len(),
         staged = scan.staged_bundle_dirs.len(),
@@ -2246,7 +2257,7 @@ fn run_cycle(
             }
         }
     }
-    info!(
+    debug!(
         event = "scheduler.imported",
         claimed,
         imported,
@@ -2259,6 +2270,7 @@ fn run_cycle(
     // Deletion inference is gated on a COMPLETE enumeration (spec §11.1): a
     // partial scan asserts nothing about absent items.
     let mut deletions: u64 = 0;
+    let mut source_lifecycle_changed = false;
     if scan.enumeration_complete {
         let enumeration_record_id =
             acquisition::record_enumeration(index_root, context, scope_uri, scan.elapsed_ms)?;
@@ -2285,13 +2297,16 @@ fn run_cycle(
             &dispatch.identity,
             connector.source_system(),
         )?;
-        crate::deletion::restore_reappeared_sources(
+        let reactivated = crate::deletion::restore_reappeared_sources(
             index_root,
             &dispatch.registry,
             &dispatch.projections.dense_cache,
             dispatch.projections.dense_dimension,
             connector.source_system(),
         )?;
+        // Source transitions can finish work left by a previous cycle even
+        // when this enumeration did not discover a new file or deletion.
+        source_lifecycle_changed = !deactivated_pairs.is_empty() || reactivated > 0;
 
         // §11.3 step 4's trailing archive-verify-delete, gated on the
         // pre-deactivation snapshot each deactivation minted. Run AFTER
@@ -2330,18 +2345,41 @@ fn run_cycle(
         deletions,
         elapsed_ms: cycle_started.elapsed().as_millis() as u64,
     };
-    info!(
-        event = "scheduler.cycle_completed",
-        enumerated = stats.enumerated,
-        staged = stats.staged,
-        skipped_unchanged = stats.skipped,
-        imported = stats.imported,
-        failures = stats.failures,
-        deletions = stats.deletions,
-        scan_elapsed_ms = scan.elapsed_ms,
-        elapsed_ms = stats.elapsed_ms,
-        "sync cycle completed"
-    );
+    // Enumeration/bookkeeping alone is idle. Keep real work and incomplete or
+    // failed scans visible at INFO without repeating empty cycles there.
+    let report_activity = stats.staged > 0
+        || stats.imported > 0
+        || stats.failures > 0
+        || stats.deletions > 0
+        || source_lifecycle_changed
+        || !scan.enumeration_complete;
+    if report_activity {
+        info!(
+            event = "scheduler.cycle_completed",
+            enumerated = stats.enumerated,
+            staged = stats.staged,
+            skipped_unchanged = stats.skipped,
+            imported = stats.imported,
+            failures = stats.failures,
+            deletions = stats.deletions,
+            scan_elapsed_ms = scan.elapsed_ms,
+            elapsed_ms = stats.elapsed_ms,
+            "sync cycle completed"
+        );
+    } else {
+        debug!(
+            event = "scheduler.cycle_completed",
+            enumerated = stats.enumerated,
+            staged = stats.staged,
+            skipped_unchanged = stats.skipped,
+            imported = stats.imported,
+            failures = stats.failures,
+            deletions = stats.deletions,
+            scan_elapsed_ms = scan.elapsed_ms,
+            elapsed_ms = stats.elapsed_ms,
+            "sync cycle completed"
+        );
+    }
     // Changes = staged + deleted: both are observed state transitions the
     // cadence should track; skipped/unchanged items are not change signal.
     let changes = stats.staged + deletions;
@@ -3003,6 +3041,12 @@ fn record_projection_build_failure(
             error = %audit_error,
             "durable projection.failed audit could not be recorded; original build error stands"
         );
+    } else {
+        // The original build failed, but its failure marker committed separately.
+        info!(
+            event = "scheduler.projection_build.failure_audit_committed",
+            source_id, parse_id, "projection failure audit committed"
+        );
     }
 }
 
@@ -3434,9 +3478,10 @@ impl CadenceState {
             // rates (spec §9.5). There is deliberately no cadence ceiling —
             // that would be a policy knob — and growth is self-correcting:
             // the EMA pull-down above shrinks the delay as soon as changes
-            // reappear. The f64→u64 `as` cast saturates, so the conversion
-            // cannot overflow (a representation limit, not a policy value).
-            let grown = ((delay_ms as f64) * QUIET_CYCLE_GROWTH) as u64;
+            // reappear. Round upward so the 1 ms floor grows instead of
+            // truncating 1.5 back to 1 forever. The f64→u64 cast saturates
+            // at the representation limit without introducing a policy ceiling.
+            let grown = ((delay_ms as f64) * QUIET_CYCLE_GROWTH).ceil() as u64;
             if grown != delay_ms {
                 info!(
                     event = "scheduler.cadence_adapted",

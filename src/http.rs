@@ -13,7 +13,7 @@ use axum::{
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::maintenance::MaintenancePermit;
 
@@ -194,7 +194,7 @@ async fn storage_admission(
     match tokio::spawn(async move {
         let _permit = permit;
         let response = next.run(request).await;
-        info!(
+        debug!(
             event = "http.admitted_task_finished",
             route = task_route,
             status = response.status().as_u16(),
@@ -245,7 +245,7 @@ async fn post_rebuild_all(
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let started = log_route_started("/v1/health", "health_reading");
     let response = state.health();
-    info!(
+    debug!(
         event = "http.route.result_ready",
         route = "/v1/health",
         stage = "health_reading",
@@ -262,13 +262,24 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 /// Log the accepted boundary for one route-specific HTTP request.
 fn log_route_started(route: &'static str, stage: &'static str) -> Instant {
     let started = Instant::now();
-    info!(
-        event = "http.route.started",
-        route,
-        stage,
-        elapsed_ms = 0_u64,
-        "HTTP route started"
-    );
+    // Polling traces belong at DEBUG; query and admin lifecycle starts remain INFO.
+    if matches!(route, "/v1/health" | "/operations/{operationId}") {
+        debug!(
+            event = "http.route.started",
+            route,
+            stage,
+            elapsed_ms = 0_u64,
+            "HTTP route started"
+        );
+    } else {
+        info!(
+            event = "http.route.started",
+            route,
+            stage,
+            elapsed_ms = 0_u64,
+            "HTTP route started"
+        );
+    }
 
     started
 }
@@ -2668,7 +2679,7 @@ async fn get_operation(
         return Err(error);
     };
 
-    info!(
+    debug!(
         event = "http.route.result_ready",
         route,
         stage = "result_ready",

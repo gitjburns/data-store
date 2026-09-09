@@ -26,7 +26,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::artifact_store::{ArtifactRef, ArtifactStore};
 use crate::connectors::{
@@ -626,7 +626,7 @@ fn ensure_source_object(
             ),
         })?;
     if let Some(id) = existing {
-        info!(
+        debug!(
             event = "acquisition.source_object_deduplicated",
             source_object_id = id,
             source_hash = bundle.source_hash,
@@ -764,7 +764,7 @@ fn maintain_source_location(
             )?;
             append_event(tx, &event)?;
         }
-        info!(
+        debug!(
             event = "acquisition.source_location_refreshed",
             source_location_id = location_id,
             source_system = manifest.source_system,
@@ -920,7 +920,7 @@ pub(crate) fn record_enumeration(
     }
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "record_enumeration")?;
 
-    info!(
+    debug!(
         event = "acquisition.enumeration_recorded",
         acquisition_record_id = record.id,
         source_system = record.source_system,
@@ -951,7 +951,7 @@ pub(crate) fn apply_enumeration_deletions(
     enumeration_record_id: &str,
 ) -> Result<Vec<String>, ApiError> {
     let started = Instant::now();
-    info!(
+    debug!(
         event = "acquisition.enumeration_deletions_started",
         source_system,
         scope_uri,
@@ -986,14 +986,26 @@ pub(crate) fn apply_enumeration_deletions(
     };
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "apply_enumeration_deletions")?;
 
-    info!(
-        event = "acquisition.enumeration_deletions_applied",
-        source_system,
-        deleted_count = deleted.len(),
-        enumeration_record_id,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "enumeration deletion inference applied"
-    );
+    // Keep actual deletion commits visible even if a later scheduler phase fails.
+    if deleted.is_empty() {
+        debug!(
+            event = "acquisition.enumeration_deletions_applied",
+            source_system,
+            deleted_count = deleted.len(),
+            enumeration_record_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "enumeration deletion inference applied"
+        );
+    } else {
+        info!(
+            event = "acquisition.enumeration_deletions_applied",
+            source_system,
+            deleted_count = deleted.len(),
+            enumeration_record_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "enumeration deletion inference applied"
+        );
+    }
     Ok(deleted)
 }
 
@@ -1181,7 +1193,7 @@ pub(crate) fn known_location_state(
         }
     }
 
-    info!(
+    debug!(
         event = "acquisition.known_state_loaded",
         source_system,
         known_count = known.len() as u64,
@@ -1238,7 +1250,7 @@ fn insert_acquisition_record(
             record.id, record.source_system, record.native_uri
         ),
     })?;
-    info!(
+    debug!(
         event = "acquisition.record_inserted",
         acquisition_record_id = record.id,
         source_system = record.source_system,

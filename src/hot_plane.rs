@@ -18,7 +18,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::error::ApiError;
 
@@ -654,7 +654,7 @@ pub(crate) fn begin_write_transaction<'c>(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<Transaction<'c>, ApiError> {
-    info!(
+    debug!(
         event = %format!("{log_namespace}.transaction_begin"),
         operation, "write transaction beginning"
     );
@@ -689,7 +689,7 @@ pub(crate) enum WriteTransactionAttempt<'c> {
 /// Contention-aware sibling of `begin_write_transaction`: attempt one IMMEDIATE
 /// write transaction, but classify a post-busy_timeout `SQLITE_BUSY` as writer
 /// contention (`Busy`) instead of a storage fault. On `Busy` the begin boundary
-/// is logged at INFO (`{log_namespace}.transaction_begin_busy`) because
+/// is logged at DEBUG (`{log_namespace}.transaction_begin_busy`) because
 /// contention is normal operation here — the scheduler holds the writer lock
 /// across a source's whole embed — and the caller decides whether to defer or
 /// wait. Every other rusqlite error takes the identical ERROR log and
@@ -701,7 +701,7 @@ pub(crate) fn begin_write_transaction_if_free<'c>(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<WriteTransactionAttempt<'c>, ApiError> {
-    info!(
+    debug!(
         event = %format!("{log_namespace}.transaction_begin"),
         operation, "write transaction beginning"
     );
@@ -710,7 +710,7 @@ pub(crate) fn begin_write_transaction_if_free<'c>(
         Err(rusqlite::Error::SqliteFailure(err, _))
             if err.code == rusqlite::ErrorCode::DatabaseBusy =>
         {
-            info!(
+            debug!(
                 event = %format!("{log_namespace}.transaction_begin_busy"),
                 operation,
                 "write transaction begin deferred; writer lock held (busy_timeout expired)"
@@ -747,7 +747,7 @@ pub(crate) fn begin_read_transaction<'c>(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<Transaction<'c>, ApiError> {
-    info!(
+    debug!(
         event = %format!("{log_namespace}.transaction_begin"),
         operation, "read transaction beginning"
     );
@@ -766,16 +766,15 @@ pub(crate) fn begin_read_transaction<'c>(
         })
 }
 
-/// Commit one hot-plane transaction with attempt/success/failure logging
-/// under the caller's namespace (the commit attempt is logged before
-/// `commit()` per the diagnostics standard, so a wedged commit still leaves
-/// evidence); after success every row written on the transaction is durable.
+/// Commit one hot-plane transaction with DEBUG attempt/success and ERROR failure
+/// logging under the caller's namespace. Callers own INFO outcomes for meaningful
+/// durable changes; after success every row written on the transaction is durable.
 pub(crate) fn commit_transaction(
     tx: Transaction<'_>,
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<(), ApiError> {
-    info!(
+    debug!(
         event = %format!("{log_namespace}.transaction_commit"),
         operation, "transaction commit attempt"
     );
@@ -790,7 +789,7 @@ pub(crate) fn commit_transaction(
             message: format!("failed to commit {operation} transaction: {source}"),
         }
     })?;
-    info!(
+    debug!(
         event = %format!("{log_namespace}.transaction_committed"),
         operation, "transaction committed"
     );

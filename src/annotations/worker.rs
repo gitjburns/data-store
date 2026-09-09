@@ -88,7 +88,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
 use crate::annotations::memo::{self, MemoItem};
@@ -405,7 +405,7 @@ fn run_cycle(
     retry_attempts: &mut HashMap<String, u32>,
 ) -> Result<CycleReport, ApiError> {
     let started = Instant::now();
-    info!(
+    debug!(
         event = "annotation_worker.cycle_started",
         "annotation discovery cycle starting"
     );
@@ -466,7 +466,7 @@ fn run_cycle(
                         // contention: count the deferral, log it once, and end
                         // the cycle early for the same reason as above.
                         totals.deferred += 1;
-                        info!(
+                        debug!(
                             event = "annotation_worker.cycle_deferred",
                             source_id = %source.source_id,
                             parse_id = %source.active_parse_id,
@@ -515,22 +515,50 @@ fn run_cycle(
         }
     }
 
-    info!(
-        event = "annotation_worker.cycle_completed",
-        sources_examined = sources.len(),
-        expected = totals.expected,
-        missing = totals.missing,
-        built = totals.built,
-        memoized = totals.memoized,
-        failed = totals.failed,
-        source_failures = totals.source_failures,
-        projection_failures = totals.projection_failures,
-        orphans_adopted = totals.orphans_adopted,
-        deferred = totals.deferred,
-        exhausted = totals.exhausted,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "annotation discovery cycle completed"
-    );
+    // Discovery and expected writer contention are DEBUG even with work waiting.
+    // Actual annotation changes and failures remain INFO; projections log their own outcomes.
+    let report_activity = totals.built > 0
+        || totals.memoized > 0
+        || totals.failed > 0
+        || totals.source_failures > 0
+        || totals.projection_failures > 0
+        || totals.orphans_adopted > 0
+        || totals.exhausted > 0;
+    if report_activity {
+        info!(
+            event = "annotation_worker.cycle_completed",
+            sources_examined = sources.len(),
+            expected = totals.expected,
+            missing = totals.missing,
+            built = totals.built,
+            memoized = totals.memoized,
+            failed = totals.failed,
+            source_failures = totals.source_failures,
+            projection_failures = totals.projection_failures,
+            orphans_adopted = totals.orphans_adopted,
+            deferred = totals.deferred,
+            exhausted = totals.exhausted,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "annotation discovery cycle completed"
+        );
+    } else {
+        debug!(
+            event = "annotation_worker.cycle_completed",
+            sources_examined = sources.len(),
+            expected = totals.expected,
+            missing = totals.missing,
+            built = totals.built,
+            memoized = totals.memoized,
+            failed = totals.failed,
+            source_failures = totals.source_failures,
+            projection_failures = totals.projection_failures,
+            orphans_adopted = totals.orphans_adopted,
+            deferred = totals.deferred,
+            exhausted = totals.exhausted,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "annotation discovery cycle completed"
+        );
+    }
     Ok(CycleReport {
         sources_examined: sources.len() as u64,
         totals,
@@ -1089,7 +1117,7 @@ fn prepare_work_item(
         )? == BuildFlow::Deferred
         {
             counts.deferred += 1;
-            info!(
+            debug!(
                 event = "annotation_worker.cycle_deferred",
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
@@ -1117,7 +1145,7 @@ fn prepare_work_item(
         }))),
         None => {
             counts.deferred += 1;
-            info!(
+            debug!(
                 event = "annotation_worker.cycle_deferred",
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
@@ -1816,7 +1844,7 @@ fn build_annotation_derived_projections(
             // The parse was superseded (or the source deactivated) between the
             // cycle-start read and now: skip so no projection is built for a
             // non-active parse.
-            info!(
+            debug!(
                 event = "annotation_worker.projection_build_skipped",
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
@@ -1828,7 +1856,7 @@ fn build_annotation_derived_projections(
             // Some required annotation is still failed/building: the annotation
             // build is incomplete, so building projections now would materialize
             // a partial summary/graph. Skip; the next cycle re-attempts.
-            info!(
+            debug!(
                 event = "annotation_worker.projection_build_skipped",
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
@@ -1845,12 +1873,6 @@ fn build_annotation_derived_projections(
     }
 
     let started = Instant::now();
-    info!(
-        event = "annotation_worker.projection_build_started",
-        source_id = %source.source_id,
-        parse_id = %source.active_parse_id,
-        "annotation-derived projection build starting"
-    );
 
     let mut connection = hot_plane::open_write(index_root)?;
     // PRE-PAID boundary: the projection build produces nothing external, so on
@@ -1864,6 +1886,14 @@ fn build_annotation_derived_projections(
         WriteTransactionAttempt::Begun(tx) => tx,
         WriteTransactionAttempt::Busy => return Ok(BuildFlow::Deferred),
     };
+    // An expected busy writer is a deferral, not a build start at INFO.
+    info!(
+        event = "annotation_worker.projection_build_started",
+        source_id = %source.source_id,
+        parse_id = %source.active_parse_id,
+        "annotation-derived projection build starting"
+    );
+
     // The whole build rides `tx`; the first builder Err aborts it below, so no
     // partial annotation-derived projection set ever commits.
     let build =
@@ -2012,6 +2042,12 @@ fn record_projection_build_failure(
             parse_id,
             error = %audit_error,
             "durable projection.failed audit could not be recorded; original build error stands"
+        );
+    } else {
+        // The original build failed, but its failure marker committed separately.
+        info!(
+            event = "annotation_worker.projection_build.failure_audit_committed",
+            source_id, parse_id, "projection failure audit committed"
         );
     }
 }
