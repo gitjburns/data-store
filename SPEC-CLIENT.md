@@ -376,6 +376,9 @@ Both clients show server-provided retrieval provenance beneath each passage:
 channel names, annotation contribution, direct entity matches, and directed
 relationship paths. Contribution describes candidate-list overlap, not a
 measured improvement in results. Missing provenance is explicitly unavailable.
+Dense matches distinguish direct passages, section-guided matches with their
+heading hierarchy, and document-scoped context. Web details retain the section,
+window, and fine-chunk references per matched unit.
 The CLI deduplicates repeated paths for display; raw output preserves unit
 mappings. The web view previews three distinct explanations and retains all
 matches, support references, and context units in expandable retrieval details.

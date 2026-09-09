@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{error, info, warn};
 
+use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
 use crate::events::{append_event, entry, new_system_event};
 use crate::hot_plane;
@@ -223,6 +224,7 @@ struct ActivationContext<'a> {
 /// unconfirmed, as recorded at the corresponding boundary.
 pub(crate) fn gate_and_activate(
     index_root: &Path,
+    store: &ArtifactStore,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -247,6 +249,7 @@ pub(crate) fn gate_and_activate(
     // event appends, commit — honoring the §31.1 brevity contract.
     let _barrier_guard = registry.acquire(&source_id);
 
+    verify_section_payload(&connection, store, parse_run_id, dense_dimension)?;
     let tx =
         hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "gate_and_activate")?;
     let outcome = match gate_transaction_body(&tx, parse_run_id, &source_id) {
@@ -301,6 +304,7 @@ pub(crate) fn gate_and_activate(
             publish_dense_cache(
                 dense_cache,
                 &connection,
+                store,
                 parse_run_id,
                 predecessor_id.as_deref(),
                 dense_dimension,
@@ -363,13 +367,14 @@ pub(crate) fn gate_and_activate(
 fn publish_dense_cache(
     dense_cache: &DenseCache,
     connection: &Connection,
+    store: &ArtifactStore,
     activated_parse_id: &str,
     predecessor_parse_id: Option<&str>,
     dense_dimension: usize,
 ) -> Result<(), ApiError> {
     let started = Instant::now();
     dense_cache
-        .load_parse(connection, activated_parse_id, dense_dimension)
+        .load_parse(connection, store, activated_parse_id, dense_dimension)
         .map_err(|source| {
             error!(event = "activation.publish_failed", parse_run_id = activated_parse_id,
             predecessor_parse_id = predecessor_parse_id.unwrap_or("none"),
@@ -410,6 +415,7 @@ fn publish_dense_cache(
 // `drive_activation_cleanup`.
 pub(crate) fn accept_held_parse(
     index_root: &Path,
+    store: &ArtifactStore,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -430,6 +436,7 @@ pub(crate) fn accept_held_parse(
     // candidate for this source.
     let _barrier_guard = registry.acquire(&source_id);
 
+    verify_section_payload(&connection, store, parse_run_id, dense_dimension)?;
     let tx =
         hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "accept_held_parse")?;
     let (predecessor_id, superseded_held_ids) =
@@ -469,6 +476,7 @@ pub(crate) fn accept_held_parse(
     publish_dense_cache(
         dense_cache,
         &connection,
+        store,
         parse_run_id,
         predecessor_id.as_deref(),
         dense_dimension,
@@ -819,6 +827,25 @@ fn verify_activation_prerequisites(
             ),
         });
     }
+    // DenseVector is shared by two representations: a section envelope must
+    // never mask a missing fine passage plane, or vice versa.
+    for index_name in [
+        None,
+        Some(crate::projections::section_dense::SECTION_DENSE_INDEX_NAME),
+    ] {
+        if !envelope::has_fresh_index_for_parse(
+            tx,
+            parse_run_id,
+            ProjectionType::DenseVector,
+            index_name,
+        )? {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "parse {parse_run_id} cannot activate: dense index {index_name:?} is missing; rebuild the source"
+                ),
+            });
+        }
+    }
     tracing::debug!(
         event = "activation.prerequisites_ok",
         parse_run_id,
@@ -826,6 +853,31 @@ fn verify_activation_prerequisites(
         "activation prerequisites satisfied: content-derived projections fresh"
     );
     Ok(())
+}
+
+/// Validate persisted section bytes and canonical mappings before pointer commit;
+/// the later cache publication therefore cannot accept a legacy missing plane.
+fn verify_section_payload(
+    connection: &Connection,
+    store: &ArtifactStore,
+    parse_id: &str,
+    dimension: usize,
+) -> Result<(), ApiError> {
+    let result = crate::projections::section_dense::load_section_dense(
+        connection, store, parse_id, dimension,
+    )
+    .and_then(|plane| {
+        plane.ok_or_else(|| ApiError::StorageOperation {
+            message: format!(
+                "parse {parse_id} cannot activate without section embeddings; rebuild the source"
+            ),
+        })
+    });
+    result.map(|_| ()).map_err(|error| {
+        error!(event = "activation.section_validation_failed", parse_id, error = %error,
+            committed = false, "section representation rejected before activation");
+        error
+    })
 }
 
 /// The shared activate path (spec §13.6 as one transaction, steps a–e):

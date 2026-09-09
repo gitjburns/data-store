@@ -76,6 +76,27 @@ pub(crate) struct UnitRetrievalMatch {
     pub(crate) unit_id: String,
     pub(crate) channels: Vec<RetrievalChannel>,
     pub(crate) graph_matches: Vec<GraphMatch>,
+    pub(crate) dense_matches: Vec<DenseRetrievalMatch>,
+}
+
+/// Distinguish fine passage discovery from section-guided nomination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DenseRepresentation {
+    Passage,
+    Section,
+}
+
+/// Exact dense artifact that nominated a unit; section evidence never extends
+/// to neighboring units outside that window's canonical input mapping.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DenseRetrievalMatch {
+    pub(crate) representation: DenseRepresentation,
+    pub(crate) chunk_id: Option<String>,
+    pub(crate) section_window_id: Option<String>,
+    pub(crate) section_id: Option<String>,
+    pub(crate) section_path: Vec<String>,
 }
 
 /// A query-matched normalized name and the actual path that reached a unit.

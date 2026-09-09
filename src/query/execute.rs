@@ -389,7 +389,7 @@ fn run_pipeline_body(
     }
 
     *stage = "capture_dense_planes";
-    let captured = clone_dense_planes(dense_cache, active, query_id);
+    let captured = clone_dense_planes(dense_cache, registry, active, query_id)?;
     latencies.capture_ms = capture_started_at.elapsed().as_millis() as u64;
     info!(
         event = "query.execute.captured",
@@ -864,36 +864,39 @@ fn collect_active_parses(
 /// discipline, `dense_cache.rs::snapshot_for_parse`); once captured, a concurrent
 /// cutover that evicts the plane does not affect this query.
 ///
-/// A captured active parse whose dense plane is ABSENT is possible only in the
-/// tiny window where a concurrent cutover evicted a predecessor plane after the
-/// active-set read; it is a VISIBLE degradation, never silent (§3: silent
-/// degradation is prohibited): logged as an explicit `warn` boundary event, and
-/// the parse proceeds with its remaining channels (lexical + graph) via a `None`
-/// `dense_plane`.
+/// Both dense representations are required by retrieval v3. A known cutover
+/// remains retryable; otherwise missing planes reject the whole query with an
+/// actionable rebuild requirement rather than silently dropping a channel.
 fn clone_dense_planes(
     dense_cache: &DenseCache,
+    registry: &CutoverRegistry,
     active: Vec<ActiveParse>,
     query_id: &str,
-) -> Vec<CapturedParse> {
+) -> Result<Vec<CapturedParse>, ApiError> {
     active
         .into_iter()
         .map(|parse| {
             let dense_plane = dense_cache.snapshot_for_parse(&parse.parse_id);
-            if dense_plane.is_none() {
+            if dense_plane.as_ref().is_none_or(|plane| plane.sections().is_none()) {
+                // A cutover may engage between the first barrier probe and the
+                // cache clone. Preserve its retry signal when it is observable.
+                registry.reject_if_active(&parse.source_id)?;
                 warn!(
                     event = "query.execute.dense_plane_missing",
                     query_id,
                     source_id = %parse.source_id,
                     parse_id = %parse.parse_id,
-                    "captured active parse has no dense plane snapshot; proceeding \
-                     with its lexical and graph channels only (degraded, not silent)"
+                    "captured active parse lacks complete passage and section dense projections; rebuild required"
                 );
+                return Err(ApiError::ServiceUnavailable {
+                    message: format!("source {} parse {} lacks complete passage and section dense projections; rebuild required: run data-store --config <config-path> --rebuild-all", parse.source_id, parse.parse_id),
+                });
             }
-            CapturedParse {
+            Ok(CapturedParse {
                 source_id: parse.source_id,
                 parse_id: parse.parse_id,
                 dense_plane,
-            }
+            })
         })
         .collect()
 }

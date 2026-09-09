@@ -35,8 +35,8 @@
 //! empty-result `[]` marker convention (a producer that found nothing still
 //! completes its building row with an empty JSON-array body so the key is
 //! satisfied and not rebuilt). Execution is SERIAL (no waves — sampling is small);
-//! a shutdown probe runs between items so a shutdown request during sampling ends
-//! the driver promptly. The worker's dedicated discovery loop is NOT reused (its
+//! cancellation interrupts HTTP sampling and prevents unfinished output committing.
+//! The worker's dedicated discovery loop is NOT reused (its
 //! item enumeration is private); this driver mirrors the call sequence directly.
 
 use std::path::{Path, PathBuf};
@@ -52,6 +52,7 @@ use crate::annotations::store::{self, NewAnnotation, ReopenableRow, ReopenableSt
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::hot_plane;
+use crate::maintenance::AnnotationCancellation;
 use crate::model::Provenance;
 use crate::policy::AnnotatorNamingPolicy;
 use crate::scheduler::{self, DryRunReadyParse};
@@ -92,7 +93,8 @@ pub(crate) struct DryRunInputs {
 struct SampleCounts {
     /// Section groups sampled (attempted) for this source, across both types.
     groups_sampled: u64,
-    /// Producer HTTP calls made (memo misses that ran the model).
+    /// Producer invocations attempted, including cancellation before HTTP dispatch.
+    /// HTTP lifecycle logs determine which attempts actually reached the network.
     producer_calls: u64,
     /// Memo hits re-minted without a model call.
     memo_hits: u64,
@@ -120,7 +122,11 @@ impl SampleCounts {
 /// serve the reduced router (`http::build_dry_run_router`), invoke this, log the
 /// mode-ready-for-inspection line, and serve until shutdown. This function owns
 /// only the pass + sampling; it does NOT bind or serve.
-pub(crate) fn run(inputs: DryRunInputs, shutdown: &ShutdownSignal) -> Result<(), ApiError> {
+pub(crate) fn run(
+    inputs: DryRunInputs,
+    shutdown: &ShutdownSignal,
+    cancellation: AnnotationCancellation,
+) -> Result<(), ApiError> {
     // Driver-scoped start boundary. main.rs emits `dry_run.mode_started` at the
     // outer mode boundary (bind/serve lifecycle); this distinct name marks the
     // inner pass+sampling driver so the two boundaries are distinguishable.
@@ -155,7 +161,7 @@ pub(crate) fn run(inputs: DryRunInputs, shutdown: &ShutdownSignal) -> Result<(),
     // or an unbuildable client fails the mode loudly, because sampling IS the
     // mode's purpose (unlike the normal worker, where annotations are
     // non-critical and a client load failure only parks the worker).
-    let client = AnnotatorClient::load(&inputs.annotator, &inputs.config_root)?;
+    let client = AnnotatorClient::load(&inputs.annotator, &inputs.config_root, cancellation)?;
     let naming_rules = inputs.naming_policy.rules.as_slice();
 
     // Phase 2: sample the first N section groups per source per type. Serial —
@@ -163,14 +169,21 @@ pub(crate) fn run(inputs: DryRunInputs, shutdown: &ShutdownSignal) -> Result<(),
     let mut total = SampleCounts::default();
     let mut sources_sampled: u64 = 0;
     for ready in &pass.ready {
-        if shutdown.wait_timeout(std::time::Duration::ZERO) {
+        if client.cancellation().reason().is_some()
+            || shutdown.wait_timeout(std::time::Duration::ZERO)
+        {
             // A shutdown request ends sampling promptly. Already-sampled sources
             // are durable; the rest are covered by the next normal start (their
             // parses are ready and un-held). Deliberately not counted as failure.
-            warn!(
-                event = "dry_run.sampling_abandoned_shutdown",
+            info!(
+                event = "dry_run.sampling_cancelled",
+                reason = client
+                    .cancellation()
+                    .reason()
+                    .map(|reason| reason.label())
+                    .unwrap_or("shutdown"),
                 sources_sampled,
-                "shutdown requested during sampling; ending dry-run sampling early"
+                "cancellation requested during sampling; ending dry-run sampling early"
             );
             break;
         }
@@ -189,6 +202,7 @@ pub(crate) fn run(inputs: DryRunInputs, shutdown: &ShutdownSignal) -> Result<(),
             parse_id = %ready.parse_run_id,
             groups_sampled = counts.groups_sampled,
             producer_calls = counts.producer_calls,
+            producer_calls_scope = "invocations_attempted",
             memo_hits = counts.memo_hits,
             already_satisfied = counts.already_satisfied,
             failures = counts.failures,
@@ -204,6 +218,7 @@ pub(crate) fn run(inputs: DryRunInputs, shutdown: &ShutdownSignal) -> Result<(),
         sources_sampled,
         groups_sampled = total.groups_sampled,
         producer_calls = total.producer_calls,
+        producer_calls_scope = "invocations_attempted",
         memo_hits = total.memo_hits,
         already_satisfied = total.already_satisfied,
         failures = total.failures,
@@ -256,14 +271,17 @@ fn sample_source(
             .collect();
 
         for invocation in sampled_groups {
-            if shutdown.wait_timeout(std::time::Duration::ZERO) {
+            if client.cancellation().reason().is_some()
+                || shutdown.wait_timeout(std::time::Duration::ZERO)
+            {
                 // No NEW paid producer call may start after a shutdown request;
                 // return what is done so far (already-built rows are durable).
-                warn!(
-                    event = "dry_run.sampling_abandoned_shutdown",
+                info!(
+                    event = "dry_run.sampling_cancelled",
+                    reason = client.cancellation().reason().map(|reason| reason.label()).unwrap_or("shutdown"),
                     source_id = %ready.source_id,
                     parse_id = %ready.parse_run_id,
-                    "shutdown requested mid-source; ending this source's sampling"
+                    "cancellation requested mid-source; ending this source's sampling"
                 );
                 return Ok(counts);
             }
@@ -346,10 +364,23 @@ fn sample_item(
         memo::lookup(&connection, &memo_key)?
     };
 
+    let cancellation = client.cancellation();
+    if sampling_cancelled(cancellation, "before_persistence") {
+        return Ok(());
+    }
     if let Some(entry) = cached {
         // MEMO HIT: re-mint the cached invocation output as annotation rows in ONE
         // transaction, with NO model call. Mirrors `worker::remint_from_memo`.
-        remint_from_memo(index_root, &request, reopened, &entry, &memo_key)?;
+        if !remint_from_memo(
+            index_root,
+            &request,
+            reopened,
+            &entry,
+            &memo_key,
+            cancellation,
+        )? {
+            return Ok(());
+        }
         counts.memo_hits += 1;
         info!(
             event = "dry_run.memo_hit",
@@ -373,7 +404,9 @@ fn sample_item(
         let result = reopen_or_insert_building(&tx, reopened, &request);
         match result {
             Ok(id) => {
-                hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "build_open")?;
+                if !commit_unless_cancelled(tx, "build_open", cancellation)? {
+                    return Ok(());
+                }
                 id
             }
             Err(source) => {
@@ -390,22 +423,46 @@ fn sample_item(
     // Producer call (the only external dependency in this mode). A failure parks
     // the row failed and counts a failure; it is NOT fatal. Dry-run sampling
     // has no retry ladder, so every call runs at the base temperature.
-    counts.producer_calls += 1;
     let context = invocation.log_context();
     context.record("trigger", "dry_run");
     context.record("source_id", ready.source_id.as_str());
     context.record("parse_id", ready.parse_run_id.as_str());
     context.record("annotation_id", building_id.as_str());
     let _entered = context.enter();
-    match producer::invoke(
+    if sampling_cancelled(cancellation, "before_producer") {
+        return Ok(());
+    }
+    counts.producer_calls += 1;
+    let result = producer::invoke(
         kind,
         client,
         invocation,
         naming_rules,
         llm_client::PRODUCER_TEMPERATURE,
-    ) {
+    );
+    // Cancellation can arrive after the response or during validation. Its output
+    // and provider errors must not be persisted as fresh annotations or failures,
+    // but an already-observed error remains part of the diagnostic record.
+    if sampling_cancelled(cancellation, "after_producer") {
+        if let Err(source) = &result
+            && source.error().is_some()
+        {
+            warn!(
+                event = "dry_run.build_error_discarded",
+                source_id = %ready.source_id,
+                parse_id = %ready.parse_run_id,
+                producer = kind.producer_name(),
+                annotation_id = %building_id,
+                failure_class = source.class(),
+                error = %source,
+                "observed producer error discarded after cancellation; no failure persisted"
+            );
+        }
+        return Ok(());
+    }
+    match result {
         Ok(produced) => {
-            complete_build(
+            if !complete_build(
                 index_root,
                 config,
                 naming_rules,
@@ -414,7 +471,10 @@ fn sample_item(
                 &building_id,
                 &produced,
                 &memo_key,
-            )?;
+                cancellation,
+            )? {
+                return Ok(());
+            }
             info!(
                 event = "dry_run.build_completed",
                 source_id = %ready.source_id,
@@ -425,8 +485,40 @@ fn sample_item(
                 "dry-run validated annotation output committed"
             );
         }
+        Err(producer::InvocationFailure::Cancelled(reason)) => {
+            info!(
+                event = "dry_run.build_cancelled",
+                reason = reason.label(),
+                annotation_id = %building_id,
+                "dry-run annotation cancelled; building row left for recovery"
+            );
+        }
         Err(source) => {
-            fail_build(index_root, &building_id, source.error())?;
+            let Some(error) = source.error() else {
+                return Ok(());
+            };
+            // Observe the producer boundary before SQL so a rollback or persistence
+            // error cannot obscure the failure that led to this write attempt.
+            warn!(
+                event = "dry_run.producer_failure_observed",
+                failure_class = source.class(),
+                error = %source,
+                producer = kind.producer_name(),
+                annotation_state = "failure_not_yet_persisted",
+                "dry-run producer failed; recording its result is pending"
+            );
+            if !fail_build(index_root, &building_id, error, cancellation)? {
+                // The transaction may observe cancellation after the earlier probe;
+                // retain the known error under this invocation's source/build span.
+                warn!(
+                    event = "dry_run.build_error_discarded",
+                    failure_class = source.class(),
+                    error = %source,
+                    producer = kind.producer_name(),
+                    "observed producer error discarded during cancellation-aware persistence"
+                );
+                return Ok(());
+            }
             counts.failures += 1;
             warn!(
                 event = "dry_run.build_failed",
@@ -500,13 +592,18 @@ fn reopen_or_insert_building(
 /// with its per-item `memoizedFrom` (§21.3 honesty). Mirrors
 /// `worker::remint_from_memo` (minus the writer-contention defer — the dry run is
 /// single-threaded, so a plain committed begin is correct).
+/// Returns false when cancellation discards the re-mint without a durable memo hit.
 fn remint_from_memo(
     index_root: &Path,
     request: &NewAnnotation,
     reopened: Option<&ReopenableRow>,
     entry: &memo::MemoEntry,
     memo_key: &str,
-) -> Result<(), ApiError> {
+    cancellation: &AnnotationCancellation,
+) -> Result<bool, ApiError> {
+    if sampling_cancelled(cancellation, "memo_remint") {
+        return Ok(false);
+    }
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "memo_remint")?;
     let body = (|| -> Result<(), ApiError> {
@@ -551,7 +648,7 @@ fn remint_from_memo(
             source,
         ));
     }
-    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "memo_remint")
+    commit_unless_cancelled(tx, "memo_remint", cancellation)
 }
 
 /// MEMO MISS completion: complete item 1 into the building row, insert items 2..N
@@ -561,6 +658,7 @@ fn remint_from_memo(
 /// BY-DESIGN "no annotations" marker for ALL producer kinds (the same marker the
 /// annotation-derived projection builders skip), so the key is satisfied and not
 /// rebuilt on a re-run. Mirrors `worker::complete_build`.
+/// Returns false when cancellation discards output before its completion commits.
 #[allow(clippy::too_many_arguments)]
 fn complete_build(
     index_root: &Path,
@@ -571,7 +669,11 @@ fn complete_build(
     building_id: &str,
     produced: &[ProducedAnnotation],
     memo_key: &str,
-) -> Result<(), ApiError> {
+    cancellation: &AnnotationCancellation,
+) -> Result<bool, ApiError> {
+    if sampling_cancelled(cancellation, "build_complete") {
+        return Ok(false);
+    }
     let mut connection = hot_plane::open_write(index_root)?;
     let tx =
         hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "build_complete")?;
@@ -637,17 +739,22 @@ fn complete_build(
             source,
         ));
     }
-    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "build_complete")
+    commit_unless_cancelled(tx, "build_complete", cancellation)
 }
 
 /// Park the building row failed with bounded detail in one transaction. The
 /// failed row stays visible (§21 rule 3) and is retried by a later run. Mirrors
 /// `worker::fail_build`.
+/// Returns false when cancellation prevents the failure from being persisted.
 fn fail_build(
     index_root: &Path,
     building_id: &str,
     producer_error: &ApiError,
-) -> Result<(), ApiError> {
+    cancellation: &AnnotationCancellation,
+) -> Result<bool, ApiError> {
+    if sampling_cancelled(cancellation, "build_fail") {
+        return Ok(false);
+    }
     let detail = crate::util::truncate_persisted_detail(&producer_error.to_string());
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "build_fail")?;
@@ -660,7 +767,57 @@ fn fail_build(
             source,
         ));
     }
-    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "build_fail")
+    commit_unless_cancelled(tx, "build_fail", cancellation)
+}
+
+/// Report discarded sampling work without counting cancellation as a provider failure.
+fn sampling_cancelled(cancellation: &AnnotationCancellation, phase: &'static str) -> bool {
+    let Some(reason) = cancellation.reason() else {
+        return false;
+    };
+    info!(
+        event = "dry_run.build_cancelled",
+        reason = reason.label(),
+        phase,
+        "dry-run sampling cancelled; unfinished results discarded"
+    );
+    true
+}
+
+/// Only a committed transaction may contribute to sampling success counters.
+/// Cancellation rolls back explicitly so the operator sees a confirmed outcome.
+fn commit_unless_cancelled(
+    tx: rusqlite::Transaction<'_>,
+    phase: &'static str,
+    cancellation: &AnnotationCancellation,
+) -> Result<bool, ApiError> {
+    if let Some(reason) = cancellation.reason() {
+        let started = std::time::Instant::now();
+        tx.rollback().map_err(|source| {
+            warn!(
+                event = "dry_run.cancellation_rollback_failed",
+                reason = reason.label(),
+                phase,
+                error = %source,
+                durable_outcome = "unconfirmed",
+                "could not confirm rollback of cancelled annotation work"
+            );
+            ApiError::StorageOperation {
+                message: format!("dry-run {phase} cancellation rollback failed: {source}"),
+            }
+        })?;
+        info!(
+            event = "dry_run.cancellation_rolled_back",
+            reason = reason.label(),
+            phase,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            durable_outcome = "rolled_back",
+            "cancelled annotation transaction rolled back"
+        );
+        return Ok(false);
+    }
+    hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, phase)?;
+    Ok(true)
 }
 
 /// Final provenance of a freshly-produced (model-run) annotation: the model ran,

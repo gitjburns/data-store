@@ -4,15 +4,79 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::{error::ApiError, state::ShutdownSignal};
 
 /// Shared admission and exclusive rebuild ownership, independent of corpus storage.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MaintenanceGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    annotation_cancellation: watch::Sender<Option<AnnotationCancelReason>>,
+}
+
+/// Cancellation is control flow, distinct from provider failures and retry debt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnnotationCancelReason {
+    Rebuild,
+    Shutdown,
+    StoragePaused,
+    OwnerDropped,
+}
+
+impl AnnotationCancelReason {
+    /// Stable operator labels preserve the reason even across request/thread boundaries.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Rebuild => "rebuild",
+            Self::Shutdown => "shutdown",
+            Self::StoragePaused => "storage_paused",
+            Self::OwnerDropped => "cancellation_owner_dropped",
+        }
+    }
+}
+
+/// Each request clones a receiver so cancellation wakes an otherwise idle HTTP
+/// future. Storage leases still govern when it is safe to clear persisted data.
+#[derive(Debug, Clone)]
+pub(crate) struct AnnotationCancellation {
+    receiver: watch::Receiver<Option<AnnotationCancelReason>>,
+}
+
+impl AnnotationCancellation {
+    /// Check without blocking; a lost owner fails closed instead of leaving a request running.
+    pub(crate) fn reason(&self) -> Option<AnnotationCancelReason> {
+        if self.receiver.has_changed().is_err() {
+            return Some(AnnotationCancelReason::OwnerDropped);
+        }
+        *self.receiver.borrow()
+    }
+
+    /// Await the same control state polled by synchronous worker checkpoints.
+    pub(crate) async fn cancelled(&mut self) -> AnnotationCancelReason {
+        loop {
+            if let Some(reason) = self.reason() {
+                return reason;
+            }
+            if self.receiver.changed().await.is_err() {
+                return AnnotationCancelReason::OwnerDropped;
+            }
+        }
+    }
+}
+
+impl Default for MaintenanceGate {
+    /// The sender retains state even before an annotation client subscribes.
+    fn default() -> Self {
+        let (annotation_cancellation, _) = watch::channel(None);
+        Self {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+            annotation_cancellation,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -35,6 +99,13 @@ struct Lease {
 }
 
 impl MaintenanceGate {
+    /// Subscribe without taking a storage lease; admitted work owns its lease separately.
+    pub(crate) fn annotation_cancellation(&self) -> AnnotationCancellation {
+        AnnotationCancellation {
+            receiver: self.annotation_cancellation.subscribe(),
+        }
+    }
+
     /// Fail closed on lock poison: uncertain admission accounting cannot permit deletion.
     fn lock(&self) -> Result<MutexGuard<'_, GateState>, ApiError> {
         self.state.lock().map_err(|source| ApiError::InternalIo {
@@ -133,6 +204,13 @@ impl MaintenanceGate {
         }
         state.rebuilding = true;
         state.detail = Some("rebuild-all: draining storage work".into());
+        self.annotation_cancellation
+            .send_replace(Some(AnnotationCancelReason::Rebuild));
+        info!(
+            event = "maintenance.annotation_cancellation_requested",
+            reason = "rebuild",
+            "cancelling annotation requests before draining storage work"
+        );
         self.changed.notify_all();
         Ok(())
     }
@@ -180,6 +258,9 @@ impl MaintenanceGate {
         state.generation = generation;
         state.detail = None;
         state.rebuilding = false;
+        // Drain proved every old lease was released. Only the new storage
+        // generation may dispatch again after this reset of cancellation state.
+        self.annotation_cancellation.send_replace(None);
         self.changed.notify_all();
         Ok(())
     }
@@ -195,6 +276,12 @@ impl MaintenanceGate {
         };
         state.detail = Some(format!("rebuild-all requires explicit retry: {detail}"));
         state.rebuilding = false;
+        self.annotation_cancellation
+            .send_replace(Some(if state.stopped {
+                AnnotationCancelReason::Shutdown
+            } else {
+                AnnotationCancelReason::StoragePaused
+            }));
         self.changed.notify_all();
     }
 
@@ -210,6 +297,13 @@ impl MaintenanceGate {
     pub(crate) fn stop(&self) -> Result<(), ApiError> {
         let mut state = self.lock()?;
         state.stopped = true;
+        self.annotation_cancellation
+            .send_replace(Some(AnnotationCancelReason::Shutdown));
+        info!(
+            event = "maintenance.annotation_cancellation_requested",
+            reason = "shutdown",
+            "cancelling outstanding annotation requests for shutdown"
+        );
         self.changed.notify_all();
         Ok(())
     }

@@ -234,6 +234,53 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    /// Resolve a recorded artifact location by content identity, always reading
+    /// from this store. A restored envelope may retain its original root path;
+    /// that path must never become an arbitrary filesystem read authority.
+    pub(crate) fn get_bytes_by_uri(&self, uri: &str) -> Result<Vec<u8>, ApiError> {
+        let hash = self.hash_from_uri(uri)?;
+        self.get_bytes(hash)
+    }
+
+    /// Pin an existing envelope payload to a verified manifest reference.
+    pub(crate) fn reference_for_uri(&self, uri: &str) -> Result<ArtifactRef, ApiError> {
+        let hash = self.hash_from_uri(uri)?;
+        let bytes = self.get_bytes(hash)?;
+        Ok(self.artifact_ref(hash.to_owned(), &self.blob_path(hash), bytes.len() as u64))
+    }
+
+    /// Accept only the store's canonical sha256/shard/hash URI suffix. The
+    /// historical root is metadata; only the validated hash selects local bytes.
+    fn hash_from_uri<'uri>(&self, uri: &'uri str) -> Result<&'uri str, ApiError> {
+        let path = Path::new(uri);
+        let invalid = || ApiError::StorageOperation {
+            message: format!("invalid content-addressed artifact URI: {uri:?}"),
+        };
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(invalid());
+        }
+        let hash = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(invalid)?;
+        self.validate_hash(hash)?;
+        let shard = path.parent().ok_or_else(invalid)?;
+        if shard.file_name().and_then(|name| name.to_str()) != Some(&hash[..2])
+            || shard
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                != Some(HASH_ALGORITHM_DIR)
+        {
+            return Err(invalid());
+        }
+        Ok(hash)
+    }
+
     /// Report whether a blob exists for the given hash. A malformed hash is
     /// simply "not stored" — existence is a query, not a validation boundary.
     pub(crate) fn exists(&self, hash: &str) -> bool {

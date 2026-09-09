@@ -458,6 +458,38 @@ pub(crate) fn fresh_types_for_parse(
     Ok(types)
 }
 
+/// Require a unique fresh representation so two dense indexes cannot satisfy
+/// each other's activation requirement. SQLite IS also matches the unnamed
+/// passage index's NULL identity without treating it as a wildcard.
+pub(crate) fn has_fresh_index_for_parse(
+    conn: &Connection,
+    parse_id: &str,
+    projection_type: ProjectionType,
+    index_name: Option<&str>,
+) -> Result<bool, ApiError> {
+    const SQL: &str = "SELECT count(*) FROM retrieval_projections
+        WHERE parse_id = ?1 AND projection_type = ?2 AND index_name IS ?3
+        AND freshness_status = 'fresh' AND deleted_at IS NULL";
+    let type_name = enum_wire_name(&projection_type, "projection type")?;
+    let count: i64 = conn
+        .query_row(SQL, params![parse_id, type_name, index_name], |row| {
+            row.get(0)
+        })
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!(
+                "failed to check {type_name} index {index_name:?} for parse {parse_id}: {source}"
+            ),
+        })?;
+    if count > 1 {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "parse {parse_id} has {count} fresh {type_name} indexes named {index_name:?}; expected exactly one"
+            ),
+        });
+    }
+    Ok(count == 1)
+}
+
 /// Read every fresh, non-deleted envelope of a source's CURRENT active parse
 /// (active-parse scoping enforced in the query's active_parse_id subselect,
 /// not by the caller — mirror of `annotations::store::fresh_for_active_parse`).

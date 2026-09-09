@@ -794,6 +794,49 @@ pub(crate) fn restore_source_from_snapshot(
     // Load the manifest once for the re-import; get_json re-hashes it to its
     // address (tamper-evident) — remapped to a RestoreFailed with restore context.
     let manifest = load_manifest(&store, &snapshot)?;
+    // Reject legacy/incompatible snapshots before opening a write transaction.
+    // Section vectors are immutable artifacts: restoration never calls a model.
+    let section_planes =
+        crate::snapshot::verify::verified_section_planes(&store, &snapshot, &manifest)?;
+    let mut matching_sections = section_planes
+        .iter()
+        .filter(|(_, plane)| plane.source_id == source_id && plane.parse_id == parse_id);
+    let section_plane = (|| {
+        let plane = matching_sections.next().map(|(_, plane)| plane).ok_or_else(|| ApiError::RestoreFailed {
+            message: format!("snapshot {} lacks section embeddings for parse {parse_id}; rebuild the corpus instead of restoring this pre-feature snapshot", snapshot.id),
+        })?;
+        if matching_sections.next().is_some() || plane.dimension != dense_dimension {
+            return Err(ApiError::RestoreFailed {
+                message: format!("snapshot {} has duplicate or dimension-incompatible section embeddings for parse {parse_id}; rebuild the corpus", snapshot.id),
+            });
+        }
+        let envelopes = load_archived_jsonl(&store, &manifest, "retrieval_projections")?;
+        // A historical stale/superseded envelope is valid forensic evidence but
+        // cannot be published as an active retrieval representation on restore.
+        for index_name in [None, Some(crate::projections::section_dense::SECTION_DENSE_INDEX_NAME)] {
+            let count = envelopes.iter().filter(|record|
+                record.get("parse_id").and_then(Value::as_str) == Some(parse_id)
+                    && record.get("source_id").and_then(Value::as_str) == Some(source_id)
+                    && record.get("projection_type").and_then(Value::as_str) == Some("dense_vector")
+                    && record.get("index_name").and_then(Value::as_str) == index_name
+                    && record.get("freshness_status").and_then(Value::as_str) == Some("fresh")
+                    && record.get("deleted_at").is_none_or(Value::is_null)).count();
+            if count != 1 {
+                return Err(ApiError::RestoreFailed {
+                    message: format!("snapshot {}: parse {parse_id} requires one fresh dense index {index_name:?}, found {count}; rebuild the corpus", snapshot.id),
+                });
+            }
+        }
+        Ok(plane)
+    })().map_err(|error| {
+        error!(event = "restore.section_preflight_failed", source_id, parse_id,
+            snapshot_id = %snapshot.id, error = %error, committed = false,
+            "restore rejected before section payload re-import");
+        error
+    })?;
+    info!(event = "restore.section_preflight_completed", source_id, parse_id,
+        snapshot_id = %snapshot.id, section_windows = section_plane.windows.len(),
+        "section payload integrity and compatibility verified before restore writes");
 
     // Re-import + rebuild ride ONE IMMEDIATE transaction so a failure rolls back
     // the whole restore (no partial hot state ever commits). Blob bytes are read
@@ -801,7 +844,11 @@ pub(crate) fn restore_source_from_snapshot(
     // so they run inside the tx body freely; only the hot-plane writes are txn'd.
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "restore")?;
-    let counts = match restore_body(&tx, &store, &snapshot, &manifest, source_id, parse_id) {
+    let counts = match restore_body(&tx, &store, &snapshot, &manifest, source_id, parse_id)
+        .and_then(|counts| {
+            crate::projections::section_dense::validate_plane(&tx, section_plane)?;
+            Ok(counts)
+        }) {
         Ok(counts) => counts,
         Err(source) => {
             return Err(hot_plane::abort_transaction(
@@ -839,7 +886,7 @@ pub(crate) fn restore_source_from_snapshot(
     // The `connection` opened for the re-import is reused for the load read.
     let _barrier_guard = registry.acquire(source_id);
     dense_cache
-        .load_parse(&connection, parse_id, dense_dimension)
+        .load_parse(&connection, &store, parse_id, dense_dimension)
         .map_err(|source| {
             error!(event = "restore.publish_failed", source_id, parse_id,
             snapshot_id = %snapshot.id, committed = true, error = %source,

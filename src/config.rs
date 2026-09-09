@@ -134,7 +134,8 @@ pub enum LoggingLevel {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceConfig {
-    /// Explicit accelerator backend. CPU fallback is intentionally unsupported.
+    /// Accelerator used only when a local retrieval model is selected.
+    /// Local model inference has no CPU fallback.
     pub device: InferenceDeviceKind,
     /// Device index passed to the selected accelerator backend.
     pub device_index: usize,
@@ -319,17 +320,107 @@ impl DenseModelConfig {
     }
 }
 
+/// Bind ColBERT token limits and width to one explicitly configured inference backend.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColbertModelConfig {
-    /// Local model artifact directory for ColBERT-Zero.
-    pub path: PathBuf,
+    /// Explicit late-interaction backend selection, with no fallback.
+    pub backend: ColbertBackendKind,
+    /// Local ColBERT-Zero artifact directory. Required for the local backend;
+    /// forbidden for HTTP, which loads only the tokenizer locally.
+    pub path: Option<PathBuf>,
     /// Expected ColBERT token-vector width.
     pub dimension: u32,
     /// Runtime token cap for ColBERT query inputs.
     pub query_max_tokens: u32,
     /// Runtime token cap for ColBERT document/unit inputs.
     pub document_max_tokens: u32,
+    /// Full vLLM pooling route URL. Required only for the HTTP backend.
+    pub endpoint: Option<String>,
+    /// Served ColBERT model name sent in pooling requests. HTTP only.
+    pub model: Option<String>,
+    /// Absolute tokenizer JSON path matching the served checkpoint. HTTP only;
+    /// local tokenization preserves passage budgets and ColBERT input markers.
+    pub tokenizer_file_path: Option<PathBuf>,
+    /// Whole-request pooling timeout in seconds. Required for HTTP only.
+    pub timeout_seconds: Option<u64>,
+    /// Optional owner-only HTTP bearer-key file; forbidden for local inference.
+    pub api_key_file_path: Option<PathBuf>,
+}
+
+/// Select who produces token matrices; both backends retain local tokenization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColbertBackendKind {
+    /// In-process Candle ColBERT-Zero inference.
+    Local,
+    /// vLLM token-embedding pooling endpoint.
+    Http,
+}
+
+impl ColbertModelConfig {
+    /// Expose model weights only to the explicitly selected local backend.
+    pub fn local_path(&self) -> Result<&Path, ApiError> {
+        match (self.backend, self.path.as_deref()) {
+            (ColbertBackendKind::Local, Some(path)) => Ok(path),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.colbert has no local model path unless backend = \"local\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Return the validated full pooling URL without adding route components.
+    pub fn http_endpoint(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.endpoint.as_deref()) {
+            (ColbertBackendKind::Http, Some(endpoint)) => Ok(endpoint.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.colbert has no endpoint unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Return the provider's model identifier for pooling requests.
+    pub fn http_model(&self) -> Result<&str, ApiError> {
+        match (self.backend, self.model.as_deref()) {
+            (ColbertBackendKind::Http, Some(model)) => Ok(model.trim()),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.colbert has no model unless backend = \"http\"".to_string(),
+            }),
+        }
+    }
+
+    /// Locate the served checkpoint's tokenizer without requiring local weights.
+    pub fn http_tokenizer_file_path(&self) -> Result<&Path, ApiError> {
+        match (self.backend, self.tokenizer_file_path.as_deref()) {
+            (ColbertBackendKind::Http, Some(path)) => Ok(path),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.colbert has no tokenizer_file_path unless backend = \"http\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Return the whole-request deadline used by the blocking pooling client.
+    pub fn http_timeout_seconds(&self) -> Result<u64, ApiError> {
+        match (self.backend, self.timeout_seconds) {
+            (ColbertBackendKind::Http, Some(timeout_seconds)) => Ok(timeout_seconds),
+            _ => Err(ApiError::InvalidConfig {
+                message: "models.colbert has no timeout_seconds unless backend = \"http\""
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Resolve relative credential paths against the configuration directory.
+    pub fn resolved_http_api_key_file_path(&self, config_root: &Path) -> Option<PathBuf> {
+        let path = self.api_key_file_path.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+
+        Some(config_root.join(path))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -529,10 +620,6 @@ impl ServiceConfig {
             "docling.document_timeout_seconds",
             self.docling.document_timeout_seconds,
         )?;
-        // models.dense.path is backend-conditional; validate_dense_backend_fields
-        // owns its absolute-path check in the Local arm.
-        require_absolute_path("models.colbert.path", &self.models.colbert.path)?;
-
         require_non_empty("docling.pdf_backend", &self.docling.pdf_backend)?;
         if !matches!(
             self.docling.pdf_backend.trim(),
@@ -564,6 +651,7 @@ impl ServiceConfig {
         require_non_empty("models.dense.pooling", &self.models.dense.pooling)?;
         require_positive("models.dense.dimension", self.models.dense.dimension)?;
         validate_dense_backend_fields(&self.models.dense)?;
+        validate_colbert_backend_fields(&self.models.colbert)?;
         require_positive("models.colbert.dimension", self.models.colbert.dimension)?;
         require_positive(
             "models.colbert.query_max_tokens",
@@ -818,6 +906,81 @@ fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiErro
             require_positive_u64("models.dense.timeout_seconds", timeout_seconds)?;
             if let Some(api_key_file_path) = dense.api_key_file_path.as_ref() {
                 require_non_empty_path("models.dense.api_key_file_path", api_key_file_path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject missing or mixed ColBERT backend settings before model initialization;
+/// HTTP keeps a matching tokenizer locally but must never require model weights.
+fn validate_colbert_backend_fields(colbert: &ColbertModelConfig) -> Result<(), ApiError> {
+    match colbert.backend {
+        ColbertBackendKind::Local => {
+            let Some(path) = colbert.path.as_ref() else {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.colbert.path is required when backend = \"local\"".to_string(),
+                });
+            };
+            require_absolute_path("models.colbert.path", path)?;
+            if colbert.endpoint.is_some()
+                || colbert.model.is_some()
+                || colbert.tokenizer_file_path.is_some()
+                || colbert.timeout_seconds.is_some()
+                || colbert.api_key_file_path.is_some()
+            {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.colbert with backend = \"local\" must not set endpoint, model, tokenizer_file_path, timeout_seconds, or api_key_file_path"
+                        .to_string(),
+                });
+            }
+        }
+        ColbertBackendKind::Http => {
+            if colbert.path.is_some() {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.colbert with backend = \"http\" must not set path".to_string(),
+                });
+            }
+            let endpoint = colbert.http_endpoint()?;
+            let endpoint_url =
+                reqwest::Url::parse(endpoint).map_err(|error| ApiError::InvalidConfig {
+                    message: format!("models.colbert.endpoint is not a valid URL: {error}"),
+                })?;
+            // Endpoint identity is logged and hashed. Authentication belongs in
+            // the owner-only key file, never in URL components exposed there.
+            if !endpoint_url.username().is_empty()
+                || endpoint_url.password().is_some()
+                || endpoint_url.query().is_some()
+                || endpoint_url.fragment().is_some()
+            {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.colbert.endpoint must not contain user information, query parameters, or a fragment; use api_key_file_path for authentication".to_string(),
+                });
+            }
+            if !matches!(endpoint_url.scheme(), "http" | "https")
+                || endpoint_url.host_str().is_none()
+                || !endpoint_url
+                    .path()
+                    .trim_end_matches('/')
+                    .ends_with("/pooling")
+            {
+                return Err(ApiError::InvalidConfig {
+                    message: "models.colbert.endpoint must be a full http:// or https:// pooling route URL ending in /pooling"
+                        .to_string(),
+                });
+            }
+            require_non_empty("models.colbert.model", colbert.http_model()?)?;
+            require_absolute_path(
+                "models.colbert.tokenizer_file_path",
+                colbert.http_tokenizer_file_path()?,
+            )?;
+            require_positive_u64(
+                "models.colbert.timeout_seconds",
+                colbert.http_timeout_seconds()?,
+            )?;
+            if let Some(api_key_file_path) = colbert.api_key_file_path.as_ref() {
+                require_non_empty_path("models.colbert.api_key_file_path", api_key_file_path)?;
             }
         }
     }

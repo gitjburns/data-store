@@ -58,10 +58,10 @@
 //!   - POST-PAID boundaries (`build_complete`, `build_fail`): a paid producer
 //!     call already succeeded (or its failure evidence exists), so its output
 //!     must not be discarded on contention. These WAIT for the writer lock,
-//!     re-attempting across busy_timeout windows, bounded ONLY by the shutdown
-//!     signal. On shutdown before the lock frees, the worker abandons the
-//!     completion and the `building` row is covered by the crash-orphan
-//!     adoption path above, exactly like a process exit.
+//!     re-attempting across busy_timeout windows until shutdown or maintenance
+//!     cancellation. Cancellation discards output, rolls back uncommitted writes,
+//!     and leaves `building` rows for rebuild deletion or orphan recovery. The
+//!     storage lease remains held until scoped HTTP tasks and SQLite work stop.
 //!
 //! CUTOVER STANCE. The worker takes NO cutover barrier: it swaps no active
 //! pointers and writes only parse-scoped rows. If a parse is superseded
@@ -100,6 +100,7 @@ use crate::annotations::store::{self, NewAnnotation};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
+use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::model::{ProducerType, Provenance, SemanticAnnotationType};
 // The CA2 operator policy module (crate root), distinct from the §21.4
 // `crate::annotations::policy` module imported above.
@@ -293,7 +294,11 @@ fn run_worker(
         "annotation worker thread started"
     );
 
-    let client = match AnnotatorClient::load(&annotator_config, &config_root) {
+    let client = match AnnotatorClient::load(
+        &annotator_config,
+        &config_root,
+        maintenance.annotation_cancellation(),
+    ) {
         Ok(client) => client,
         Err(source) => {
             error!(
@@ -387,7 +392,11 @@ fn run_worker(
             &shutdown,
             &mut output_retries,
         ) {
-            Ok(report) => publish_cycle_annotation_health(&health_slot, &report),
+            Ok(Some(report)) if client.cancellation().reason().is_none() => {
+                publish_cycle_annotation_health(&health_slot, &report);
+            }
+            // Cancellation is control flow, not a completed freshness measurement.
+            Ok(_) => {}
             Err(source) => error!(
                 event = "annotation_worker.cycle_failed",
                 error = %source,
@@ -426,7 +435,11 @@ fn run_cycle(
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
     output_retries: &mut RetryState,
-) -> Result<CycleReport, ApiError> {
+) -> Result<Option<CycleReport>, ApiError> {
+    let cancellation = client.cancellation();
+    if let Some(reason) = cancellation.reason() {
+        return cancelled_cycle(reason);
+    }
     output_retries.call_failed_in_cycle = false;
     let started = Instant::now();
     debug!(
@@ -442,6 +455,9 @@ fn run_cycle(
     let mut totals = CycleTotals::default();
     let mut sources_examined = 0usize;
     for source in &sources {
+        if let Some(reason) = cancellation.reason() {
+            return cancelled_cycle(reason);
+        }
         // Source discovery is a snapshot; an early-ended cycle has not examined
         // the remaining sources. Keep logs and published health honest about that.
         sources_examined += 1;
@@ -460,6 +476,9 @@ fn run_cycle(
             output_retries,
         ) {
             Ok((source_counts, flow)) => {
+                if let BuildFlow::Cancelled(reason) = flow {
+                    return cancelled_cycle(reason);
+                }
                 totals.add(&source_counts);
                 if flow == BuildFlow::CallFailed {
                     // The wave has recorded all successes/failures. Stop here
@@ -498,7 +517,8 @@ fn run_cycle(
                 // like a per-source annotation fault: a broken projection build
                 // for one source must not stall the rest of the cycle, and the
                 // stateless next cycle re-attempts it.
-                match build_annotation_derived_projections(index_root, source) {
+                match build_annotation_derived_projections(index_root, source, cancellation) {
+                    Ok(BuildFlow::Cancelled(reason)) => return cancelled_cycle(reason),
                     Ok(BuildFlow::Deferred) => {
                         // The projection build (a pre-paid boundary) hit writer
                         // contention: count the deferral, log it once, and end
@@ -558,6 +578,9 @@ fn run_cycle(
         }
     }
 
+    if let Some(reason) = cancellation.reason() {
+        return cancelled_cycle(reason);
+    }
     // Discovery and expected writer contention are DEBUG even with work waiting.
     // Exhaustion is reported once at ERROR; unchanged exhausted work is routine
     // discovery. Actual changes and new failures retain an INFO cycle summary.
@@ -612,10 +635,20 @@ fn run_cycle(
             "annotation discovery cycle completed"
         );
     }
-    Ok(CycleReport {
+    Ok(Some(CycleReport {
         sources_examined: sources_examined as u64,
         totals,
-    })
+    }))
+}
+
+/// End a cancelled cycle without publishing partial freshness as completed work.
+fn cancelled_cycle(reason: AnnotationCancelReason) -> Result<Option<CycleReport>, ApiError> {
+    info!(
+        event = "annotation_worker.cycle_cancelled",
+        reason = reason.label(),
+        "annotation cycle cancelled; unfinished results discarded and storage work stopped"
+    );
+    Ok(None)
 }
 
 /// The freshness outcome of one completed cycle, returned for the C10b health
@@ -732,6 +765,8 @@ struct WorkItem {
 enum BuildFlow {
     Continue,
     Deferred,
+    /// Maintenance cancels the entire cycle without failure or retry accounting.
+    Cancelled(AnnotationCancelReason),
     /// A call failed; the complete wave has been recorded, and the next cycle
     /// owns retrying it. Distinct from SQLite contention and output exhaustion.
     CallFailed,
@@ -752,12 +787,13 @@ enum BuildFlow {
 /// the writer lock, so the completion was abandoned WITHOUT writing — the
 /// `building` row is then covered by the existing crash-orphan adoption path,
 /// exactly like a process exit. There is deliberately NO retry-count bound: the
-/// shutdown signal IS the bound (knob-free), because paid producer output must
-/// not be discarded on ordinary contention while the process lives.
+/// shutdown or maintenance signal is the bound, because paid producer output
+/// must not be discarded on ordinary contention while the process lives.
 #[derive(PartialEq, Eq)]
 enum CompletionOutcome {
     Committed,
     AbandonedShutdown,
+    Cancelled(AnnotationCancelReason),
 }
 
 /// Result of `run_post_paid_transaction`: either the body ran and committed
@@ -768,18 +804,20 @@ enum CompletionOutcome {
 enum PostPaidOutcome<T> {
     Committed(T),
     AbandonedShutdown,
+    Cancelled(AnnotationCancelReason),
 }
 
 /// Run a POST-PAID transaction body on a fresh hot-plane write connection,
-/// waiting out writer contention until the transaction begins or shutdown is
+/// waiting out writer contention until the transaction begins or cancellation is
 /// requested. Each `begin_write_transaction_if_free` attempt already blocked up
 /// to the connection's busy_timeout inside SQLite, so between attempts we only
-/// probe shutdown (non-blocking) before retrying; the wait is bounded SOLELY by
-/// the shutdown signal (no retry-count knob — paid producer output must not be
+/// probe shutdown and maintenance before retrying; the wait is bounded by
+/// their cancellation signals (paid producer output must not be
 /// discarded on ordinary contention while the process lives). A periodic INFO
 /// every `WAIT_LOG_EVERY` consecutive busy attempts (~5 min) makes a long stall
 /// visible in the durable log. On a successful begin the `body` runs on the
-/// transaction; `Ok` commits and yields `Committed(value)`, `Err` aborts and
+/// transaction; `Ok` commits unless cancellation arrived during the body,
+/// in which case it rolls back and yields `Cancelled`. `Err` aborts and
 /// propagates. On shutdown before the lock frees, WARN and yield
 /// `AbandonedShutdown` WITHOUT writing — the `building` row is then covered by
 /// the crash-orphan adoption path, exactly like a process exit.
@@ -795,16 +833,23 @@ fn run_post_paid_transaction<T>(
     operation: &'static str,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
+    cancellation: &AnnotationCancellation,
     mut body: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, ApiError>,
 ) -> Result<PostPaidOutcome<T>, ApiError> {
     // ~60 busy attempts × ~5 s busy_timeout ≈ 5 min between stall logs.
     const WAIT_LOG_EVERY: u64 = 60;
+    if let Some(reason) = cancellation.reason() {
+        return Ok(PostPaidOutcome::Cancelled(reason));
+    }
     let mut connection = hot_plane::open_write(index_root)?;
     let started = Instant::now();
     let mut busy_attempts: u64 = 0;
     loop {
-        // Shutdown is the only bound: probe before each (re)attempt so a
-        // shutdown that lands during a busy_timeout wait is honored promptly.
+        // Maintenance also discards paid output; never retry a busy writer after
+        // cancellation. SQLite remains synchronous and releases before admission.
+        if let Some(reason) = cancellation.reason() {
+            return Ok(PostPaidOutcome::Cancelled(reason));
+        }
         if shutdown.wait_timeout(Duration::ZERO) {
             warn!(
                 event = "annotation_worker.completion_abandoned_shutdown",
@@ -823,10 +868,18 @@ fn run_post_paid_transaction<T>(
             operation,
         )? {
             WriteTransactionAttempt::Begun(tx) => {
+                if let Some(reason) = cancellation.reason() {
+                    rollback_cancelled(tx, operation, reason)?;
+                    return Ok(PostPaidOutcome::Cancelled(reason));
+                }
                 // Lock acquired: run the caller's body, then commit-or-abort. The
                 // tx stays scoped to this iteration, so no borrow escapes.
                 return match body(&tx) {
                     Ok(value) => {
+                        if let Some(reason) = cancellation.reason() {
+                            rollback_cancelled(tx, operation, reason)?;
+                            return Ok(PostPaidOutcome::Cancelled(reason));
+                        }
                         hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, operation)?;
                         Ok(PostPaidOutcome::Committed(value))
                     }
@@ -853,6 +906,36 @@ fn run_post_paid_transaction<T>(
             }
         }
     }
+}
+
+/// Roll back cancelled work explicitly so logs distinguish confirmed cleanup
+/// from an actual rollback failure. Cancellation itself is never a storage error.
+fn rollback_cancelled(
+    tx: rusqlite::Transaction<'_>,
+    operation: &'static str,
+    reason: AnnotationCancelReason,
+) -> Result<(), ApiError> {
+    tx.rollback().map_err(|source| {
+        error!(
+            event = "annotation_worker.cancellation_rollback_failed",
+            operation,
+            reason = reason.label(),
+            error = %source,
+            durable_outcome = "unconfirmed",
+            "cancelled annotation transaction rollback failed"
+        );
+        ApiError::StorageOperation {
+            message: format!("failed to roll back cancelled {operation} transaction: {source}"),
+        }
+    })?;
+    info!(
+        event = "annotation_worker.transaction_cancelled",
+        operation,
+        reason = reason.label(),
+        durable_outcome = "rolled_back",
+        "cancelled annotation transaction rolled back"
+    );
+    Ok(())
 }
 
 /// One producer build that has passed its PRE-PAID `build_open` boundary and is
@@ -913,6 +996,10 @@ fn build_source(
     output_retries: &mut RetryState,
 ) -> Result<(SourceCounts, BuildFlow), ApiError> {
     let mut counts = SourceCounts::default();
+    let cancellation = client.cancellation();
+    if let Some(reason) = cancellation.reason() {
+        return Ok((counts, BuildFlow::Cancelled(reason)));
+    }
 
     // Build the shared invocation plan and per-item keys on a read connection,
     // dropped before any long-running producer call or write transaction.
@@ -943,6 +1030,10 @@ fn build_source(
     let mut pending: Vec<PendingBuild> = Vec::new();
 
     for item in work_items {
+        if let Some(reason) = cancellation.reason() {
+            // Buffered rows are recoverable; no new producer work is owed for them.
+            return Ok((counts, BuildFlow::Cancelled(reason)));
+        }
         // Reopenable row (if any) is consumed by the PRE-PAID build_open below.
         // Satisfaction/reopen match on the CONTENT key (CA2): a content key
         // already fresh under ANY producer identity is satisfied, so a model
@@ -1048,8 +1139,10 @@ fn build_source(
             reopened,
             effective_temperature,
             &mut counts,
+            cancellation,
         )? {
             PreparedItem::Memoized => {}
+            PreparedItem::Cancelled(reason) => return Ok((counts, BuildFlow::Cancelled(reason))),
             PreparedItem::Pending(prepared) => {
                 pending.push(*prepared);
                 if pending.len() >= ANNOTATOR_CONCURRENT_CALLS {
@@ -1159,6 +1252,7 @@ enum PreparedItem {
     Memoized,
     Pending(Box<PendingBuild>),
     Deferred,
+    Cancelled(AnnotationCancelReason),
 }
 
 /// PRE-PAID phase for one work item, worker-thread serial (mirrors the former
@@ -1168,8 +1262,7 @@ enum PreparedItem {
 /// gate's base-or-ladder decision; memo re-mints ignore it — no call runs). A
 /// SQLITE_BUSY at either pre-paid boundary is counted as `deferred`, logged
 /// once (`cycle_deferred`), and returned as `Deferred`.
-// Eight positional args after threading the gate's effective temperature;
-// codebase-standard `allow` rather than an unrelated refactor.
+// Keep the established source/item preparation inputs and cancellation explicit.
 #[allow(clippy::too_many_arguments)]
 fn prepare_work_item(
     index_root: &Path,
@@ -1180,7 +1273,11 @@ fn prepare_work_item(
     reopened: Option<&store::ReopenableRow>,
     effective_temperature: f64,
     counts: &mut SourceCounts,
+    cancellation: &AnnotationCancellation,
 ) -> Result<PreparedItem, ApiError> {
+    if let Some(reason) = cancellation.reason() {
+        return Ok(PreparedItem::Cancelled(reason));
+    }
     // Look up the memo cache on a read connection dropped before any write.
     let cached = {
         let connection = hot_plane::open_read(index_root)?;
@@ -1190,7 +1287,7 @@ fn prepare_work_item(
     if let Some(entry) = cached {
         // `remint_from_memo` opens a PRE-PAID (`memo_remint`) write boundary:
         // on writer contention it defers without a model call.
-        if remint_from_memo(
+        let flow = remint_from_memo(
             index_root,
             config,
             naming_rules,
@@ -1198,8 +1295,12 @@ fn prepare_work_item(
             item,
             reopened,
             &entry,
-        )? == BuildFlow::Deferred
-        {
+            cancellation,
+        )?;
+        if let BuildFlow::Cancelled(reason) = flow {
+            return Ok(PreparedItem::Cancelled(reason));
+        }
+        if flow == BuildFlow::Deferred {
             counts.deferred += 1;
             debug!(
                 event = "annotation_worker.cycle_deferred",
@@ -1220,7 +1321,21 @@ fn prepare_work_item(
 
     // Memo MISS: pass the PRE-PAID `build_open` boundary (durable in-flight
     // truth) and buffer for the concurrent producer wave.
-    match open_producer_build(index_root, config, naming_rules, source, item, reopened)? {
+    let opened = open_producer_build(
+        index_root,
+        config,
+        naming_rules,
+        source,
+        item,
+        reopened,
+        cancellation,
+    )?;
+    // A cancelled open leaves no new work to dispatch and must not count as
+    // contention. The admission lease keeps this signal latched until we exit.
+    if let Some(reason) = cancellation.reason() {
+        return Ok(PreparedItem::Cancelled(reason));
+    }
+    match opened {
         Some((request, building_id)) => {
             let log_context = crate::util::LogContext::current();
             if reopened.is_none() {
@@ -1320,6 +1435,8 @@ fn reopen_or_insert_building(
 /// `memoized: true`, `memoizedFrom: <that item's original annotation id>`, and
 /// the memoization key hash, so an auditor always knows the model did not run
 /// (§21.3 honesty).
+// Keep cancellation explicit at this existing source/item transaction boundary.
+#[allow(clippy::too_many_arguments)]
 fn remint_from_memo(
     index_root: &Path,
     config: &AnnotatorModelConfig,
@@ -1328,7 +1445,11 @@ fn remint_from_memo(
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
     entry: &memo::MemoEntry,
+    cancellation: &AnnotationCancellation,
 ) -> Result<BuildFlow, ApiError> {
+    if let Some(reason) = cancellation.reason() {
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     let request = new_annotation_request(config, naming_rules, source, item)?;
 
     let mut connection = hot_plane::open_write(index_root)?;
@@ -1342,6 +1463,10 @@ fn remint_from_memo(
         WriteTransactionAttempt::Begun(tx) => tx,
         WriteTransactionAttempt::Busy => return Ok(BuildFlow::Deferred),
     };
+    if let Some(reason) = cancellation.reason() {
+        rollback_cancelled(tx, "memo_remint", reason)?;
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     let body = (|| -> Result<(), ApiError> {
         // The building row is either freshly inserted or the reopened row;
         // either way it completes to the first cached item.
@@ -1389,6 +1514,11 @@ fn remint_from_memo(
             source_error,
         ));
     }
+    // A rebuild that arrived during synchronous replay must not publish that replay.
+    if let Some(reason) = cancellation.reason() {
+        rollback_cancelled(tx, "memo_remint", reason)?;
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "memo_remint")?;
 
     info!(
@@ -1407,7 +1537,8 @@ fn remint_from_memo(
 /// the chosen row) in a committed transaction, so the in-flight truth is durable
 /// (§21 rule 3) BEFORE any producer call. This is a PRE-PAID boundary — no
 /// producer call has been made — so writer contention defers quietly rather than
-/// waiting: `Ok(None)` signals SQLITE_BUSY (the caller counts/logs the deferral),
+/// waiting: `Ok(None)` signals SQLITE_BUSY or cancellation (the caller checks
+/// the latched cancellation reason before counting/logging a deferral),
 /// `Ok(Some((request, building_id)))` hands the durable row to the wave. The
 /// producer HTTP call and the POST-PAID completion happen later in the wave, off
 /// this pre-paid boundary, so a full busy_timeout is never burned before any
@@ -1419,7 +1550,11 @@ fn open_producer_build(
     source: &ActiveSource,
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
+    cancellation: &AnnotationCancellation,
 ) -> Result<Option<(NewAnnotation, String)>, ApiError> {
+    if cancellation.reason().is_some() {
+        return Ok(None);
+    }
     let request = new_annotation_request(config, naming_rules, source, item)?;
 
     let mut connection = hot_plane::open_write(index_root)?;
@@ -1431,6 +1566,10 @@ fn open_producer_build(
         WriteTransactionAttempt::Begun(tx) => tx,
         WriteTransactionAttempt::Busy => return Ok(None),
     };
+    if let Some(reason) = cancellation.reason() {
+        rollback_cancelled(tx, "build_open", reason)?;
+        return Ok(None);
+    }
     let building_id = match reopen_or_insert_building(&tx, reopened, &request) {
         Ok(id) => id,
         Err(source_error) => {
@@ -1442,6 +1581,10 @@ fn open_producer_build(
             ));
         }
     };
+    if let Some(reason) = cancellation.reason() {
+        rollback_cancelled(tx, "build_open", reason)?;
+        return Ok(None);
+    }
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "build_open")?;
     Ok(Some((request, building_id)))
 }
@@ -1450,12 +1593,11 @@ fn open_producer_build(
 /// scoped OS threads (up to `ANNOTATOR_CONCURRENT_CALLS`, the buffer cap), join,
 /// then commit each POST-PAID result SERIALLY on the worker thread. Drains
 /// `pending`; on return the wave is empty and its builds are committed (or the
-/// cycle is ending on shutdown).
+/// cycle is ending on cancellation).
 ///
 /// WHY WRITES STAY SERIAL: `producer::invoke` is the only pure unit — it takes
-/// `&AnnotatorClient` (which is `Sync`: it holds a `reqwest::blocking::Client`,
-/// `Send + Sync`, plus immutable String/PathBuf/Option fields) — so every thread
-/// borrows the same client with no `Arc`. No SQLite handle crosses the scope;
+/// `&AnnotatorClient` (which owns the shared HTTP runtime and cancellation watch)
+/// — so each scoped thread borrows the same client. No SQLite handle crosses the scope;
 /// `complete_build`/`fail_build` run here, after the join, one at a time, so all
 /// hot-plane writes remain serial on this thread and per-target attribution
 /// (built vs failed, which `building_id`) is preserved exactly as the old
@@ -1466,14 +1608,11 @@ fn open_producer_build(
 /// per-handle joins additionally map a panicked producer thread to a producer
 /// error so that target parks `failed` rather than poisoning the wave).
 ///
-/// SHUTDOWN RULE: the shutdown probe is honored BEFORE dispatching — if shutdown
-/// is already requested, no new wave starts (the buffered `building` rows are
-/// left for crash-orphan adoption, exactly like a process exit) and
-/// `ShutdownAbort` is returned. Once a wave is dispatched its in-flight calls
-/// complete (bounded by the HTTP timeout); each POST-PAID commit then waits out
-/// writer contention bounded by shutdown, and the FIRST commit abandoned on
-/// shutdown ends the wave with `ShutdownAbort` (remaining committed-nothing
-/// targets are likewise left as crash orphans).
+/// CANCELLATION RULE: maintenance is checked before dispatch and after every
+/// scoped HTTP thread joins, before accounting or persistence. Cancelled waves
+/// discard both successes and failures. Every transaction checks again before
+/// its body and commit; no storage admission is released with live writers.
+/// Buffered `building` rows remain for rebuild deletion or orphan recovery.
 // The source-scoped wave inputs include worker-owned retry state; keep the
 // existing explicit boundary rather than introduce a pass-through context.
 #[allow(clippy::too_many_arguments)]
@@ -1488,6 +1627,11 @@ fn dispatch_and_commit_wave(
     output_retries: &mut RetryState,
     shutdown: &ShutdownSignal,
 ) -> Result<BuildFlow, ApiError> {
+    let cancellation = client.cancellation();
+    if let Some(reason) = cancellation.reason() {
+        pending.clear();
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     if pending.is_empty() {
         return Ok(BuildFlow::Continue);
     }
@@ -1556,6 +1700,50 @@ fn dispatch_and_commit_wave(
                 .collect()
         });
 
+    // Scoped joins finish every HTTP task before we release storage admission.
+    // Cancellation wins over successes and failures alike, before retry debt or
+    // durable result state is created for this discarded wave.
+    if let Some(reason) = cancellation.reason().or_else(|| {
+        produced.iter().find_map(|outcome| match outcome {
+            Err(InvocationFailure::Cancelled(reason)) => Some(*reason),
+            _ => None,
+        })
+    }) {
+        // Cancellation discards persistence and retry debt, not failure evidence
+        // already returned by joined producers. Record those errors in their
+        // invocation contexts without validating or changing annotation state.
+        for (build, outcome) in wave.iter().zip(&produced) {
+            if let Err(source_error) = outcome
+                && !matches!(source_error, InvocationFailure::Cancelled(_))
+            {
+                let _entered = build.log_context.enter();
+                warn!(
+                    event = "annotation_worker.discarded_failure",
+                    source_id = %source.source_id,
+                    parse_id = %source.active_parse_id,
+                    producer = producer_label(build.item.kind),
+                    annotation_id = %build.building_id,
+                    failure_class = source_error.class(),
+                    error = %source_error,
+                    cancellation_reason = reason.label(),
+                    disposition = "discarded_without_persistence",
+                    retry_accounted = false,
+                    failure_accounted = false,
+                    "producer failure retained in diagnostics; cancelled wave discards persistence and accounting"
+                );
+            }
+        }
+        info!(
+            event = "annotation_worker.wave_cancelled",
+            source_id = %source.source_id,
+            parse_id = %source.active_parse_id,
+            reason = reason.label(),
+            discarded_results = produced.len(),
+            "producer wave joined; cancelled results discarded without retry or failure accounting"
+        );
+        return Ok(BuildFlow::Cancelled(reason));
+    }
+
     // Classify every joined result before any fallible persistence. Otherwise
     // an earlier SQL failure could hide later invalid outputs or call failures.
     let mut call_failures = 0;
@@ -1601,6 +1789,9 @@ fn dispatch_and_commit_wave(
     // A call failure stops FUTURE waves only; record this wave's results using
     // the existing storage-failure and shutdown boundaries.
     for (build, (outcome, output_failures)) in wave.into_iter().zip(produced) {
+        if let Some(reason) = cancellation.reason() {
+            return Ok(BuildFlow::Cancelled(reason));
+        }
         let _entered = build.log_context.enter();
         match outcome {
             Ok(produced_items) => {
@@ -1608,7 +1799,7 @@ fn dispatch_and_commit_wave(
                 // writer contention (bounded by shutdown); a shutdown-abandon
                 // leaves the building row for crash-orphan adoption and ABORTS the
                 // wave so no further paid completion is attempted post-shutdown.
-                if complete_build(
+                match complete_build(
                     index_root,
                     config,
                     naming_rules,
@@ -1619,9 +1810,13 @@ fn dispatch_and_commit_wave(
                     &produced_items,
                     build.effective_temperature,
                     shutdown,
-                )? == CompletionOutcome::AbandonedShutdown
-                {
-                    return Ok(BuildFlow::ShutdownAbort);
+                    cancellation,
+                )? {
+                    CompletionOutcome::Committed => {}
+                    CompletionOutcome::AbandonedShutdown => return Ok(BuildFlow::ShutdownAbort),
+                    CompletionOutcome::Cancelled(reason) => {
+                        return Ok(BuildFlow::Cancelled(reason));
+                    }
                 }
                 counts.built += 1;
             }
@@ -1631,7 +1826,7 @@ fn dispatch_and_commit_wave(
                 // context via the error text (prompt/output never logged).
                 // POST-PAID (the failure evidence exists): `fail_build` waits out
                 // contention; a shutdown-abandon likewise aborts the wave.
-                if fail_build(
+                match fail_build(
                     index_root,
                     source,
                     &build.item,
@@ -1639,9 +1834,13 @@ fn dispatch_and_commit_wave(
                     &source_error,
                     output_failures,
                     shutdown,
-                )? == CompletionOutcome::AbandonedShutdown
-                {
-                    return Ok(BuildFlow::ShutdownAbort);
+                    cancellation,
+                )? {
+                    CompletionOutcome::Committed => {}
+                    CompletionOutcome::AbandonedShutdown => return Ok(BuildFlow::ShutdownAbort),
+                    CompletionOutcome::Cancelled(reason) => {
+                        return Ok(BuildFlow::Cancelled(reason));
+                    }
                 }
                 counts.failed += 1;
             }
@@ -1683,6 +1882,7 @@ fn complete_build(
     produced_items: &[ProducedAnnotation],
     effective_temperature: f64,
     shutdown: &ShutdownSignal,
+    cancellation: &AnnotationCancellation,
 ) -> Result<CompletionOutcome, ApiError> {
     let persistence_started = Instant::now();
     // POST-PAID: wait out writer contention for the paid producer output (bounded
@@ -1693,6 +1893,7 @@ fn complete_build(
         "build_complete",
         source,
         shutdown,
+        cancellation,
         |tx| -> Result<usize, ApiError> {
             let Some((first, rest)) = produced_items.split_first() else {
                 // An empty producer result (e.g. no entities found) still
@@ -1787,6 +1988,7 @@ fn complete_build(
     )? {
         PostPaidOutcome::Committed(count) => count,
         PostPaidOutcome::AbandonedShutdown => return Ok(CompletionOutcome::AbandonedShutdown),
+        PostPaidOutcome::Cancelled(reason) => return Ok(CompletionOutcome::Cancelled(reason)),
     };
 
     info!(
@@ -1809,6 +2011,8 @@ fn complete_build(
 /// (which rides in the error text); prompt content and model output never
 /// enter the log. Failure class and output count explain whether the next
 /// cycle may retry without inferring policy from the error text.
+// The existing failure boundary also carries maintenance cancellation explicitly.
+#[allow(clippy::too_many_arguments)]
 fn fail_build(
     index_root: &Path,
     source: &ActiveSource,
@@ -1817,18 +2021,28 @@ fn fail_build(
     producer_error: &InvocationFailure,
     output_failures: u32,
     shutdown: &ShutdownSignal,
+    cancellation: &AnnotationCancellation,
 ) -> Result<CompletionOutcome, ApiError> {
+    if let InvocationFailure::Cancelled(reason) = producer_error {
+        return Ok(CompletionOutcome::Cancelled(*reason));
+    }
     let detail = truncate_persisted_detail(&producer_error.to_string());
 
     // POST-PAID: the producer failure evidence exists and must be recorded, so
     // wait out writer contention (bounded by shutdown); a shutdown-abandon leaves
     // the building row for crash-orphan adoption (retried like any interrupted
     // build next run).
-    match run_post_paid_transaction(index_root, "build_fail", source, shutdown, |tx| {
-        store::mark_failed(tx, building_id, &detail)
-    })? {
+    match run_post_paid_transaction(
+        index_root,
+        "build_fail",
+        source,
+        shutdown,
+        cancellation,
+        |tx| store::mark_failed(tx, building_id, &detail),
+    )? {
         PostPaidOutcome::Committed(()) => {}
         PostPaidOutcome::AbandonedShutdown => return Ok(CompletionOutcome::AbandonedShutdown),
+        PostPaidOutcome::Cancelled(reason) => return Ok(CompletionOutcome::Cancelled(reason)),
     }
 
     warn!(
@@ -2011,7 +2225,11 @@ fn read_active_sources(conn: &Connection) -> Result<Vec<ActiveSource>, ApiError>
 fn build_annotation_derived_projections(
     index_root: &Path,
     source: &ActiveSource,
+    cancellation: &AnnotationCancellation,
 ) -> Result<BuildFlow, ApiError> {
+    if let Some(reason) = cancellation.reason() {
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     // Guard 1 + 2 on a read connection dropped before the write transaction.
     let should_build = {
         let connection = hot_plane::open_read(index_root)?;
@@ -2049,6 +2267,9 @@ fn build_annotation_derived_projections(
     }
 
     let started = Instant::now();
+    if let Some(reason) = cancellation.reason() {
+        return Ok(BuildFlow::Cancelled(reason));
+    }
 
     let mut connection = hot_plane::open_write(index_root)?;
     // PRE-PAID boundary: the projection build produces nothing external, so on
@@ -2062,6 +2283,10 @@ fn build_annotation_derived_projections(
         WriteTransactionAttempt::Begun(tx) => tx,
         WriteTransactionAttempt::Busy => return Ok(BuildFlow::Deferred),
     };
+    if let Some(reason) = cancellation.reason() {
+        rollback_cancelled(tx, "projection_build", reason)?;
+        return Ok(BuildFlow::Cancelled(reason));
+    }
     // An expected busy writer is a deferral, not a build start at INFO.
     info!(
         event = "annotation_worker.projection_build_started",
@@ -2076,6 +2301,10 @@ fn build_annotation_derived_projections(
         build_annotation_projection_transaction(&tx, &source.source_id, &source.active_parse_id);
     match build {
         Ok(()) => {
+            if let Some(reason) = cancellation.reason() {
+                rollback_cancelled(tx, "projection_build", reason)?;
+                return Ok(BuildFlow::Cancelled(reason));
+            }
             hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build")?;
             info!(
                 event = "annotation_worker.projection_build_succeeded",
@@ -2106,6 +2335,7 @@ fn build_annotation_derived_projections(
                 &source.source_id,
                 &source.active_parse_id,
                 &error,
+                cancellation,
             );
             Err(error)
         }
@@ -2176,13 +2406,23 @@ fn record_projection_build_failure(
     source_id: &str,
     parse_id: &str,
     build_error: &ApiError,
+    cancellation: &AnnotationCancellation,
 ) {
-    let outcome = (|| -> Result<(), ApiError> {
+    // A real build error remains logged even if maintenance cancels its separate
+    // audit write. Never label a cancelled or rolled-back audit as committed.
+    let outcome = (|| -> Result<Option<AnnotationCancelReason>, ApiError> {
+        if let Some(reason) = cancellation.reason() {
+            return Ok(Some(reason));
+        }
         let tx = hot_plane::begin_write_transaction(
             connection,
             TX_LOG_NAMESPACE,
             "projection_build_failure",
         )?;
+        if let Some(reason) = cancellation.reason() {
+            rollback_cancelled(tx, "projection_build_failure", reason)?;
+            return Ok(Some(reason));
+        }
         let body = (|| -> Result<(), ApiError> {
             let projection_id = envelope::insert_building(
                 &tx,
@@ -2201,7 +2441,12 @@ fn record_projection_build_failure(
         })();
         match body {
             Ok(()) => {
-                hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build_failure")
+                if let Some(reason) = cancellation.reason() {
+                    rollback_cancelled(tx, "projection_build_failure", reason)?;
+                    return Ok(Some(reason));
+                }
+                hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build_failure")?;
+                Ok(None)
             }
             Err(source) => Err(hot_plane::abort_transaction(
                 tx,
@@ -2211,20 +2456,30 @@ fn record_projection_build_failure(
             )),
         }
     })();
-    if let Err(audit_error) = outcome {
-        error!(
-            event = "annotation_worker.projection_build.failure_audit_failed",
+    match outcome {
+        Err(audit_error) => {
+            error!(
+                event = "annotation_worker.projection_build.failure_audit_failed",
+                source_id,
+                parse_id,
+                error = %audit_error,
+                "durable projection.failed audit could not be recorded; original build error stands"
+            );
+        }
+        Ok(Some(reason)) => info!(
+            event = "annotation_worker.projection_build.failure_audit_cancelled",
             source_id,
             parse_id,
-            error = %audit_error,
-            "durable projection.failed audit could not be recorded; original build error stands"
-        );
-    } else {
-        // The original build failed, but its failure marker committed separately.
-        info!(
-            event = "annotation_worker.projection_build.failure_audit_committed",
-            source_id, parse_id, "projection failure audit committed"
-        );
+            reason = reason.label(),
+            "projection failure audit cancelled; original build failure remains in the log"
+        ),
+        Ok(None) => {
+            // The original build failed, but its failure marker committed separately.
+            info!(
+                event = "annotation_worker.projection_build.failure_audit_committed",
+                source_id, parse_id, "projection failure audit committed"
+            );
+        }
     }
 }
 

@@ -31,8 +31,8 @@ const EXPECTED_ARCHITECTURE: &str = "ModernBertModel";
 const EXPECTED_HIDDEN_SIZE: usize = 768;
 const EXPECTED_PROJECTION_DIMENSION: usize = 128;
 const EXPECTED_TOKENIZER_MAX_LENGTH: usize = 518;
-const SMOKE_QUERY: &str = "clear writing style rules";
-const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
+pub(super) const SMOKE_QUERY: &str = "clear writing style rules";
+pub(super) const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 const PROJECTION_DIR_NAME: &str = "1_Dense";
 const PROJECTION_MODEL_FILE_NAME: &str = "model.safetensors";
 const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
@@ -43,7 +43,7 @@ const TOKEN_VECTOR_NORM_EPS: f64 = 1e-12;
 /// equivalent to the retained singular path. The longest is sized against the
 /// runtime-loaded `local_attention` so it crosses a local-window boundary and
 /// forces a masked padded region relative to the shorter two.
-const SMOKE_BATCH_SHORT: &str = "Clear rules.";
+pub(super) const SMOKE_BATCH_SHORT: &str = "Clear rules.";
 const SMOKE_BATCH_MEDIUM: &str =
     "Prefer specific words and direct sentences when explaining technical changes to a reader.";
 /// Per-token-vector cosine floor between the batched and singular embeddings of
@@ -272,7 +272,7 @@ impl ColbertRuntime {
         progress("colbert_tokenizer_ready")?;
         progress("colbert_config_loading")?;
         let model_config = load_modernbert_config(&artifacts.config_path)?;
-        validate_modernbert_config(&model_config, config)?;
+        validate_modernbert_config(&model_config)?;
         progress("colbert_config_ready")?;
         progress("colbert_tokenizer_contract_validating")?;
         validate_tokenizer_contract(artifacts, config)?;
@@ -2296,12 +2296,20 @@ impl MetalSafeLayerNorm {
     }
 }
 
-/// Validate ColBERT service config values that are tied to the local model contract.
-fn validate_colbert_config(config: &ColbertModelConfig) -> Result<(), ApiError> {
+/// Validate the ColBERT-Zero projection contract shared by local and HTTP backends.
+pub(super) fn validate_colbert_config(config: &ColbertModelConfig) -> Result<(), ApiError> {
     if config.dimension as usize != EXPECTED_PROJECTION_DIMENSION {
         return Err(inference_error(format!(
             "models.colbert.dimension must be {EXPECTED_PROJECTION_DIMENSION}, got {}",
             config.dimension
+        )));
+    }
+
+    if config.query_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
+        || config.document_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
+    {
+        return Err(inference_error(format!(
+            "models.colbert query/document max tokens must be <= {EXPECTED_TOKENIZER_MAX_LENGTH}"
         )));
     }
 
@@ -2325,10 +2333,7 @@ fn load_modernbert_config(path: &Path) -> Result<ModernBertConfig, ApiError> {
 }
 
 /// Ensure the root model config is the expected ModernBERT contract for ColBERT-Zero.
-fn validate_modernbert_config(
-    model_config: &ModernBertConfig,
-    config: &ColbertModelConfig,
-) -> Result<(), ApiError> {
+fn validate_modernbert_config(model_config: &ModernBertConfig) -> Result<(), ApiError> {
     if model_config.model_type != EXPECTED_MODEL_TYPE {
         return Err(inference_error(format!(
             "ColBERT model_type must be {EXPECTED_MODEL_TYPE}, got {}",
@@ -2393,13 +2398,6 @@ fn validate_modernbert_config(
         return Err(inference_error(
             "ColBERT RoPE theta values must be finite and greater than zero".to_string(),
         ));
-    }
-    if config.query_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
-        || config.document_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
-    {
-        return Err(inference_error(format!(
-            "models.colbert query/document max tokens must be <= {EXPECTED_TOKENIZER_MAX_LENGTH}"
-        )));
     }
 
     Ok(())
@@ -2690,17 +2688,17 @@ fn json_usize_at(value: &serde_json::Value, path: &[&str], label: &str) -> Resul
 }
 
 /// Apply the ColBERT-Zero query prompt and marker inside the runtime boundary.
-fn format_query(text: &str) -> String {
+pub(super) fn format_query(text: &str) -> String {
     format!("{QUERY_PROMPT}{QUERY_MARKER}{text}")
 }
 
 /// Apply the ColBERT-Zero document prompt and marker inside the runtime boundary.
-fn format_document(text: &str) -> String {
+pub(super) fn format_document(text: &str) -> String {
     format!("{DOCUMENT_PROMPT}{DOCUMENT_MARKER}{text}")
 }
 
 /// Tokenize one formatted ColBERT text and apply the configured service truncation.
-fn tokenize_formatted(
+pub(super) fn tokenize_formatted(
     tokenizer: &Tokenizer,
     text: &str,
     max_tokens: usize,
@@ -3033,7 +3031,10 @@ fn batched_document_matrices(
 }
 
 /// Compute ColBERT MaxSim by summing each query token's best document-token dot product.
-fn maxsim_score(query_vectors: &Tensor, document_vectors: &Tensor) -> Result<f32, ApiError> {
+pub(super) fn maxsim_score(
+    query_vectors: &Tensor,
+    document_vectors: &Tensor,
+) -> Result<f32, ApiError> {
     let (query_tokens, _) = query_vectors.dims2().map_err(|source| {
         inference_error(format!("ColBERT query projection shape error: {source}"))
     })?;

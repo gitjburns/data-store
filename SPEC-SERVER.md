@@ -939,11 +939,19 @@ parse — **never canonical evidence**. The MVP set:
 
 - **Content-derived, built pre-activation** for the candidate parse: chunk,
   lexical (the `chunk_text_index` FTS5 index over chunk text), dense
-  (per-chunk vectors), multivector (per-unit ColBERT matrices), derived view.
+  (per-chunk vectors plus section windows), multivector (per-unit ColBERT matrices), derived view.
   These are the activation-required set (§11.1).
 - **Annotation-derived, built post-activation** by the annotation worker:
   summary (materializing summary annotations) and graph (entity mentions and
   entity edges derived from entity/relation annotations).
+
+Section windows include heading hierarchy and canonical text up to 2,048 local
+ColBERT-tokenizer tokens. Their vectors and exact fragment mappings live in an
+immutable artifact referenced by a `dense_vector` envelope with
+`index_name = section_dense_v1`. Both this envelope and the fine-passage envelope
+must be fresh before activation. The cache reloads both on startup and publishes
+both atomically on activation/restore. Missing legacy representations require an
+explicit rebuild-all; no schema or runtime migration is performed.
 
 ### 12.2 Parse-scoped, active-only
 
@@ -1081,6 +1089,11 @@ an immediate 503. (§7.)
 3. **Dense + lexical candidate generation**, with independent candidate limits
    of 100 per channel. Resolve chunks to canonical units and exclude explicit
    header/footer units before they consume ranking slots.
+   Dense additionally shortlists 20 section windows with the same query vector;
+   each nominates up to five units by best fine-chunk cosine within that window.
+   Units without fine vectors cannot be nominated. Equal-weight RRF combines
+   the direct and section-guided lists, deduplicating to 100 dense candidates
+   before outer fusion. Provenance retains the representation and section path.
 4. **Graph candidate generation**: entity-name entry, then a
    semantic-only one-hop traversal over annotation-derived mentions/edges, no
    LLM in the query path. Entry matching (the D9 amendment) has an always-on
@@ -1137,7 +1150,8 @@ because their identity (`id` + `version` + hash over their canonical
 serialization) must be stable and auditable across processes:
 
 - **RetrievalProfile** (spec §24.2) — channels, candidate pool sizes, RRF
-  constant, overfetch, hop budget, final-passage caps.
+  constant, overfetch, hop budget, final-passage caps. Version 3 adds section
+  shortlist and per-window nomination limits.
 - **AssemblyPolicy** (spec §25) — retention of selected canonical passage
   constituents and explicit raw evidence safety ceilings.
 - **Required-annotation-set policy** (spec §21.4) — which annotation types
@@ -1204,6 +1218,11 @@ are the Guarantee-3 verified-recompute seam (§19).
   archived bytes and re-deriving from archived rows. **No model call exists
   anywhere in verification or restore** (hard invariant): vectors are decoded
   from stored blobs and compared, never regenerated.
+
+Section artifacts are explicit manifest references. Verification checks exact
+canonical text/fragment coverage, ownership, and complete envelope membership.
+Restore rejects snapshots without the required dense representations before its
+write transaction; accepted section vectors are reused from archived bytes.
 
 ### 15.6 The deletion gate blocks deletion
 

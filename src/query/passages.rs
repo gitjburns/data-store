@@ -21,6 +21,7 @@ use crate::query::model::RetrievalHit;
 use crate::query::provenance::{
     AnnotationContribution, RetrievalChannel, RetrievalProvenance, UnitRetrievalMatch,
 };
+use crate::sections::read_section;
 
 // Bound cells before bringing them into Rust. Oversized authoritative data is
 // an explicit error, never a silently shortened raw evidence record.
@@ -32,14 +33,6 @@ SELECT source_id, content_type,
        CASE WHEN length(CAST(COALESCE(locators_json, '[]') AS BLOB)) <= ?3
             THEN COALESCE(locators_json, '[]') END
 FROM content_units WHERE parse_id = ?1 AND id = ?2";
-const SECTION_SQL: &str = "
-SELECT DISTINCT p.id
-FROM unit_relationships r JOIN content_units p
-  ON p.parse_id = r.parse_id AND p.id = r.from_unit_id
-WHERE r.parse_id = ?1 AND r.to_unit_id = ?2
-  AND r.relationship_type IN ('logically_contains', 'contains')
-  AND p.content_type != 'page'
-LIMIT 2";
 const PREVIOUS_SQL: &str = "
 SELECT DISTINCT CASE WHEN from_unit_id = ?2 THEN to_unit_id ELSE from_unit_id END
 FROM unit_relationships WHERE parse_id = ?1 AND
@@ -176,6 +169,7 @@ impl PassageCandidate {
             }
             let mut unit_channels = Vec::new();
             let mut graph_matches = BTreeSet::new();
+            let mut dense_matches = BTreeSet::new();
             for hit in channel_hits.iter().filter(owns_unit) {
                 if !unit_channels.contains(&hit.channel) {
                     unit_channels.push(hit.channel);
@@ -184,6 +178,7 @@ impl PassageCandidate {
                     channels.push(hit.channel);
                 }
                 graph_matches.extend(hit.graph_matches.iter().cloned());
+                dense_matches.extend(hit.dense_matches.iter().cloned());
             }
             if unit_channels.is_empty() {
                 return Err(failure(format!(
@@ -198,6 +193,7 @@ impl PassageCandidate {
                 unit_id: unit_id.clone(),
                 channels: unit_channels,
                 graph_matches: graph_matches.into_iter().collect(),
+                dense_matches: dense_matches.into_iter().collect(),
             });
         }
         // Exclusivity is per unit against this query's capped channel lists,
@@ -632,46 +628,6 @@ fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, A
         locators: serde_json::from_str(&locators)
             .map_err(|source| failure(format!("locators of {unit_id}: {source}")))?,
     })
-}
-
-/// Find the nearest logical section through nested tables/figures. Physical page
-/// parents never mask logical ancestry; cycles and exhausted traversal fail visibly.
-fn read_section(
-    conn: &Connection,
-    parse_id: &str,
-    unit_id: &str,
-) -> Result<(Option<String>, Vec<String>), ApiError> {
-    let mut current = unit_id.to_string();
-    let mut visited = BTreeSet::from([current.clone()]);
-    for _ in 0..MAX_PASSAGE_UNITS {
-        let Some(id) = unique_link(conn, SECTION_SQL, parse_id, &current, "logical parent")? else {
-            return Ok((None, Vec::new()));
-        };
-        if !visited.insert(id.clone()) {
-            return Err(failure(format!(
-                "logical containment cycle at {id} in {parse_id}"
-            )));
-        }
-        let parent = read_unit(conn, parse_id, &id)?;
-        if parent.content_type == ContentType::TextSection {
-            let path = if let Some(value) = parent.body.get("sectionPath") {
-                serde_json::from_value::<Vec<String>>(value.clone())
-                    .map_err(|source| failure(format!("section path of {id}: {source}")))?
-            } else {
-                parent
-                    .body
-                    .get("headingText")
-                    .and_then(Value::as_str)
-                    .map(|heading| vec![heading.to_string()])
-                    .unwrap_or_default()
-            };
-            return Ok((Some(id), path));
-        }
-        current = id;
-    }
-    Err(failure(format!(
-        "logical section ancestry of {unit_id} exceeds {MAX_PASSAGE_UNITS} hops"
-    )))
 }
 
 /// Detect ambiguous graph boundaries explicitly instead of choosing an arbitrary

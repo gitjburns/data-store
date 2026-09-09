@@ -5,22 +5,28 @@
 //! One external endpoint serves all three producers. There is no fallback
 //! model or endpoint: a call failure becomes `ApiError::AnnotationProducer`,
 //! and the annotation worker parks the affected annotation as `failed` for a
-//! later retry pass. Prompt content and model output are external-language
+//! later retry pass. Maintenance cancellation is a separate outcome and does
+//! not consume a failure retry. Prompt content and model output are external-language
 //! payloads and never enter the service log (DIAGNOSTICS forbidden-data
 //! rules); logs carry only compact boundary facts.
 
 use std::{
     fmt, fs,
+    future::{Future, poll_fn},
     path::{Path, PathBuf},
+    pin::pin,
+    sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
-use reqwest::{StatusCode, blocking::Client};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
+use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::util::truncate_diagnostic_text;
 
 /// Stable adapter-mode label carried in this client's boundary logs, mirroring
@@ -38,17 +44,30 @@ const ANNOTATOR_HTTP_MODE: &str = "openai_chat_completions";
 /// per-call temperatures for failed-row retries via `complete`.
 pub(crate) const PRODUCER_TEMPERATURE: f64 = 0.0;
 
-/// Blocking OpenAI-compatible chat-completions client shared by the three
-/// producers. Holds the configured endpoint/model and an optional bearer key;
-/// the key is never logged or shown in Debug output.
+/// Synchronous producer interface over cancellable HTTP I/O. The shared runtime
+/// keeps pooled connections alive between calls; only dedicated annotation
+/// threads may call `complete`. The bearer key is excluded from Debug output.
 #[derive(Clone)]
 pub(crate) struct AnnotatorClient {
     client: Client,
+    // Clones share one reactor for the full client lifetime, including idle
+    // pooled connections. Dropping the client before its runtime closes the pool.
+    runtime: Arc<tokio::runtime::Runtime>,
+    cancellation: AnnotationCancellation,
     endpoint: String,
     model: String,
     timeout_seconds: u64,
     api_key: Option<String>,
     api_key_file_path: Option<PathBuf>,
+}
+
+/// Cancellation must reach the worker without being counted as a provider failure.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionFailure {
+    #[error("annotator request cancelled: {0:?}")]
+    Cancelled(AnnotationCancelReason),
+    #[error(transparent)]
+    Request(#[from] ApiError),
 }
 
 impl fmt::Debug for AnnotatorClient {
@@ -135,18 +154,19 @@ struct ChatChoiceMessage {
 }
 
 impl AnnotatorClient {
-    /// Build the blocking client and load the optional bearer key.
+    /// Build the shared HTTP reactor and client, and load the optional bearer key.
     ///
     /// There is deliberately NO startup smoke request here, and this loader is
     /// NOT readiness-critical: annotations build post-activation on a dedicated
     /// worker and never block activation or readiness. An unreachable or
     /// misconfigured endpoint therefore must not fail startup — it simply
     /// parks each attempted annotation as `failed` at call time for a later
-    /// retry pass. Only local, deterministic setup (client build, key-file
-    /// read) can fail here.
+    /// retry pass. Only local setup (runtime/client build, key-file read) can
+    /// fail here. The owner must release the final client on a synchronous thread.
     pub(crate) fn load(
         config: &AnnotatorModelConfig,
         config_root: &Path,
+        cancellation: AnnotationCancellation,
     ) -> Result<Self, ApiError> {
         let endpoint = config.endpoint.trim().to_string();
         let model = config.model.trim().to_string();
@@ -156,6 +176,18 @@ impl AnnotatorClient {
             Some(path) => Some(read_api_key(path)?),
             None => None,
         };
+        // Scoped producer threads share this runtime, so pooled HTTP connections
+        // never outlive the reactor that created them. SQLite stays on the
+        // synchronous caller; the single runtime worker services only HTTP I/O.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|source| ApiError::AnnotationProducer {
+                message: format!(
+                    "failed to build annotator HTTP runtime for endpoint {endpoint}: {source}"
+                ),
+            })?;
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .build()
@@ -177,6 +209,8 @@ impl AnnotatorClient {
 
         Ok(Self {
             client,
+            runtime: Arc::new(runtime),
+            cancellation,
             endpoint,
             model,
             timeout_seconds,
@@ -185,25 +219,31 @@ impl AnnotatorClient {
         })
     }
 
+    /// Expose the same maintenance signal used by HTTP calls to stop worker dispatch.
+    pub(crate) fn cancellation(&self) -> &AnnotationCancellation {
+        &self.cancellation
+    }
+
     /// Run one chat-completions call and return the first choice's message
     /// content verbatim. `request_purpose` identifies the producer/invocation
     /// for logs; `temperature` is the per-call sampling temperature (the base
     /// `PRODUCER_TEMPERATURE` for first attempts, retry-escalated values from
     /// the worker's ladder), logged and sent verbatim so the audit trail
-    /// records what actually ran. Every non-success outcome — transport error,
+    /// records what actually ran. Every request failure — transport error,
     /// timeout, non-2xx status, unreadable or malformed body, or a missing
     /// choice/content — is an `ApiError::AnnotationProducer` carrying
     /// endpoint/model/status and a bounded body excerpt. Prompt text and model
-    /// output are never logged.
+    /// output are never logged. Maintenance cancellation drops the HTTP future
+    /// and returns a distinct outcome so the worker does not count a failed attempt.
     pub(crate) fn complete(
         &self,
         request_purpose: &str,
         system_prompt: &str,
         user_content: &str,
         temperature: f64,
-    ) -> Result<String, ApiError> {
+    ) -> Result<String, CompletionFailure> {
         let context = crate::util::model_call_context("annotator", request_purpose);
-        let _entered = context.enter();
+        let entered = context.enter();
         let started_at = Instant::now();
         // Char count is a safe compact shape fact; the content itself is a
         // forbidden log payload.
@@ -219,9 +259,32 @@ impl AnnotatorClient {
             input_chars,
             "annotator chat-completions call started"
         );
+        // Async polling enters the span only while running, rather than retaining
+        // a thread-local guard through network waits.
+        drop(entered);
 
-        let result = self.send_and_parse(system_prompt, user_content, temperature);
+        let result = {
+            let mut cancellation = self.cancellation.clone();
+            let mut cancelled = pin!(cancellation.cancelled());
+            let mut request = pin!(self.send_and_parse(system_prompt, user_content, temperature));
+            // Cancellation wins a simultaneous response and covers both headers
+            // and body reads. Leaving this scope drops the in-flight future;
+            // vLLM may observe the disconnect, but remote completion is unknown.
+            self.runtime.block_on(context.instrument(poll_fn(|cx| {
+                if let Poll::Ready(reason) = cancelled.as_mut().poll(cx) {
+                    return Poll::Ready(Err(CompletionFailure::Cancelled(reason)));
+                }
+                match request.as_mut().poll(cx) {
+                    Poll::Ready(response) => Poll::Ready(match self.cancellation.reason() {
+                        Some(reason) => Err(CompletionFailure::Cancelled(reason)),
+                        None => response.map_err(CompletionFailure::Request),
+                    }),
+                    Poll::Pending => Poll::Pending,
+                }
+            })))
+        };
 
+        let _entered = context.enter();
         match &result {
             Ok(response) => {
                 info!(
@@ -244,7 +307,22 @@ impl AnnotatorClient {
                     "annotator response received; annotation validation pending"
                 );
             }
-            Err(source) => {
+            Err(CompletionFailure::Cancelled(reason)) => {
+                info!(
+                    event = "annotator_http.call.cancelled",
+                    adapter_mode = ANNOTATOR_HTTP_MODE,
+                    request_purpose,
+                    endpoint = %self.endpoint,
+                    model = %self.model,
+                    temperature,
+                    input_chars,
+                    reason = reason.label(),
+                    remote_outcome = "unknown",
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "annotator request cancelled locally; remote inference outcome unknown"
+                );
+            }
+            Err(CompletionFailure::Request(source)) => {
                 error!(
                     event = "annotator_http.call.failed",
                     adapter_mode = ANNOTATOR_HTTP_MODE,
@@ -266,8 +344,9 @@ impl AnnotatorClient {
     /// Build the request body, send it, and map every failure mode into a
     /// producer error. Split out from `complete` so the boundary logging in
     /// `complete` wraps exactly one fallible unit of work. `temperature` is
-    /// the caller's per-call sampling temperature (see `complete`).
-    fn send_and_parse(
+    /// the caller's per-call sampling temperature (see `complete`). Only network
+    /// waits suspend; response decoding remains synchronous on the producer thread.
+    async fn send_and_parse(
         &self,
         system_prompt: &str,
         user_content: &str,
@@ -301,7 +380,7 @@ impl AnnotatorClient {
 
         // Transport-level failure (DNS, connect, TLS, timeout) surfaces before
         // any HTTP status exists.
-        let response = request_builder.send().map_err(|source| {
+        let response = request_builder.send().await.map_err(|source| {
             self.call_error(
                 None,
                 &format!(
@@ -311,7 +390,7 @@ impl AnnotatorClient {
             )
         })?;
         let status = response.status();
-        let body = response.text().map_err(|source| {
+        let body = response.text().await.map_err(|source| {
             self.call_error(
                 Some(status),
                 &format!(

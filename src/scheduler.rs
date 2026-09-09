@@ -49,7 +49,7 @@ use crate::{
     acquisition::{self, AcquisitionContext, ImportOutcome, MIME_TYPE_PDF, MIME_TYPE_PLAIN_TEXT},
     activation::{self, ActivationDecision},
     artifact_store::ArtifactStore,
-    config::{DoclingConfig, StorageConfig},
+    config::{DenseModelConfig, DoclingConfig, StorageConfig},
     connectors::{
         AcquisitionBundleManifest, BUNDLE_MANIFEST_FILE_NAME, ScanError, acquisition_staging_root,
         bundle_dir_for, filesystem::FilesystemConnector,
@@ -59,7 +59,7 @@ use crate::{
     hot_plane,
     identity::ApplicationIdentity,
     ids::new_sync_queue_entry_id,
-    inference::{ColbertRuntime, DenseEmbeddingBackend},
+    inference::{ColbertBackend, DenseEmbeddingBackend},
     model::{
         OperationStatus, ParseRunStatus, ParserCapabilityProfile, ProducerType, Provenance,
         SyncQueueEntry, SyncQueueState, SystemEventType,
@@ -70,7 +70,9 @@ use crate::{
         pdf_worker, text_worker,
     },
     primitives::utc_now,
-    projections::{chunk, dense, dense_cache::DenseCache, envelope, lexical, multivector, view},
+    projections::{
+        chunk, dense, dense_cache::DenseCache, envelope, lexical, multivector, section_dense, view,
+    },
     source::{corpus_relative_source, resolve_contained_source, resolve_source_reference},
     state::{
         CutoverRegistry, ExclusiveGate, FabricHealth, FabricSourceCounts, ShutdownSignal,
@@ -325,7 +327,9 @@ enum ParseRoute {
 /// see the C7 seam note at the construction site).
 pub(crate) struct ProjectionRuntime {
     pub(crate) dense: DenseEmbeddingBackend,
-    pub(crate) colbert: ColbertRuntime,
+    /// Operator-stated model identity archived with the section vectors.
+    pub(crate) dense_config: DenseModelConfig,
+    pub(crate) colbert: ColbertBackend,
     pub(crate) dense_dimension: usize,
     pub(crate) colbert_dimension: usize,
     /// Shared process-global model-call serializer (same instance AppState
@@ -2814,8 +2818,10 @@ fn gate_ready_parse(
     // OUTSIDE that hold (this call precedes gate_and_activate), preserving the
     // §31.1 brevity rule.
     crate::snapshot::pre_activation_snapshot(index_root, &dispatch.identity, parse_run_id)?;
+    let store = ArtifactStore::open(index_root)?;
     let decision = activation::gate_and_activate(
         index_root,
+        &store,
         &dispatch.registry,
         &dispatch.projections.dense_cache,
         dispatch.projections.dense_dimension,
@@ -2891,12 +2897,10 @@ fn gate_ready_parse(
 /// so `projection.failed` survives for the operator even though the build tx
 /// vanished.
 ///
-/// Model-gate boundary (spec §1.5): the dense batch and the colbert batch each
-/// hold ONE `ModelCallPermit` for the whole batch — acquired once per parse per
-/// model role, never per item — and the two roles are acquired SEPARATELY and do
-/// NOT overlap (the dense permit drops before the colbert permit is acquired).
-/// Non-model builders (chunk, lexical, view) run with NO permit held. The gate
-/// is the SAME process-global serializer AppState uses (see ProjectionRuntime).
+/// Local dense and ColBERT batches each hold one process-global model permit
+/// per parse, with no overlap between roles. HTTP backends and non-model
+/// builders hold no accelerator permit. Remote calls remain inside the owning
+/// write transaction so all projection rows still commit or roll back together.
 fn build_content_derived_projections(
     runtime: &ProjectionRuntime,
     index_root: &Path,
@@ -3006,41 +3010,67 @@ fn build_projection_transaction(
             runtime.dense_dimension,
             Some(&permit),
         )?;
+        section_dense::build_section_dense(
+            tx,
+            store,
+            source_id,
+            parse_id,
+            &runtime.dense,
+            &runtime.dense_config,
+            runtime.colbert.tokenizer(),
+            Some(&permit),
+        )?;
         // `permit` drops here: the dense gate release precedes the colbert
         // acquire, honoring the non-overlapping-roles gate boundary.
         outcome
     } else {
         // HTTP backend: no gate across network I/O (§1.5). The builder packs its
         // own DENSE_HTTP_BATCH_SIZE windows.
-        dense::build_dense_vectors(
+        let outcome = dense::build_dense_vectors(
             tx,
             source_id,
             parse_id,
             &runtime.dense,
             runtime.dense_dimension,
             None,
-        )?
+        )?;
+        section_dense::build_section_dense(
+            tx,
+            store,
+            source_id,
+            parse_id,
+            &runtime.dense,
+            &runtime.dense_config,
+            runtime.colbert.tokenizer(),
+            None,
+        )?;
+        outcome
     };
 
-    // 4. Multivector — per-unit ColBERT matrices under a SEPARATE model permit
-    //    (colbert role), acquired only after the dense permit released above.
+    // 4. Multivector — local inference holds its own permit after dense has
+    //    released its permit. HTTP inference never holds the accelerator gate;
+    //    its calls still run inside this owning projection write transaction.
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::MultiVector)?;
     {
-        let permit = acquire_model_call_gate_on(
-            &runtime.gate,
-            parse_id,
-            COLBERT_MODEL_ROLE,
-            COLBERT_CALL_PURPOSE,
-        )?;
+        let permit = if runtime.colbert.uses_local_model_gate() {
+            Some(acquire_model_call_gate_on(
+                &runtime.gate,
+                parse_id,
+                COLBERT_MODEL_ROLE,
+                COLBERT_CALL_PURPOSE,
+            )?)
+        } else {
+            None
+        };
         multivector::build_multivectors(
             tx,
             source_id,
             parse_id,
             &runtime.colbert,
             runtime.colbert_dimension,
-            &permit,
+            permit.as_ref(),
         )?;
-        // colbert permit drops here.
+        // The local ColBERT permit drops before the non-model view builder.
     }
 
     // 5. Derived view — render + archive; independent of chunks/vectors, run

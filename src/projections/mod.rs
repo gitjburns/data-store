@@ -34,6 +34,7 @@ pub(crate) mod envelope;
 pub(crate) mod graph;
 pub(crate) mod lexical;
 pub(crate) mod multivector;
+pub(crate) mod section_dense;
 pub(crate) mod view;
 
 use serde::Serialize;

@@ -398,7 +398,12 @@ fn build_all_chunks(
         // per-window vectors in window order, so window order == chunk order.
         DenseEmbeddingBackend::Http(client) => {
             let windows: Vec<&[StoredChunk]> = chunks.chunks(DENSE_HTTP_BATCH_SIZE).collect();
-            let window_vectors = embed_windows_concurrently(client, &windows, parse_id)?;
+            let texts: Vec<&str> = chunks
+                .iter()
+                .map(|chunk| chunk.targeting_text.as_str())
+                .collect();
+            let text_windows: Vec<&[&str]> = texts.chunks(DENSE_HTTP_BATCH_SIZE).collect();
+            let window_vectors = embed_windows_concurrently(client, &text_windows, parse_id)?;
 
             // All windows embedded and length-checked; now persist serially in
             // chunk order on the caller's transaction. Every window's vectors
@@ -455,7 +460,7 @@ fn build_all_chunks(
 /// before the transaction opens.
 fn embed_windows_concurrently(
     client: &HttpDenseClient,
-    windows: &[&[StoredChunk]],
+    windows: &[&[&str]],
     parse_id: &str,
 ) -> Result<Vec<Vec<Vec<f32>>>, ApiError> {
     let mut results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(windows.len());
@@ -473,15 +478,11 @@ fn embed_windows_concurrently(
             let handles: Vec<_> = wave
                 .iter()
                 .map(|window| {
-                    let texts: Vec<&str> = window
-                        .iter()
-                        .map(|chunk| chunk.targeting_text.as_str())
-                        .collect();
                     // Shared `&client` crosses the scope boundary by reference
                     // (Sync); the borrow lives only for this scope.
                     scope.spawn(
                         crate::util::LogContext::current()
-                            .wrap(move || client.embed_passage_vectors(&texts)),
+                            .wrap(move || client.embed_passage_vectors(window)),
                     )
                 })
                 .collect();
@@ -514,7 +515,7 @@ fn embed_windows_concurrently(
             if vectors.len() != window.len() {
                 return Err(ApiError::StorageOperation {
                     message: format!(
-                        "HTTP dense backend returned {} vectors for {} chunks of parse {parse_id}",
+                        "HTTP dense backend returned {} vectors for {} inputs of parse {parse_id}",
                         vectors.len(),
                         window.len()
                     ),
@@ -525,6 +526,29 @@ fn embed_windows_concurrently(
     }
 
     Ok(results)
+}
+
+/// Embed additional retrieval representations with the same bounded HTTP
+/// batching as passages. The caller owns local accelerator admission and every
+/// persistence boundary; these worker threads perform network calls only.
+pub(crate) fn embed_texts(
+    backend: &DenseEmbeddingBackend,
+    texts: &[&str],
+    parse_id: &str,
+) -> Result<Vec<Vec<f32>>, ApiError> {
+    match backend {
+        DenseEmbeddingBackend::Local(runtime) => texts
+            .iter()
+            .map(|text| runtime.embed_complete_passage_vector(text))
+            .collect(),
+        DenseEmbeddingBackend::Http(client) => {
+            let windows: Vec<&[&str]> = texts.chunks(DENSE_HTTP_BATCH_SIZE).collect();
+            Ok(embed_windows_concurrently(client, &windows, parse_id)?
+                .into_iter()
+                .flatten()
+                .collect())
+        }
+    }
 }
 
 /// Validate one chunk's embedded vector and INSERT its row. Shared by both embed

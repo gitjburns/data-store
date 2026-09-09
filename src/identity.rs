@@ -214,10 +214,24 @@ struct ModelIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     dense_api_key_file_path: Option<String>,
 
-    colbert_path: String,
+    colbert_backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_path: Option<String>,
     colbert_dimension: u32,
     colbert_query_max_tokens: u32,
     colbert_document_max_tokens: u32,
+    /// HTTP facts identify the remote model and its matching local tokenizer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_tokenizer_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_timeout_seconds: Option<u64>,
+    /// Resolved PATH of the ColBERT API-key file, never its contents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colbert_api_key_file_path: Option<String>,
 
     reranker_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,10 +298,28 @@ impl ConfigurationIdentity {
                     .api_key_file_path
                     .as_deref()
                     .map(path_string),
-                colbert_path: path_string(&config.models.colbert.path),
+                // Validation guarantees the optional fields describe only the
+                // selected backend; credentials remain paths, never key contents.
+                colbert_backend: format!("{:?}", config.models.colbert.backend),
+                colbert_path: config.models.colbert.path.as_deref().map(path_string),
                 colbert_dimension: config.models.colbert.dimension,
                 colbert_query_max_tokens: config.models.colbert.query_max_tokens,
                 colbert_document_max_tokens: config.models.colbert.document_max_tokens,
+                colbert_endpoint: config.models.colbert.endpoint.clone(),
+                colbert_model: config.models.colbert.model.clone(),
+                colbert_tokenizer_file_path: config
+                    .models
+                    .colbert
+                    .tokenizer_file_path
+                    .as_deref()
+                    .map(path_string),
+                colbert_timeout_seconds: config.models.colbert.timeout_seconds,
+                colbert_api_key_file_path: config
+                    .models
+                    .colbert
+                    .api_key_file_path
+                    .as_deref()
+                    .map(path_string),
                 reranker_backend: format!("{:?}", config.models.reranker.backend),
                 reranker_path: config.models.reranker.path.as_deref().map(path_string),
                 reranker_max_tokens: config.models.reranker.max_tokens,

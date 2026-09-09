@@ -29,6 +29,7 @@ mod query;
 mod reset;
 mod restore;
 mod scheduler;
+mod sections;
 mod snapshot;
 mod source;
 mod state;
@@ -633,6 +634,7 @@ async fn run_http_service(
     // AppState below. The dense/colbert runtimes are cheap Clone handles; the
     // expected vector widths come from config.models.{dense,colbert}.dimension.
     let scheduler_dense_runtime = inference.dense.clone();
+    let scheduler_dense_config = config.models.dense.clone();
     let scheduler_colbert_runtime = inference.colbert.clone();
     let scheduler_dense_dimension = config.models.dense.dimension as usize;
     let scheduler_colbert_dimension = config.models.colbert.dimension as usize;
@@ -682,7 +684,31 @@ async fn run_http_service(
                 );
                 maintenance.fail(format!("operation {operation_id} did not complete"));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Restore both immutable dense representations before workers
+                // or query routing can observe the newly initialized state.
+                let cache_root = state.config.storage.index_root.clone();
+                let startup_cache = Arc::clone(&dense_cache);
+                let loaded =
+                    tokio::task::spawn_blocking(util::LogContext::current().wrap(move || {
+                        load_startup_dense_cache(
+                            &cache_root,
+                            &startup_cache,
+                            scheduler_dense_dimension,
+                        )
+                    }))
+                    .await
+                    .map_err(|source| ApiError::InternalIo {
+                        message: format!("startup dense cache loading failed to join: {source}"),
+                    })
+                    .and_then(|result| result);
+                if let Err(source) = loaded {
+                    error!(event = "startup.dense_cache_failed", error = %source,
+                        "storage admission paused because dense cache loading failed");
+                    dense_cache.clear();
+                    maintenance.fail(source.to_string());
+                }
+            }
             Err(source) => {
                 error!(event = "rebuild_all.recovery_check_failed", %source, "storage admission paused because recovery state is unknown");
                 maintenance.fail(source.to_string());
@@ -695,6 +721,7 @@ async fn run_http_service(
     // here after AppState::new because the gate is created inside AppState.
     let scheduler_projection_runtime = scheduler::ProjectionRuntime {
         dense: scheduler_dense_runtime,
+        dense_config: scheduler_dense_config,
         colbert: scheduler_colbert_runtime,
         dense_dimension: scheduler_dense_dimension,
         colbert_dimension: scheduler_colbert_dimension,
@@ -830,6 +857,72 @@ async fn run_http_service(
     serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
+    Ok(())
+}
+
+/// Populate the active cache from persisted data in one read snapshot. Legacy
+/// parses remain identifiable with absent section data so queries can request a
+/// deliberate rebuild while the admin routes remain available. No inference runs.
+fn load_startup_dense_cache(
+    index_root: &std::path::Path,
+    cache: &projections::dense_cache::DenseCache,
+    dimension: usize,
+) -> Result<(), ApiError> {
+    const MAX_STARTUP_PARSES: usize = 100_000;
+    const ACTIVE_PARSES_SQL: &str = "SELECT active_parse_id FROM source_objects
+        WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL
+        ORDER BY id LIMIT ?1";
+    let started = Instant::now();
+    info!(
+        event = "startup.dense_cache_started",
+        "loading active passage and section dense planes"
+    );
+    let mut connection = hot_plane::open_read(index_root)?;
+    let tx = hot_plane::begin_read_transaction(&mut connection, "startup", "dense_cache_loading")?;
+    let store = artifact_store::ArtifactStore::open(index_root)?;
+    let mut statement =
+        tx.prepare(ACTIVE_PARSES_SQL)
+            .map_err(|source| ApiError::StorageOperation {
+                message: format!("startup active-parse query preparation failed: {source}"),
+            })?;
+    let parses = statement
+        .query_map([MAX_STARTUP_PARSES as i64 + 1], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("startup active-parse query failed: {source}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("startup active-parse row decoding failed: {source}"),
+        })?;
+    if parses.len() > MAX_STARTUP_PARSES {
+        return Err(ApiError::StorageOperation {
+            message: format!("startup dense cache exceeds {MAX_STARTUP_PARSES} active parses"),
+        });
+    }
+    let mut rebuild_required = 0usize;
+    for parse_id in &parses {
+        cache.load_parse(&tx, &store, parse_id, dimension)?;
+        if cache
+            .snapshot_for_parse(parse_id)
+            .is_some_and(|plane| plane.sections().is_none())
+        {
+            rebuild_required += 1;
+            warn!(
+                event = "startup.section_dense_rebuild_required",
+                parse_id,
+                "active parse lacks section embeddings; run data-store --rebuild-all before querying this parse"
+            );
+        }
+    }
+    info!(
+        event = "startup.dense_cache_completed",
+        active_parses = parses.len(),
+        rebuild_required,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "active dense cache loaded from persisted passage and section projections"
+    );
     Ok(())
 }
 
@@ -1035,6 +1128,7 @@ async fn run_annotation_dry_run_mode(
         application_identity,
         entity_match_policy.document,
     ));
+    let annotation_cancellation = state.maintenance().annotation_cancellation();
     let app = http::build_dry_run_router(state).layer(TraceLayer::new_for_http());
 
     // The pass runs on a blocking task while the listener serves, so the
@@ -1042,15 +1136,28 @@ async fn run_annotation_dry_run_mode(
     // and failure are logged by the wrapper task; a failed pass deliberately
     // keeps the service up — partial vocabulary is still worth inspecting.
     let pass_shutdown = Arc::clone(&shutdown_signal);
+    // The watcher needs its own receiver after the pass takes the client's token.
+    let watcher_cancellation = annotation_cancellation.clone();
     let pass_handle = tokio::task::spawn_blocking(
-        util::LogContext::current().wrap(move || dry_run::run(pass_inputs, &pass_shutdown)),
+        util::LogContext::current()
+            .wrap(move || dry_run::run(pass_inputs, &pass_shutdown, annotation_cancellation)),
     );
     let pass_watcher = tokio::spawn(util::LogContext::current().instrument(async move {
         match pass_handle.await {
-            Ok(Ok(())) => info!(
-                event = "dry_run.pass_completed",
-                "dry-run pass complete; vocabulary is ready for inspection (POST /shutdown to end)"
-            ),
+            Ok(Ok(())) => {
+                if let Some(reason) = watcher_cancellation.reason() {
+                    info!(
+                        event = "dry_run.pass_cancelled",
+                        reason = reason.label(),
+                        "dry-run sampling ended on cancellation; previously committed vocabulary retained"
+                    );
+                } else {
+                    info!(
+                        event = "dry_run.pass_completed",
+                        "dry-run pass complete; vocabulary is ready for inspection (POST /shutdown to end)"
+                    );
+                }
+            }
             Ok(Err(source)) => error!(
                 event = "dry_run.pass_failed",
                 error = %source,
@@ -1078,8 +1185,9 @@ async fn run_annotation_dry_run_mode(
         .with_graceful_shutdown(wait_for_shutdown_signal(Arc::clone(&shutdown_signal)))
         .await;
     admin_token_file.cleanup_if_current();
-    // A shutdown mid-pass ends the pass at its next between-item probe; await
-    // the watcher so the pass's terminal log lands before the process exits.
+    // Shutdown cancels annotation HTTP work and stops subsequent sampling items;
+    // the parsing pass keeps its existing lifecycle. Await the watcher so the
+    // pass's terminal log lands before the process exits.
     if pass_watcher.await.is_err() {
         error!(
             event = "dry_run.pass_watcher_join_failed",

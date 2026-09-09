@@ -55,6 +55,9 @@ use crate::hot_plane;
 use crate::model::{ForensicSnapshot, ForensicSnapshotManifest, SnapshotArtifactRef};
 use crate::projections::ChunkerConfig;
 use crate::projections::graph::normalize_entity_name;
+use crate::projections::section_dense::{
+    SECTION_DENSE_INDEX_NAME, SectionDensePlane, read_section_payload,
+};
 
 /// Log-event namespace for this module's verification boundary logs, so every
 /// verify line is attributable to snapshot verification.
@@ -99,6 +102,8 @@ pub(crate) fn verify_mechanical(
         Ok(counts) => counts,
         Err(source) => return Err(log_tier_failure("mechanical", snapshot, started, source)),
     };
+    let section_planes = verified_section_planes(&store, snapshot, &manifest)
+        .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
 
     info!(
         event = "snapshot.verify.mechanical_succeeded",
@@ -107,10 +112,172 @@ pub(crate) fn verify_mechanical(
         sections_checked = counts.sections_checked as u64,
         blob_refs_hashed = counts.blob_refs_hashed as u64,
         marker_refs_skipped = counts.marker_refs_skipped as u64,
+        section_dense_payloads = section_planes.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "mechanical snapshot verification succeeded"
     );
     Ok(())
+}
+
+/// Cross-check immutable section payloads against their archived envelopes and
+/// canonical ownership without opening or modifying the live database. Unfinished
+/// incoming parses need no section payload until they own a completed dense plane.
+pub(crate) fn verified_section_planes(
+    store: &ArtifactStore,
+    snapshot: &ForensicSnapshot,
+    manifest: &ForensicSnapshotManifest,
+) -> Result<Vec<(String, SectionDensePlane)>, ApiError> {
+    let envelopes = load_archived_jsonl(store, snapshot, manifest, "retrieval_projections")?;
+    let units = load_archived_jsonl(store, snapshot, manifest, "content_units")?;
+    let relationships = load_archived_jsonl(store, snapshot, manifest, "unit_relationships")?;
+    let mut refs = BTreeMap::new();
+    for artifact in &manifest.retrieval_indexes {
+        if artifact.artifact_type != super::SECTION_DENSE_PAYLOAD_TYPE {
+            continue;
+        }
+        let id = artifact
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("projectionId"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: section payload has no projectionId",
+                    snapshot.id
+                ))
+            })?;
+        if refs.insert(id, artifact).is_some() {
+            return Err(verification_failure(format!(
+                "snapshot {}: duplicate section payload for {id}",
+                snapshot.id
+            )));
+        }
+    }
+    let mut sections = Vec::new();
+    let mut completed_dense_parses = BTreeSet::new();
+    let mut completed_section_parses = BTreeSet::new();
+    for record in &envelopes {
+        let object = as_object(record, snapshot, "retrieval_projections")?;
+        let is_section = json_str(object, "index_name") == Some(SECTION_DENSE_INDEX_NAME);
+        let completed = matches!(
+            json_str(object, "freshness_status"),
+            Some("fresh" | "stale" | "superseded")
+        );
+        if !is_section {
+            if completed
+                && json_str(object, "projection_type") == Some("dense_vector")
+                && json_is_null_or_absent(object, "index_name")
+            {
+                completed_dense_parses.insert(required_str(
+                    object,
+                    "parse_id",
+                    snapshot,
+                    "retrieval_projections",
+                )?);
+            }
+            continue;
+        }
+        if json_str(object, "projection_type") != Some("dense_vector") {
+            return Err(verification_failure(format!(
+                "snapshot {}: section index has incorrect projection type",
+                snapshot.id
+            )));
+        }
+        let Some(uri) = json_str(object, "payload_uri") else {
+            if !completed {
+                continue;
+            }
+            return Err(verification_failure(format!(
+                "snapshot {}: completed section index has no payload",
+                snapshot.id
+            )));
+        };
+        let id = required_str(object, "id", snapshot, "retrieval_projections")?;
+        let source_id = required_str(object, "source_id", snapshot, "retrieval_projections")?;
+        let parse_id = required_str(object, "parse_id", snapshot, "retrieval_projections")?;
+        let artifact = refs.remove(id.as_str()).ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: section projection {id} has no explicit payload reference",
+                snapshot.id
+            ))
+        })?;
+        let metadata = artifact.metadata.as_ref().ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: section projection {id} has no metadata",
+                snapshot.id
+            ))
+        })?;
+        let dimension = metadata
+            .get("dimension")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: section projection {id} has invalid dimension",
+                    snapshot.id
+                ))
+            })?;
+        if store.reference_for_uri(uri)?.hash != artifact.hash
+            || store.reference_for_uri(&artifact.uri)?.hash != artifact.hash
+        {
+            return Err(verification_failure(format!(
+                "snapshot {}: section projection {id} payload hash differs from envelope",
+                snapshot.id
+            )));
+        }
+        let plane = read_section_payload(store, uri, &source_id, &parse_id, dimension)?;
+        if metadata.get("sourceId").and_then(Value::as_str) != Some(source_id.as_str())
+            || metadata.get("parseId").and_then(Value::as_str) != Some(parse_id.as_str())
+            || metadata.get("policyHash").and_then(Value::as_str)
+                != Some(plane.policy_hash.as_str())
+            || metadata.get("windowCount").and_then(Value::as_u64)
+                != Some(plane.windows.len() as u64)
+        {
+            return Err(verification_failure(format!(
+                "snapshot {}: section projection {id} metadata disagrees with payload",
+                snapshot.id
+            )));
+        }
+        let input_ids = required_str(
+            object,
+            "input_unit_ids_json",
+            snapshot,
+            "retrieval_projections",
+        )?;
+        let input_ids: Vec<String> = serde_json::from_str(&input_ids).map_err(|source| {
+            verification_failure(format!(
+                "snapshot {}: section projection {id} inputs are invalid: {source}",
+                snapshot.id
+            ))
+        })?;
+        if input_ids != crate::projections::section_dense::plane_input_ids(&plane) {
+            return Err(verification_failure(format!(
+                "snapshot {}: section projection {id} input membership differs from payload",
+                snapshot.id
+            )));
+        }
+        crate::projections::section_dense::validate_archived_plane(&units, &relationships, &plane)?;
+        if completed {
+            completed_section_parses.insert(parse_id);
+        }
+        sections.push((id, plane));
+    }
+    if !refs.is_empty() {
+        return Err(verification_failure(format!(
+            "snapshot {}: section payload references have no owning envelope",
+            snapshot.id
+        )));
+    }
+    if let Some(parse_id) = completed_dense_parses
+        .difference(&completed_section_parses)
+        .next()
+    {
+        return Err(verification_failure(format!(
+            "snapshot {}: parse {parse_id} lacks section embeddings; pre-feature snapshots cannot be restored under the current retrieval policy; rebuild the corpus",
+            snapshot.id
+        )));
+    }
+    Ok(sections)
 }
 
 /// Deletion-gate verification (§30.5 / §31.2 step 4): mechanical verification
@@ -148,6 +315,9 @@ pub(crate) fn verify_deletion_gate(
     );
 
     let manifest = load_and_check_manifest(&store, snapshot)?;
+    let section_windows_compared =
+        verify_live_section_planes(&store, &connection, snapshot, &manifest, &subject_parse_id)
+            .map_err(|source| log_tier_failure("deletion_gate", snapshot, started, source))?;
 
     // Each sub-check compares an archived artifact against the live hot plane,
     // returns the count of rows it compared, and returns Err on the first
@@ -201,6 +371,7 @@ pub(crate) fn verify_deletion_gate(
         tier = "deletion_gate",
         snapshot_id = %snapshot.id,
         subject_parse_id = %subject_parse_id,
+        section_windows_compared,
         chunks_compared = counts.chunks_compared as u64,
         dense_compared = counts.dense_compared as u64,
         multivector_compared = counts.multivector_compared as u64,
@@ -210,6 +381,116 @@ pub(crate) fn verify_deletion_gate(
         "deletion-gate rebuild verification succeeded"
     );
     Ok(())
+}
+
+/// Require the exact archived section payload and canonical mappings to survive
+/// in the hot plane before allowing its envelope and units to be deleted.
+fn verify_live_section_planes(
+    store: &ArtifactStore,
+    connection: &Connection,
+    snapshot: &ForensicSnapshot,
+    manifest: &ForensicSnapshotManifest,
+    parse_id: &str,
+) -> Result<usize, ApiError> {
+    let section_planes = verified_section_planes(store, snapshot, manifest)?;
+    let archived_ids: BTreeSet<&str> = section_planes
+        .iter()
+        .filter(|(_, plane)| plane.parse_id == parse_id)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    // Include every named section envelope, regardless of freshness or payload:
+    // cleanup must never delete a live representation the snapshot did not pin.
+    // One extra row beyond the archive cardinality is sufficient to reject it.
+    const LIVE_SECTION_IDS_SQL: &str = "SELECT id FROM retrieval_projections
+        WHERE parse_id = ?1 AND index_name = ?2 ORDER BY id LIMIT ?3";
+    let mut statement = connection.prepare(LIVE_SECTION_IDS_SQL).map_err(|source| {
+        verification_failure(format!(
+            "snapshot {}: prepare live section identities for {parse_id}: {source}",
+            snapshot.id
+        ))
+    })?;
+    let live_ids = statement
+        .query_map(
+            params![
+                parse_id,
+                SECTION_DENSE_INDEX_NAME,
+                archived_ids.len().saturating_add(1)
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|source| {
+            verification_failure(format!(
+                "snapshot {}: query live section identities for {parse_id}: {source}",
+                snapshot.id
+            ))
+        })?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|source| {
+            verification_failure(format!(
+                "snapshot {}: read live section identities for {parse_id}: {source}",
+                snapshot.id
+            ))
+        })?;
+    if let Some(id) = live_ids
+        .iter()
+        .find(|id| !archived_ids.contains(id.as_str()))
+    {
+        return Err(verification_failure(format!(
+            "snapshot {}: live section envelope {id} for parse {parse_id} has no archived payload; refusing deletion",
+            snapshot.id
+        )));
+    }
+    if let Some(id) = archived_ids.iter().find(|id| !live_ids.contains(**id)) {
+        return Err(verification_failure(format!(
+            "snapshot {}: archived section envelope {id} for parse {parse_id} is absent from the hot plane",
+            snapshot.id
+        )));
+    }
+    let mut windows = 0;
+    for (id, plane) in section_planes {
+        if plane.parse_id != parse_id {
+            continue;
+        }
+        let uri: String = connection
+            .query_row(
+                "SELECT payload_uri FROM retrieval_projections WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|source| {
+                verification_failure(format!(
+                    "snapshot {}: live section envelope {id} missing or invalid: {source}",
+                    snapshot.id
+                ))
+            })?;
+        let archived = manifest
+            .retrieval_indexes
+            .iter()
+            .find(|artifact| {
+                artifact.artifact_type == super::SECTION_DENSE_PAYLOAD_TYPE
+                    && artifact
+                        .metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("projectionId"))
+                        .and_then(Value::as_str)
+                        == Some(id.as_str())
+            })
+            .ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: section ref {id} missing",
+                    snapshot.id
+                ))
+            })?;
+        if store.reference_for_uri(&uri)?.hash != archived.hash {
+            return Err(verification_failure(format!(
+                "snapshot {}: live section payload {id} differs from archived bytes",
+                snapshot.id
+            )));
+        }
+        crate::projections::section_dense::validate_plane(connection, &plane)?;
+        windows += plane.windows.len();
+    }
+    Ok(windows)
 }
 
 /// Counts recorded for the mechanical-tier success log: how much was actually

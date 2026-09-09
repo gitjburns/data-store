@@ -305,8 +305,18 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   builds the content-derived projections in **one transaction**
   (`build_projection_transaction`): `chunk::build_chunks` →
   `lexical::build_lexical_index` → `dense::build_dense_vectors` →
+  `section_dense::build_section_dense` →
   `multivector::build_multivectors` → `view::build_derived_view`. Each carries a
   `retrieval_projections` envelope with a freshness status.
+
+  Section windows retain the existing passage vectors and add heading-prefixed
+  canonical text, capped at 2,048 tokens measured with the local ColBERT
+  tokenizer. Unsectioned text uses explicit document-scoped windows. The
+  self-contained artifact records exact text fragments, canonical membership,
+  model/tokenizer identity, window-policy hash, and vectors. Its `dense_vector`
+  envelope uses `index_name = section_dense_v1`; the passage envelope retains
+  a null index name. Both must be fresh before activation. No schema migration
+  is involved; existing corpora require the explicit rebuild-all operation.
 
 - **Gate / activate.** `activation::gate_and_activate` enforces a **single active
   parse per source** with dominance gating. A non-dominant but valid parse takes
@@ -556,6 +566,12 @@ model call anywhere in the restore/verify path — a grep for
 `embed|InferenceRuntime|score_|docling` over `restore.rs` must match no code
 symbols (its only hits are the comments stating this invariant).
 
+Section payloads are explicitly pinned in snapshot manifests. Verification checks
+their exact canonical fragment coverage and complete live/archive envelope sets.
+Restore requires the target's passage and section representations before writing;
+pre-feature snapshots are incompatible. Valid section vectors are read from the
+archived artifact and published with the passage plane without inference.
+
 ### 5.5 Deletion lifecycle (`src/deletion.rs`)
 
 Deletion propagation is **evidence-based** and runs post-drain in the
@@ -593,11 +609,14 @@ capture and every subsequent read share a single pinned WAL snapshot. The
 passed `ResolvedScope` / `&[CapturedParse]` **is** the scope mechanism (§6, §38):
 there is no separate scope enforcement pass. Each captured parse carries its
 dense plane as an `Arc<DensePlane>` clone taken under the same snapshot.
+The plane contains passage and section vectors together. Startup reloads active
+planes before starting workers; a scoped parse missing either representation
+causes an explicit rebuild-required query error.
 
 ```
 open read-only transaction → capture scoped active parses → cutover-barrier probe
        ↓
-dense + lexical chunks → canonical units ┐
+dense passages + section nominations + lexical chunks → canonical units ┐
 graph entity matches + one semantic hop ─┴→ rank fusion (100 units)
        ↓
 ColBERT MaxSim (persisted unit matrices)
@@ -619,6 +638,14 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   path. Each channel supplies up to 100 candidates independently of the requested
   result count. **RRF across all three channels** deduplicates canonical units
   into a 100-unit pool before ColBERT scoring.
+
+  Dense retrieval uses the same query vector to shortlist 20 section windows.
+  Each nominates up to five eligible units by their best fine-chunk cosine,
+  strictly within that window's canonical membership. Units lacking fine vectors
+  contribute context but cannot be nominated. Direct and section-guided lists
+  merge with equal-weight RRF, deduplicate, and cap at 100 before contributing
+  one dense ranking to outer fusion. Result provenance retains both routes and
+  their section headings.
 
   Entry matching is **policy-threaded** (the D9 amendment). `graph_channel`
   receives the `EntityMatchPolicy` (Section 3.2), threaded from startup through
@@ -665,9 +692,9 @@ and annotation requirements. Each has a stable version and self-hash over its
 canonical serialization, excluding the hash field, and an `active_*()` accessor.
 
 - The **`RetrievalProfile`** (`src/query/profile.rs`, `active_profile` /
-  `seal_mvp_profile`) supplies the RRF
+  `seal_mvp_profile`, version 3) supplies the RRF
   fusion constant (`rrf_k = 60`), per-channel and MaxSim candidate pool sizes
-  (`100`), the reranker
+  (`100`), section shortlist (`20`) and nominations per window (`5`), the reranker
   passage pool size (`30`, raised to the requested count up to `100`), and the D9 graph hop budget (`1`). These are
   deliberately NOT config keys: the D3 ruling moved
   every retrieval knob out of operational config into this hashed document,

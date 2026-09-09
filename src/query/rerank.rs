@@ -8,12 +8,9 @@
 //!    already fused by RRF) using the ColBERT document matrices PERSISTED at
 //!    build time. §38 forbids recomputing those document vectors at search
 //!    time, so the loader decodes stored blobs and MaxSim never re-embeds a
-//!    document. The QUERY, however, is embedded LIVE by the local ColBERT model
-//!    (`score_persisted_candidates` emits `model_call.started` under
-//!    `model_role="colbert"`), so this stage IS a live local accelerator call
-//!    and holds the model-call gate under the colbert role for the duration of
-//!    the scoring call — mirroring the scheduler's colbert acquire
-//!    (`scheduler.rs`).
+//!    document. The query is embedded live by the selected ColBERT backend.
+//!    Local inference/scoring holds the model-call gate; remote query embedding
+//!    and CPU MaxSim run without that accelerator permit.
 //!
 //! 2. **Final reranker** scores passages built from MaxSim-ranked units via the config-selected
 //!    reranker backend. The gate discipline is CALLER-SIDE and backend-aware:
@@ -40,7 +37,7 @@ use tracing::{error, info};
 
 use crate::error::ApiError;
 use crate::inference::{
-    ColbertCandidateScore, ColbertRuntime, RerankerBackend, RerankerCandidateInput,
+    ColbertBackend, ColbertCandidateScore, RerankerBackend, RerankerCandidateInput,
     RerankerCandidateScore,
 };
 use crate::projections::multivector;
@@ -82,10 +79,8 @@ pub(crate) struct RerankStageContext<'a> {
 /// Loads the persisted ColBERT matrices for the fused pool (capped at
 /// `colbert_candidate_pool_size`) via the query-time loader — NO document
 /// recomputation (§38) — then scores them against a LIVE query embedding.
-/// Because `score_persisted_candidates` embeds the query on the local ColBERT
-/// model, the whole scoring call runs under the model-call gate held for the
-/// colbert role and released the instant scoring returns (the `permit` drops at
-/// the end of the block).
+/// The local backend holds the model-call gate while embedding and scoring;
+/// the HTTP backend embeds remotely and performs CPU MaxSim without that gate.
 ///
 /// `pool` is the RRF-fused, unit-grained hit list. Candidates are grouped by
 /// their originating `parse_id` because both the matrix load and the store are
@@ -98,7 +93,7 @@ pub(crate) struct RerankStageContext<'a> {
 /// omitted by the loader and therefore carry no MaxSim score.
 pub(crate) fn run_maxsim_stage(
     ctx: &RerankStageContext<'_>,
-    colbert: &ColbertRuntime,
+    colbert: &ColbertBackend,
     pool: &[RetrievalHit],
     expected_dimension: usize,
     colbert_candidate_pool_size: usize,
@@ -113,6 +108,8 @@ pub(crate) fn run_maxsim_stage(
 
     info!(
         event = "rerank.maxsim.started",
+        backend = ?colbert.backend_kind(),
+        uses_local_model_gate = colbert.uses_local_model_gate(),
         query_id = ctx.query_id,
         parse_count = capped.len(),
         candidate_count,
@@ -142,32 +139,40 @@ pub(crate) fn run_maxsim_stage(
         candidates.append(&mut loaded);
     }
 
-    // Score under the colbert model-call gate: MaxSim reuses persisted document
-    // matrices (§38: no document recomputation) but embeds the QUERY live on the
-    // local ColBERT model, so this is a live local accelerator call. Acquire the
-    // gate around the scoring call and drop the permit the instant it returns —
-    // exactly the scheduler's colbert acquire discipline (`scheduler.rs`).
+    // Only the local backend embeds and scores on the accelerator. HTTP query
+    // embedding and its CPU MaxSim comparison must not hold that exclusive gate.
     let gate_started = Instant::now();
     let (scores, gate_wait_ms, scoring_ms) = {
-        let permit = acquire_model_call_gate_on(
-            ctx.gate,
-            ctx.query_id,
-            COLBERT_MODEL_ROLE,
-            COLBERT_CALL_PURPOSE,
-        )
-        .inspect_err(|source| {
-            error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
-                stage = "model_gate", error = %source,
-                error_chain = %crate::util::error_chain(source),
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                "ColBERT scoring could not acquire the model gate");
-        })?;
-        let gate_wait_ms = gate_started.elapsed().as_millis() as u64;
+        let permit = if colbert.uses_local_model_gate() {
+            Some(
+                acquire_model_call_gate_on(
+                    ctx.gate,
+                    ctx.query_id,
+                    COLBERT_MODEL_ROLE,
+                    COLBERT_CALL_PURPOSE,
+                )
+                .inspect_err(|source| {
+                    error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                    stage = "model_gate", error = %source,
+                    error_chain = %crate::util::error_chain(source),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "ColBERT scoring could not acquire the model gate");
+                })?,
+            )
+        } else {
+            None
+        };
+        let gate_wait_ms = if permit.is_some() {
+            gate_started.elapsed().as_millis() as u64
+        } else {
+            0
+        };
         let scoring_started = Instant::now();
         let scores = colbert
             .score_persisted_candidates(ctx.query, &candidates)
             .inspect_err(|source| {
                 error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                    backend = ?colbert.backend_kind(),
                     stage = "scoring", candidate_count = candidates.len(),
                     error = %source, error_chain = %crate::util::error_chain(source),
                     gate_wait_ms, scoring_ms = scoring_started.elapsed().as_millis() as u64,
@@ -175,13 +180,14 @@ pub(crate) fn run_maxsim_stage(
                     "ColBERT MaxSim scoring failed");
             })?;
         let scoring_ms = scoring_started.elapsed().as_millis() as u64;
-        // `permit` drops here, releasing the gate immediately after scoring.
+        // Release local admission immediately after its accelerator work.
         drop(permit);
         (scores, gate_wait_ms, scoring_ms)
     };
 
     info!(
         event = "rerank.maxsim.completed",
+        backend = ?colbert.backend_kind(),
         query_id = ctx.query_id,
         parse_count = capped.len(),
         candidate_count,

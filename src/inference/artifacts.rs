@@ -6,7 +6,7 @@ use std::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    config::{DenseBackendKind, ModelConfig, RerankerBackendKind},
+    config::{ColbertBackendKind, DenseBackendKind, ModelConfig, RerankerBackendKind},
     error::ApiError,
 };
 
@@ -20,7 +20,8 @@ pub struct ModelArtifactSet {
     /// backend has no local model to validate, so this is `None` there (mirror
     /// of the reranker's optional artifacts).
     pub dense: Option<ModelArtifacts>,
-    pub colbert: ModelArtifacts,
+    /// HTTP ColBERT loads only its tokenizer, never local inference weights.
+    pub colbert: Option<ModelArtifacts>,
     pub reranker: Option<ModelArtifacts>,
 }
 
@@ -34,8 +35,8 @@ pub struct ModelArtifacts {
 }
 
 impl ModelArtifactSet {
-    /// Validate all configured model directories and tokenizer files. Dense and
-    /// reranker local artifacts are validated only when their backend is local;
+    /// Validate all configured model directories and tokenizer files. All
+    /// local artifacts are validated only when their backend is local;
     /// an HTTP backend has no local model directory to check.
     pub fn load(config: &ModelConfig) -> Result<Self, ApiError> {
         Ok(Self {
@@ -45,7 +46,13 @@ impl ModelArtifactSet {
                 }
                 DenseBackendKind::Http => None,
             },
-            colbert: ModelArtifacts::load("colbert", &config.colbert.path)?,
+            colbert: match config.colbert.backend {
+                ColbertBackendKind::Local => Some(ModelArtifacts::load(
+                    "colbert",
+                    config.colbert.local_path()?,
+                )?),
+                ColbertBackendKind::Http => None,
+            },
             reranker: match config.reranker.backend {
                 RerankerBackendKind::Local => Some(ModelArtifacts::load(
                     "reranker",
@@ -63,7 +70,11 @@ impl ModelArtifactSet {
             Some(dense) => details.push(dense.health_detail()),
             None => details.push("dense artifacts ready: remote HTTP backend".to_string()),
         }
-        details.push(self.colbert.health_detail());
+        match &self.colbert {
+            Some(colbert) => details.push(colbert.health_detail()),
+            None => details
+                .push("colbert artifacts ready: remote HTTP backend (tokenizer only)".to_string()),
+        }
         match &self.reranker {
             Some(reranker) => details.push(reranker.health_detail()),
             None => details.push("reranker artifacts ready: remote HTTP backend".to_string()),

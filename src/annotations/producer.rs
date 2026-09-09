@@ -22,9 +22,14 @@ use rusqlite::Connection;
 use serde_json::json;
 use tracing::warn;
 
-use crate::annotations::{entity, llm_client::AnnotatorClient, relation, summary};
+use crate::annotations::{
+    entity,
+    llm_client::{AnnotatorClient, CompletionFailure},
+    relation, summary,
+};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
+use crate::maintenance::AnnotationCancelReason;
 use crate::model::{
     self, ContentType, ContentUnit, ProducerType, ProvenanceInputRef, ProvenanceObjectType,
     SemanticAnnotationType,
@@ -116,6 +121,9 @@ pub(crate) struct ProducedAnnotation {
 /// worker's output retry budget; call and routing faults do not change sampling.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InvocationFailure {
+    /// Operator cancellation is neither rejected model output nor a call fault.
+    #[error("annotation invocation cancelled: {0:?}")]
+    Cancelled(AnnotationCancelReason),
     /// The endpoint did not return a usable completion envelope.
     #[error(transparent)]
     Call(ApiError),
@@ -131,16 +139,18 @@ impl InvocationFailure {
     /// Supply stable diagnostic labels without parsing provider error text.
     pub(crate) fn class(&self) -> &'static str {
         match self {
+            Self::Cancelled(_) => "cancelled",
             Self::Call(_) => "call_failure",
             Self::InvalidOutput(_) => "invalid_output",
             Self::Internal(_) => "internal_error",
         }
     }
 
-    /// Expose the original error for existing persistence and API boundaries.
-    pub(crate) fn error(&self) -> &ApiError {
+    /// Preserve actual failures for persistence; cancellation must never mint a failed row.
+    pub(crate) fn error(&self) -> Option<&ApiError> {
         match self {
-            Self::Call(error) | Self::InvalidOutput(error) | Self::Internal(error) => error,
+            Self::Cancelled(_) => None,
+            Self::Call(error) | Self::InvalidOutput(error) | Self::Internal(error) => Some(error),
         }
     }
 }
@@ -491,6 +501,9 @@ pub(crate) fn invoke(
     naming_rules: &[String],
     temperature: f64,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
+    if let Some(reason) = client.cancellation().reason() {
+        return Err(InvocationFailure::Cancelled(reason));
+    }
     match (kind, &invocation.kind) {
         (ProducerKind::Entity | ProducerKind::Relation, InvocationKind::SectionGroup { .. }) => {}
         (ProducerKind::Summary, InvocationKind::Document { .. }) => {}
@@ -527,7 +540,15 @@ pub(crate) fn invoke(
             &user_content,
             temperature,
         )
-        .map_err(InvocationFailure::Call)?;
+        .map_err(|failure| match failure {
+            CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
+            CompletionFailure::Request(source) => InvocationFailure::Call(source),
+        })?;
+    // A response that raced operator cancellation is discarded before parsing
+    // and can never be charged as invalid output by the serial worker.
+    if let Some(reason) = client.cancellation().reason() {
+        return Err(InvocationFailure::Cancelled(reason));
+    }
     kind.parse_output(&raw)
         .map_err(InvocationFailure::InvalidOutput)
 }

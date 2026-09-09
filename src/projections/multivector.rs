@@ -1,14 +1,12 @@
 //! C6e multi-vector builder: ColBERT document-token matrices as `multi_vector`
 //! projections persisted PER CONTENT UNIT (`unit_multivector_projections`,
-//! D4), parse-scoped and rebuildable from canonical state through a
-//! length-routed hybrid of the batched `embed_documents` and singular
-//! `embed_document` inference APIs (CPd hybrid ruling, 2026-07-18), using the
-//! typed fabric matrix codec (spec §22).
+//! D4), parse-scoped and rebuildable from canonical state through
+//! local length-routed embedding calls or remote batched token embeddings,
+//! using the typed fabric matrix codec (spec §22).
 //!
 //! PER-UNIT rationale (D4, resolved 2026-07-11). ColBERT matrices are keyed to
 //! canonical ContentUnits, one row per (parse, unit) — NOT per chunk. The MVP
-//! keeps ColBERT as a `multi_vector` projection and the length-routed
-//! batched/singular pair is its producer; the payload key is the unit id, so
+//! keeps ColBERT as a `multi_vector` projection; the payload key is the unit id, so
 //! MaxSim scoring (C7c) and hot cleanup scan the parse's units directly. Chunks
 //! (C6b) are a separate projection plane and never the multi-vector key.
 //!
@@ -16,16 +14,10 @@
 //! canonical ContentUnits in reading order — never Docling output — so a rebuild
 //! is a pure function of committed canonical evidence.
 //!
-//! Gate discipline (D-fact 9, §1.5, §7c). `embed_documents` and
-//! `embed_document` are LOCAL ColBERT model calls and must run under the
-//! caller-side model-call gate
-//! (`AppState::acquire_model_call_gate` -> `ModelCallPermit`, released on drop;
-//! state.rs). This builder is a PURE function (§8): it does not touch
-//! scheduler/worker/main and does not acquire the gate itself. The caller
-//! acquires ONE `ModelCallPermit` and holds it ACROSS the whole per-parse batch
-//! (not per unit — re-acquiring per unit would thrash the exclusive gate and
-//! interleave other model work between a single parse's tokens), then passes it
-//! by reference as proof the gate is held for the batch's duration.
+//! The caller holds one model-call permit across a local build and passes no
+//! permit for HTTP. This builder validates that admission without acquiring a
+//! gate itself. Remote requests remain inside the caller's write transaction;
+//! projection rows and their envelope still commit or roll back together.
 
 use std::time::Instant;
 
@@ -35,7 +27,7 @@ use tracing::{error, info};
 
 use crate::error::ApiError;
 use crate::ids::new_retrieval_projection_id;
-use crate::inference::{ColbertDocumentEmbedding, ColbertRuntime};
+use crate::inference::{ColbertBackend, ColbertDocumentEmbedding};
 use crate::model::{
     ContentType, ProducerType, Provenance, ProvenanceInputRef, ProvenanceObjectType,
 };
@@ -66,7 +58,7 @@ const COLBERT_DOCUMENT_PRODUCER_VERSION: &str = "1";
 /// by its own longest member rather than the parse's longest unit.
 const COLBERT_DOCUMENT_BATCH_WINDOW: usize = 16;
 
-/// Routing threshold for the CPd length-threshold hybrid (user-ruled
+/// Local routing threshold for the CPd length-threshold hybrid (user-ruled
 /// 2026-07-18): a unit whose raw-text token count (`count_document_tokens`)
 /// is at or below this embeds through the batched `embed_documents` windows;
 /// a longer unit takes the singular `embed_document` path. Engineering fact, not an operator config
@@ -78,8 +70,8 @@ const COLBERT_DOCUMENT_BATCH_WINDOW: usize = 16;
 const COLBERT_BATCH_ROUTE_MAX_TOKENS: usize = 128;
 
 /// Ordered SELECT of a parse's content units in reading order. The multi-vector
-/// builder embeds short units in `COLBERT_DOCUMENT_BATCH_WINDOW`-sized batched
-/// windows and long units singularly (`COLBERT_BATCH_ROUTE_MAX_TOKENS`) but
+/// builder uses `COLBERT_DOCUMENT_BATCH_WINDOW`-sized windows, except that
+/// local long units embed singularly (`COLBERT_BATCH_ROUTE_MAX_TOKENS`). It
 /// persists one row per unit, and reading order is preserved only so build/rebuild
 /// logs and any downstream iteration are deterministic; unlike the annotation
 /// producers, ColBERT matrices are per-unit and order-independent for storage.
@@ -124,19 +116,15 @@ INSERT INTO unit_multivector_projections (
 /// Build the per-unit ColBERT multi-vector projection for one parse.
 ///
 /// Opens a `MultiVector` envelope (`building`), reads the parse's ordered
-/// ContentUnits, embeds each unit's evidence text under the caller-held gate —
-/// length-routed: batched windows for units at or below
-/// `COLBERT_BATCH_ROUTE_MAX_TOKENS`, the singular path above it — validates
-/// each matrix, encodes it, and inserts one `unit_multivector_projections` row
+/// ContentUnits, embeds each unit's evidence text through the selected backend,
+/// validates each matrix, encodes it, and inserts one `unit_multivector_projections` row
 /// per unit; on full success completes the envelope `fresh`. Any failure marks
 /// the envelope `failed` and returns the error, so the envelope's freshness
 /// always reflects the outcome.
 ///
-/// Gate: `_gate` is a borrow of the caller's `ModelCallPermit`, proving the
-/// exclusive model-call gate is held for the WHOLE batch (D-fact 9). This
-/// function neither acquires nor releases it; the caller's held permit governs
-/// every `embed_documents` and `embed_document` call below, and the gate is
-/// released when the caller drops the permit after the batch.
+/// Local calls require the caller's permit for the whole build and retain the
+/// length threshold between singular and batched inference. HTTP requires no
+/// permit and batches all units, avoiding one remote request per long unit.
 ///
 /// Rebuild idempotence: prior rows for the parse are deleted BEFORE inserting
 /// (see `DELETE_PARSE_MULTIVECTORS_SQL`), so `UNIQUE(parse_id, unit_id)` never
@@ -147,10 +135,20 @@ pub(crate) fn build_multivectors(
     tx: &Transaction<'_>,
     source_id: &str,
     parse_id: &str,
-    colbert_runtime: &ColbertRuntime,
+    colbert_runtime: &ColbertBackend,
     expected_dimension: usize,
-    _gate: &ModelCallPermit,
+    gate: Option<&ModelCallPermit>,
 ) -> Result<String, ApiError> {
+    // Enforce caller-side admission before touching rows: local inference must
+    // hold the accelerator permit, while HTTP must never hold it over a request.
+    if gate.is_some() != colbert_runtime.uses_local_model_gate() {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "ColBERT {:?} multi-vector build received incompatible model-call gate admission",
+                colbert_runtime.backend_kind(),
+            ),
+        });
+    }
     let started_at = Instant::now();
     let units = read_parse_units(tx, parse_id)?;
     let embeddable: Vec<UnitText> = units
@@ -166,6 +164,7 @@ pub(crate) fn build_multivectors(
 
     info!(
         event = "multivector_build.started",
+        backend = ?colbert_runtime.backend_kind(),
         source_id,
         parse_id,
         unit_count = embeddable.len(),
@@ -206,6 +205,7 @@ pub(crate) fn build_multivectors(
             envelope::complete_fresh(tx, &projection_id, None)?;
             info!(
                 event = "multivector_build.completed",
+                backend = ?colbert_runtime.backend_kind(),
                 // The enclosing owner reports durability after its commit.
                 persistence = "pending_commit",
                 source_id,
@@ -244,6 +244,7 @@ pub(crate) fn build_multivectors(
             )?;
             error!(
                 event = "multivector_build.failed",
+                backend = ?colbert_runtime.backend_kind(),
                 source_id,
                 parse_id,
                 projection_id = %projection_id,
@@ -259,8 +260,7 @@ pub(crate) fn build_multivectors(
 }
 
 /// Delete prior rows, then embed/validate/encode/insert one matrix per unit,
-/// length-routing each unit to the batched or singular embed path
-/// (`COLBERT_BATCH_ROUTE_MAX_TOKENS`) and returning the build totals for the
+/// length-routing local units while batching all HTTP units, then returning totals for the
 /// completion log (safe aggregates — never matrix values, which are forbidden
 /// in logs). Split out so `build_multivectors` can wrap the whole payload write
 /// in a single success/failure envelope transition.
@@ -269,7 +269,7 @@ fn build_rows(
     source_id: &str,
     parse_id: &str,
     projection_id: &str,
-    colbert_runtime: &ColbertRuntime,
+    colbert_runtime: &ColbertBackend,
     expected_dimension: usize,
     units: &[UnitText],
 ) -> Result<BuildRowsTotals, ApiError> {
@@ -285,7 +285,7 @@ fn build_rows(
     let now = utc_now()?;
     let mut total_tokens = 0usize;
 
-    // Hybrid routing (CPd length-threshold ruling, 2026-07-18): count each
+    // Local hybrid routing (CPd length-threshold ruling, 2026-07-18): count each
     // unit's ColBERT tokens once and split the parse into a batched pool
     // (short units, embedded in windows) and a singular pool (long units,
     // embedded one at a time) — batched embedding is measurably SLOWER past
@@ -305,8 +305,11 @@ fn build_rows(
     }
     let mut batched_indices: Vec<usize> = Vec::new();
     let mut singular_indices: Vec<usize> = Vec::new();
+    // The threshold measures local accelerator padding cost. Remote serving
+    // owns that execution cost, so batch every HTTP unit to avoid per-unit RTTs.
+    let local_routing = colbert_runtime.uses_local_model_gate();
     for (index, &token_length) in token_lengths.iter().enumerate() {
-        if token_length <= COLBERT_BATCH_ROUTE_MAX_TOKENS {
+        if !local_routing || token_length <= COLBERT_BATCH_ROUTE_MAX_TOKENS {
             batched_indices.push(index);
         } else {
             singular_indices.push(index);
@@ -347,8 +350,8 @@ fn build_rows(
     });
 
     for window in batched_indices.chunks(COLBERT_DOCUMENT_BATCH_WINDOW) {
-        // One batched forward per window under the caller-held gate (the permit
-        // borrowed by build_multivectors). embed_documents self-logs ONE
+        // One batch per window, holding the caller's gate only for local
+        // inference. embed_documents self-logs ONE
         // model_call.* pair with batch-level fields (text_count, summed chars,
         // summed true token count) — no per-unit unit_id at this boundary.
         let batch: Vec<(&str, &str)> = window

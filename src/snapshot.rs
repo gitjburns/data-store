@@ -70,6 +70,9 @@ use crate::primitives::utc_now;
 
 pub(crate) mod verify;
 
+/// Manifest payload identity shared by archival, verification, and restoration.
+pub(crate) const SECTION_DENSE_PAYLOAD_TYPE: &str = "section_dense_payload";
+
 /// Log-event namespace for this module's boundary logs and the namespace passed
 /// to the shared hot-plane transaction helpers, so every snapshot log line and
 /// transaction boundary is attributable to snapshot minting.
@@ -390,6 +393,7 @@ fn mint(
         retrieval_projections = counts.retrieval_projections as u64,
         chunk_projections = counts.chunk_projections as u64,
         dense_blobs = counts.dense_blobs as u64,
+        section_dense_payloads = counts.section_dense_payloads as u64,
         multivector_blobs = counts.multivector_blobs as u64,
         deletion_evidence_rows = counts.deletion_evidence_rows as u64,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -447,6 +451,7 @@ struct ArchivedCounts {
     retrieval_projections: usize,
     chunk_projections: usize,
     dense_blobs: usize,
+    section_dense_payloads: usize,
     multivector_blobs: usize,
     deletion_evidence_rows: usize,
 }
@@ -535,6 +540,9 @@ fn build_and_archive_manifest(
     retrieval_projections.push(multivector_meta);
     let multivector_blob_count = multivector_blobs.len();
     retrieval_indexes.extend(multivector_blobs);
+    let section_payloads = reference_section_dense_payloads(connection, store)?;
+    let section_dense_payloads = section_payloads.len();
+    retrieval_indexes.extend(section_payloads);
 
     // --- Sealed policies/profiles serialized at snapshot time (§30.4
     // assemblyPolicies/retrievalProfiles/capabilityProfiles). These are
@@ -654,6 +662,7 @@ fn build_and_archive_manifest(
         retrieval_projections: retrieval_projection_count(&manifest, "retrieval_projections"),
         chunk_projections: retrieval_projection_count(&manifest, "chunk_projections"),
         dense_blobs: dense_blob_count,
+        section_dense_payloads,
         multivector_blobs: multivector_blob_count,
         deletion_evidence_rows: manifest
             .deletion_records
@@ -668,6 +677,73 @@ fn build_and_archive_manifest(
     let manifest_value = json_value_of(&manifest)?;
     let manifest_ref = store.put_json(&manifest_value)?;
     Ok((manifest_ref, counts))
+}
+
+/// Pin immutable section payloads explicitly: envelope URIs alone are not a
+/// manifest dependency and would otherwise escape completeness/hash checks.
+fn reference_section_dense_payloads(
+    connection: &Connection,
+    store: &ArtifactStore,
+) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
+    use crate::projections::section_dense::{SECTION_DENSE_INDEX_NAME, SectionDensePlane};
+    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
+    let mut refs = Vec::new();
+    for record in records {
+        if record.get("index_name").and_then(Value::as_str) != Some(SECTION_DENSE_INDEX_NAME) {
+            continue;
+        }
+        let Some(uri) = record.get("payload_uri").and_then(Value::as_str) else {
+            // A building/failed attempt has no completed representation to archive.
+            if matches!(
+                record.get("freshness_status").and_then(Value::as_str),
+                Some("building" | "failed")
+            ) {
+                continue;
+            }
+            return Err(ApiError::StorageOperation {
+                message: "section dense projection has no payload URI".to_owned(),
+            });
+        };
+        let stored = store.reference_for_uri(uri)?;
+        let plane: SectionDensePlane = serde_json::from_slice(&store.get_bytes(&stored.hash)?)
+            .map_err(|source| ApiError::StorageOperation {
+                message: format!("invalid section dense payload {}: {source}", stored.hash),
+            })?;
+        let plane = crate::projections::section_dense::read_section_payload(
+            store,
+            uri,
+            &plane.source_id,
+            &plane.parse_id,
+            plane.dimension,
+        )?;
+        crate::projections::section_dense::validate_plane(connection, &plane)?;
+        if record.get("source_id").and_then(Value::as_str) != Some(plane.source_id.as_str())
+            || record.get("parse_id").and_then(Value::as_str) != Some(plane.parse_id.as_str())
+        {
+            return Err(ApiError::StorageOperation {
+                message: "section dense envelope/payload ownership mismatch".to_owned(),
+            });
+        }
+        let mut metadata = BTreeMap::new();
+        metadata.insert("projectionId".to_owned(), record["id"].clone());
+        metadata.insert("sourceId".to_owned(), Value::String(plane.source_id));
+        metadata.insert("parseId".to_owned(), Value::String(plane.parse_id));
+        metadata.insert("windowCount".to_owned(), Value::from(plane.windows.len()));
+        metadata.insert("dimension".to_owned(), Value::from(plane.dimension));
+        metadata.insert("policyHash".to_owned(), Value::String(plane.policy_hash));
+        refs.push(SnapshotArtifactRef {
+            artifact_type: SECTION_DENSE_PAYLOAD_TYPE.to_owned(),
+            uri: stored.uri,
+            hash: stored.hash,
+            format: Some("json".to_owned()),
+            created_at: record
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            metadata: Some(metadata),
+        });
+    }
+    Ok(refs)
 }
 
 /// The archived record count of the `retrieval_projections` section's JSONL ref

@@ -333,7 +333,10 @@ when the request set `debug: true`:
       "retrievalProvenance": {
         "channels": ["dense"],
         "annotationContribution": "none",
-        "matchedUnits": [{"unitId": "...", "channels": ["dense"], "graphMatches": []}],
+        "matchedUnits": [{
+          "unitId": "...", "channels": ["dense"], "graphMatches": [],
+          "denseMatches": [{"representation": "passage", "chunkId": "...", "sectionWindowId": null, "sectionId": null, "sectionPath": []}]
+        }],
         "contextUnitIds": []
       }
     }
@@ -387,12 +390,23 @@ passage citations remain present.
 | --- | --- | --- |
 | `channels` | array of `dense`, `lexical`, `graph` | Union of the retained matches' channel memberships. |
 | `annotationContribution` | `none`, `overlap`, `additional_matches` | No retained graph match; every retained graph match also occurs in another channel; or at least one retained unit occurs only in graph. |
-| `matchedUnits` | array | Final-passage units admitted to the fused pool, each with `unitId`, `channels`, and `graphMatches`. |
+| `matchedUnits` | array | Final-passage units admitted to the fused pool, each with `unitId`, `channels`, `graphMatches`, and `denseMatches`. |
 | `contextUnitIds` | array of string | Remaining passage units, added as surrounding context. |
 
 Membership is checked against this query's eligible, capped channel lists and
 the final merged passage. It does not establish which passages would survive
 with a channel disabled or measure answer-quality improvement.
+
+Each `denseMatches` entry has `representation` (`passage` or `section`),
+`chunkId`, `sectionWindowId`, `sectionId` (nullable strings), and `sectionPath`
+(array of headings). Section matches identify the window that nominated the
+unit; `chunkId` identifies its best fine-grained match. A null `sectionId` on
+a section match denotes document-scoped content without a section heading.
+
+Dense retrieval combines direct passage and section-guided ranks before outer
+channel fusion. Its diagnostic `score` is the inner RRF score, not raw cosine.
+Queries return `503 service_unavailable` with rebuild instructions when any
+scoped active parse lacks the required passage/section cache data.
 
 Each `graphMatches` entry has `matchedEntity` (normalized name), `matchClass`
 (`exact`, `acronym`, `token_prefix`), and `kind` (`direct_mention`,
@@ -488,7 +502,7 @@ always), `sourceId` (string, always), `parseId` (string, always), `unitIds`
 `score` (number, always), `rank` (integer, omitted when absent),
 `matchedProjectionId` (string, omitted when absent), `matchedAnnotationId`
 (string, omitted when absent), `explanation` (string, omitted when absent),
-`graphMatches` (array, always; the same path records used in result provenance).
+`graphMatches` and `denseMatches` (arrays, always; the same path records used in result provenance).
 A fused record's `channel` is representative; `channelHits` preserves every
 eligible channel membership.
 
@@ -887,6 +901,10 @@ both required:
 
 A failure on the restore path surfaces on the polled Operation as `failed` with
 error kind `restore_failed` (`500`).
+
+Snapshots without the required passage and section dense projections are
+rejected before restore writes. Valid section payloads are restored from
+verified artifacts, never regenerated through model calls.
 
 **Response `202`** — `{ operationId }`.
 

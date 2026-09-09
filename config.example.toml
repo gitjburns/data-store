@@ -161,7 +161,11 @@ max_tokens = 8192
 #api_key_file_path = ".data-store-dense-api-key"
 
 [models.colbert]
-# Local ColBERT-Zero model directory.
+# Select local Candle inference or a vLLM token-embedding endpoint; no fallback.
+# HTTP inference uses local tokenization and CPU MaxSim, without local model weights.
+# When all retrieval backends are HTTP, [inference] does not initialize an accelerator.
+backend = "local"
+# Required for local; forbidden for HTTP.
 path = "/absolute/path/to/colbert-zero"
 # Expected ColBERT token-vector dimension.
 dimension = 128
@@ -169,6 +173,18 @@ dimension = 128
 query_max_tokens = 512
 # Maximum encoded document/unit tokens for ColBERT document embedding.
 document_max_tokens = 512
+
+# HTTP backend: set backend = "http", remove path above, and set all four fields.
+# Full /pooling route; no URL credentials, query parameters, or fragment.
+#endpoint = "http://colbert-host:8000/pooling"
+# Model served with ColBERTModernBertModel and the token_embed pooling task.
+#model = "lightonai/ColBERT-Zero"
+# Absolute path to tokenizer.json from the same served checkpoint; no weights needed.
+#tokenizer_file_path = "/absolute/path/to/colbert-zero/tokenizer.json"
+# Whole-request HTTP timeout in seconds.
+#timeout_seconds = 60
+# Optional HTTP-only owner-only bearer-key file; relative to this config directory.
+#api_key_file_path = ".data-store-colbert-api-key"
 
 [models.reranker]
 # Reranker backend selection. There is no fallback between backends; the

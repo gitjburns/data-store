@@ -1468,8 +1468,10 @@ async fn post_activate(
         "parse_activation",
         move || {
             let dense_dimension = state_for_task.config.models.dense.dimension as usize;
+            let store = crate::artifact_store::ArtifactStore::open(&task_index_root)?;
             let decision = crate::activation::gate_and_activate(
                 &task_index_root,
+                &store,
                 state_for_task.cutover_registry(),
                 state_for_task.dense_cache(),
                 dense_dimension,
@@ -1520,8 +1522,10 @@ async fn post_accept(
         "parse_activation",
         move || {
             let dense_dimension = state_for_task.config.models.dense.dimension as usize;
+            let store = crate::artifact_store::ArtifactStore::open(&task_index_root)?;
             let decision = crate::activation::accept_held_parse(
                 &task_index_root,
+                &store,
                 state_for_task.cutover_registry(),
                 state_for_task.dense_cache(),
                 dense_dimension,

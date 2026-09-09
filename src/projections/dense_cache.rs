@@ -16,10 +16,8 @@
 //! never interleaves with another publish of the same source.
 //!
 //! Ephemeral vs durable (spec §8.4): the durable source of truth is the
-//! `chunk_dense_vectors` table; a plane in this cache is DERIVED from those rows
-//! and is fully rebuildable from them. Caches are excluded from snapshots (spec
-//! §8.4), so this state is never persisted and never replayed — it is rebuilt
-//! by re-reading the durable rows through C6c-1's loader.
+//! `chunk_dense_vectors` table and immutable section artifacts. The cache is
+//! derived from both and reconstructed without inference at startup and restore.
 //!
 //! Parallel-array layout (approved design fact): a plane stores its vectors as
 //! PARALLEL ARRAYS — one contiguous row-major `Vec<f32>` of length n*dim, a
@@ -46,8 +44,10 @@ use std::time::Instant;
 use rusqlite::Connection;
 use tracing::{debug, error, info};
 
+use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
 use crate::projections::dense::load_dense_vectors_for_parse;
+use crate::projections::section_dense::{SectionDensePlane, load_section_dense};
 
 /// One immutable loaded dense plane for a single active parse, stored as
 /// parallel arrays (see the module-level layout note). Once built the plane is
@@ -75,6 +75,9 @@ pub(crate) struct DensePlane {
     /// Embedding dimension: the stride into `vectors` and the length of every
     /// row. Uniform across the plane (a mismatch fails in C6c-1's loader).
     dimension: usize,
+    // Both representations share one immutable publication. None identifies a
+    // legacy parse explicitly; query execution must require an operator rebuild.
+    sections: Option<SectionDensePlane>,
 }
 
 impl DensePlane {
@@ -89,6 +92,7 @@ impl DensePlane {
     fn from_rows(
         rows: Vec<crate::projections::dense::StoredDenseVectorRow>,
         dimension: usize,
+        sections: Option<SectionDensePlane>,
     ) -> Self {
         let mut vectors = Vec::with_capacity(rows.len() * dimension);
         let mut chunk_ids = Vec::with_capacity(rows.len());
@@ -105,6 +109,7 @@ impl DensePlane {
             chunk_ids,
             norms,
             dimension,
+            sections,
         }
     }
 
@@ -134,6 +139,11 @@ impl DensePlane {
     /// norm of row `i`, reused by the cosine scorer.
     pub(crate) fn norms(&self) -> &[f32] {
         &self.norms
+    }
+
+    /// Return the section representation captured in the same cache publication.
+    pub(crate) fn sections(&self) -> Option<&SectionDensePlane> {
+        self.sections.as_ref()
     }
 }
 
@@ -203,12 +213,12 @@ impl DenseCache {
     /// scoring against it undisturbed — a swap is tear-free because a plane is
     /// immutable and readers hold their own `Arc` (see `snapshot_for_parse`).
     ///
-    /// No model calls and no gate: this LOADS persisted vectors (a pure SQLite
-    /// read via C6c-1's loader, which takes no model gate). The rows are already
-    /// validated by the loader, so no re-validation happens here.
+    /// Load persisted vectors and section artifacts without model calls. Both
+    /// loaders validate their representation before the single cache swap.
     pub(crate) fn load_parse(
         &self,
         conn: &Connection,
+        store: &ArtifactStore,
         parse_id: &str,
         expected_dimension: usize,
     ) -> Result<(), ApiError> {
@@ -235,7 +245,16 @@ impl DenseCache {
             }
         };
         let row_count = rows.len();
-        let plane = Arc::new(DensePlane::from_rows(rows, expected_dimension));
+        let sections =
+            load_section_dense(conn, store, parse_id, expected_dimension).map_err(|error| {
+                error!(event = "dense_cache.load.failed", parse_id, expected_dimension,
+                error = %error, elapsed_ms = started.elapsed().as_millis() as u64,
+                "active section dense plane load failed; cache not published");
+                error
+            })?;
+        let section_window_count = sections.as_ref().map_or(0, |plane| plane.windows.len());
+        let section_projection_present = sections.is_some();
+        let plane = Arc::new(DensePlane::from_rows(rows, expected_dimension, sections));
 
         // Swap under the lock: a single map insert replacing any prior plane.
         // Held only for this pointer move, never across the load above.
@@ -247,6 +266,8 @@ impl DenseCache {
             event = "dense_cache.load.completed",
             parse_id,
             vector_count = row_count,
+            section_window_count,
+            section_projection_present,
             dimension = expected_dimension,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "active dense plane loaded and swapped in"

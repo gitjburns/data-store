@@ -717,6 +717,15 @@ function graphMatchMarkup(match) {
   return `${path} — ${esc(kinds[match.kind] || match.kind)} via ${entity}`;
 }
 
+/** Describe the discovery representation; a section's fine chunk only ranks its nominees. */
+function denseMatchDescription(match) {
+  if (match.representation === 'passage') return 'Direct passage match';
+  if (match.representation !== 'section') return `Dense match: ${match.representation}`;
+  if (match.sectionId == null) return 'Document-scoped context match';
+  const path = Array.isArray(match.sectionPath) ? match.sectionPath.join(' / ') : '';
+  return `Section-guided match: ${path || match.sectionId}`;
+}
+
 /**
  * Present server-owned candidate attribution without deriving contribution from
  * merged passage channels. Preview deduplication affects display only: the unit
@@ -736,7 +745,20 @@ function retrievalProvenanceMarkup(provenance) {
   const matchedUnits = Array.isArray(provenance.matchedUnits) ? provenance.matchedUnits : [];
   const contextUnits = Array.isArray(provenance.contextUnitIds) ? provenance.contextUnitIds : [];
   const explanations = new Set();
+  const denseExplanations = new Set();
   const unitRows = matchedUnits.map((unit) => {
+    const denseMatches = Array.isArray(unit.denseMatches) ? unit.denseMatches : [];
+    const denseMarkup = denseMatches.map((match) => {
+      const description = denseMatchDescription(match);
+      denseExplanations.add(description);
+      // Window/chunk identifiers have no detail endpoint. Preserve them as text;
+      // only canonical section identifiers link to the existing unit view.
+      const section = match.sectionId ? `<div>Section: ${unitLink(match.sectionId)}</div>` : '';
+      const window = match.sectionWindowId
+        ? `<div>Section window: <code>${esc(match.sectionWindowId)}</code></div>` : '';
+      const chunk = match.chunkId ? `<div>Passage chunk: <code>${esc(match.chunkId)}</code></div>` : '';
+      return `<li>${esc(description)}${section}${window}${chunk}</li>`;
+    }).join('');
     const matches = Array.isArray(unit.graphMatches) ? unit.graphMatches : [];
     const matchMarkup = matches.map((match) => {
       const explanation = graphMatchMarkup(match);
@@ -749,6 +771,7 @@ function retrievalProvenanceMarkup(provenance) {
     return [
       unitLink(unit.unitId),
       retrievalChannelsMarkup(unit.channels),
+      denseMarkup ? `<ul class="retrieval-matches">${denseMarkup}</ul>` : escOr(null),
       matchMarkup ? `<ul class="retrieval-matches">${matchMarkup}</ul>` : escOr(null),
     ];
   });
@@ -756,17 +779,22 @@ function retrievalProvenanceMarkup(provenance) {
     .map((explanation) => `<li>${explanation}</li>`).join('');
   const additional = explanations.size > 3
     ? `<p>${esc(explanations.size - 3)} more annotation matches in retrieval details.</p>` : '';
+  const densePreview = Array.from(denseExplanations).slice(0, 3)
+    .map((description) => `<li>${esc(description)}</li>`).join('');
+  const denseAdditional = denseExplanations.size > 3
+    ? `<p>${esc(denseExplanations.size - 3)} more dense match descriptions in retrieval details.</p>` : '';
   const contextNote = contextUnits.length > 0
     ? `<p>${esc(contextUnits.length)} passage units added as context; no retrieval match is attributed to them.</p>`
     : '';
   return `<div class="retrieval-provenance">
     <div><strong>Matched by:</strong> ${retrievalChannelsMarkup(provenance.channels)}</div>
+    ${densePreview ? `<div><strong>Dense retrieval:</strong><ul class="retrieval-matches">${densePreview}</ul></div>` : ''}${denseAdditional}
     <p><strong>Annotation contribution:</strong> ${esc(contribution)}</p>
     ${preview ? `<ul class="retrieval-matches">${preview}</ul>` : ''}${additional}${contextNote}
     <details class="evidence-detail">
       <summary>Retrieval details</summary>
       <p>Candidate matches describe how units entered retrieval, not whether annotations improved the result.</p>
-      ${dataTable(['Matched unit', 'Matched by', 'Annotation matches'], unitRows)}
+      ${dataTable(['Matched unit', 'Matched by', 'Dense matches', 'Annotation matches'], unitRows)}
       ${contextUnits.length > 0 ? `<p>Context units: ${idListMarkup(contextUnits, unitLink)}</p>` : ''}
       ${jsonTree(provenance, 'Complete retrieval provenance', 0)}
     </details>
@@ -1042,7 +1070,7 @@ function latencyMarkup(latencies) {
 /**
  * Preserve each candidate record's fields in both retrieval diagnostic tables.
  * A fused record keeps one representative channel; it cannot describe overlap.
- * Optional graph paths supplement the original notes rather than replacing them.
+ * Dense representation evidence and graph paths supplement the original notes.
  */
 function retrievalHitsMarkup(pool, title, channelHeading) {
   if (!Array.isArray(pool) || pool.length === 0) return '';
@@ -1057,6 +1085,8 @@ function retrievalHitsMarkup(pool, title, channelHeading) {
       .join('<br />');
     const matches = Array.isArray(hit.graphMatches) && hit.graphMatches.length > 0
       ? jsonTree(hit.graphMatches, 'Graph matches', 0) : '';
+    const denseMatches = Array.isArray(hit.denseMatches) && hit.denseMatches.length > 0
+      ? jsonTree(hit.denseMatches, 'Dense matches', 0) : '';
     return [
       escOr(hit.rank),
       badge(hit.channel || 'unknown'),
@@ -1065,7 +1095,8 @@ function retrievalHitsMarkup(pool, title, channelHeading) {
       formatScore(hit.score),
       sourceLink(hit.sourceId),
       idListMarkup(hit.unitIds, unitLink),
-      notes === '' && matches === '' ? escOr(null) : notes + matches,
+      notes === '' && matches === '' && denseMatches === ''
+        ? escOr(null) : notes + matches + denseMatches,
     ];
   });
   return `<h3 class="subhead">${esc(title)}</h3>${dataTable(

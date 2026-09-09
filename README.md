@@ -305,6 +305,13 @@ This attribution is available without `debug`; it describes candidate matches,
 not a measured improvement in retrieval quality. Web retrieval details retain
 unit mappings and supporting references.
 
+Dense retrieval uses both passage vectors and section-heading/content vectors.
+Results identify direct passage and section-guided matches. Existing indexes
+require an explicit `data-store --config config.toml --rebuild-all` from the
+project root: this clears indexed state and artifacts and reingests the corpus.
+Until rebuilt, queries against old parses report that section embeddings are
+missing. Pre-feature snapshots cannot restore the new dense representation.
+
 The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
 `query-raw`) with the same query text to print the complete response JSON. Raw
 output does not automatically enable request diagnostics.

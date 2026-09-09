@@ -38,15 +38,16 @@ use crate::projections::graph::{
 use crate::projections::lexical::match_chunks;
 use crate::query::model::{RetrievalChannel, RetrievalHit, RetrievalHitType};
 use crate::query::profile::RetrievalProfile;
-use crate::query::provenance::{GraphMatch, GraphReach, GraphRelationship, MatchClass};
+use crate::query::provenance::{
+    DenseRepresentation, DenseRetrievalMatch, GraphMatch, GraphReach, GraphRelationship, MatchClass,
+};
 
 /// One scope-captured active parse the C7d pipeline hands the channels. It
 /// carries both identifiers a `RetrievalHit` needs (`source_id`, `parse_id`)
 /// and, for the dense channel, the `Arc<DensePlane>` snapshot C7d captured for
 /// this parse INSIDE the read transaction (via `DenseCache::snapshot_for_parse`)
-/// so capture and scoring share one WAL snapshot. `dense_plane` is `None` when
-/// the parse has no loaded dense plane (never activated a dense projection, or
-/// evicted); the dense channel skips such parses without error.
+/// so capture and scoring share one WAL snapshot. Capture rejects missing
+/// passage or section planes before any retrieval stage can run.
 ///
 /// This is the sole scope surface the channels see: reading only the parses in
 /// the passed `&[CapturedParse]` IS the scope mechanism (§6, §38). C7b-2's graph
@@ -81,9 +82,9 @@ struct LexicalChunkHit {
     source_id: String,
 }
 
-/// Dense retrieval channel (§24.3): exact cosine of `query_vector` against the
-/// captured `Arc<DensePlane>` snapshots, one per in-scope parse. Emits up to
-/// `limit` chunk-grained hits per parse, highest similarity first.
+/// Score captured fine chunks once, highest cosine first. The direct branch
+/// takes its existing global shortlist; section nomination reuses all scores so
+/// passages outside that shortlist can still be discovered through a section.
 ///
 /// DP1/scope: reads only the captured planes on the passed parses — no
 /// connection is opened here, no out-of-scope parse is scanned. Cosine reuses
@@ -95,7 +96,6 @@ fn dense_channel(
     query_id: &str,
     parses: &[CapturedParse],
     query_vector: &[f32],
-    limit: usize,
 ) -> Vec<DenseChunkHit> {
     let started_at = Instant::now();
     let query_norm = l2_norm(query_vector);
@@ -136,14 +136,10 @@ fn dense_channel(
                     source_id: parse.source_id.clone(),
                 });
             }
-            // Bound per parse to `limit`, most similar first, before merging.
-            parse_hits.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
-            parse_hits.truncate(limit);
             hits.extend(parse_hits);
         }
-        // Merge across parses and keep the global top `limit` by similarity.
+        // Preserve the fine branch's cosine ordering before its separate cap.
         hits.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
-        hits.truncate(limit);
     }
 
     debug!(
@@ -151,7 +147,6 @@ fn dense_channel(
         query_id,
         parse_count = parses.len(),
         hit_count = hits.len(),
-        limit,
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "dense channel candidate generation completed"
     );
@@ -375,6 +370,204 @@ fn resolve_lexical_to_units(
         .collect()
 }
 
+/// Section nominations retain their first (best section-rank, then unit-rank)
+/// occurrence; duplicate windows must not give a unit extra fusion votes.
+struct SectionNominations {
+    units: Vec<String>,
+    evidence: HashMap<String, DenseRetrievalMatch>,
+    window_count: usize,
+    section_units_without_fine_vectors: usize,
+}
+
+/// Rank section windows globally, then nominate only canonical units actually
+/// inside each window using their strongest fine-chunk match. All reads retain
+/// the captured transaction; crossing a section through a shared fine chunk
+/// cannot nominate the chunk's other units.
+fn section_nominations(
+    conn: &Connection,
+    parses: &[CapturedParse],
+    query_vector: &[f32],
+    best_chunks: &HashMap<&str, &DenseChunkHit>,
+    owners: &mut HashMap<String, CandidateUnit>,
+    profile: &RetrievalProfile,
+) -> Result<SectionNominations, ApiError> {
+    let query_norm = l2_norm(query_vector);
+    let mut windows = Vec::new();
+    for parse in parses {
+        let plane = parse.dense_plane.as_ref().ok_or_else(|| ApiError::ServiceUnavailable {
+            message: format!("source {} parse {} requires rebuilding passage and section dense projections; run data-store --config <config-path> --rebuild-all", parse.source_id, parse.parse_id),
+        })?;
+        let sections = plane.sections().ok_or_else(|| ApiError::ServiceUnavailable {
+            message: format!("source {} parse {} requires rebuilding section dense projections; run data-store --config <config-path> --rebuild-all", parse.source_id, parse.parse_id),
+        })?;
+        if sections.source_id != parse.source_id
+            || sections.parse_id != parse.parse_id
+            || sections.dimension != query_vector.len()
+            || plane.dimension() != query_vector.len()
+        {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "dense projection ownership or query dimension mismatch for source {} parse {}",
+                    parse.source_id, parse.parse_id
+                ),
+            });
+        }
+        if query_norm <= 0.0 || !query_norm.is_finite() {
+            continue;
+        }
+        for window in &sections.windows {
+            let dot: f32 = window
+                .vector
+                .iter()
+                .zip(query_vector)
+                .map(|(left, right)| left * right)
+                .sum();
+            let similarity = dot / (window.norm * query_norm);
+            if !similarity.is_finite() {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "non-finite section cosine for window {} in parse {}",
+                        window.window_id, parse.parse_id
+                    ),
+                });
+            }
+            windows.push((similarity, parse, window));
+        }
+    }
+    windows.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.parse_id.cmp(&right.1.parse_id))
+            .then_with(|| left.2.window_id.cmp(&right.2.window_id))
+    });
+    windows.truncate(profile.section_candidate_limit as usize);
+    let mut output = SectionNominations {
+        units: Vec::new(),
+        evidence: HashMap::new(),
+        window_count: windows.len(),
+        section_units_without_fine_vectors: 0,
+    };
+    for (_, parse, window) in windows {
+        let mut candidates = Vec::new();
+        for unit_id in &window.input_unit_ids {
+            validate_candidate_unit(conn, owners, unit_id, &parse.source_id, &parse.parse_id)?;
+            if !owners[unit_id].eligible {
+                continue;
+            }
+            let Some(chunk) = best_chunks.get(unit_id.as_str()) else {
+                // Section context includes code and short leaves that the fine
+                // chunker excludes. Without a fine cosine these units cannot
+                // seed a section-guided passage, but their context is retained.
+                output.section_units_without_fine_vectors += 1;
+                continue;
+            };
+            if chunk.source_id != parse.source_id || chunk.parse_id != parse.parse_id {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "section window {} unit {unit_id} has a fine chunk from another source or parse",
+                        window.window_id
+                    ),
+                });
+            }
+            candidates.push((unit_id, *chunk));
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .similarity
+                .total_cmp(&left.1.similarity)
+                .then_with(|| left.0.cmp(right.0))
+        });
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        candidates.truncate(profile.section_passages_per_window as usize);
+        for (unit_id, chunk) in candidates {
+            if output.evidence.contains_key(unit_id) {
+                continue;
+            }
+            output.units.push(unit_id.clone());
+            output.evidence.insert(
+                unit_id.clone(),
+                DenseRetrievalMatch {
+                    representation: DenseRepresentation::Section,
+                    chunk_id: Some(chunk.chunk_id.clone()),
+                    section_window_id: Some(window.window_id.clone()),
+                    section_id: window.section_id.clone(),
+                    section_path: window.section_path.clone(),
+                },
+            );
+        }
+    }
+    Ok(output)
+}
+
+/// Combine two unit lists with equal-weight RRF, retaining a single dense vote
+/// for outer fusion. Similarity now stores the inner RRF score, not a cosine.
+fn merge_dense_representations(
+    direct: &[DenseMatch],
+    sections: &[String],
+    profile: &RetrievalProfile,
+) -> Vec<DenseMatch> {
+    let mut scores: HashMap<&str, f64> = HashMap::new();
+    for (rank, unit_id) in direct
+        .iter()
+        .map(|matched| matched.unit_id.as_str())
+        .enumerate()
+        .chain(sections.iter().map(String::as_str).enumerate())
+    {
+        *scores.entry(unit_id).or_default() += 1.0 / (f64::from(profile.rrf_k) + (rank + 1) as f64);
+    }
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    ranked.truncate(profile.default_max_candidates_per_channel as usize);
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, (unit_id, score))| DenseMatch {
+            unit_id: unit_id.to_owned(),
+            similarity: score as f32,
+            rank: index + 1,
+        })
+        .collect()
+}
+
+/// Attribute only admitted direct candidates and deduplicated section nominations;
+/// scoring a fine chunk for section ordering alone is not direct discovery.
+fn dense_evidence(
+    direct: &[DenseMatch],
+    direct_chunks: &[DenseChunkHit],
+    chunk_unit_map: &HashMap<String, Vec<String>>,
+    sections: SectionNominations,
+) -> HashMap<String, Vec<DenseRetrievalMatch>> {
+    let mut evidence: HashMap<String, Vec<DenseRetrievalMatch>> = direct
+        .iter()
+        .map(|matched| (matched.unit_id.clone(), Vec::new()))
+        .collect();
+    for chunk in direct_chunks {
+        if let Some(units) = chunk_unit_map.get(&chunk.chunk_id) {
+            for unit in units {
+                if let Some(matches) = evidence.get_mut(unit) {
+                    matches.push(DenseRetrievalMatch {
+                        representation: DenseRepresentation::Passage,
+                        chunk_id: Some(chunk.chunk_id.clone()),
+                        section_window_id: None,
+                        section_id: None,
+                        section_path: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    for (unit_id, matched) in sections.evidence {
+        evidence.entry(unit_id).or_default().push(matched);
+    }
+    for matches in evidence.values_mut() {
+        matches.sort();
+        matches.dedup();
+    }
+    evidence
+}
+
 /// Build a unit-grained hit only after canonical ownership has been verified.
 fn unit_hit(
     unit_id: &str,
@@ -396,6 +589,7 @@ fn unit_hit(
         matched_annotation_id: None,
         explanation: None,
         graph_matches: Vec::new(),
+        dense_matches: Vec::new(),
     }
 }
 
@@ -434,7 +628,8 @@ pub(crate) fn fused_channels(
     // Preserve the failed read stage across every early return from fusion.
     let mut stage = "lexical_retrieval";
     let result: Result<ChannelFusionOutcome, ApiError> = (|| {
-        let dense_hits = dense_channel(query_id, parses, query_vector, candidate_limit);
+        let all_dense_hits = dense_channel(query_id, parses, query_vector);
+        let dense_hits = &all_dense_hits[..all_dense_hits.len().min(candidate_limit)];
         let lexical_hits = lexical_channel(conn, query_id, parses, query_text, candidate_limit)?;
 
         // Grain-change boundary: chunk-grained hits → unit-grained matches. Fusion
@@ -442,15 +637,15 @@ pub(crate) fn fused_channels(
         stage = "chunk_unit_mapping";
         let chunk_unit_map = load_chunk_unit_map(conn, parses)?;
         stage = "unit_ownership";
-        let owners = build_unit_owner_index(
+        let mut owners = build_unit_owner_index(
             conn,
             parses,
-            &dense_hits,
+            dense_hits,
             &lexical_hits,
             graph_hits,
             &chunk_unit_map,
         )?;
-        let mut dense_matches = resolve_dense_to_units(&dense_hits, &chunk_unit_map);
+        let mut dense_matches = resolve_dense_to_units(dense_hits, &chunk_unit_map);
         let mut lexical_matches = resolve_lexical_to_units(&lexical_hits, &chunk_unit_map);
         let dense_units_before_filter = dense_matches.len();
         let lexical_units_before_filter = lexical_matches.len();
@@ -469,6 +664,60 @@ pub(crate) fn fused_channels(
         for (index, matched) in lexical_matches.iter_mut().enumerate() {
             matched.rank = index + 1;
         }
+        stage = "section_dense_retrieval";
+        // All fine chunks are cosine-sorted. Keeping the first occurrence gives
+        // each unit its best fine score without expanding section target mappings.
+        let mut best_chunks = HashMap::new();
+        for chunk in &all_dense_hits {
+            let units =
+                chunk_unit_map
+                    .get(&chunk.chunk_id)
+                    .ok_or_else(|| ApiError::StorageOperation {
+                        message: format!(
+                            "dense chunk {} has no input-unit mapping in parse {}",
+                            chunk.chunk_id, chunk.parse_id
+                        ),
+                    })?;
+            for unit_id in units {
+                best_chunks.entry(unit_id.as_str()).or_insert(chunk);
+            }
+        }
+        let section_started = Instant::now();
+        info!(
+            event = "query.channel.section_dense.started",
+            query_id,
+            section_limit = profile.section_candidate_limit,
+            passages_per_window = profile.section_passages_per_window,
+            "section-guided dense candidate generation started"
+        );
+        let sections = section_nominations(
+            conn,
+            parses,
+            query_vector,
+            &best_chunks,
+            &mut owners,
+            profile,
+        )?;
+        let direct_units = dense_matches.len();
+        let section_units = sections.units.len();
+        let section_windows = sections.window_count;
+        let section_units_without_fine_vectors = sections.section_units_without_fine_vectors;
+        let combined_dense = merge_dense_representations(&dense_matches, &sections.units, profile);
+        let dense_provenance =
+            dense_evidence(&dense_matches, dense_hits, &chunk_unit_map, sections);
+        dense_matches = combined_dense;
+        info!(
+            event = "query.channel.section_dense.completed",
+            query_id,
+            fine_chunks_scored = all_dense_hits.len(),
+            direct_units,
+            section_windows,
+            section_units,
+            combined_dense_units = dense_matches.len(),
+            section_units_without_fine_vectors,
+            elapsed_ms = section_started.elapsed().as_millis() as u64,
+            "passage and section candidates merged into one dense channel"
+        );
         let mut graph_eligible = Vec::new();
         let mut graph_seen = std::collections::HashSet::new();
         let mut graph_excluded = 0;
@@ -497,13 +746,15 @@ pub(crate) fn fused_channels(
         // must not erase the graph traversal evidence or lexical/dense attribution.
         let mut channel_hits = Vec::new();
         for matched in &dense_matches {
-            channel_hits.push(unit_hit(
+            let mut hit = unit_hit(
                 &matched.unit_id,
                 &owners[&matched.unit_id],
                 RetrievalChannel::Dense,
                 f64::from(matched.similarity),
                 matched.rank,
-            ));
+            );
+            hit.dense_matches = dense_provenance[&matched.unit_id].clone();
+            channel_hits.push(hit);
         }
         for matched in &lexical_matches {
             channel_hits.push(unit_hit(
@@ -532,6 +783,9 @@ pub(crate) fn fused_channels(
                     matched.score,
                     matched.rank,
                 );
+                if matched.dense_rank.is_some() {
+                    hit.dense_matches = dense_provenance[&matched.unit_id].clone();
+                }
                 if matched.graph_rank.is_some()
                     && let Some(graph) = graph_eligible
                         .iter()
@@ -1102,6 +1356,7 @@ fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> Retriev
         matched_annotation_id: None,
         explanation: Some(explanation),
         graph_matches: candidate.graph_matches.iter().cloned().collect(),
+        dense_matches: Vec::new(),
     }
 }
 

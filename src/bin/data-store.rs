@@ -26,8 +26,8 @@ mod serve;
 #[path = "../query/provenance.rs"]
 mod provenance;
 use provenance::{
-    AnnotationContribution, GraphMatch, GraphReach, MatchClass, RetrievalChannel,
-    RetrievalProvenance,
+    AnnotationContribution, DenseRepresentation, DenseRetrievalMatch, GraphMatch, GraphReach,
+    MatchClass, RetrievalChannel, RetrievalProvenance,
 };
 
 const PROMPT: &str = "data-store> ";
@@ -2055,6 +2055,17 @@ fn render_retrieval_provenance(provenance: Option<&RetrievalProvenance>) {
     };
     let channels: Vec<&str> = provenance.channels.iter().map(channel_label).collect();
     println!("  Matched by: {}", channels.join(" · "));
+    // Group display descriptions across merged units; raw output keeps the
+    // exact unit, fine-chunk, and section-window references for every match.
+    let dense_descriptions: std::collections::BTreeSet<String> = provenance
+        .matched_units
+        .iter()
+        .flat_map(|unit| &unit.dense_matches)
+        .map(dense_match_description)
+        .collect();
+    for description in dense_descriptions {
+        println!("  Dense retrieval: {description}");
+    }
     let contribution = match provenance.annotation_contribution {
         AnnotationContribution::None => "No annotation-based candidate matches in this passage",
         AnnotationContribution::Overlap => {
@@ -2077,6 +2088,25 @@ fn render_retrieval_provenance(provenance: Option<&RetrievalProvenance>) {
     }
     if !provenance.context_unit_ids.is_empty() {
         println!("  Includes surrounding context beyond the retrieved matches");
+    }
+}
+
+/// Describe section discovery without inventing headings for document-scoped
+/// windows or implying that the fine chunk independently supplied a section hit.
+fn dense_match_description(matched: &DenseRetrievalMatch) -> String {
+    match matched.representation {
+        DenseRepresentation::Passage => "Direct passage match".to_owned(),
+        DenseRepresentation::Section => match &matched.section_id {
+            None => "Document-scoped context match".to_owned(),
+            Some(section_id) => {
+                let section = if matched.section_path.is_empty() {
+                    section_id.clone()
+                } else {
+                    matched.section_path.join(" / ")
+                };
+                format!("Section-guided match: {section}")
+            }
+        },
     }
 }
 

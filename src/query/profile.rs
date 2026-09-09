@@ -20,7 +20,7 @@
 //! abstract shape does not name (`rrf_k`,
 //! `colbert_candidate_pool_size`, `reranker_candidate_pool_size`,
 //! `graph_hop_budget`) are added as additional profile fields and covered by
-//! the same self-hash. Candidate budgets and passage ranking use the sealed v2
+//! the same self-hash. Candidate budgets and passage ranking use the sealed v3
 //! values; the graph hop budget remains one.
 
 use std::sync::OnceLock;
@@ -76,6 +76,10 @@ pub(crate) struct RetrievalProfile {
     pub(crate) max_top_k: u32,
     /// Reciprocal-rank-fusion rank constant `k` (RRF `1/(k+rank)`).
     pub(crate) rrf_k: u32,
+    /// Global section-window shortlist before nomination of canonical units.
+    pub(crate) section_candidate_limit: u32,
+    /// Eligible units nominated per section window by their best fine-chunk cosine.
+    pub(crate) section_passages_per_window: u32,
     /// Fused-pool size fed to ColBERT MaxSim re-scoring.
     pub(crate) colbert_candidate_pool_size: u32,
     /// Minimum passage candidate depth for final reranking; requests for more
@@ -115,8 +119,8 @@ pub(crate) fn active_profile() -> Result<&'static RetrievalProfile, ApiError> {
     }
 }
 
-/// Seal retrieval v2: candidate generation stays independent of result count,
-/// all three channels participate in RRF, and final ranking evaluates passages.
+/// Seal retrieval v3: passage and section lists fuse inside the dense channel,
+/// which retains one vote alongside lexical and graph in outer RRF.
 ///
 /// `created_at` is a FIXED authoring timestamp, not runtime state: this is a
 /// versioned document whose identity (id + version + hash) must be stable
@@ -127,7 +131,7 @@ fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
     let candidate_pool = 100;
     let mut profile = RetrievalProfile {
         id: "retrieval-profile".to_string(),
-        version: "2".to_string(),
+        version: "3".to_string(),
 
         // MVP channel set: dense, lexical, graph (multi_vector channel deferred
         // post-MVP, 2026-07-15 rescope).
@@ -146,12 +150,14 @@ fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
         default_top_k: default_results,
         max_top_k: MAX_QUERY_RESULTS as u32,
         rrf_k: 60,
+        section_candidate_limit: 20,
+        section_passages_per_window: 5,
         colbert_candidate_pool_size: candidate_pool,
         reranker_candidate_pool_size: 30,
         graph_hop_budget: 1,
 
         // Fixed authoring timestamp of this versioned document; see fn comment.
-        created_at: "2026-09-06T00:00:00.000Z".to_string(),
+        created_at: "2026-09-08T00:00:00.000Z".to_string(),
         profile_hash: String::new(),
     };
     // Self-hash over the document minus its own hash field (spec §16.2 rules);

@@ -164,6 +164,36 @@ impl DenseEmbeddingRuntime {
         )]
     }
 
+    /// Section artifacts record complete model input. Reject text that the local
+    /// dense tokenizer would truncate; existing fine-passage behavior is unchanged.
+    pub(crate) fn embed_complete_passage_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
+        let mut tokenizer = self.tokenizer.clone();
+        tokenizer.with_truncation(None).map_err(|source| {
+            inference_error(format!(
+                "failed to disable dense token counter truncation: {source}"
+            ))
+        })?;
+        tokenizer.with_padding(None);
+        let tokens = tokenizer
+            .encode(format_dense_passage_text(text), true)
+            .map_err(|source| {
+                inference_error(format!("dense section tokenization failed: {source}"))
+            })?
+            .len();
+        let limit = self
+            .tokenizer
+            .get_truncation()
+            .map_or(self.max_tokens, |truncation| {
+                truncation.max_length.min(self.max_tokens)
+            });
+        if tokens > limit {
+            return Err(inference_error(format!(
+                "dense section input requires {tokens} dense-model tokens, exceeding local limit {limit}; refusing truncated section embedding"
+            )));
+        }
+        self.embed_passage_vector(text)
+    }
+
     /// Embed a retrieval unit as a passage and return its dense vector.
     // Consumed by the dense builder's Local arm (projections/dense.rs
     // build_all_chunks) and the dense-batch-diagnostic bin's dtype validation.
