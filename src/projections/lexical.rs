@@ -135,6 +135,8 @@ pub(crate) fn build_lexical_index(
             envelope::complete_fresh(tx, &projection_id, None)?;
             info!(
                 event = "projection.build.completed",
+                // The enclosing owner reports durability after its commit.
+                persistence = "pending_commit",
                 projection_type = "lexical_document",
                 projection_id = %projection_id,
                 source_id,

@@ -224,7 +224,7 @@ pub(crate) fn register_policy_version(
         // Unchanged: the latest recorded content already matches, so the
         // append-only log gets no new row and no event. Report the standing
         // version without advancing it.
-        info!(
+        tracing::debug!(
             event = "policy.version_unchanged",
             policy_id = %policy_id,
             version = *latest_version,
@@ -271,10 +271,11 @@ pub(crate) fn register_policy_version(
 
     info!(
         event = "policy.version_advanced",
+        committed = connection.is_autocommit(),
         policy_id = %policy_id,
         version = next_version,
         content_hash = %content_hash,
-        "policy content changed; appended new version"
+        "policy version and audit event written; committed field reflects transaction ownership"
     );
 
     Ok(RegisteredVersion {

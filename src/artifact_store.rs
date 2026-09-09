@@ -93,7 +93,7 @@ impl ArtifactStore {
                 ),
             }
         })?;
-        info!(
+        tracing::debug!(
             event = "artifact_store.opened",
             root = %root.display(),
             "artifact store root ready"
@@ -116,7 +116,7 @@ impl ArtifactStore {
         // cheap integrity proxy here; full byte verification happens on read.
         if let Ok(existing) = fs::metadata(&path) {
             if existing.len() == incoming_size {
-                info!(
+                tracing::debug!(
                     event = "artifact_store.blob_deduplicated",
                     hash,
                     path = %path.display(),
@@ -180,7 +180,7 @@ impl ArtifactStore {
         let path = self.blob_path(hash);
         // Start-boundary log so a read that hangs or dies (filesystem stall,
         // process kill) is attributable to this blob from the log alone.
-        info!(
+        tracing::debug!(
             event = "artifact_store.blob_read_started",
             hash,
             path = %path.display(),
@@ -192,6 +192,7 @@ impl ArtifactStore {
                 hash,
                 path = %path.display(),
                 error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "blob read failed"
             );
             ApiError::StorageOperation {
@@ -222,7 +223,7 @@ impl ArtifactStore {
                 ),
             });
         }
-        info!(
+        tracing::debug!(
             event = "artifact_store.blob_read",
             hash,
             path = %path.display(),

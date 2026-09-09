@@ -260,6 +260,8 @@ impl RerankerRuntime {
                 content: SMOKE_DISTRACTOR_DOCUMENT.to_string(),
             },
         ];
+        let context = crate::util::model_call_context("reranker", "startup_smoke_scoring");
+        let _entered = context.enter();
         let smoke_started_at = Instant::now();
         info!(
             event = "model_call.started",
@@ -388,6 +390,8 @@ impl RerankerRuntime {
     where
         F: FnMut(u64, u64) -> Result<(), ApiError>,
     {
+        let context = crate::util::model_call_context("reranker", "candidate_batch_scoring");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let query_chars = query.chars().count();
         let document_chars = candidates
@@ -557,6 +561,8 @@ impl RerankerRuntime {
         query_chars: usize,
         candidate: &TokenizedRerankerCandidate,
     ) -> Result<RerankerCandidateScore, ApiError> {
+        let context = crate::util::model_call_context("reranker", "candidate_pair_scoring");
+        let _entered = context.enter();
         let started_at = Instant::now();
         info!(
             event = "model_call.started",

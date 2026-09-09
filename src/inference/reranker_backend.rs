@@ -6,7 +6,7 @@ use std::{
 
 use reqwest::{StatusCode, blocking::Client};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     config::RerankerModelConfig,
@@ -78,6 +78,9 @@ struct HttpRerankRequest<'request> {
 #[derive(Debug, Deserialize)]
 struct HttpRerankResponse {
     results: Vec<HttpRerankResult>,
+    // Provider metadata is diagnostic-only and may be absent or nonstandard.
+    id: Option<serde_json::Value>,
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +302,8 @@ impl HttpRerankerClient {
     where
         F: FnMut(u64, u64) -> Result<(), ApiError>,
     {
+        let context = crate::util::model_call_context("reranker", call_purpose);
+        let _entered = context.enter();
         let started_at = Instant::now();
         let query_chars = query.chars().count();
         let document_chars = candidates
@@ -321,7 +326,7 @@ impl HttpRerankerClient {
         );
 
         let result = (|| -> Result<Vec<RerankerCandidateScore>, ApiError> {
-            info!(
+            debug!(
                 event = "model_call.input_ready",
                 model_role = "reranker",
                 adapter_mode = HTTP_RERANKER_MODE,
@@ -430,6 +435,7 @@ impl HttpRerankerClient {
         let response = match request_builder.send() {
             Ok(response) => response,
             Err(source) => {
+                let error_detail = crate::util::error_chain(&source);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "reranker",
@@ -440,12 +446,12 @@ impl HttpRerankerClient {
                     candidates = candidates.len(),
                     phase = "send_request",
                     elapsed_ms = http_started.elapsed().as_millis() as u64,
-                    error = %source,
+                    error = %error_detail,
                     "HTTP reranker request failed"
                 );
                 return Err(ApiError::InferenceInit {
                     message: format!(
-                        "HTTP reranker request to {} failed before response: {source}",
+                        "HTTP reranker request to {} failed before response: {error_detail}",
                         self.endpoint
                     ),
                 });
@@ -455,6 +461,7 @@ impl HttpRerankerClient {
         let body = match response.text() {
             Ok(body) => body,
             Err(source) => {
+                let error_detail = crate::util::error_chain(&source);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "reranker",
@@ -466,12 +473,12 @@ impl HttpRerankerClient {
                     http_status = status.as_u16(),
                     phase = "read_response_body",
                     elapsed_ms = http_started.elapsed().as_millis() as u64,
-                    error = %source,
+                    error = %error_detail,
                     "HTTP reranker request failed"
                 );
                 return Err(ApiError::InferenceInit {
                     message: format!(
-                        "HTTP reranker response body from {} could not be read: {source}",
+                        "HTTP reranker response body from {} could not be read: {error_detail}",
                         self.endpoint
                     ),
                 });
@@ -533,9 +540,13 @@ impl HttpRerankerClient {
             candidates = candidates.len(),
             http_status = status.as_u16(),
             scores = parsed.results.len(),
+            provider_response_id = parsed.id.as_ref().and_then(serde_json::Value::as_str),
+            prompt_tokens = parsed.usage.as_ref().and_then(|usage| usage.get("prompt_tokens")).and_then(serde_json::Value::as_u64),
+            total_tokens = parsed.usage.as_ref().and_then(|usage| usage.get("total_tokens")).and_then(serde_json::Value::as_u64),
             response_body_chars = body.chars().count(),
             elapsed_ms = http_started.elapsed().as_millis() as u64,
-            "HTTP reranker request completed"
+            result_state = "response_received_unvalidated",
+            "HTTP reranker response received; score validation pending"
         );
 
         Ok(parsed)

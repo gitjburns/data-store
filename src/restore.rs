@@ -295,6 +295,11 @@ pub(crate) fn complete_superseded_parse(
 ) -> Result<(), ApiError> {
     let started = Instant::now();
     let flow = cleanup_flow_label(&mode);
+    let cleanup_log = crate::util::LogContext::new("parse_cleanup", superseded_parse_id);
+    cleanup_log.record("source_id", source_id);
+    cleanup_log.record("parse_id", superseded_parse_id);
+    cleanup_log.record("trigger", flow);
+    let _cleanup_log = cleanup_log.enter();
     info!(
         event = "restore.cleanup_started",
         source_id, superseded_parse_id, flow, "superseded-parse archive-verify-delete starting"
@@ -378,6 +383,7 @@ pub(crate) fn complete_superseded_parse(
 
     info!(
         event = "restore.cleanup_completed",
+        committed = true,
         source_id,
         superseded_parse_id,
         flow,
@@ -749,6 +755,10 @@ pub(crate) fn restore_source_from_snapshot(
     parse_id: &str,
 ) -> Result<(), ApiError> {
     let started = Instant::now();
+    let restore_log = crate::util::LogContext::new("source_restore", source_id);
+    restore_log.record("source_id", source_id);
+    restore_log.record("parse_id", parse_id);
+    let _restore_log = restore_log.enter();
     info!(
         event = "restore.started",
         source_id, parse_id, "restore from ForensicSnapshot starting"
@@ -803,6 +813,18 @@ pub(crate) fn restore_source_from_snapshot(
         }
     };
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "restore")?;
+    // Durable restoration and in-memory publication can fail independently.
+    // Record the successful commit before entering the fallible cache boundary.
+    info!(
+        event = "restore.committed",
+        source_id,
+        parse_id,
+        snapshot_id = %snapshot.id,
+        committed = true,
+        dense_cache_published = false,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "snapshot rows restored and committed; dense cache publication pending"
+    );
 
     // Dense-cache publish, mirroring the activation publish invariant
     // (`activation::publish_dense_cache`, activation.rs) and MUST STAY IN STEP
@@ -816,7 +838,15 @@ pub(crate) fn restore_source_from_snapshot(
     // `deactivated_at` next) with no loaded dense plane is a broken publish.
     // The `connection` opened for the re-import is reused for the load read.
     let _barrier_guard = registry.acquire(source_id);
-    dense_cache.load_parse(&connection, parse_id, dense_dimension)?;
+    dense_cache
+        .load_parse(&connection, parse_id, dense_dimension)
+        .map_err(|source| {
+            error!(event = "restore.publish_failed", source_id, parse_id,
+            snapshot_id = %snapshot.id, committed = true, error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "snapshot rows committed but dense cache publication failed");
+            source
+        })?;
     // Barrier releases at guard drop (function return); the caller's flag-clear
     // runs after this returns Ok, so ordering is: durable commit → under-barrier
     // publish → (caller) flag-clear.

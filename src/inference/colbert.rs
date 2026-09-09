@@ -575,6 +575,8 @@ impl ColbertRuntime {
         unit_id: &str,
         document: &str,
     ) -> Result<ColbertDocumentEmbedding, ApiError> {
+        let context = crate::util::model_call_context("colbert", "document_embedding");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let document_chars = document.chars().count();
         info!(
@@ -658,6 +660,8 @@ impl ColbertRuntime {
         &self,
         units: &[(&str, &str)],
     ) -> Result<Vec<ColbertDocumentEmbedding>, ApiError> {
+        let context = crate::util::model_call_context("colbert", "document_embedding_batched");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let text_count = units.len();
         let document_chars: usize = units.iter().map(|(_, text)| text.chars().count()).sum();
@@ -789,6 +793,8 @@ impl ColbertRuntime {
     where
         F: FnMut(u64, u64) -> Result<(), ApiError>,
     {
+        let context = crate::util::model_call_context("colbert", "persisted_candidate_scoring");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let query_chars = query.chars().count();
         let document_tokens = candidates
@@ -3249,6 +3255,8 @@ fn run_colbert_startup_call<T, F>(
 where
     F: FnOnce() -> Result<T, ApiError>,
 {
+    let context = crate::util::model_call_context("colbert", diagnostics.call_purpose);
+    let _entered = context.enter();
     let started_at = Instant::now();
     log_colbert_startup_call_started(diagnostics);
     let result = call();

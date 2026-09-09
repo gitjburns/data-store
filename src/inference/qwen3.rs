@@ -88,6 +88,11 @@ impl Qwen3Model {
         tensor_prefix: Option<&str>,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
+        let context =
+            crate::util::LogContext::new("model_call", &crate::util::diagnostic_id("call"));
+        context.record("model_role", label);
+        context.record("call_purpose", "startup_model_load");
+        let _entered = context.enter();
         let started_at = Instant::now();
         info!(
             event = "model_call.started",

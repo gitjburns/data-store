@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rusqlite::Connection;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::error::ApiError;
 use crate::projections::dense::load_dense_vectors_for_parse;
@@ -296,7 +296,7 @@ impl DenseCache {
         } else {
             // Evicting an absent parse is a benign no-op (e.g. a source with no
             // dense plane), logged so an unexpected miss is still visible.
-            info!(
+            debug!(
                 event = "dense_cache.evict.absent",
                 parse_id, "dense plane eviction requested for a parse with no loaded plane"
             );

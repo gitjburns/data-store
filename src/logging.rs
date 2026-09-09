@@ -7,7 +7,7 @@ use std::{
 
 use tracing_subscriber::{
     filter::LevelFilter,
-    fmt::MakeWriter,
+    fmt::{MakeWriter, format::FmtSpan},
     layer::{Layer, SubscriberExt},
     util::SubscriberInitExt,
 };
@@ -67,12 +67,13 @@ pub fn init_file_logging(
         file: Arc::new(Mutex::new(file)),
     };
     let filter = config.level.to_level_filter();
-    // The default tracing formatter keeps logs human-readable and includes
-    // structured event fields such as event="search.completed" for grep.
+    // The existing formatter includes inherited work-context fields alongside
+    // events. Context spans are metadata, not additional start/close log records.
     let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
         .with_thread_ids(false)
+        .with_span_events(FmtSpan::NONE)
         .with_writer(writer)
         .with_filter(filter);
 

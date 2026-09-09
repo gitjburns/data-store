@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     config::DoclingConfig,
@@ -344,6 +344,10 @@ fn run_docling(
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     expected_artifact_path: PathBuf,
 ) -> Result<DoclingRunOutput, ApiError> {
+    let context =
+        crate::util::LogContext::new("external_process", &crate::util::diagnostic_id("docling"));
+    context.record("call_purpose", "document_conversion");
+    let _entered = context.enter();
     let DoclingLaunch {
         config,
         args,
@@ -465,7 +469,7 @@ fn run_docling(
         relative_source: relative_source.clone(),
         output_dir: output_dir_for_log.clone(),
     };
-    info!(
+    debug!(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
         pipe = stdout_context.label,
@@ -475,8 +479,10 @@ fn run_docling(
         output_dir = %stdout_context.output_dir,
         "Docling child output reader thread spawned"
     );
-    let stdout_reader =
-        thread::spawn(move || read_child_output(stdout, stdout_context, None, None));
+    let stdout_reader = thread::spawn(
+        crate::util::LogContext::current()
+            .wrap(move || read_child_output(stdout, stdout_context, None, None)),
+    );
     let stderr_context = DoclingChildOutputContext {
         label: "stderr",
         process_id,
@@ -484,7 +490,7 @@ fn run_docling(
         relative_source,
         output_dir: output_dir_for_log,
     };
-    info!(
+    debug!(
         event = "docling.child_output_reader.spawned",
         task_purpose = "read_docling_child_output",
         pipe = stderr_context.label,
@@ -496,14 +502,14 @@ fn run_docling(
     );
     let stderr_progress_sender = progress_sender.clone();
     let stderr_progress_state = progress_state.clone();
-    let stderr_reader = thread::spawn(move || {
+    let stderr_reader = thread::spawn(crate::util::LogContext::current().wrap(move || {
         read_child_output(
             stderr,
             stderr_context,
             stderr_progress_sender,
             Some(stderr_progress_state),
         )
-    });
+    }));
     let process_context = DoclingProcessContext {
         config,
         output_dir,
@@ -923,7 +929,7 @@ where
         output_dir,
     } = context;
     let started = Instant::now();
-    info!(
+    debug!(
         event = "docling.child_output_reader.started",
         task_purpose = "read_docling_child_output",
         pipe = label,
@@ -960,7 +966,7 @@ where
             }
         };
         if bytes_read == 0 {
-            info!(
+            debug!(
                 event = "docling.child_output_reader.completed",
                 task_purpose = "read_docling_child_output",
                 pipe = label,

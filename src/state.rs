@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     config::ServiceConfig,
@@ -930,7 +930,7 @@ pub(crate) fn acquire_model_call_gate_on(
     call_purpose: &'static str,
 ) -> Result<ModelCallPermit, ApiError> {
     let wait_started = Instant::now();
-    info!(
+    debug!(
         event = "model_gate.waiting",
         operation_id, model_role, call_purpose, "model execution gate wait started"
     );
@@ -951,7 +951,7 @@ pub(crate) fn acquire_model_call_gate_on(
         );
         return Err(error);
     }
-    info!(
+    debug!(
         event = "model_gate.acquired",
         operation_id,
         model_role,
@@ -972,7 +972,8 @@ pub(crate) fn acquire_model_call_gate_on(
 impl Drop for ModelCallPermit {
     /// Release exclusive model access and log the release side of the model-call boundary.
     fn drop(&mut self) {
-        info!(
+        self.gate.release();
+        debug!(
             event = "model_gate.released",
             operation_id = %self.operation_id,
             model_role = self.model_role,
@@ -980,7 +981,6 @@ impl Drop for ModelCallPermit {
             held_ms = self.acquired_at.elapsed().as_millis() as u64,
             "model execution gate released"
         );
-        self.gate.release();
     }
 }
 
@@ -990,13 +990,13 @@ impl Drop for CutoverBarrierGuard {
     /// with the hold duration — durable evidence that the §31.1 brevity
     /// contract (milliseconds) held.
     fn drop(&mut self) {
+        self.gate.release();
         info!(
             event = "cutover_barrier.released",
             source_id = %self.source_id,
             held_ms = self.acquired_at.elapsed().as_millis() as u64,
             "cutover barrier released"
         );
-        self.gate.release();
     }
 }
 

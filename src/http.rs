@@ -3,19 +3,20 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, MatchedPath, Path, Query, Request, State,
-        rejection::{JsonRejection, QueryRejection},
+        DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Query, Request, State,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, error, info, warn};
 
 use crate::maintenance::MaintenancePermit;
+use crate::util::LogContext;
 
 use crate::assembly::model::EvidencePack;
 use crate::inference::{ColbertCandidateScore, RerankerCandidateScore};
@@ -43,6 +44,64 @@ use crate::{
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+
+/// Preserve Axum's path response contract while recording pre-handler failures.
+struct DiagnosticPath<T>(T);
+
+impl<S, T> FromRequestParts<S> for DiagnosticPath<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = PathRejection;
+
+    /// Forward Axum's original rejection so its status and body remain unchanged.
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .inspect_err(|rejection| {
+                log_extraction_failed("path_extraction", rejection, rejection.status())
+            })
+    }
+}
+
+/// Preserve direct query extraction while attributing failures to the request.
+struct DiagnosticQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for DiagnosticQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = QueryRejection;
+
+    /// Log the cause without consuming, rewriting, or replacing Axum's rejection.
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .inspect_err(|rejection| {
+                log_extraction_failed("query_extraction", rejection, rejection.status())
+            })
+    }
+}
+
+/// Record extractor errors that return before a handler can log their cause.
+fn log_extraction_failed(
+    stage: &'static str,
+    rejection: &dyn std::error::Error,
+    status: StatusCode,
+) {
+    let error_chain = crate::util::error_chain(rejection);
+    if status.is_server_error() {
+        error!(event = "http.extraction.failed", stage, status = status.as_u16(),
+            reason = %rejection, error_chain, "HTTP request extraction failed");
+    } else {
+        warn!(event = "http.extraction.failed", stage, status = status.as_u16(),
+            reason = %rejection, error_chain, "HTTP request extraction rejected");
+    }
+}
 
 /// Build the Axum router for supported health and operation-control routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -97,6 +156,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             storage_admission,
         ))
+        .layer(middleware::from_fn(request_diagnostics))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
@@ -134,8 +194,58 @@ pub fn build_dry_run_router(state: Arc<AppState>) -> Router {
         .route("/annotations/vocabulary", get(get_annotation_vocabulary))
         .route("/shutdown", post(post_shutdown))
         .route("/operations/{operationId}", get(get_operation))
+        .layer(middleware::from_fn(request_diagnostics))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
+}
+
+/// Correlate admission, extractor rejection, blocking work, and response rendering.
+/// Instrument the future instead of entering a span across an async suspension.
+async fn request_diagnostics(request: Request, next: Next) -> Response {
+    let request_id = crate::ids::new_request_id();
+    let context = LogContext::new("request", &request_id);
+    context.record("trigger", "http_request");
+    context.record("method", request.method().as_str());
+    context.record("request_path", request.uri().path());
+    context.record(
+        "route",
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|path| path.as_str())
+            .unwrap_or("<unmatched>"),
+    );
+    context
+        .instrument(async move {
+            let started = Instant::now();
+            let response = next.run(request).await;
+            // This records response construction, not successful delivery to a client.
+            // Extractor failures can bypass handlers, so this boundary covers them too.
+            if response.status().is_server_error() {
+                error!(
+                    event = "http.response.ready",
+                    status = response.status().as_u16(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "HTTP error response ready"
+                );
+            } else if response.status().is_client_error() {
+                warn!(
+                    event = "http.response.ready",
+                    status = response.status().as_u16(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "HTTP request rejected"
+                );
+            } else {
+                debug!(
+                    event = "http.response.ready",
+                    status = response.status().as_u16(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "HTTP response ready"
+                );
+            }
+            response
+        })
+        .await
 }
 
 /// Retain admission through the complete handler even if its client disconnects:
@@ -191,7 +301,7 @@ async fn storage_admission(
         }
     };
     let task_route = route.clone();
-    match tokio::spawn(async move {
+    match tokio::spawn(LogContext::current().instrument(async move {
         let _permit = permit;
         let response = next.run(request).await;
         debug!(
@@ -201,7 +311,7 @@ async fn storage_admission(
             "admitted HTTP task finished"
         );
         response
-    })
+    }))
     .await
     {
         Ok(response) => response,
@@ -215,6 +325,15 @@ async fn storage_admission(
     }
 }
 
+/// Capture request correlation before a closure leaves its instrumented future.
+fn spawn_blocking_with_context<F, T>(work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(LogContext::current().wrap(work))
+}
+
 /// Drain and accept rebuild-all on a blocking boundary, then detach clearing.
 /// The middleware shields the initial wait from client cancellation. Acceptance
 /// waits for existing writers before persisting an Operation; health remains live.
@@ -226,14 +345,16 @@ async fn post_rebuild_all(
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
     let reserve_state = Arc::clone(&state);
-    let operation_id = tokio::task::spawn_blocking(move || crate::reset::reserve(&reserve_state))
+    let operation_id = spawn_blocking_with_context(move || crate::reset::reserve(&reserve_state))
         .await
         .map_err(|source| ApiError::InternalIo {
             message: format!("rebuild-all acceptance task failed to join: {source}"),
-        })?
+        })
+        .inspect_err(|source| log_route_failed(route, "acceptance_join", source, &started))?
         .inspect_err(|source| log_route_failed(route, "accepting", source, &started))?;
+    LogContext::current().record("operation_id", operation_id.as_str());
     let task_id = operation_id.clone();
-    tokio::task::spawn_blocking(move || crate::reset::run(&state, &task_id));
+    spawn_blocking_with_context(move || crate::reset::run(&state, &task_id));
     log_operation_accepted(route, "rebuild_all", &operation_id, &started);
     Ok((
         StatusCode::ACCEPTED,
@@ -263,7 +384,10 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 fn log_route_started(route: &'static str, stage: &'static str) -> Instant {
     let started = Instant::now();
     // Polling traces belong at DEBUG; query and admin lifecycle starts remain INFO.
-    if matches!(route, "/v1/health" | "/operations/{operationId}") {
+    if matches!(
+        route,
+        "/v1/health" | "/operations/{operationId}" | "/sync/status"
+    ) {
         debug!(
             event = "http.route.started",
             route,
@@ -295,6 +419,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let error_kind = self.error_kind();
         let message = self.to_string();
+        let error_chain = crate::util::error_chain(&self);
         let mut detail = self.operation_error_detail();
         // status_u16 only emits valid HTTP status codes; a conversion failure is
         // a programming error surfaced as a logged 500 instead of a panic.
@@ -320,7 +445,9 @@ impl IntoResponse for ApiError {
                 status = status.as_u16(),
                 error_kind,
                 error = %message,
-                "API error response"
+                error_chain,
+                stage = "error_response_rendering",
+                "API error response constructed; work outcome is recorded at its owning boundary"
             );
         } else {
             warn!(
@@ -328,7 +455,9 @@ impl IntoResponse for ApiError {
                 status = status.as_u16(),
                 error_kind,
                 error = %message,
-                "API error response"
+                error_chain,
+                stage = "error_response_rendering",
+                "API error response constructed"
             );
         }
         let body = ErrorBody { error: detail };
@@ -342,6 +471,7 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
     let status = error.status_u16();
     let error_kind = error.error_kind();
     let error_message = error.to_string();
+    let error_chain = crate::util::error_chain(error);
     if status >= 500 {
         error!(
             event = "http.route.failed",
@@ -350,6 +480,7 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
             status,
             error_kind,
             error = %error_message,
+            error_chain,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "HTTP route failed"
         );
@@ -361,6 +492,7 @@ fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, 
             status,
             error_kind,
             error = %error_message,
+            error_chain,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "HTTP route failed"
         );
@@ -578,7 +710,7 @@ async fn post_query(
     let state_for_blocking = Arc::clone(&state);
     let debug_requested = validated.debug;
     let join =
-        tokio::task::spawn_blocking(move || run_query_pipeline(&state_for_blocking, validated))
+        spawn_blocking_with_context(move || run_query_pipeline(&state_for_blocking, validated))
             .await;
 
     let outcome = match join {
@@ -645,6 +777,7 @@ fn run_query_pipeline(
     // random bytes); a mint failure fails the query loudly rather than falling
     // back to a non-unique id.
     let query_id = crate::ids::new_query_execution_record_id()?;
+    LogContext::current().record("query_id", query_id.as_str());
 
     // Resolve scope from the validated constraints (R3: both-present conjoins).
     let scope = resolve_scope(ScopeInput {
@@ -757,7 +890,11 @@ async fn insert_pending_operation(
     target_object_type: &'static str,
     target_object_id: String,
 ) -> Result<String, ApiError> {
-    let join = tokio::task::spawn_blocking(move || {
+    let started = Instant::now();
+    let context = LogContext::current();
+    context.record("target_object_type", target_object_type);
+    context.record("target_object_id", target_object_id.as_str());
+    let join = spawn_blocking_with_context(move || {
         crate::operations::insert_pending(
             &index_root,
             operation_type,
@@ -766,12 +903,21 @@ async fn insert_pending_operation(
         )
     })
     .await;
-    match join {
+    let result = match join {
         Ok(result) => result,
         Err(join_error) => Err(ApiError::InternalIo {
             message: format!("pending-operation insert task failed to join: {join_error}"),
         }),
+    };
+    match &result {
+        Ok(operation_id) => context.record("operation_id", operation_id.as_str()),
+        Err(source) => error!(event = "http.operation_insert.failed",
+            stage = "insert_pending_operation", error = %source,
+            error_chain = %crate::util::error_chain(source),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "operation acceptance failed; no operation ID returned"),
     }
+    result
 }
 
 /// Spawn the DETACHED work for one async admin Operation and pin the durability
@@ -797,7 +943,7 @@ fn spawn_admin_operation<F>(
 ) where
     F: FnOnce() -> Result<(), ApiError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_with_context(move || {
         // The HTTP response may already be gone; retain admission through the
         // terminal Operation write so rebuild-all cannot erase this task's data.
         let _permit = permit;
@@ -829,8 +975,8 @@ fn spawn_admin_operation<F>(
         );
 
         // Convert a panic in the domain work into a bounded `failed` terminal
-        // state: the load-bearing durability guarantee is that this task ALWAYS
-        // leaves the row terminal, panic included. `AssertUnwindSafe` is sound
+        // state. Terminal persistence may itself fail; its failure log preserves
+        // that unresolved outcome. `AssertUnwindSafe` is sound
         // here because a panic ends the task — no caught-across state is observed
         // after unwinding; the only post-panic action is the durable mark_failed.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
@@ -861,8 +1007,11 @@ fn spawn_admin_operation<F>(
                     status = error.status_u16(),
                     error_kind = error.error_kind(),
                     error = %error,
+                    error_chain = %crate::util::error_chain(&error),
+                    last_confirmed_operation_status = "running",
+                    work_effects = "see_domain_boundary_logs",
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "detached admin operation failed"
+                    "admin work failed; recording terminal operation failure"
                 );
                 mark_operation_failed(
                     operation_type,
@@ -926,6 +1075,10 @@ fn log_terminal_mark_failure(
         status = error.status_u16(),
         error_kind = error.error_kind(),
         error = %error,
+        error_chain = %crate::util::error_chain(error),
+        last_confirmed_operation_status = "running",
+        terminal_operation_status = "unknown",
+        next_action = "inspect_operation_and_domain_boundary_logs",
         elapsed_ms = started.elapsed().as_millis() as u64,
         "detached admin operation terminal transition failed"
     );
@@ -998,6 +1151,7 @@ async fn post_sources(
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
+    LogContext::current().record("source_paths", request.native_uri.as_str());
 
     // Lexical containment prescreen (ruled 2026-07-17): a nativeUri that is
     // not an absolute path under the corpus root, or that carries traversal
@@ -1127,15 +1281,17 @@ fn validate_parse_coordinate(
 /// coordinate actually re-parsed.
 async fn post_source_parses(
     State(state): State<Arc<AppState>>,
-    Path(source_id): Path<String>,
+    DiagnosticPath(source_id): DiagnosticPath<String>,
     headers: HeaderMap,
     payload: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/sources/{sourceId}/parses";
+    LogContext::current().record("source_id", source_id.as_str());
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
+    LogContext::current().record("source_paths", request.native_uri.as_str());
     let index_root = state.config.storage.index_root.clone();
 
     // Operation targetObjectId integrity (Option 1 ruling 2026-07-16): the path
@@ -1148,7 +1304,7 @@ async fn post_source_parses(
         let validate_source_id = source_id.clone();
         let validate_source_system = request.source_system.clone();
         let validate_native_uri = request.native_uri.clone();
-        let validation = tokio::task::spawn_blocking(move || {
+        let validation = spawn_blocking_with_context(move || {
             validate_parse_coordinate(
                 &validate_index_root,
                 &validate_source_id,
@@ -1159,7 +1315,8 @@ async fn post_source_parses(
         .await
         .map_err(|join_error| ApiError::InternalIo {
             message: format!("parse-coordinate validation task failed to join: {join_error}"),
-        })?;
+        })
+        .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?;
         if let Err(error) = validation {
             log_route_failed(route, "coordinate_validating", &error, &started);
             return Err(error);
@@ -1216,7 +1373,7 @@ async fn enqueue_ingest(
 ) -> Result<(), ApiError> {
     let enqueue_index_root = index_root.clone();
     let enqueue_operation_id = operation_id.to_owned();
-    let join = tokio::task::spawn_blocking(move || {
+    let join = spawn_blocking_with_context(move || {
         crate::scheduler::enqueue_coalesced(
             &enqueue_index_root,
             &source_system,
@@ -1249,7 +1406,7 @@ async fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &
     let detail = detail.to_owned();
     // Await within the cancellation-shielded HTTP task so its storage lease
     // also covers this last orphan-repair write.
-    let join = tokio::task::spawn_blocking(move || {
+    let join = spawn_blocking_with_context(move || {
         // mark_failed is `running`-guarded, so advance through `running` first —
         // the same sequence the drain's fail path uses for a still-pending row.
         if let Err(error) = crate::operations::mark_running(&index_root, &operation_id) {
@@ -1284,10 +1441,12 @@ async fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &
 async fn post_activate(
     State(state): State<Arc<AppState>>,
     Extension(permit): Extension<MaintenancePermit>,
-    Path((source_id, parse_id)): Path<(String, String)>,
+    DiagnosticPath((source_id, parse_id)): DiagnosticPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/sources/{sourceId}/parses/{parseId}/activate";
+    LogContext::current().record("source_id", source_id.as_str());
+    LogContext::current().record("parse_id", parse_id.as_str());
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
 
@@ -1335,10 +1494,11 @@ async fn post_activate(
 async fn post_accept(
     State(state): State<Arc<AppState>>,
     Extension(permit): Extension<MaintenancePermit>,
-    Path(parse_id): Path<String>,
+    DiagnosticPath(parse_id): DiagnosticPath<String>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/parses/{parseId}/accept";
+    LogContext::current().record("parse_id", parse_id.as_str());
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
 
@@ -1389,10 +1549,11 @@ async fn post_accept(
 async fn post_discard(
     State(state): State<Arc<AppState>>,
     Extension(permit): Extension<MaintenancePermit>,
-    Path(parse_id): Path<String>,
+    DiagnosticPath(parse_id): DiagnosticPath<String>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/parses/{parseId}/discard";
+    LogContext::current().record("parse_id", parse_id.as_str());
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
 
@@ -1772,11 +1933,13 @@ async fn get_parses(
     }
 
     let index_root = state.config.storage.index_root.clone();
-    let parses = tokio::task::spawn_blocking(move || read_held_parses(&index_root))
+    let parses = spawn_blocking_with_context(move || read_held_parses(&index_root))
         .await
         .map_err(|join_error| ApiError::InternalIo {
             message: format!("held-parse listing task failed to join: {join_error}"),
-        })??;
+        })
+        .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+        .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
 
     info!(
         event = "http.route.result_ready",
@@ -2082,11 +2245,13 @@ async fn get_annotation_vocabulary(
 
     let index_root = state.config.storage.index_root.clone();
     let response =
-        tokio::task::spawn_blocking(move || read_vocabulary(&index_root, annotation_type, scope))
+        spawn_blocking_with_context(move || read_vocabulary(&index_root, annotation_type, scope))
             .await
             .map_err(|join_error| ApiError::InternalIo {
                 message: format!("vocabulary aggregation task failed to join: {join_error}"),
-            })??;
+            })
+            .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+            .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
 
     // Handler-boundary log: bounded facts only — NEVER vocabulary text. Scope,
     // type, group/row counts, skips, truncation, elapsed (CA2 ruling 8, item 4).
@@ -2656,21 +2821,24 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
 /// row via the operations store; an absent id maps to a 404 (`NotFound`).
 async fn get_operation(
     State(state): State<Arc<AppState>>,
-    Path(operation_id): Path<String>,
+    DiagnosticPath(operation_id): DiagnosticPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<Operation>, ApiError> {
     let route = "/operations/{operationId}";
+    LogContext::current().record("operation_id", operation_id.as_str());
     let started = log_route_started(route, "authorizing");
     authorize_request(&state, &headers, route, &started)?;
 
     let index_root = state.config.storage.index_root.clone();
     let lookup_id = operation_id.clone();
     let operation =
-        tokio::task::spawn_blocking(move || crate::operations::get(&index_root, &lookup_id))
+        spawn_blocking_with_context(move || crate::operations::get(&index_root, &lookup_id))
             .await
             .map_err(|join_error| ApiError::InternalIo {
                 message: format!("operation read task failed to join: {join_error}"),
-            })??;
+            })
+            .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+            .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
     let Some(operation) = operation else {
         let error = ApiError::NotFound {
             message: format!("no operation {operation_id}"),
@@ -2699,18 +2867,22 @@ async fn get_operation(
 /// which is indistinguishable from absence at the API — both map to 404.
 async fn get_unit(
     State(state): State<Arc<AppState>>,
-    Path(unit_id): Path<String>,
+    DiagnosticPath(unit_id): DiagnosticPath<String>,
 ) -> Result<Json<ContentUnit>, ApiError> {
     let route = "/units/{unitId}";
+    LogContext::current().record("target_object_type", "unit");
+    LogContext::current().record("target_object_id", unit_id.as_str());
     let started = log_route_started(route, "reading");
 
     let index_root = state.config.storage.index_root.clone();
     let lookup_id = unit_id.clone();
-    let unit = tokio::task::spawn_blocking(move || read_active_unit(&index_root, &lookup_id))
+    let unit = spawn_blocking_with_context(move || read_active_unit(&index_root, &lookup_id))
         .await
         .map_err(|join_error| ApiError::InternalIo {
             message: format!("unit read task failed to join: {join_error}"),
-        })??;
+        })
+        .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+        .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
     let Some(unit) = unit else {
         return Err(not_found_logged(
             route,
@@ -2757,10 +2929,12 @@ struct RelationshipsResponse {
 /// parse is active on its source (same §14 gate as the unit read).
 async fn get_unit_relationships(
     State(state): State<Arc<AppState>>,
-    Path(unit_id): Path<String>,
-    Query(params): Query<RelationshipsQuery>,
+    DiagnosticPath(unit_id): DiagnosticPath<String>,
+    DiagnosticQuery(params): DiagnosticQuery<RelationshipsQuery>,
 ) -> Result<Json<RelationshipsResponse>, ApiError> {
     let route = "/units/{unitId}/relationships";
+    LogContext::current().record("target_object_type", "unit");
+    LogContext::current().record("target_object_id", unit_id.as_str());
     let started = log_route_started(route, "reading");
 
     let direction = match parse_direction(params.direction.as_deref()) {
@@ -2773,7 +2947,7 @@ async fn get_unit_relationships(
     let index_root = state.config.storage.index_root.clone();
     let lookup_id = unit_id.clone();
     let relationship_type = params.relationship_type.clone();
-    let relationships = tokio::task::spawn_blocking(move || {
+    let relationships = spawn_blocking_with_context(move || {
         read_active_unit_relationships(
             &index_root,
             &lookup_id,
@@ -2784,7 +2958,9 @@ async fn get_unit_relationships(
     .await
     .map_err(|join_error| ApiError::InternalIo {
         message: format!("relationships read task failed to join: {join_error}"),
-    })??;
+    })
+    .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+    .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
     let Some(relationships) = relationships else {
         return Err(not_found_logged(
             route,
@@ -2811,18 +2987,21 @@ async fn get_unit_relationships(
 /// location set and freshness. An absent source is a 404.
 async fn get_source(
     State(state): State<Arc<AppState>>,
-    Path(source_id): Path<String>,
+    DiagnosticPath(source_id): DiagnosticPath<String>,
 ) -> Result<Json<SourceObject>, ApiError> {
     let route = "/sources/{sourceId}";
+    LogContext::current().record("source_id", source_id.as_str());
     let started = log_route_started(route, "reading");
 
     let index_root = state.config.storage.index_root.clone();
     let lookup_id = source_id.clone();
-    let source = tokio::task::spawn_blocking(move || read_source(&index_root, &lookup_id))
+    let source = spawn_blocking_with_context(move || read_source(&index_root, &lookup_id))
         .await
         .map_err(|join_error| ApiError::InternalIo {
             message: format!("source read task failed to join: {join_error}"),
-        })??;
+        })
+        .inspect_err(|error| log_route_failed(route, "blocking_join", error, &started))?
+        .inspect_err(|error| log_route_failed(route, "storage_read", error, &started))?;
     let Some(source) = source else {
         return Err(not_found_logged(
             route,
@@ -2884,7 +3063,7 @@ impl From<SyncHealth> for SyncStatusResponse {
 async fn get_sync_status(State(state): State<Arc<AppState>>) -> Json<SyncStatusResponse> {
     let started = log_route_started("/sync/status", "reading");
     let response = SyncStatusResponse::from(state.sync_health_snapshot());
-    info!(
+    debug!(
         event = "http.route.result_ready",
         route = "/sync/status",
         stage = "result_ready",

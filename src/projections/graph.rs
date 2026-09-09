@@ -255,7 +255,7 @@ pub(crate) fn build_graph_projection(
     parse_id: &str,
 ) -> Result<String, ApiError> {
     let started = Instant::now();
-    info!(
+    debug!(
         event = "graph.build_started",
         source_id, parse_id, "graph projection build starting"
     );
@@ -348,6 +348,8 @@ pub(crate) fn build_graph_projection(
 
     info!(
         event = "graph.build_succeeded",
+        // The worker owns the transaction and its INFO commit outcome.
+        persistence = "pending_commit",
         source_id,
         parse_id,
         projection_id = %projection_id,

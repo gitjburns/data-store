@@ -250,6 +250,8 @@ pub(crate) fn execute_query(
             query_id,
             stage = "open_read",
             error = %error,
+            error_chain = %crate::util::error_chain(error),
+            elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
             "query pipeline failed opening the read connection"
         );
     })?;
@@ -264,6 +266,8 @@ pub(crate) fn execute_query(
             query_id,
             stage = "begin_read_transaction",
             error = %error,
+            error_chain = %crate::util::error_chain(error),
+            elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
             "query pipeline failed beginning the read transaction"
         );
     })?;
@@ -275,6 +279,9 @@ pub(crate) fn execute_query(
     // Run the body against `&*tx`. Split out so the snapshot-held log below fires
     // on BOTH success and failure — the read transaction drops when `tx` leaves
     // scope regardless of outcome (a read tx needs no commit).
+    // Advance only at stage boundaries so the terminal failure identifies the
+    // last attempted stage, including failures propagated by an early `?`.
+    let mut stage = "capture_active_set";
     let result = run_pipeline_body(
         &tx,
         registry,
@@ -289,21 +296,19 @@ pub(crate) fn execute_query(
         scope,
         request_ctx,
         &mut latencies,
+        &mut stage,
     );
 
-    // DP1 snapshot-held-duration log: emitted at the boundary where the read
-    // transaction completes for BOTH success and failure, because the pinned WAL
-    // snapshot blocked checkpointing for exactly this window either way.
+    // Release this query's snapshot before reporting it. Other readers can
+    // still constrain checkpoints; this event makes no global checkpoint claim.
+    drop(tx);
     latencies.snapshot_held_ms = snapshot_started_at.elapsed().as_millis() as u64;
     info!(
         event = "query.execute.snapshot_released",
         query_id,
         snapshot_held_ms = latencies.snapshot_held_ms,
-        "query WAL read snapshot released; checkpointing unblocked past this query"
+        "query WAL read transaction dropped"
     );
-    // `tx` drops here (read transaction: no commit needed), releasing the
-    // snapshot and the connection.
-    drop(tx);
 
     match result {
         Ok(mut outcome) => {
@@ -326,8 +331,9 @@ pub(crate) fn execute_query(
             error!(
                 event = "query.execute.failed",
                 query_id,
-                stage = "pipeline_body",
+                stage,
                 error = %error,
+                error_chain = %crate::util::error_chain(&error),
                 snapshot_held_ms = latencies.snapshot_held_ms,
                 elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
                 "query pipeline failed"
@@ -356,6 +362,7 @@ fn run_pipeline_body(
     scope: &ResolvedScope,
     request_ctx: QueryRequestContext,
     latencies: &mut QueryStageLatencies,
+    stage: &mut &'static str,
 ) -> Result<QueryPipelineOutcome, ApiError> {
     // === Capture the scope-filtered active set INSIDE the transaction (DP1),
     // then clone the dense planes for those parses. The SQLite active-set read
@@ -376,10 +383,12 @@ fn run_pipeline_body(
     // `execute_query` emits on every return. A barrier engaging AFTER this probe
     // passes is licensed §31.1 in-flight behavior: this query already holds a
     // consistent WAL read snapshot (DP1), so the cutover cannot tear its reads. ===
+    *stage = "cutover_barrier";
     for parse in &active {
         registry.reject_if_active(&parse.source_id)?;
     }
 
+    *stage = "capture_dense_planes";
     let captured = clone_dense_planes(dense_cache, active, query_id);
     latencies.capture_ms = capture_started_at.elapsed().as_millis() as u64;
     info!(
@@ -399,6 +408,7 @@ fn run_pipeline_body(
     // permit is acquired, so the exclusive gate is never held across the network
     // round-trip. `embed_query_vector` never acquires the gate itself. ===
     let embed_started_at = Instant::now();
+    *stage = "dense_query_embedding";
     let query_vector = if inference.dense.uses_local_model_gate() {
         let permit =
             acquire_model_call_gate_on(gate, query_id, DENSE_MODEL_ROLE, DENSE_CALL_PURPOSE)?;
@@ -415,6 +425,7 @@ fn run_pipeline_body(
     // Generate graph hits before fusion so they compete in the same bounded
     // three-channel pool instead of being appended after its cutoff.
     let graph_started_at = Instant::now();
+    *stage = "graph_retrieval";
     let graph_hits = graph_channel(
         conn,
         query_id,
@@ -426,6 +437,7 @@ fn run_pipeline_body(
     latencies.graph_ms = graph_started_at.elapsed().as_millis() as u64;
     // Candidate depth is independent of the requested final passage count.
     let fusion_started_at = Instant::now();
+    *stage = "dense_lexical_fusion";
     let top_k = request_ctx.max_final_evidence_units as usize;
     let fusion = fused_channels(
         conn,
@@ -462,6 +474,7 @@ fn run_pipeline_body(
     // persisted matrices (loaded on `conn`); the ColBERT query embed inside is
     // gated by the stage itself (not double-gated here). ===
     let maxsim_started_at = Instant::now();
+    *stage = "colbert_maxsim";
     let maxsim = run_maxsim_stage(
         &ctx,
         &inference.colbert,
@@ -474,6 +487,7 @@ fn run_pipeline_body(
     // Form distinct passages before final scoring. Larger requested result sets
     // raise passage candidate depth without exceeding the already-bounded seeds.
     let passage_started_at = Instant::now();
+    *stage = "passage_construction";
     let passage_limit = (profile.reranker_candidate_pool_size as usize)
         .max(top_k)
         .min(profile.colbert_candidate_pool_size as usize);
@@ -490,11 +504,13 @@ fn run_pipeline_body(
     // The final model evaluates the same passage and section context that will
     // be presented. Gate ownership remains inside the reranking boundary.
     let rerank_started_at = Instant::now();
+    *stage = "passage_reranking";
     let reranked = run_reranker_stage(&ctx, &inference.reranker, &passage_candidates)?;
     latencies.rerank_ms = rerank_started_at.elapsed().as_millis() as u64;
 
     // Final count applies here, after passage ranking. A score with an unknown
     // candidate identity is a protocol fault, never silently dropped evidence.
+    *stage = "passage_selection";
     let selected = reranked
         .iter()
         .take(top_k)
@@ -512,6 +528,7 @@ fn run_pipeline_body(
     // Canonical evidence and source citations are resolved before releasing this
     // snapshot, so the two response surfaces cannot disagree across a cutover.
     let assembly_started_at = Instant::now();
+    *stage = "evidence_assembly";
     let evidence_pack = assemble_evidence_pack(
         conn,
         inference,
@@ -523,6 +540,7 @@ fn run_pipeline_body(
     )?;
     // Candidates are retained for debug inspection; clone only the final
     // passages to produce independently owned presentation records.
+    *stage = "result_citations";
     let results = selected
         .into_iter()
         .map(|(candidate, score)| candidate.clone().into_result(conn, score))

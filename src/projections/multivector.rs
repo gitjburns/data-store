@@ -206,6 +206,8 @@ pub(crate) fn build_multivectors(
             envelope::complete_fresh(tx, &projection_id, None)?;
             info!(
                 event = "multivector_build.completed",
+                // The enclosing owner reports durability after its commit.
+                persistence = "pending_commit",
                 source_id,
                 parse_id,
                 projection_id = %projection_id,
@@ -224,7 +226,22 @@ pub(crate) fn build_multivectors(
             Ok(projection_id)
         }
         Err(source) => {
-            envelope::mark_failed(tx, &projection_id, &source.to_string())?;
+            // A secondary marker failure must not erase the original model or
+            // storage failure from the diagnostic record.
+            envelope::mark_failed(tx, &projection_id, &source.to_string()).inspect_err(
+                |mark_error| {
+                    error!(
+                        event = "multivector_build.failure_marker_failed",
+                        source_id,
+                        parse_id,
+                        projection_id = %projection_id,
+                        error = %source,
+                        mark_error = %mark_error,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "multi-vector build and failure marker both failed"
+                    );
+                },
+            )?;
             error!(
                 event = "multivector_build.failed",
                 source_id,

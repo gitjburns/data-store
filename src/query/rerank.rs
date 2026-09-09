@@ -131,7 +131,14 @@ pub(crate) fn run_maxsim_stage(
             parse_id,
             unit_ids,
             expected_dimension,
-        )?;
+        )
+        .inspect_err(|source| {
+            error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                parse_id, stage = "matrix_loading", candidate_count = unit_ids.len(),
+                error = %source, error_chain = %crate::util::error_chain(source),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "ColBERT candidate matrices could not be loaded");
+        })?;
         candidates.append(&mut loaded);
     }
 
@@ -140,17 +147,37 @@ pub(crate) fn run_maxsim_stage(
     // local ColBERT model, so this is a live local accelerator call. Acquire the
     // gate around the scoring call and drop the permit the instant it returns —
     // exactly the scheduler's colbert acquire discipline (`scheduler.rs`).
-    let scores = {
+    let gate_started = Instant::now();
+    let (scores, gate_wait_ms, scoring_ms) = {
         let permit = acquire_model_call_gate_on(
             ctx.gate,
             ctx.query_id,
             COLBERT_MODEL_ROLE,
             COLBERT_CALL_PURPOSE,
-        )?;
-        let scores = colbert.score_persisted_candidates(ctx.query, &candidates)?;
+        )
+        .inspect_err(|source| {
+            error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                stage = "model_gate", error = %source,
+                error_chain = %crate::util::error_chain(source),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "ColBERT scoring could not acquire the model gate");
+        })?;
+        let gate_wait_ms = gate_started.elapsed().as_millis() as u64;
+        let scoring_started = Instant::now();
+        let scores = colbert
+            .score_persisted_candidates(ctx.query, &candidates)
+            .inspect_err(|source| {
+                error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                    stage = "scoring", candidate_count = candidates.len(),
+                    error = %source, error_chain = %crate::util::error_chain(source),
+                    gate_wait_ms, scoring_ms = scoring_started.elapsed().as_millis() as u64,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "ColBERT MaxSim scoring failed");
+            })?;
+        let scoring_ms = scoring_started.elapsed().as_millis() as u64;
         // `permit` drops here, releasing the gate immediately after scoring.
         drop(permit);
-        scores
+        (scores, gate_wait_ms, scoring_ms)
     };
 
     info!(
@@ -158,6 +185,10 @@ pub(crate) fn run_maxsim_stage(
         query_id = ctx.query_id,
         parse_count = capped.len(),
         candidate_count,
+        loaded_candidates = candidates.len(),
+        missing_matrices = candidate_count.saturating_sub(candidates.len()),
+        gate_wait_ms,
+        scoring_ms,
         scored = scores.len(),
         colbert_candidate_pool_size,
         expected_dimension,
@@ -214,15 +245,26 @@ pub(crate) fn run_reranker_stage(
 
     // Gate boundary: acquire ONLY for the local accelerator path. The Http
     // branch performs no acquire, so the gate is never held across network I/O.
+    // Keep waiting separate from backend scoring; HTTP scoring includes the
+    // network round trip and is not a claim about provider inference time.
+    let mut gate_wait_ms = 0_u64;
+    let mut scoring_ms = None;
+    let mut failed_stage = "model_gate";
     let scoring_result = (|| {
         if uses_gate {
-            let permit = acquire_model_call_gate_on(
+            let gate_started = Instant::now();
+            let admission = acquire_model_call_gate_on(
                 ctx.gate,
                 ctx.query_id,
                 RERANKER_MODEL_ROLE,
                 RERANKER_CALL_PURPOSE,
-            )?;
+            );
+            gate_wait_ms = gate_started.elapsed().as_millis() as u64;
+            let permit = admission?;
+            failed_stage = "scoring";
+            let scoring_started = Instant::now();
             let scores = reranker.score_candidates(ctx.query, &inputs);
+            scoring_ms = Some(scoring_started.elapsed().as_millis() as u64);
             // `permit` drops here: the local reranker gate release follows scoring.
             drop(permit);
             scores
@@ -230,7 +272,11 @@ pub(crate) fn run_reranker_stage(
             // Http backend: no gate. Holding the model-call gate across the HTTP
             // request would serialize a network round-trip behind the exclusive
             // local-accelerator gate — forbidden (§1.5 gate discipline).
-            reranker.score_candidates(ctx.query, &inputs)
+            failed_stage = "scoring";
+            let scoring_started = Instant::now();
+            let scores = reranker.score_candidates(ctx.query, &inputs);
+            scoring_ms = Some(scoring_started.elapsed().as_millis() as u64);
+            scores
         }
     })();
     let scores = match scoring_result {
@@ -238,6 +284,9 @@ pub(crate) fn run_reranker_stage(
         Err(source) => {
             error!(
                 event = "rerank.final.failed",
+                stage = failed_stage,
+                gate_wait_ms,
+                scoring_ms,
                 query_id = ctx.query_id,
                 backend = reranker.kind(),
                 uses_local_model_gate = uses_gate,
@@ -245,6 +294,7 @@ pub(crate) fn run_reranker_stage(
                 input_char_count,
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 error = %source,
+                error_chain = %crate::util::error_chain(&source),
                 "passage reranking failed"
             );
             return Err(source);
@@ -253,6 +303,8 @@ pub(crate) fn run_reranker_stage(
 
     info!(
         event = "rerank.final.completed",
+        gate_wait_ms,
+        scoring_ms,
         query_id = ctx.query_id,
         backend = reranker.kind(),
         uses_local_model_gate = uses_gate,

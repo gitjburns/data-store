@@ -17,6 +17,7 @@
 //!   are bit-reproducible and unitId-ascending ordering is stable.
 //!
 //! Rebuilds re-import IDs from stored artifacts; IDs are never re-derived.
+//! Request diagnostic IDs are separate process-local handles, not canonical records.
 
 use crate::error::ApiError;
 use crate::primitives::current_time_ms;
@@ -107,6 +108,12 @@ pub(crate) fn new_sync_queue_entry_id() -> Result<String, ApiError> {
 /// operations store when it inserts a pending row (`operations::insert_pending`).
 pub(crate) fn new_operation_id() -> Result<String, ApiError> {
     new_prefixed_id("op_")
+}
+
+/// Correlate HTTP diagnostics within the process without introducing a durable
+/// record or a new request failure when clock/entropy services are unavailable.
+pub(crate) fn new_request_id() -> String {
+    crate::util::diagnostic_id("req")
 }
 
 /// Derive the deterministic ContentUnit ID for a unit at `sequence_index`

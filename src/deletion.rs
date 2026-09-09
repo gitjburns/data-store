@@ -287,6 +287,11 @@ fn deactivate_one_source(
     active_parse_id: &str,
 ) -> Result<(), ApiError> {
     let started = std::time::Instant::now();
+    let source_log = crate::util::LogContext::new("source_deactivation", source_id);
+    source_log.record("source_id", source_id);
+    source_log.record("parse_id", active_parse_id);
+    source_log.record("trigger", "last_current_location_deleted");
+    let _source_log = source_log.enter();
     info!(
         event = "deletion.source_deactivating",
         source_id,
@@ -503,7 +508,8 @@ fn restore_one_source(
     // Delegate to the shared restore→reactivate completion path (one source of
     // truth for the durable end state; §31.3 operator rollback in http.rs calls
     // the same wrapper). §11.4 reactivation carries the same_hash_reappearance
-    // reason. On Err the source stays deactivated and no flag-clear happened.
+    // reason. A late publish failure can occur after durable reactivation, so
+    // the error boundary must not claim that the flag remained unchanged.
     if let Err(source) = restore_and_reactivate_source(
         index_root,
         registry,
@@ -519,7 +525,7 @@ fn restore_one_source(
             active_parse_id,
             error = %source,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "restore-and-reactivate failed; source stays deactivated, flag not cleared"
+            "restore-and-reactivate failed; consult committed restore and cache publication boundaries"
         );
         return Err(source);
     }
@@ -765,12 +771,13 @@ fn access_lost_body(
 
         info!(
             event = "deletion.location_access_lost",
+            committed = false,
             source_location_id = location_id,
             source_system,
             native_uri,
             source_object_id,
             acquisition_record_id,
-            "location transitioned to access_lost: source-side scan failure"
+            "access_lost transition staged: source-side scan failure"
         );
         count += 1;
     }

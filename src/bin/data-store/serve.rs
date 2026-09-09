@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post},
 };
 
-use super::{ClientContext, read_admin_token, url};
+use super::{ClientContext, ClientRequestDiagnostic, read_admin_token, url};
 
 // Assets are embedded at compile time (SPEC-web-ui.md §3): the serve binary must
 // not depend on a working directory or an installed asset tree.
@@ -265,20 +265,36 @@ async fn run_passthrough<F>(method: &'static str, proxy_path: String, hop: F) ->
 where
     F: FnOnce() -> Result<(StatusCode, String)> + Send + 'static,
 {
+    let diagnostic = ClientRequestDiagnostic::new();
+    // The browser receives the upstream body unchanged; local correlation belongs
+    // to console diagnostics, and elapsed time includes blocking-pool waiting.
     match tokio::task::spawn_blocking(hop).await {
         Ok(Ok((status, body))) => {
-            println!("serve proxy {method} {proxy_path} -> {}", status.as_u16());
+            println!(
+                "serve proxy {method} {proxy_path} -> {} local_request_id={} elapsed_ms={} outcome=upstream_response",
+                status.as_u16(),
+                diagnostic.id,
+                diagnostic.started.elapsed().as_millis()
+            );
             (status, [(header::CONTENT_TYPE, CONTENT_TYPE_JSON)], body).into_response()
         }
         Ok(Err(source)) => {
             let message = format!("{method} {proxy_path} failed upstream: {source:#}");
-            println!("serve proxy {method} {proxy_path} -> 502 ({source:#})");
+            println!(
+                "serve proxy {method} {proxy_path} -> 502 ({source:#}) local_request_id={} elapsed_ms={} stage=upstream_hop",
+                diagnostic.id,
+                diagnostic.started.elapsed().as_millis()
+            );
             error_response(StatusCode::BAD_GATEWAY, "proxy_transport_failure", &message)
         }
         Err(source) => {
             let message =
                 format!("{method} {proxy_path} upstream request did not complete: {source}");
-            println!("serve proxy {method} {proxy_path} -> 502 ({source})");
+            println!(
+                "serve proxy {method} {proxy_path} -> 502 ({source}) local_request_id={} elapsed_ms={} stage=blocking_join outcome=unknown",
+                diagnostic.id,
+                diagnostic.started.elapsed().as_millis()
+            );
             error_response(StatusCode::BAD_GATEWAY, "proxy_transport_failure", &message)
         }
     }

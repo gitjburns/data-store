@@ -103,18 +103,29 @@ struct ChatMessage<'request> {
     content: &'request str,
 }
 
-/// Minimal typed view of the chat-completions response. Only the first
-/// choice's message content is consumed; unknown fields are ignored because
-/// the producer contract needs exactly the assistant text and nothing else.
+/// Annotation parsing consumes first-choice text; optional provider metadata
+/// supplies diagnostic facts without changing response acceptance.
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    // Metadata is optional provider data, not a condition for accepting content.
+    id: Option<serde_json::Value>,
+    usage: Option<serde_json::Value>,
 }
 
-/// One choice envelope; only its message is read.
+/// One choice envelope with its optional provider termination reason.
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    finish_reason: Option<serde_json::Value>,
+}
+
+/// Preserve provider metadata until the HTTP boundary records its measured facts.
+struct CompletedResponse {
+    content: String,
+    response_id: Option<serde_json::Value>,
+    usage: Option<serde_json::Value>,
+    finish_reason: Option<serde_json::Value>,
 }
 
 /// The assistant message; only its textual content is consumed.
@@ -191,6 +202,8 @@ impl AnnotatorClient {
         user_content: &str,
         temperature: f64,
     ) -> Result<String, ApiError> {
+        let context = crate::util::model_call_context("annotator", request_purpose);
+        let _entered = context.enter();
         let started_at = Instant::now();
         // Char count is a safe compact shape fact; the content itself is a
         // forbidden log payload.
@@ -210,7 +223,7 @@ impl AnnotatorClient {
         let result = self.send_and_parse(system_prompt, user_content, temperature);
 
         match &result {
-            Ok(content) => {
+            Ok(response) => {
                 info!(
                     event = "annotator_http.call.completed",
                     adapter_mode = ANNOTATOR_HTTP_MODE,
@@ -220,9 +233,15 @@ impl AnnotatorClient {
                     temperature,
                     input_chars,
                     // Output length only; content is a forbidden log payload.
-                    output_chars = content.chars().count(),
+                    output_chars = response.content.chars().count(),
+                    provider_response_id = response.response_id.as_ref().and_then(serde_json::Value::as_str),
+                    prompt_tokens = response.usage.as_ref().and_then(|usage| usage.get("prompt_tokens")).and_then(serde_json::Value::as_u64),
+                    completion_tokens = response.usage.as_ref().and_then(|usage| usage.get("completion_tokens")).and_then(serde_json::Value::as_u64),
+                    total_tokens = response.usage.as_ref().and_then(|usage| usage.get("total_tokens")).and_then(serde_json::Value::as_u64),
+                    finish_reason = response.finish_reason.as_ref().and_then(serde_json::Value::as_str),
+                    annotation_state = "awaiting_validation",
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "annotator chat-completions call completed"
+                    "annotator response received; annotation validation pending"
                 );
             }
             Err(source) => {
@@ -241,7 +260,7 @@ impl AnnotatorClient {
             }
         }
 
-        result
+        result.map(|response| response.content)
     }
 
     /// Build the request body, send it, and map every failure mode into a
@@ -253,7 +272,7 @@ impl AnnotatorClient {
         system_prompt: &str,
         user_content: &str,
         temperature: f64,
-    ) -> Result<String, ApiError> {
+    ) -> Result<CompletedResponse, ApiError> {
         let request = ChatCompletionRequest {
             model: &self.model,
             messages: vec![
@@ -283,13 +302,22 @@ impl AnnotatorClient {
         // Transport-level failure (DNS, connect, TLS, timeout) surfaces before
         // any HTTP status exists.
         let response = request_builder.send().map_err(|source| {
-            self.call_error(None, &format!("request failed before response: {source}"))
+            self.call_error(
+                None,
+                &format!(
+                    "request failed before response: {}",
+                    crate::util::error_chain(&source)
+                ),
+            )
         })?;
         let status = response.status();
         let body = response.text().map_err(|source| {
             self.call_error(
                 Some(status),
-                &format!("response body could not be read: {source}"),
+                &format!(
+                    "response body could not be read: {}",
+                    crate::util::error_chain(&source)
+                ),
             )
         })?;
 
@@ -315,19 +343,19 @@ impl AnnotatorClient {
 
         // Shape violation: the endpoint returned 2xx but no usable assistant
         // message. This is a producer failure, not an empty result.
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
-            .ok_or_else(|| {
-                self.call_error(
-                    Some(status),
-                    "response contained no choices[0].message.content",
-                )
-            })?;
+        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            self.call_error(
+                Some(status),
+                "response contained no choices[0].message.content",
+            )
+        })?;
 
-        Ok(content)
+        Ok(CompletedResponse {
+            content: choice.message.content,
+            response_id: parsed.id,
+            usage: parsed.usage,
+            finish_reason: choice.finish_reason,
+        })
     }
 
     /// Construct a producer error carrying the endpoint/model/status context an

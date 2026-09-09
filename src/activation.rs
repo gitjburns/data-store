@@ -218,8 +218,9 @@ struct ActivationContext<'a> {
 /// predecessor's conformance report when one exists, and either perform the
 /// cutover or hold the candidate with heldReason = conformance_regression.
 /// Calling this on a run that is not ready-and-not-held is a caller-contract
-/// `BadRequest`; `Err` otherwise means an infrastructure fault and no state
-/// changed (the transaction rolled back).
+/// `BadRequest`; other errors identify infrastructure faults. A cache publish
+/// error can follow a committed pointer change; commit errors leave durability
+/// unconfirmed, as recorded at the corresponding boundary.
 pub(crate) fn gate_and_activate(
     index_root: &Path,
     registry: &CutoverRegistry,
@@ -259,7 +260,7 @@ pub(crate) fn gate_and_activate(
                 source_id,
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "parse activation gate failed; no state changed"
+                "parse activation transaction body failed; rollback requested"
             );
             return Err(source);
         }
@@ -366,7 +367,17 @@ fn publish_dense_cache(
     predecessor_parse_id: Option<&str>,
     dense_dimension: usize,
 ) -> Result<(), ApiError> {
-    dense_cache.load_parse(connection, activated_parse_id, dense_dimension)?;
+    let started = Instant::now();
+    dense_cache
+        .load_parse(connection, activated_parse_id, dense_dimension)
+        .map_err(|source| {
+            error!(event = "activation.publish_failed", parse_run_id = activated_parse_id,
+            predecessor_parse_id = predecessor_parse_id.unwrap_or("none"),
+            committed = true, error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "activation pointer committed but dense cache publication failed");
+            source
+        })?;
     if let Some(predecessor_parse_id) = predecessor_parse_id {
         // The predecessor is no longer the active parse, so its plane is evicted
         // under the same barrier hold that published the new one.
@@ -433,7 +444,7 @@ pub(crate) fn accept_held_parse(
                     source_id,
                     error = %source,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "held-parse accept failed; no state changed"
+                    "held-parse accept transaction body failed; rollback requested"
                 );
                 return Err(source);
             }
@@ -522,7 +533,7 @@ pub(crate) fn discard_held_parse(index_root: &Path, parse_run_id: &str) -> Resul
                 parse_run_id,
                 error = %source,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "held-parse discard failed; no state changed"
+                "held-parse discard transaction body failed; rollback requested"
             );
             return Err(source);
         }
@@ -808,7 +819,7 @@ fn verify_activation_prerequisites(
             ),
         });
     }
-    info!(
+    tracing::debug!(
         event = "activation.prerequisites_ok",
         parse_run_id,
         required_projection_count = REQUIRED_CONTENT_DERIVED_PROJECTIONS.len(),
@@ -846,10 +857,11 @@ fn activate_candidate(
         )?;
         info!(
             event = "activation.predecessor_archiving",
+            committed = false,
             parse_run_id = ctx.candidate_id,
             source_id = ctx.source_id,
             predecessor_parse_id = predecessor_id,
-            "predecessor parse moved to archiving; C9 archive-verify-delete completes it"
+            "predecessor archiving transition staged; cleanup follows commit"
         );
     }
 
@@ -1024,10 +1036,11 @@ fn supersede_other_held(
         append_event(tx, &event)?;
         info!(
             event = "activation.hold_superseded",
+            committed = false,
             source_id,
             superseded_parse_id = superseded_id.as_str(),
             superseding_parse_id = superseding_id,
-            "older held candidate superseded"
+            "held candidate supersession staged in activation transaction"
         );
     }
     // Thread the superseded held ids out for the caller's post-barrier §31.2

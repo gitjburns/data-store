@@ -87,7 +87,10 @@ impl MaintenanceGate {
                 if parked {
                     info!(
                         event = "maintenance.worker_resumed",
-                        worker, "worker storage access resumed"
+                        worker,
+                        generation = state.generation,
+                        wait_ms = started.elapsed().as_millis() as u64,
+                        "worker storage access resumed"
                     );
                 }
                 return Ok(Some(self.admit(&mut state)));
@@ -95,7 +98,11 @@ impl MaintenanceGate {
             if state.detail.is_some() && !parked {
                 info!(
                     event = "maintenance.worker_parked",
-                    worker, "worker parked between cycles"
+                    worker,
+                    generation = state.generation,
+                    active_storage_leases = state.active,
+                    reason = state.detail.as_deref(),
+                    "worker parked between cycles"
                 );
                 parked = true;
             }

@@ -127,6 +127,8 @@ pub(crate) fn build_chunks(
             envelope::complete_fresh(tx, &projection_id, None)?;
             info!(
                 event = "chunk_build.success",
+                // The enclosing owner reports durability after its commit.
+                persistence = "pending_commit",
                 source_id,
                 parse_id,
                 projection_id = %projection_id,
@@ -139,6 +141,7 @@ pub(crate) fn build_chunks(
         Err(error) => {
             error!(
                 event = "chunk_build.failure",
+                error = %error,
                 source_id,
                 parse_id,
                 projection_id = %projection_id,

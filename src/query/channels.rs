@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::error::ApiError;
 use crate::model::ContentType;
@@ -429,126 +429,148 @@ pub(crate) fn fused_channels(
         "dense, lexical, and graph fusion started"
     );
 
-    let dense_hits = dense_channel(query_id, parses, query_vector, candidate_limit);
-    let lexical_hits = lexical_channel(conn, query_id, parses, query_text, candidate_limit)?;
+    // Preserve the failed read stage across every early return from fusion.
+    let mut stage = "lexical_retrieval";
+    let result: Result<ChannelFusionOutcome, ApiError> = (|| {
+        let dense_hits = dense_channel(query_id, parses, query_vector, candidate_limit);
+        let lexical_hits = lexical_channel(conn, query_id, parses, query_text, candidate_limit)?;
 
-    // Grain-change boundary: chunk-grained hits → unit-grained matches. Fusion
-    // keys on unit_id, so resolution MUST precede fusion (design rule, §6/§38).
-    let chunk_unit_map = load_chunk_unit_map(conn, parses)?;
-    let owners = build_unit_owner_index(
-        conn,
-        parses,
-        &dense_hits,
-        &lexical_hits,
-        graph_hits,
-        &chunk_unit_map,
-    )?;
-    let mut dense_matches = resolve_dense_to_units(&dense_hits, &chunk_unit_map);
-    let mut lexical_matches = resolve_lexical_to_units(&lexical_hits, &chunk_unit_map);
-    let dense_units_before_filter = dense_matches.len();
-    let lexical_units_before_filter = lexical_matches.len();
-    // Every resolved unit was checked above; filtering changes eligibility, not scope.
-    dense_matches.retain(|matched| owners[&matched.unit_id].eligible);
-    lexical_matches.retain(|matched| owners[&matched.unit_id].eligible);
-    let dense_excluded = dense_units_before_filter - dense_matches.len();
-    let lexical_excluded = lexical_units_before_filter - lexical_matches.len();
-    dense_matches.truncate(candidate_limit);
-    lexical_matches.truncate(candidate_limit);
-    for (index, matched) in dense_matches.iter_mut().enumerate() {
-        matched.rank = index + 1;
-    }
-    for (index, matched) in lexical_matches.iter_mut().enumerate() {
-        matched.rank = index + 1;
-    }
-    let mut graph_eligible = Vec::new();
-    let mut graph_seen = std::collections::HashSet::new();
-    let mut graph_excluded = 0;
-    for hit in graph_hits {
-        if !owners[&hit.hit_id].eligible {
-            graph_excluded += 1;
-        } else if graph_seen.insert(hit.hit_id.as_str()) && graph_eligible.len() < candidate_limit {
-            graph_eligible.push(hit);
+        // Grain-change boundary: chunk-grained hits → unit-grained matches. Fusion
+        // keys on unit_id, so resolution MUST precede fusion (design rule, §6/§38).
+        stage = "chunk_unit_mapping";
+        let chunk_unit_map = load_chunk_unit_map(conn, parses)?;
+        stage = "unit_ownership";
+        let owners = build_unit_owner_index(
+            conn,
+            parses,
+            &dense_hits,
+            &lexical_hits,
+            graph_hits,
+            &chunk_unit_map,
+        )?;
+        let mut dense_matches = resolve_dense_to_units(&dense_hits, &chunk_unit_map);
+        let mut lexical_matches = resolve_lexical_to_units(&lexical_hits, &chunk_unit_map);
+        let dense_units_before_filter = dense_matches.len();
+        let lexical_units_before_filter = lexical_matches.len();
+        // Every resolved unit was checked above; filtering changes eligibility, not scope.
+        dense_matches.retain(|matched| owners[&matched.unit_id].eligible);
+        lexical_matches.retain(|matched| owners[&matched.unit_id].eligible);
+        let dense_excluded = dense_units_before_filter - dense_matches.len();
+        let lexical_excluded = lexical_units_before_filter - lexical_matches.len();
+        let dense_limit_excluded = dense_matches.len().saturating_sub(candidate_limit);
+        let lexical_limit_excluded = lexical_matches.len().saturating_sub(candidate_limit);
+        dense_matches.truncate(candidate_limit);
+        lexical_matches.truncate(candidate_limit);
+        for (index, matched) in dense_matches.iter_mut().enumerate() {
+            matched.rank = index + 1;
         }
-    }
-    let graph_matches: Vec<(&str, usize)> = graph_eligible
-        .iter()
-        .enumerate()
-        .map(|(index, hit)| (hit.hit_id.as_str(), index + 1))
-        .collect();
-    let fused = fuse_matches(
-        &dense_matches,
-        &lexical_matches,
-        &graph_matches,
-        fused_limit,
-        profile.rrf_k,
-    );
-    // Keep original channel scores/explanations separately: a fused ordinal score
-    // must not erase the graph traversal evidence or lexical/dense attribution.
-    let mut channel_hits = Vec::new();
-    for matched in &dense_matches {
-        channel_hits.push(unit_hit(
-            &matched.unit_id,
-            &owners[&matched.unit_id],
-            RetrievalChannel::Dense,
-            f64::from(matched.similarity),
-            matched.rank,
-        ));
-    }
-    for matched in &lexical_matches {
-        channel_hits.push(unit_hit(
-            &matched.unit_id,
-            &owners[&matched.unit_id],
-            RetrievalChannel::Lexical,
-            -matched.score,
-            matched.rank,
-        ));
-    }
-    channel_hits.extend(graph_eligible.iter().map(|hit| (*hit).clone()));
-    let pool = fused
-        .iter()
-        .map(|matched| {
-            let channel = if matched.dense_rank.is_some() {
-                RetrievalChannel::Dense
-            } else if matched.bm25_rank.is_some() {
-                RetrievalChannel::Lexical
-            } else {
-                RetrievalChannel::Graph
-            };
-            let mut hit = unit_hit(
+        for (index, matched) in lexical_matches.iter_mut().enumerate() {
+            matched.rank = index + 1;
+        }
+        let mut graph_eligible = Vec::new();
+        let mut graph_seen = std::collections::HashSet::new();
+        let mut graph_excluded = 0;
+        for hit in graph_hits {
+            if !owners[&hit.hit_id].eligible {
+                graph_excluded += 1;
+            } else if graph_seen.insert(hit.hit_id.as_str())
+                && graph_eligible.len() < candidate_limit
+            {
+                graph_eligible.push(hit);
+            }
+        }
+        let graph_matches: Vec<(&str, usize)> = graph_eligible
+            .iter()
+            .enumerate()
+            .map(|(index, hit)| (hit.hit_id.as_str(), index + 1))
+            .collect();
+        let fused = fuse_matches(
+            &dense_matches,
+            &lexical_matches,
+            &graph_matches,
+            fused_limit,
+            profile.rrf_k,
+        );
+        // Keep original channel scores/explanations separately: a fused ordinal score
+        // must not erase the graph traversal evidence or lexical/dense attribution.
+        let mut channel_hits = Vec::new();
+        for matched in &dense_matches {
+            channel_hits.push(unit_hit(
                 &matched.unit_id,
                 &owners[&matched.unit_id],
-                channel,
-                matched.score,
+                RetrievalChannel::Dense,
+                f64::from(matched.similarity),
                 matched.rank,
-            );
-            if matched.graph_rank.is_some() {
-                hit.explanation = graph_eligible
-                    .iter()
-                    .find(|graph| graph.hit_id == matched.unit_id)
-                    .and_then(|graph| graph.explanation.clone());
-            }
-            hit
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+        for matched in &lexical_matches {
+            channel_hits.push(unit_hit(
+                &matched.unit_id,
+                &owners[&matched.unit_id],
+                RetrievalChannel::Lexical,
+                -matched.score,
+                matched.rank,
+            ));
+        }
+        channel_hits.extend(graph_eligible.iter().map(|hit| (*hit).clone()));
+        let pool = fused
+            .iter()
+            .map(|matched| {
+                let channel = if matched.dense_rank.is_some() {
+                    RetrievalChannel::Dense
+                } else if matched.bm25_rank.is_some() {
+                    RetrievalChannel::Lexical
+                } else {
+                    RetrievalChannel::Graph
+                };
+                let mut hit = unit_hit(
+                    &matched.unit_id,
+                    &owners[&matched.unit_id],
+                    channel,
+                    matched.score,
+                    matched.rank,
+                );
+                if matched.graph_rank.is_some() {
+                    hit.explanation = graph_eligible
+                        .iter()
+                        .find(|graph| graph.hit_id == matched.unit_id)
+                        .and_then(|graph| graph.explanation.clone());
+                }
+                hit
+            })
+            .collect::<Vec<_>>();
 
-    info!(
-        event = "query.fusion.completed",
-        query_id,
-        dense_units = dense_matches.len(),
-        lexical_units = lexical_matches.len(),
-        graph_units = graph_eligible.len(),
-        dense_units_before_filter,
-        lexical_units_before_filter,
-        dense_excluded,
-        lexical_excluded,
-        graph_excluded,
-        candidate_limit,
-        fused_limit,
-        fused_hits = pool.len(),
-        elapsed_ms = started_at.elapsed().as_millis() as u64,
-        "dense, lexical, and graph fusion completed"
-    );
-    Ok(ChannelFusionOutcome { pool, channel_hits })
+        info!(
+            event = "query.fusion.completed",
+            query_id,
+            dense_units = dense_matches.len(),
+            lexical_units = lexical_matches.len(),
+            graph_units = graph_eligible.len(),
+            dense_units_before_filter,
+            lexical_units_before_filter,
+            dense_excluded,
+            lexical_excluded,
+            graph_excluded,
+            // Eligibility exclusions above do not include deduplication or the cap.
+            graph_duplicate_hits = graph_hits.len() - graph_excluded - graph_seen.len(),
+            graph_limit_excluded = graph_seen.len() - graph_eligible.len(),
+            dense_limit_excluded,
+            lexical_limit_excluded,
+            candidate_limit,
+            fused_limit,
+            fused_hits = pool.len(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "dense, lexical, and graph fusion completed"
+        );
+        Ok(ChannelFusionOutcome { pool, channel_hits })
+    })();
+    result.inspect_err(|source| {
+        error!(event = "query.fusion.failed", query_id, stage,
+            parse_count = parses.len(), error = %source,
+            error_chain = %crate::util::error_chain(source),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "retrieval channel fusion failed");
+    })
 }
 
 /// Canonical ownership and role eligibility retained once per candidate unit.

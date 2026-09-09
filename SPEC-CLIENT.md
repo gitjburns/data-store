@@ -469,6 +469,13 @@ Every failure renders as one of the following operator-facing errors:
   error carries the route **plus the full payload**; at the transport
   decode (`decode_success`) it carries the method and URL only.
 
+Transport diagnostics add a process-local request ID, failed stage, and elapsed
+time while retaining the underlying error chain. Admin acceptance reports include
+the local ID and time to acceptance. Serve-mode console diagnostics distinguish
+an upstream HTTP response from transport failure or an unknown blocking-task
+outcome. These IDs are not sent as HTTP headers, and client console diagnostics
+are not the service's durable log.
+
 **Mode asymmetry.** In the REPL, an error prints as `error: <msg>`
 followed by an indented `caused by: <cause>` line per link in the
 chain, and the loop **continues**. In one-shot mode the same failure

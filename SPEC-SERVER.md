@@ -148,12 +148,19 @@ Bootstrap diagnostics print to stdout before file logging initializes;
 operational logs switch to the configured file thereafter. Config and CLI
 failures before that switch still surface on stdout/stderr.
 
+Work contexts carry process, request/call, and canonical record IDs through
+async and blocking boundaries, with known source paths and triggers. HTTP response
+receipt is distinct from annotation validation and committed results. Provider
+token usage and finish metadata are optional reported facts, never estimates.
+Counters label their scope; elapsed, gate-wait, dispatch-wait, and persistence
+times describe separate boundaries. `DIAGNOSTICS.md` defines the log contract.
+
 **Forbidden log data.** API keys, bearer/admin tokens, prompt text, model
 outputs, document contents, and vector values never enter the service log.
 Logs carry bounded diagnostics only — compact boundary facts such as character
 counts, elapsed times, statuses, and truncated error excerpts. Enforcement
 sites include the annotator client (prompt content and model output are
-external-language payloads, logged only as char counts), the HTTP reranker
+external-language payloads, logged only through shape and usage metadata), the HTTP reranker
 (API key read and `Debug` output never expose the key), and the bearer-auth
 guard (a failed token is never in the error or the log). The startup handoff
 line carrying the admin token (§4.6) goes to the operator channel only; the

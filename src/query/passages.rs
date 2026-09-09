@@ -240,6 +240,8 @@ pub(crate) fn build_passages(
         ),
         Err(failure) => error!(event = "query.passages.failed", query_id,
             error = %failure, elapsed_ms = started.elapsed().as_millis() as u64,
+            error_chain = %crate::util::error_chain(failure),
+            stage = "passage_construction", seeds = ranked.len(), candidate_limit,
             "passage construction failed"),
     }
     outcome

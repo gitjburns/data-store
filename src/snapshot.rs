@@ -283,6 +283,15 @@ fn mint(
 ) -> Result<ForensicSnapshot, ApiError> {
     let started = Instant::now();
     let snapshot_id = crate::ids::new_forensic_snapshot_id()?;
+    let snapshot_log = crate::util::LogContext::new("snapshot", &snapshot_id);
+    if let Some(source_id) = &scope.subject_source_id {
+        snapshot_log.record("source_id", source_id.as_str());
+    }
+    if let Some(parse_id) = &scope.subject_parse_id {
+        snapshot_log.record("parse_id", parse_id.as_str());
+    }
+    snapshot_log.record("trigger", snapshot_type_wire_name(scope.snapshot_type));
+    let _snapshot_log = snapshot_log.enter();
     let created_at = utc_now()?;
     let type_name = snapshot_type_wire_name(scope.snapshot_type);
 
@@ -367,6 +376,7 @@ fn mint(
 
     info!(
         event = "snapshot.completed",
+        committed = true,
         snapshot_id,
         snapshot_type = type_name,
         manifest_uri = header.manifest_uri,

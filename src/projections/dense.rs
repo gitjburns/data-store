@@ -262,6 +262,8 @@ pub(crate) fn build_dense_vectors(
             };
             info!(
                 event = "dense_build.completed",
+                // The enclosing owner reports durability after its commit.
+                persistence = "pending_commit",
                 source_id,
                 parse_id,
                 projection_id = %projection_id,
@@ -477,7 +479,10 @@ fn embed_windows_concurrently(
                         .collect();
                     // Shared `&client` crosses the scope boundary by reference
                     // (Sync); the borrow lives only for this scope.
-                    scope.spawn(move || client.embed_passage_vectors(&texts))
+                    scope.spawn(
+                        crate::util::LogContext::current()
+                            .wrap(move || client.embed_passage_vectors(&texts)),
+                    )
                 })
                 .collect();
             // Join every thread in the wave before leaving the scope: an in-flight
@@ -489,8 +494,11 @@ fn embed_windows_concurrently(
                 .into_iter()
                 .map(|handle| match handle.join() {
                     Ok(result) => result,
-                    Err(_) => Err(ApiError::StorageOperation {
-                        message: format!("HTTP dense embed thread panicked for parse {parse_id}"),
+                    Err(payload) => Err(ApiError::StorageOperation {
+                        message: format!(
+                            "HTTP dense embed thread panicked for parse {parse_id}: {}",
+                            crate::util::panic_payload_message(payload.as_ref())
+                        ),
                     }),
                 })
                 .collect()

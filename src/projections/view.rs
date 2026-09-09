@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use rusqlite::{Connection, Transaction, params};
 use serde_json::Value;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use super::envelope::{self, NewProjection, ProjectionType};
 use crate::error::ApiError;
@@ -175,6 +175,8 @@ pub(crate) fn build_derived_view(
 
     info!(
         event = "derived_view.build_succeeded",
+        // The blob exists; its envelope is not durable until the caller commits.
+        persistence = "payload_archived_envelope_pending_commit",
         source_id,
         parse_id,
         projection_id = %projection_id,
@@ -233,7 +235,7 @@ pub(crate) fn build_summary(
     parse_id: &str,
 ) -> Result<String, ApiError> {
     let started = Instant::now();
-    info!(
+    debug!(
         event = "summary.build_started",
         source_id, parse_id, "summary projection build starting"
     );
@@ -319,8 +321,9 @@ pub(crate) fn build_summary(
         return Err(complete_error);
     }
 
-    info!(
+    debug!(
         event = "summary.build_succeeded",
+        persistence = "pending_commit",
         source_id,
         parse_id,
         projection_id = %projection_id,

@@ -491,13 +491,14 @@ pub(crate) fn enqueue_coalesced(
                 })?;
                 info!(
                     event = "scheduler.queue_coalesced",
+                    committed = false,
                     entry_id,
                     source_system,
                     native_uri,
                     prior_state,
                     reason,
                     operation_id = operation_id.unwrap_or("none"),
-                    "detection coalesced into existing sync queue entry"
+                    "queue coalescing staged in transaction"
                 );
             }
             None => {
@@ -522,12 +523,13 @@ pub(crate) fn enqueue_coalesced(
                 })?;
                 info!(
                     event = "scheduler.queue_enqueued",
+                    committed = false,
                     entry_id,
                     source_system,
                     native_uri,
                     reason,
                     operation_id = operation_id.unwrap_or("none"),
-                    "new sync queue entry enqueued"
+                    "new queue entry staged in transaction"
                 );
             }
         }
@@ -661,6 +663,13 @@ pub(crate) fn complete(index_root: &Path, entry_id: &str) -> Result<(), ApiError
     // row is gone. Drops through cleanly for autonomous rows (operation_id None).
     if let Some(operation_id) = &operation_id {
         crate::operations::mark_succeeded(index_root, operation_id)?;
+        info!(
+            event = "scheduler.operation_completed",
+            entry_id,
+            operation_id = operation_id.as_str(),
+            committed = true,
+            "queue-coupled operation success committed"
+        );
     }
     Ok(())
 }
@@ -741,6 +750,18 @@ fn drive_operation_failed(
         // Already terminal: leave it (re-park of the same entry, or a race the
         // single-scheduler design forbids — either way, no double-transition).
         OperationStatus::Succeeded | OperationStatus::Failed => {}
+    }
+    if matches!(
+        operation.status,
+        OperationStatus::Pending | OperationStatus::Running
+    ) {
+        warn!(
+            event = "scheduler.operation_failed",
+            operation_id,
+            error = error_detail,
+            committed = true,
+            "queue-coupled operation failure committed"
+        );
     }
     Ok(())
 }
@@ -1068,9 +1089,13 @@ pub(crate) fn start(
     // so the two publish independently and neither gates the other.
     fabric_slot: Arc<Mutex<FabricHealth>>,
 ) -> Result<thread::JoinHandle<()>, ApiError> {
+    // Tracing scopes are thread-local; retain startup identity across the
+    // dedicated scheduler thread boundary, including panic diagnostics.
+    let worker_log = crate::util::LogContext::current();
     thread::Builder::new()
         .name("sync-scheduler".to_string())
         .spawn(move || {
+            let _worker_log = worker_log.enter();
             // Panic containment (diagnostics: spawned tasks must leave
             // durable panic evidence): without this wrapper a scheduler
             // panic would unwind silently into the joining main thread. The
@@ -1335,6 +1360,11 @@ fn run_scheduler(
             .last_cycle_started
             .map(|previous| cycle_started.duration_since(previous).as_millis() as u64);
         cadence.last_cycle_started = Some(cycle_started);
+        let cycle_log =
+            crate::util::LogContext::new("sync_cycle", &crate::util::diagnostic_id("sync"));
+        cycle_log.record("trigger", "scheduled_scan");
+        cycle_log.record("source_paths", scope_uri.as_str());
+        let _cycle_log = cycle_log.enter();
 
         let delay_ms = match run_cycle(
             &index_root,
@@ -1664,6 +1694,11 @@ pub(crate) fn run_annotation_dry_run_pass(
     };
     for entry in &entries {
         let bundle_dir = bundle_dir_for(&staging_root, &entry.native_uri);
+        let entry_log = crate::util::LogContext::new("sync_entry", &entry.id);
+        entry_log.record("entry_id", entry.id.as_str());
+        entry_log.record("source_paths", entry.native_uri.as_str());
+        entry_log.record("trigger", "annotation_dry_run");
+        let _entry_log = entry_log.enter();
         // Queue-coupled Operations do not arise in this mode (all detections are
         // autonomous), but the dispatch step is NOT special-cased (mechanic 2):
         // mark_operation_running_at_dispatch is a no-op for autonomous rows.
@@ -2006,6 +2041,12 @@ fn run_cycle(
     // complete() succeeds), so backpressure cannot latch on it.
     for entry in &entries {
         let entry_started = Instant::now();
+        // Queue identity survives scheduling; this child scope carries the
+        // readable source into every synchronous import/parse/build boundary.
+        let entry_log = crate::util::LogContext::new("sync_entry", &entry.id);
+        entry_log.record("entry_id", entry.id.as_str());
+        entry_log.record("source_paths", entry.native_uri.as_str());
+        let _entry_log = entry_log.enter();
         let bundle_dir = bundle_dir_for(staging_root, &entry.native_uri);
 
         // Operation link for this entry's drain diagnostics: read best-effort so
@@ -2016,9 +2057,11 @@ fn run_cycle(
         // it degrades to "unknown" rather than propagating. Autonomous rows have
         // no link ("none"). The missing-bundle pre-check below keeps its own
         // `?`-propagating read because that value is on its load-bearing path.
+        let mut operation_link_known = true;
         let drain_operation_id = match entry_operation_id(index_root, &entry.id) {
             Ok(link) => link,
             Err(source) => {
+                operation_link_known = false;
                 warn!(
                     event = "scheduler.drain_entry_operation_link_unavailable",
                     entry_id = entry.id,
@@ -2029,7 +2072,21 @@ fn run_cycle(
                 None
             }
         };
-        let drain_operation_id = drain_operation_id.as_deref().unwrap_or("none");
+        if let Some(operation_id) = &drain_operation_id {
+            entry_log.record("operation_id", operation_id.as_str());
+            entry_log.record("trigger", "operator_request");
+        } else if operation_link_known {
+            entry_log.record("trigger", "discovered_or_recovered_queue_entry");
+        } else {
+            entry_log.record("trigger", "unknown_operation_link_unreadable");
+        }
+        let drain_operation_id = drain_operation_id
+            .as_deref()
+            .unwrap_or(if operation_link_known {
+                "none"
+            } else {
+                "unknown"
+            });
 
         // Missing-bundle policy for OPERATOR entries (Option A ruling,
         // 2026-07-16). An operator-enqueued row (operation_id present) whose
@@ -2101,7 +2158,7 @@ fn run_cycle(
                     decision = "defer_race_enqueued_after_scan",
                     elapsed_ms = entry_started.elapsed().as_millis() as u64,
                     "operator entry enqueued after this cycle's prescreen override; \
-                     leaving pending for the next cycle"
+                     leaving operation pending and queue entry in-flight for next-cycle reclamation"
                 );
                 continue;
             }
@@ -2427,6 +2484,8 @@ fn parse_chain_prefix(
             ),
         });
     };
+    let source_log = crate::util::LogContext::new("source", source_id);
+    let _source_log = source_log.enter();
     info!(
         event = "scheduler.parse_dispatch.started",
         entry_id = entry.id,
@@ -2737,6 +2796,17 @@ fn gate_ready_parse(
     parse_run_id: &str,
     consumed_bundle: Option<&Path>,
 ) -> Result<ActivationDecision, ApiError> {
+    let parse_log = crate::util::LogContext::new("parse", parse_run_id);
+    parse_log.record("source_id", source_id);
+    parse_log.record(
+        "trigger",
+        if consumed_bundle.is_some() {
+            "fresh_ready_parse"
+        } else {
+            "ready_parse_recovery"
+        },
+    );
+    let _parse_log = parse_log.enter();
     build_content_derived_projections(&dispatch.projections, index_root, source_id, parse_run_id)?;
 
     // Pre-activation snapshot (§30.6): minted immediately BEFORE the gate. The
@@ -2876,7 +2946,7 @@ fn build_content_derived_projections(
                 parse_id,
                 error = %error,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "content-derived projection build failed; build transaction rolled back"
+                "content-derived projection build failed; build transaction rollback requested"
             );
             record_projection_build_failure(&mut connection, source_id, parse_id, &error);
             Err(error)

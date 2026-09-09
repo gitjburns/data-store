@@ -14,9 +14,9 @@
 //! bounded error and a parse.failed event (§13.5 rule 2: every failed
 //! attempt writes a durable failure record) — never an importer `Err`.
 //! `Err` is reserved for faults of the canonical side itself (SQL, artifact
-//! store, clock); on such a fault the run row deliberately stays `building`,
-//! because marking it `failed` would blame the parse for our own
-//! infrastructure fault. Stuck `building` rows are operator-visible through
+//! store, clock); the importer does not mark the run `failed` for its own
+//! infrastructure fault. Failed commits leave final durability unconfirmed.
+//! Stuck `building` rows are operator-visible through
 //! the error logs here; a dedicated health surface arrives at C10b (the
 //! scheduler dispatch warns past stale `building` rows meanwhile).
 //!
@@ -285,6 +285,10 @@ pub(crate) fn import_parser_bundle(
     };
 
     let parse_run_id = new_parse_run_id()?;
+    let parse_log = crate::util::LogContext::new("parse_import", &parse_run_id);
+    parse_log.record("source_id", claims.source_id.as_str());
+    parse_log.record("parse_id", parse_run_id.as_str());
+    let _parse_log = parse_log.enter();
     let created_at = utc_now()?;
     let mut connection = hot_plane::open_write(index_root)?;
     create_building_run(&mut connection, &parse_run_id, &claims, &created_at)?;
@@ -297,11 +301,8 @@ pub(crate) fn import_parser_bundle(
         "parse run recorded in building state"
     );
 
-    // One terminal fault boundary for the attributed import: every
-    // canonical-side Err after the building insert leaves the run row in
-    // `building` (both status transitions commit transactionally inside the
-    // attempt), so this single wrapper durably attributes that outcome to
-    // the run identity instead of relying on each fault site to log it.
+    // Attribute faults to the run without claiming its final durable status:
+    // a failed commit does not expose a confirmed rollback result.
     let attempt = AttributedImport {
         index_root,
         bundle_dir,
@@ -319,8 +320,9 @@ pub(crate) fn import_parser_bundle(
                 parse_run_id,
                 bundle_dir = %bundle_dir.display(),
                 error = %source,
+                durable_outcome = "unconfirmed_after_building_insert",
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "import failed on the canonical side; run row left in building state"
+                "import failed on the canonical side after recording the building run"
             );
             Err(source)
         }
@@ -1423,21 +1425,23 @@ fn ready_transaction_body(tx: &Transaction<'_>, state: &ReadyState<'_>) -> Resul
     for unit in &state.rows.units {
         insert_content_unit(tx, unit)?;
     }
-    info!(
+    tracing::debug!(
         event = "parse.units_persisted",
+        committed = false,
         parse_run_id = state.parse_run_id,
         unit_count = state.rows.units.len() as u64,
-        "content unit rows written"
+        "content unit rows staged in the ready transaction"
     );
 
     for relationship in &state.rows.relationships {
         insert_unit_relationship(tx, relationship)?;
     }
-    info!(
+    tracing::debug!(
         event = "parse.relationships_persisted",
+        committed = false,
         parse_run_id = state.parse_run_id,
         relationship_count = state.rows.relationships.len() as u64,
-        "unit relationship rows written"
+        "unit relationship rows staged in the ready transaction"
     );
 
     let completed_at = utc_now()?;
@@ -1474,10 +1478,11 @@ fn ready_transaction_body(tx: &Transaction<'_>, state: &ReadyState<'_>) -> Resul
             ),
         });
     }
-    info!(
+    tracing::debug!(
         event = "parse.run_ready",
+        committed = false,
         parse_run_id = state.parse_run_id,
-        "parse run transitioned to ready"
+        "parse ready transition staged in the transaction"
     );
 
     let mut payload = Map::from_iter([

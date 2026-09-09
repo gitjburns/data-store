@@ -84,6 +84,7 @@ pub(crate) fn build_evidence_pack(
 
     // This closure keeps every fallible assembly operation under one diagnostic
     // boundary, including annotation/relationship reads and timestamp generation.
+    let mut stage = "passage_inclusion";
     let assembled = (|| {
         let mut state = SelectionState {
             selected: Vec::new(),
@@ -100,7 +101,14 @@ pub(crate) fn build_evidence_pack(
                 &options,
                 &count_tokens,
                 &mut state,
-            )?;
+            )
+            .inspect_err(|source| {
+                error!(event = "assembly.passage.failed", query_id,
+                    parse_id = passage.parse_id, unit_id = passage.anchor_unit_id,
+                    stage = "passage_inclusion", error = %source,
+                    error_chain = %crate::util::error_chain(source),
+                    "selected passage could not be assembled");
+            })?;
         }
         let selected_unit_ids: Vec<String> = state
             .selected
@@ -108,6 +116,7 @@ pub(crate) fn build_evidence_pack(
             .map(|unit| unit.unit_id.clone())
             .collect();
         let relationships = if options.include_relationships {
+            stage = "relationship_reading";
             Some(selected_relationships(
                 conn,
                 &state
@@ -120,10 +129,12 @@ pub(crate) fn build_evidence_pack(
             None
         };
         let annotations = if options.include_annotations {
+            stage = "annotation_reading";
             Some(collect_annotations(conn, captured, &selected_unit_ids)?)
         } else {
             None
         };
+        stage = "evidence_pack_construction";
         let pack = EvidencePack {
             query_id: query_id.to_string(),
             query_text: query_text.to_string(),
@@ -172,9 +183,11 @@ pub(crate) fn build_evidence_pack(
         Err(source) => {
             error!(
                 event = "assembly.build.failed",
+                stage,
                 query_id,
                 passage_count = passages.len(),
                 error = %source,
+                error_chain = %crate::util::error_chain(&source),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "assembly evidence-pack build failed"
             );

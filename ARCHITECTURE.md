@@ -18,6 +18,13 @@ dedicated annotation worker then enriches each newly activated parse. The HTTP
 surface exists to answer queries, expose diagnostics, and accept rare operator
 overrides (re-parse, activate/accept/discard, snapshot, restore, shutdown).
 
+Operational logs use the existing `tracing` backend and `util::LogContext`.
+Owners attach known targets, triggers, and IDs; contexts travel explicitly with
+blocking/thread closures and instrumented futures. Process-local request/call IDs
+supplement canonical IDs without creating records or changing HTTP contracts.
+Stage outcomes distinguish received, validated, staged, committed, and published
+state. `DIAGNOSTICS.md` defines the fields, measurements, and level policy.
+
 ### Architectural invariant: async is confined to the transport shell
 
 Async/`tokio` lives **only** in the HTTP transport. Every piece of lifecycle

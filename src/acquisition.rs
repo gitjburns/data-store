@@ -657,10 +657,11 @@ fn ensure_source_object(
     })?;
     info!(
         event = "acquisition.source_object_inserted",
+        committed = false,
         source_object_id = id,
         source_hash = bundle.source_hash,
         size_bytes = artifact.size_bytes,
-        "new source object inserted"
+        "new source object staged in import transaction"
     );
     Ok((id, true))
 }
@@ -716,11 +717,12 @@ fn maintain_source_location(
         })?;
         info!(
             event = "acquisition.source_location_inserted",
+            committed = false,
             source_location_id = location_id,
             source_system = manifest.source_system,
             native_uri = manifest.native_uri,
             source_object_id,
-            "new source location inserted"
+            "new source location staged in import transaction"
         );
         return Ok((location_id, true));
     };
@@ -732,11 +734,12 @@ fn maintain_source_location(
         if prior_status != "current" {
             info!(
                 event = "acquisition.source_location_restored",
+                committed = false,
                 source_location_id = location_id,
                 source_system = manifest.source_system,
                 native_uri = manifest.native_uri,
                 prior_status,
-                "location restored to current by reappearance of its content"
+                "location selected for restoration by reappearance of its content"
             );
         }
         tx.execute(REFRESH_SOURCE_LOCATION_SQL, params![location_id, now])
@@ -766,10 +769,11 @@ fn maintain_source_location(
         }
         debug!(
             event = "acquisition.source_location_refreshed",
+            committed = false,
             source_location_id = location_id,
             source_system = manifest.source_system,
             native_uri = manifest.native_uri,
-            "existing source location re-confirmed current"
+            "source location refresh staged in import transaction"
         );
         return Ok((location_id, false));
     }
@@ -792,13 +796,14 @@ fn maintain_source_location(
     })?;
     info!(
         event = "acquisition.source_location_rebound",
+        committed = false,
         source_location_id = location_id,
         source_system = manifest.source_system,
         native_uri = manifest.native_uri,
         previous_source_object_id = current_source_id,
         source_object_id,
         prior_status,
-        "content changed at location; location rebound to new source object"
+        "content changed at location; source rebinding staged in import transaction"
     );
     Ok((location_id, false))
 }
@@ -1111,13 +1116,14 @@ fn enumeration_deletions_body(
         // facts so the operator can audit inference without the database.
         info!(
             event = "acquisition.location_deleted",
+            committed = false,
             source_location_id = location_id,
             source_system,
             native_uri,
             source_object_id,
             signal = "absent_from_complete_enumeration",
             enumeration_record_id,
-            "location evidenced deleted: absent from complete enumeration"
+            "location deletion staged: absent from complete enumeration"
         );
         deleted_native_uris.push(native_uri);
     }
@@ -1252,11 +1258,12 @@ fn insert_acquisition_record(
     })?;
     debug!(
         event = "acquisition.record_inserted",
+        committed = false,
         acquisition_record_id = record.id,
         source_system = record.source_system,
         native_uri = record.native_uri,
         outcome,
-        "acquisition record inserted"
+        "acquisition record staged in transaction"
     );
     Ok(())
 }

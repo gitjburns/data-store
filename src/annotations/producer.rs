@@ -76,6 +76,32 @@ pub(crate) struct Invocation {
     pub(crate) targets: Vec<InvocationTarget>,
 }
 
+impl Invocation {
+    /// Correlate an invocation's preparation, HTTP call, and persistence without
+    /// logging its text. The inherited source context belongs to the caller.
+    pub(crate) fn log_context(&self) -> crate::util::LogContext {
+        let context = crate::util::LogContext::new(
+            "annotation_invocation",
+            &crate::util::diagnostic_id("invocation"),
+        );
+        context.record("target_units", self.targets.len() as u64);
+        match &self.kind {
+            InvocationKind::SectionGroup {
+                section_unit_id,
+                split_index,
+            } => {
+                context.record("section_id", section_unit_id.as_str());
+                context.record("split_index", *split_index);
+            }
+            InvocationKind::Document { split_index } => {
+                // Document summaries have no section ID; do not invent one.
+                context.record("split_index", *split_index);
+            }
+        }
+        context
+    }
+}
+
 /// One annotation produced from an invocation, before the stage-3 worker wraps
 /// it with a target-unit-id list, provenance, and freshness. `body` is the
 /// per-type camelCase JSON body; `confidence` is the optional model-reported

@@ -163,9 +163,13 @@ const TX_LOG_NAMESPACE: &str = "annotation";
 
 /// Every active source and the parse whose annotations must be built: the
 /// discovery scope of one cycle. `active_parse_id` is guaranteed present by
-/// the query's WHERE clause.
+/// the query's WHERE clause. The correlated aggregate retains every current
+/// location without multiplying producer work for multiply located content.
 const SELECT_ACTIVE_SOURCES_SQL: &str = "
-SELECT id, active_parse_id FROM source_objects
+SELECT id, active_parse_id,
+       (SELECT json_group_array(native_uri) FROM source_locations
+        WHERE source_id = source_objects.id AND status = 'current')
+FROM source_objects
 WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL";
 
 /// The source's CURRENT active-parse pointer (§14), re-read at projection-build
@@ -209,9 +213,11 @@ pub(crate) fn start(
     // scheduler's; `AppState::health()` reads it poison-recovered.
     health_slot: Arc<Mutex<AnnotationHealth>>,
 ) -> thread::JoinHandle<()> {
+    let context = crate::util::LogContext::new("worker", "annotation");
     thread::Builder::new()
         .name("annotation-worker".to_string())
         .spawn(move || {
+            let _entered = context.enter();
             // Panic containment (diagnostics: spawned tasks must leave durable
             // panic evidence): without this wrapper a worker panic would
             // unwind silently into the joining main thread. The panic is
@@ -369,6 +375,10 @@ fn run_worker(
         // cycle-wide fault publishes nothing — the last good cycle's counts stay
         // visible with their own (older) as-of, which is more honest than
         // clearing them on a transient scan failure.
+        let context =
+            crate::util::LogContext::new("annotation_cycle", &crate::util::diagnostic_id("cycle"));
+        context.record("trigger", "annotation_discovery");
+        let _entered = context.enter();
         match run_cycle(
             &index_root,
             &annotator_config,
@@ -430,7 +440,16 @@ fn run_cycle(
     };
 
     let mut totals = CycleTotals::default();
+    let mut sources_examined = 0usize;
     for source in &sources {
+        // Source discovery is a snapshot; an early-ended cycle has not examined
+        // the remaining sources. Keep logs and published health honest about that.
+        sources_examined += 1;
+        let context = crate::util::LogContext::new("annotation_source", &source.source_id);
+        context.record("source_id", source.source_id.as_str());
+        context.record("parse_id", source.active_parse_id.as_str());
+        context.record("source_paths", source.source_paths.as_str());
+        let _entered = context.enter();
         match build_source(
             index_root,
             config,
@@ -540,18 +559,23 @@ fn run_cycle(
     }
 
     // Discovery and expected writer contention are DEBUG even with work waiting.
-    // Actual annotation changes and failures remain INFO; projections log their own outcomes.
+    // Exhaustion is reported once at ERROR; unchanged exhausted work is routine
+    // discovery. Actual changes and new failures retain an INFO cycle summary.
     let report_activity = totals.built > 0
         || totals.memoized > 0
         || totals.failed > 0
         || totals.source_failures > 0
         || totals.projection_failures > 0
-        || totals.orphans_adopted > 0
-        || totals.exhausted > 0;
+        || totals.orphans_adopted > 0;
     if report_activity {
         info!(
             event = "annotation_worker.cycle_completed",
-            sources_examined = sources.len(),
+            sources_examined,
+            sources_discovered = sources.len(),
+            sources_unexamined = sources.len() - sources_examined,
+            missing_scope = "eligible_work_items_examined_before_build",
+            failed_scope = "new_failures_this_cycle",
+            work_counts_exclude_failed_sources = totals.source_failures > 0,
             expected = totals.expected,
             missing = totals.missing,
             built = totals.built,
@@ -568,7 +592,12 @@ fn run_cycle(
     } else {
         debug!(
             event = "annotation_worker.cycle_completed",
-            sources_examined = sources.len(),
+            sources_examined,
+            sources_discovered = sources.len(),
+            sources_unexamined = sources.len() - sources_examined,
+            missing_scope = "eligible_work_items_examined_before_build",
+            failed_scope = "new_failures_this_cycle",
+            work_counts_exclude_failed_sources = totals.source_failures > 0,
             expected = totals.expected,
             missing = totals.missing,
             built = totals.built,
@@ -584,7 +613,7 @@ fn run_cycle(
         );
     }
     Ok(CycleReport {
-        sources_examined: sources.len() as u64,
+        sources_examined: sources_examined as u64,
         totals,
     })
 }
@@ -601,6 +630,8 @@ struct CycleReport {
 struct ActiveSource {
     source_id: String,
     active_parse_id: String,
+    /// JSON array of current locations at discovery; empty means none recorded.
+    source_paths: String,
 }
 
 /// Per-cycle work-item accounting, aggregated across sources for the cycle
@@ -837,6 +868,10 @@ struct PendingBuild {
     /// discovery gate (base for first attempts, retry-ladder value for
     /// reopens) and stamped into the completed row's provenance.
     effective_temperature: f64,
+    /// The same invocation context accompanies its HTTP thread and later commit.
+    log_context: crate::util::LogContext,
+    /// Measures only buffering after build_open, not model or database work.
+    prepared_at: Instant,
 }
 
 /// Discover and build every missing annotation for one source. Reads the
@@ -919,6 +954,25 @@ fn build_source(
             continue;
         }
 
+        let context = item.invocation.log_context();
+        let prior_invalid_outputs = reopened
+            .and_then(|row| output_retries.outputs.get(&row.annotation_id))
+            .map_or(0, |retry| retry.invalid_outputs);
+        context.record("prior_invalid_outputs", prior_invalid_outputs);
+        context.record(
+            "trigger",
+            match reopened {
+                Some(row) if row.status == store::ReopenableStatus::OrphanedBuilding => {
+                    "orphan_recovery"
+                }
+                Some(_) => "failed_annotation_retry",
+                None => "missing_annotation",
+            },
+        );
+        if let Some(row) = reopened {
+            context.record("annotation_id", row.annotation_id.as_str());
+        }
+        let _entered = context.enter();
         // Effective sampling temperature for this item's producer call: base
         // for first attempts, escalated per retry below (the ladder).
         let mut effective_temperature = PRODUCER_TEMPERATURE;
@@ -944,7 +998,9 @@ fn build_source(
                             parse_id = %source.active_parse_id,
                             annotation_id = %row.annotation_id,
                             producer = producer_label(item.kind),
-                            attempts = ANNOTATION_RETRY_CAP,
+                            attempts = retry.invalid_outputs,
+                            attempts_scope = "invalid_outputs_in_this_process",
+                            output_retry_limit = ANNOTATION_RETRY_CAP,
                             failure_class = "invalid_output",
                             output_failures = retry.invalid_outputs,
                             "producer retries exhausted for this run; giving up \
@@ -1165,12 +1221,20 @@ fn prepare_work_item(
     // Memo MISS: pass the PRE-PAID `build_open` boundary (durable in-flight
     // truth) and buffer for the concurrent producer wave.
     match open_producer_build(index_root, config, naming_rules, source, item, reopened)? {
-        Some((request, building_id)) => Ok(PreparedItem::Pending(Box::new(PendingBuild {
-            item: item.clone(),
-            request,
-            building_id,
-            effective_temperature,
-        }))),
+        Some((request, building_id)) => {
+            let log_context = crate::util::LogContext::current();
+            if reopened.is_none() {
+                log_context.record("annotation_id", building_id.as_str());
+            }
+            Ok(PreparedItem::Pending(Box::new(PendingBuild {
+                item: item.clone(),
+                request,
+                building_id,
+                effective_temperature,
+                log_context,
+                prepared_at: Instant::now(),
+            })))
+        }
         None => {
             counts.deferred += 1;
             debug!(
@@ -1457,6 +1521,12 @@ fn dispatch_and_commit_wave(
                     // `item.kind`/`item.invocation` are borrowed for this scope only,
                     // as is the shared `naming_rules` slice (immutable, Sync).
                     scope.spawn(move || {
+                        // Scoped threads do not inherit tracing's thread-local span.
+                        let _entered = build.log_context.enter();
+                        build.log_context.record(
+                            "dispatch_wait_ms",
+                            build.prepared_at.elapsed().as_millis() as u64,
+                        );
                         producer::invoke(
                             build.item.kind,
                             client,
@@ -1493,6 +1563,7 @@ fn dispatch_and_commit_wave(
         .iter()
         .zip(produced)
         .map(|(build, outcome)| {
+            let _entered = build.log_context.enter();
             let output_failures = if let Err(source_error) = &outcome {
                 // Account for the observed result, never for scheduling a retry.
                 // This state stays on the worker; no model thread mutates it.
@@ -1530,6 +1601,7 @@ fn dispatch_and_commit_wave(
     // A call failure stops FUTURE waves only; record this wave's results using
     // the existing storage-failure and shutdown boundaries.
     for (build, (outcome, output_failures)) in wave.into_iter().zip(produced) {
+        let _entered = build.log_context.enter();
         match outcome {
             Ok(produced_items) => {
                 // POST-PAID: producer output in hand. `complete_build` waits out
@@ -1612,6 +1684,7 @@ fn complete_build(
     effective_temperature: f64,
     shutdown: &ShutdownSignal,
 ) -> Result<CompletionOutcome, ApiError> {
+    let persistence_started = Instant::now();
     // POST-PAID: wait out writer contention for the paid producer output (bounded
     // by shutdown); a shutdown-abandon leaves the building row for crash-orphan
     // adoption. The body yields the reminted count for the post-commit log.
@@ -1721,9 +1794,12 @@ fn complete_build(
         source_id = %source.source_id,
         parse_id = %source.active_parse_id,
         producer = producer_label(item.kind),
+        annotation_id = building_id,
         produced = produced_items.len(),
         cached = reminted,
-        "producer invocation completed and cached"
+        annotation_state = "fresh_committed",
+        persistence_elapsed_ms = persistence_started.elapsed().as_millis() as u64,
+        "validated annotation output committed"
     );
     Ok(CompletionOutcome::Committed)
 }
@@ -1765,6 +1841,12 @@ fn fail_build(
         failure_class = producer_error.class(),
         output_failures,
         output_retry_limit = ANNOTATION_RETRY_CAP,
+        next_action = if output_failures > ANNOTATION_RETRY_CAP {
+            "await_retry_budget_reset"
+        } else {
+            "retry_eligible_next_cycle"
+        },
+        annotation_state = "failed_committed",
         "producer invocation failed; annotation parked failed for retry-policy evaluation"
     );
     Ok(CompletionOutcome::Committed)
@@ -1868,6 +1950,7 @@ fn read_active_sources(conn: &Connection) -> Result<Vec<ActiveSource>, ApiError>
             Ok(ActiveSource {
                 source_id: row.get(0)?,
                 active_parse_id: row.get(1)?,
+                source_paths: row.get(2)?,
             })
         })
         .map_err(|source| ApiError::StorageOperation {
@@ -2016,7 +2099,7 @@ fn build_annotation_derived_projections(
                 parse_id = %source.active_parse_id,
                 error = %error,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "annotation-derived projection build failed; build transaction rolled back"
+                "annotation-derived projection build failed; rollback attempted, recording failure audit"
             );
             record_projection_build_failure(
                 &mut connection,

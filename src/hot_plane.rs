@@ -654,16 +654,23 @@ pub(crate) fn begin_write_transaction<'c>(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<Transaction<'c>, ApiError> {
+    let started = Instant::now();
     debug!(
         event = %format!("{log_namespace}.transaction_begin"),
         operation, "write transaction beginning"
     );
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
+        .inspect(|_| {
+            debug!(event = %format!("{log_namespace}.transaction_lock_acquired"),
+                operation, lock_wait_ms = started.elapsed().as_millis() as u64,
+                "write transaction acquired SQLite writer lock");
+        })
         .map_err(|source| {
             error!(
                 event = %format!("{log_namespace}.transaction_begin_failed"),
                 operation,
+                lock_wait_ms = started.elapsed().as_millis() as u64,
                 error = %source,
                 "write transaction begin failed"
             );
@@ -701,18 +708,25 @@ pub(crate) fn begin_write_transaction_if_free<'c>(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<WriteTransactionAttempt<'c>, ApiError> {
+    let started = Instant::now();
     debug!(
         event = %format!("{log_namespace}.transaction_begin"),
         operation, "write transaction beginning"
     );
     match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
-        Ok(tx) => Ok(WriteTransactionAttempt::Begun(tx)),
+        Ok(tx) => {
+            debug!(event = %format!("{log_namespace}.transaction_lock_acquired"),
+                operation, lock_wait_ms = started.elapsed().as_millis() as u64,
+                "write transaction acquired SQLite writer lock");
+            Ok(WriteTransactionAttempt::Begun(tx))
+        }
         Err(rusqlite::Error::SqliteFailure(err, _))
             if err.code == rusqlite::ErrorCode::DatabaseBusy =>
         {
             debug!(
                 event = %format!("{log_namespace}.transaction_begin_busy"),
                 operation,
+                lock_wait_ms = started.elapsed().as_millis() as u64,
                 "write transaction begin deferred; writer lock held (busy_timeout expired)"
             );
             Ok(WriteTransactionAttempt::Busy)
@@ -721,6 +735,7 @@ pub(crate) fn begin_write_transaction_if_free<'c>(
             error!(
                 event = %format!("{log_namespace}.transaction_begin_failed"),
                 operation,
+                lock_wait_ms = started.elapsed().as_millis() as u64,
                 error = %source,
                 "write transaction begin failed"
             );
@@ -774,6 +789,7 @@ pub(crate) fn commit_transaction(
     log_namespace: &'static str,
     operation: &'static str,
 ) -> Result<(), ApiError> {
+    let started = Instant::now();
     debug!(
         event = %format!("{log_namespace}.transaction_commit"),
         operation, "transaction commit attempt"
@@ -782,8 +798,10 @@ pub(crate) fn commit_transaction(
         error!(
             event = %format!("{log_namespace}.transaction_commit_failed"),
             operation,
+            commit_elapsed_ms = started.elapsed().as_millis() as u64,
             error = %source,
-            "transaction commit failed; nothing durable was written"
+            durable_outcome = "unknown",
+            "transaction commit failed; durable outcome is unconfirmed"
         );
         ApiError::StorageOperation {
             message: format!("failed to commit {operation} transaction: {source}"),
@@ -791,14 +809,14 @@ pub(crate) fn commit_transaction(
     })?;
     debug!(
         event = %format!("{log_namespace}.transaction_committed"),
+        commit_elapsed_ms = started.elapsed().as_millis() as u64,
         operation, "transaction committed"
     );
     Ok(())
 }
 
-/// Log and perform the rollback of a failed transactional body (rusqlite
-/// rolls back on drop; the explicit drop makes the boundary visible in both
-/// code and log), then hand the original error back to the caller.
+/// Drop a failed transaction and preserve its original error. Rusqlite attempts
+/// rollback on drop but does not expose that result, so logs cannot confirm it.
 pub(crate) fn abort_transaction(
     tx: Transaction<'_>,
     log_namespace: &'static str,
@@ -809,7 +827,9 @@ pub(crate) fn abort_transaction(
         event = %format!("{log_namespace}.transaction_rolled_back"),
         operation,
         error = %source,
-        "transaction rolled back; nothing durable was written"
+        rollback_state = "requested_on_drop",
+        durable_outcome = "unconfirmed",
+        "transaction body failed; rollback will be attempted on drop"
     );
     drop(tx);
     source

@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -37,6 +37,42 @@ const HEALTH_PATH: &str = "/v1/health";
 // total wait time: the poll loop runs unbounded on this interval until the
 // Operation reaches a terminal status.
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Correlate local client diagnostics without changing the service protocol.
+/// IDs are unique within this client process; they are not server request IDs.
+fn new_client_request_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "client_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Local correlation and elapsed time for a client request, including body decoding.
+struct ClientRequestDiagnostic {
+    id: String,
+    started: Instant,
+}
+
+impl ClientRequestDiagnostic {
+    /// Start timing before auth or HTTP work so failures include preparation time.
+    fn new() -> Self {
+        Self {
+            id: new_client_request_id(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Add stage and elapsed context while the underlying error retains its source chain.
+    fn failure(&self, method: &str, target_url: &str, stage: &str) -> String {
+        format!(
+            "{method} {target_url} failed at {stage}; local_request_id={} elapsed_ms={}",
+            self.id,
+            self.started.elapsed().as_millis()
+        )
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
@@ -1630,26 +1666,33 @@ fn url(context: &ClientContext, path: &str) -> String {
 
 /// Perform a public GET and deserialize its success body into `T`. No bearer.
 fn get_public<T: DeserializeOwned>(context: &ClientContext, path: &str) -> Result<T> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let target_url = url(context, path);
     let response = context
         .http
         .get(&target_url)
         .send()
-        .with_context(|| format!("GET {target_url} failed to send HTTP request"))?;
+        .with_context(|| diagnostic.failure("GET", &target_url, "sending HTTP request"))?;
     decode_success(response, "GET", &target_url)
+        .with_context(|| diagnostic.failure("GET", &target_url, "response validation"))
 }
 
 /// Perform a protected GET and return its success body as raw JSON. Reads the
 /// admin token immediately before sending (auth freshness).
 fn get_protected(context: &ClientContext, path: &str) -> Result<serde_json::Value> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let target_url = url(context, path);
     let response = context
         .http
         .get(&target_url)
-        .bearer_auth(read_admin_token(context)?)
+        .bearer_auth(
+            read_admin_token(context)
+                .with_context(|| diagnostic.failure("GET", &target_url, "reading admin token"))?,
+        )
         .send()
-        .with_context(|| format!("GET {target_url} failed to send HTTP request"))?;
+        .with_context(|| diagnostic.failure("GET", &target_url, "sending HTTP request"))?;
     decode_success(response, "GET", &target_url)
+        .with_context(|| diagnostic.failure("GET", &target_url, "response validation"))
 }
 
 /// Perform a public POST with a JSON body and return its success body as raw JSON.
@@ -1658,14 +1701,16 @@ fn post_public_json(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let target_url = url(context, path);
     let response = context
         .http
         .post(&target_url)
         .json(body)
         .send()
-        .with_context(|| format!("POST {target_url} failed to send HTTP request"))?;
+        .with_context(|| diagnostic.failure("POST", &target_url, "sending HTTP request"))?;
     decode_success(response, "POST", &target_url)
+        .with_context(|| diagnostic.failure("POST", &target_url, "response validation"))
 }
 
 /// Drive one async admin mutation to a terminal Operation state: POST the request
@@ -1678,20 +1723,29 @@ fn run_admin_operation(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<()> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let target_url = url(context, path);
-    println!("{method} {target_url}");
-    let mut builder = context
-        .http
-        .post(&target_url)
-        .bearer_auth(read_admin_token(context)?);
+    println!("{method} {target_url} local_request_id={}", diagnostic.id);
+    let mut builder = context.http.post(&target_url).bearer_auth(
+        read_admin_token(context)
+            .with_context(|| diagnostic.failure(method, &target_url, "reading admin token"))?,
+    );
     if let Some(body) = body {
         builder = builder.json(body);
     }
     let response = builder
         .send()
-        .with_context(|| format!("{method} {target_url} failed to send HTTP request"))?;
-    let accepted: OperationAcceptedBody = decode_success(response, method, &target_url)?;
-    println!("Accepted: operationId={}", accepted.operation_id);
+        .with_context(|| diagnostic.failure(method, &target_url, "sending HTTP request"))?;
+    let accepted: OperationAcceptedBody = decode_success(response, method, &target_url)
+        .with_context(|| {
+            diagnostic.failure(method, &target_url, "acceptance response validation")
+        })?;
+    println!(
+        "Accepted: operationId={} local_request_id={} acceptance_elapsed_ms={}",
+        accepted.operation_id,
+        diagnostic.id,
+        diagnostic.started.elapsed().as_millis()
+    );
     let record = poll_operation(context, &accepted.operation_id)?;
     render_operation(&record);
     Ok(())
@@ -1715,36 +1769,51 @@ fn poll_operation(context: &ClientContext, operation_id: &str) -> Result<Operati
 /// Read one Operation record without waiting for a terminal state. Used both by
 /// the poll loop and the standalone `operation` command (a single snapshot read).
 fn poll_operation_once(context: &ClientContext, operation_id: &str) -> Result<OperationRecord> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let path = format!("/operations/{}", operation_id);
     let target_url = url(context, &path);
     let response = context
         .http
         .get(&target_url)
-        .bearer_auth(read_admin_token(context)?)
+        .bearer_auth(
+            read_admin_token(context)
+                .with_context(|| diagnostic.failure("GET", &target_url, "reading admin token"))?,
+        )
         .send()
-        .with_context(|| format!("GET {target_url} failed to send HTTP request"))?;
+        .with_context(|| diagnostic.failure("GET", &target_url, "sending HTTP request"))?;
     decode_success(response, "GET", &target_url)
+        .with_context(|| diagnostic.failure("GET", &target_url, "response validation"))
 }
 
 /// Signal shutdown via `POST /shutdown` (§34): protected, 202 with NO body, not
 /// an Operation — so this reads only the status and never attempts to poll.
 fn send_shutdown(context: &ClientContext) -> Result<()> {
+    let diagnostic = ClientRequestDiagnostic::new();
     let target_url = url(context, "/shutdown");
-    println!("POST {target_url}");
+    println!("POST {target_url} local_request_id={}", diagnostic.id);
     let response = context
         .http
         .post(&target_url)
-        .bearer_auth(read_admin_token(context)?)
+        .bearer_auth(
+            read_admin_token(context)
+                .with_context(|| diagnostic.failure("POST", &target_url, "reading admin token"))?,
+        )
         .send()
-        .with_context(|| format!("POST {target_url} failed to send HTTP request"))?;
+        .with_context(|| diagnostic.failure("POST", &target_url, "sending HTTP request"))?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().with_context(|| {
-            format!("POST {target_url} failed to read HTTP error response body")
+            diagnostic.failure("POST", &target_url, "reading HTTP error response body")
         })?;
-        return Err(service_error("POST", &target_url, status, &text));
+        return Err(service_error("POST", &target_url, status, &text))
+            .with_context(|| diagnostic.failure("POST", &target_url, "response status"));
     }
-    println!("Shutdown signalled (HTTP {})", status.as_u16());
+    println!(
+        "Shutdown signalled (HTTP {}) local_request_id={} elapsed_ms={}",
+        status.as_u16(),
+        diagnostic.id,
+        diagnostic.started.elapsed().as_millis()
+    );
     Ok(())
 }
 

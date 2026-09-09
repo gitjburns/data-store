@@ -44,6 +44,23 @@ Cycle summaries use INFO when work occurred or problems were encountered, and
 DEBUG when empty and successful. Aggregate repetitive non-error diagnostics at
 the owning stage; retain individual details at DEBUG.
 
+## Work Identity And Outcome
+
+- Carry `LogContext` from the owning operation across task/thread boundaries.
+  Enter synchronous scopes; instrument futures rather than holding span guards
+  across awaits. Record each contextual fact once; use child contexts for stages.
+- Reuse canonical IDs and include known source paths and the trigger. Request
+  and call IDs are process-local diagnostics, not durable records or API handles.
+- Distinguish response receipt, validation, staged writes, committed state, and
+  publication. Report unknown outcomes explicitly; a rollback requested on drop
+  is not an observed successful rollback.
+- Label count scope: available versus examined, eligible versus exhausted, new
+  failures versus unresolved failures, and observed attempts versus retry limits.
+- Separate queue/lock waiting, endpoint round-trip, and persistence durations.
+  Token counts come only from the provider or actual tokenizer; absent metadata
+  stays absent, and character counts are never presented as tokens.
+- Preserve the original error and its nested causes at the failed boundary.
+
 ## Boundary Rule
 
 Before adding or changing code, identify the diagnostic boundaries the code
@@ -109,12 +126,12 @@ include:
 
 | Boundary | Required context |
 | --- | --- |
-| Startup | phase, mode, bind address when known, config path when known, elapsed time |
-| Operation | operation name, operation ID, stage, sequence when stream-related, elapsed time |
-| Request validation | operation or route, rejected field, safe limit/value, status, error kind |
+| Startup | process/run identity, phase, mode, bind address when known, config path when known, elapsed time |
+| Operation | request/work identity, operation ID when assigned, target, trigger, stage, elapsed time |
+| Request validation | request ID, route/path, rejected field, safe limit/value, status, error kind |
 | Source resolution | requested source, relative source, resolved path on success, elapsed time |
 | Docling/process | executable path, source reference, output directory, timeout, exit status, elapsed time, bounded failure diagnostics |
-| Model call | model role, purpose, compact input shape, configured limits, elapsed time, error on failure |
+| Model call | parent work and call IDs, role, purpose, input shape/limits, measured usage when supplied, finish reason when supplied, elapsed time, error on failure |
 | Storage | source path, version label, document ID when available, phase, counts, commit/publish state |
 | Active publish | source path, version label, vector count, published timestamp, phase |
 | Task | task purpose, operation ID when available, completion/error/panic/cancel state |

@@ -19,6 +19,16 @@ const RESET_SQL: &str = include_str!("../sql/fabric/reset.sql");
 /// hold SQLite's writer for minutes. Acceptance waits for that work, while the
 /// gate rejects competing requests and health explains the wait.
 pub(crate) fn reserve(state: &AppState) -> Result<String, ApiError> {
+    // The HTTP request identity remains the parent while no durable Operation
+    // exists yet; identify the corpus and destructive trigger during draining.
+    let context =
+        crate::util::LogContext::new("rebuild_acceptance", &crate::util::diagnostic_id("rebuild"));
+    context.record(
+        "source_paths",
+        tracing::field::display(state.config.storage.corpus_root.display()),
+    );
+    context.record("trigger", "operator_rebuild_all");
+    let _context = context.enter();
     state.maintenance().begin()?;
     let started = Instant::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -67,6 +77,13 @@ pub(crate) fn reserve(state: &AppState) -> Result<String, ApiError> {
 /// Own the detached task through its durable terminal boundary, even on panic.
 /// Failure leaves admission closed; restarting cannot bypass the retained marker.
 pub(crate) fn run(state: &AppState, operation_id: &str) {
+    let context = crate::util::LogContext::new("operation", operation_id);
+    context.record(
+        "source_paths",
+        tracing::field::display(state.config.storage.corpus_root.display()),
+    );
+    context.record("trigger", "operator_rebuild_all");
+    let _context = context.enter();
     let started = Instant::now();
     info!(
         event = "rebuild_all.task_started",
@@ -92,6 +109,8 @@ pub(crate) fn run(state: &AppState, operation_id: &str) {
             event = "rebuild_all.completed",
             operation_id,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            committed = true,
+            rebuilding_in_background = true,
             "storage cleared; automatic rebuilding resumed (corpus rebuild is not yet complete)"
         ),
         Err(source) => {

@@ -391,6 +391,12 @@ fn sample_item(
     // the row failed and counts a failure; it is NOT fatal. Dry-run sampling
     // has no retry ladder, so every call runs at the base temperature.
     counts.producer_calls += 1;
+    let context = invocation.log_context();
+    context.record("trigger", "dry_run");
+    context.record("source_id", ready.source_id.as_str());
+    context.record("parse_id", ready.parse_run_id.as_str());
+    context.record("annotation_id", building_id.as_str());
+    let _entered = context.enter();
     match producer::invoke(
         kind,
         client,
@@ -415,7 +421,8 @@ fn sample_item(
                 parse_id = %ready.parse_run_id,
                 producer = kind.producer_name(),
                 produced = produced.len(),
-                "dry-run producer invocation completed and cached"
+                annotation_state = "fresh_committed",
+                "dry-run validated annotation output committed"
             );
         }
         Err(source) => {

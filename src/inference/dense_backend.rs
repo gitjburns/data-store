@@ -184,6 +184,8 @@ struct EmbeddingsRequest<'request> {
 #[derive(Debug, Deserialize)]
 struct EmbeddingsResponse {
     data: Vec<EmbeddingData>,
+    // Optional metadata never changes vector validation or response acceptance.
+    usage: Option<serde_json::Value>,
 }
 
 /// One embedding entry: its input `index` and the raw `embedding` values.
@@ -355,6 +357,8 @@ impl HttpDenseClient {
         texts: &[&str],
         shape: DenseCallShape,
     ) -> Result<Vec<Vec<f32>>, ApiError> {
+        let context = crate::util::model_call_context("dense", shape.call_purpose);
+        let _entered = context.enter();
         let started_at = Instant::now();
         let text_count = texts.len();
         let text_chars = texts.iter().map(|text| text.chars().count()).sum::<usize>();
@@ -375,15 +379,14 @@ impl HttpDenseClient {
 
         // Retries performed by `send_request` for this call (0 when the first
         // attempt succeeded or the request was empty). Surfaced in the terminal
-        // completed/failed logs; on the exhausted-429 error path the closure
-        // returns before assigning, so the last recorded value stands.
+        // completed/failed logs. The loop updates this before each attempt, so
+        // terminal HTTP errors cannot incorrectly report zero retries.
         let mut retried_attempts = 0usize;
         let result = (|| -> Result<Vec<Vec<f32>>, ApiError> {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
-            let (response, retries) = self.send_request(texts, shape)?;
-            retried_attempts = retries;
+            let response = self.send_request(texts, shape, &mut retried_attempts)?;
             self.map_response(texts.len(), response, shape)
         })();
 
@@ -441,15 +444,19 @@ impl HttpDenseClient {
         &self,
         texts: &[&str],
         shape: DenseCallShape,
-    ) -> Result<(EmbeddingsResponse, usize), ApiError> {
+        retried_attempts: &mut usize,
+    ) -> Result<EmbeddingsResponse, ApiError> {
         // `attempt` is 1-based; attempt 1 is the initial request, attempts
         // 2..=DENSE_HTTP_RETRY_LIMIT+1 are retries each preceded by the fixed
-        // backoff for the just-failed attempt. The returned count is the number
+        // backoff for the just-failed attempt. The output count is the number
         // of retries performed (`attempt - 1`, so 0 on a first-attempt success).
         let mut attempt: usize = 1;
         loop {
+            *retried_attempts = attempt - 1;
+            let context = crate::util::LogContext::new("http_attempt", &attempt.to_string());
+            let _entered = context.enter();
             match self.send_request_once(texts, shape)? {
-                AttemptOutcome::Parsed(response) => return Ok((response, attempt - 1)),
+                AttemptOutcome::Parsed(response) => return Ok(response),
                 AttemptOutcome::Overloaded { body_excerpt } => {
                     // `attempt - 1` prior 429s indexes the backoff schedule; once
                     // it reaches DENSE_HTTP_RETRY_LIMIT the bound is exhausted.
@@ -544,6 +551,7 @@ impl HttpDenseClient {
         let response = match request_builder.send() {
             Ok(response) => response,
             Err(source) => {
+                let error_detail = crate::util::error_chain(&source);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "dense",
@@ -554,12 +562,12 @@ impl HttpDenseClient {
                     text_count = texts.len(),
                     phase = "send_request",
                     elapsed_ms = http_started.elapsed().as_millis() as u64,
-                    error = %source,
+                    error = %error_detail,
                     "HTTP dense request failed"
                 );
                 return Err(ApiError::InferenceInit {
                     message: format!(
-                        "HTTP dense request to {} failed before response: {source}",
+                        "HTTP dense request to {} failed before response: {error_detail}",
                         self.endpoint
                     ),
                 });
@@ -569,6 +577,7 @@ impl HttpDenseClient {
         let body = match response.text() {
             Ok(body) => body,
             Err(source) => {
+                let error_detail = crate::util::error_chain(&source);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "dense",
@@ -580,12 +589,12 @@ impl HttpDenseClient {
                     http_status = status.as_u16(),
                     phase = "read_response_body",
                     elapsed_ms = http_started.elapsed().as_millis() as u64,
-                    error = %source,
+                    error = %error_detail,
                     "HTTP dense request failed"
                 );
                 return Err(ApiError::InferenceInit {
                     message: format!(
-                        "HTTP dense response body from {} could not be read: {source}",
+                        "HTTP dense response body from {} could not be read: {error_detail}",
                         self.endpoint
                     ),
                 });
@@ -657,9 +666,12 @@ impl HttpDenseClient {
             text_count = texts.len(),
             http_status = status.as_u16(),
             vector_count = parsed.data.len(),
+            prompt_tokens = parsed.usage.as_ref().and_then(|usage| usage.get("prompt_tokens")).and_then(serde_json::Value::as_u64),
+            total_tokens = parsed.usage.as_ref().and_then(|usage| usage.get("total_tokens")).and_then(serde_json::Value::as_u64),
             response_body_chars = body.chars().count(),
             elapsed_ms = http_started.elapsed().as_millis() as u64,
-            "HTTP dense request completed"
+            result_state = "response_received_unvalidated",
+            "HTTP dense response received; vector validation pending"
         );
 
         Ok(AttemptOutcome::Parsed(parsed))

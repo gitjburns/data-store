@@ -77,6 +77,9 @@ pub(crate) fn verify_mechanical(
     index_root: &Path,
     snapshot: &ForensicSnapshot,
 ) -> Result<(), ApiError> {
+    let verification_log = crate::util::LogContext::new("snapshot", &snapshot.id);
+    verification_log.record("stage", "mechanical_verification");
+    let _verification_log = verification_log.enter();
     let store = ArtifactStore::open(index_root)?;
     let started = Instant::now();
     info!(
@@ -320,7 +323,7 @@ fn verify_all_refs_hash(
                 // or the manifest references bytes it did not store.
                 if artifact.artifact_type == CAPABILITY_PROFILE_HASH_MARKER_TYPE {
                     marker_refs_skipped += 1;
-                    info!(
+                    tracing::debug!(
                         event = "snapshot.verify.marker_ref_skipped",
                         snapshot_id = %snapshot.id,
                         section = *section_name,

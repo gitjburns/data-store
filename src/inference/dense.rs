@@ -168,6 +168,8 @@ impl DenseEmbeddingRuntime {
     // Consumed by the dense builder's Local arm (projections/dense.rs
     // build_all_chunks) and the dense-batch-diagnostic bin's dtype validation.
     pub fn embed_passage_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
+        let context = crate::util::model_call_context("dense", "passage_embedding");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let text_chars = text.chars().count();
         info!(
@@ -231,6 +233,8 @@ impl DenseEmbeddingRuntime {
     // Consumed by the query path (query/execute.rs dense query embedding, via
     // DenseEmbeddingBackend::embed_query_vector's Local arm).
     pub fn embed_query_vector(&self, text: &str) -> Result<Vec<f32>, ApiError> {
+        let context = crate::util::model_call_context("dense", "query_embedding");
+        let _entered = context.enter();
         let started_at = Instant::now();
         let text_chars = text.chars().count();
         info!(
@@ -310,6 +314,8 @@ impl DenseEmbeddingRuntime {
         call_purpose: &'static str,
         input_kind: &'static str,
     ) -> Result<DenseEmbeddingOutput, ApiError> {
+        let context = crate::util::model_call_context("dense", call_purpose);
+        let _entered = context.enter();
         let started_at = Instant::now();
         info!(
             event = "model_call.started",

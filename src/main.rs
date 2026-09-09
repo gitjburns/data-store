@@ -267,6 +267,26 @@ fn main() -> anyhow::Result<()> {
     // Operational logs switch to the configured file here. Config/CLI failures
     // before this point still surface through stdout/stderr.
     let logging = init_file_logging(&config.logging, config.config_root())?;
+    // The append-only log may contain several launches and both parent/child
+    // processes. Identify this run without logging environment or token values.
+    let run_log = util::LogContext::new("service_run", &util::diagnostic_id("run"));
+    let process_role = if cli_options.setup_storage {
+        "storage_setup"
+    } else if cli_options.smoke_dense {
+        "dense_smoke"
+    } else if cli_options.annotation_dry_run.is_some() {
+        "annotation_dry_run"
+    } else if env::var_os(BACKGROUND_STARTUP_FD_ENV).is_some() {
+        "service_child"
+    } else if cli_options.foreground {
+        "foreground_service"
+    } else {
+        "launcher"
+    };
+    run_log.record("process_role", process_role);
+    run_log.record("trigger", "process_start");
+    // main is synchronous; async entry points below instrument each future poll.
+    let _run_log = run_log.enter();
     println!(
         "data-store bootstrap file_logging=initialized path={}",
         logging.resolved_file_path.display()
@@ -316,7 +336,8 @@ fn main() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return runtime.block_on(run_annotation_dry_run_mode(config, groups_per_source));
+        return runtime
+            .block_on(run_log.instrument(run_annotation_dry_run_mode(config, groups_per_source)));
     }
 
     let bind_address = config.bind_address();
@@ -332,7 +353,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_http_service(config, admin_shutdown_token, reporter))
+    runtime.block_on(run_log.instrument(run_http_service(config, admin_shutdown_token, reporter)))
 }
 
 /// Bind HTTP before lengthy dependency initialization, then report readiness and serve until shutdown.
@@ -643,13 +664,15 @@ async fn run_http_service(
     // a partially cleared store into normal ingestion without explicit retry.
     if fabric_ready_at_startup {
         let recovery_root = state.config.storage.index_root.clone();
-        let recovery =
-            tokio::task::spawn_blocking(move || operations::unresolved_rebuild(&recovery_root))
-                .await
-                .map_err(|source| ApiError::InternalIo {
-                    message: format!("rebuild-all recovery inspection failed to join: {source}"),
-                })
-                .and_then(|result| result);
+        let recovery = tokio::task::spawn_blocking(
+            util::LogContext::current()
+                .wrap(move || operations::unresolved_rebuild(&recovery_root)),
+        )
+        .await
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("rebuild-all recovery inspection failed to join: {source}"),
+        })
+        .and_then(|result| result);
         match recovery {
             Ok(Some(operation_id)) => {
                 error!(
@@ -797,11 +820,13 @@ async fn run_http_service(
     }
     // An accepted rebuild owns filesystem deletion independently of its HTTP
     // response. Drain it before terminating the runtime, even during shutdown.
-    tokio::task::spawn_blocking(move || maintenance.wait_for_rebuild())
-        .await
-        .map_err(|source| ApiError::InternalIo {
-            message: format!("rebuild-all shutdown wait failed to join: {source}"),
-        })??;
+    tokio::task::spawn_blocking(
+        util::LogContext::current().wrap(move || maintenance.wait_for_rebuild()),
+    )
+    .await
+    .map_err(|source| ApiError::InternalIo {
+        message: format!("rebuild-all shutdown wait failed to join: {source}"),
+    })??;
     serve_result?;
     info!(event = "service.stopped", "data store service stopped");
 
@@ -910,14 +935,15 @@ async fn run_annotation_dry_run_mode(
     // Dry-run also writes corpus state; it cannot bypass the recovery marker
     // left by an interrupted normal-mode rebuild-all.
     let recovery_root = config.storage.index_root.clone();
-    let recovery =
-        tokio::task::spawn_blocking(move || operations::unresolved_rebuild(&recovery_root))
-            .await
-            .map_err(|source| ApiError::InternalIo {
-                message: format!("dry-run rebuild recovery inspection failed to join: {source}"),
-            })
-            .and_then(|result| result)
-            .inspect_err(|source| dry_run_fatal("rebuild_recovery", source))?;
+    let recovery = tokio::task::spawn_blocking(
+        util::LogContext::current().wrap(move || operations::unresolved_rebuild(&recovery_root)),
+    )
+    .await
+    .map_err(|source| ApiError::InternalIo {
+        message: format!("dry-run rebuild recovery inspection failed to join: {source}"),
+    })
+    .and_then(|result| result)
+    .inspect_err(|source| dry_run_fatal("rebuild_recovery", source))?;
     if let Some(operation_id) = recovery {
         let source = ApiError::ServiceUnavailable {
             message: format!(
@@ -1016,9 +1042,10 @@ async fn run_annotation_dry_run_mode(
     // and failure are logged by the wrapper task; a failed pass deliberately
     // keeps the service up — partial vocabulary is still worth inspecting.
     let pass_shutdown = Arc::clone(&shutdown_signal);
-    let pass_handle =
-        tokio::task::spawn_blocking(move || dry_run::run(pass_inputs, &pass_shutdown));
-    let pass_watcher = tokio::spawn(async move {
+    let pass_handle = tokio::task::spawn_blocking(
+        util::LogContext::current().wrap(move || dry_run::run(pass_inputs, &pass_shutdown)),
+    );
+    let pass_watcher = tokio::spawn(util::LogContext::current().instrument(async move {
         match pass_handle.await {
             Ok(Ok(())) => info!(
                 event = "dry_run.pass_completed",
@@ -1035,7 +1062,7 @@ async fn run_annotation_dry_run_mode(
                 "dry-run pass panicked; serving whatever landed for inspection"
             ),
         }
-    });
+    }));
 
     let health_url = format!("http://{bind_address}/v1/health");
     println!("data-store dry-run serving inspection health_url={health_url}");
@@ -1737,7 +1764,7 @@ async fn wait_for_shutdown_signal(signal: Arc<ShutdownSignal>) {
     );
     // The blocking domain signal stays on a standard thread; this async future
     // exists only to bridge that signal into Axum graceful shutdown.
-    std::thread::spawn(move || {
+    std::thread::spawn(util::LogContext::current().wrap(move || {
         let bridge_started = Instant::now();
         info!(
             event = "shutdown.signal_bridge_thread_started",
@@ -1766,7 +1793,7 @@ async fn wait_for_shutdown_signal(signal: Arc<ShutdownSignal>) {
                 );
             }
         }
-    });
+    }));
 
     match shutdown_waiting.await {
         Ok(()) => {
