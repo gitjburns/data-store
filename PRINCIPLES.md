@@ -31,25 +31,23 @@ data that is not accurate is misleading. Neither condition alone is sufficient.
   synchronous work synchronous. Never propagate async to match surrounding code
   or to prepare for speculative concurrency.
 
-## Observability Is Lossless
+## Operational Diagnostics
 
-Observability is not a summary layer. It is a lossless record of what happened.
+Service logs preserve compact operational evidence under `DIAGNOSTICS.md`.
+Complete external-payload auditing is deferred; service logs do not provide
+complete request/response reconstruction.
 
 Rules:
 
-- Raw external request and response payloads are authoritative audit material;
-  operator logs must preserve them complete, redacting only secrets. They need
-  not appear in the user interface.
-- Do not replace raw payloads with summaries, projections, or cleaned-up shapes.
-- Do not copy only known fields into narrower view models when round-trip
-  fidelity matters; unknown fields must survive the pipeline or remain available
-  in the retained raw payload.
-- Derived displays are allowed only as additions alongside the raw data.
-- Sanitization is allowed only for secrets; omission for convenience is
-  forbidden.
+- Record operation identities, meaningful boundaries, outcomes, counts, timings,
+  and specific errors with source context. Redact secrets.
+- Follow the payload prohibitions in `DIAGNOSTICS.md`; protocol correctness does
+  not require logging or archiving every external payload.
+- Preserve required diagnostic facts and existing authoritative records;
+  summaries and derived displays must not replace or obscure them.
 
-Operational losslessness means logs preserve enough boundary facts to
-reconstruct what happened without guessing. Each user-triggered operation must
+Logs must preserve enough boundary facts to explain operational outcomes
+without guessing. Each user-triggered operation must
 record start, meaningful boundaries, terminal success or failure, and the local
 facts available at each error boundary.
 
@@ -116,9 +114,9 @@ named constants with clear names.
 - Preserve raw `serde_json::Value` or retain the original raw payload at
   external protocol boundaries where unknown fields or byte-for-byte semantics
   matter.
-- If a provider payload is parsed into typed structs, the raw payload must still
-  be retained or logged for audit unless the project has explicitly decided the
-  unknown fields are irrelevant.
+- Typed provider structs must preserve fields and semantics required by the
+  protocol contract. Keeping raw data for correctness does not imply durable
+  payload auditing or permission to log prohibited data.
 - Prefer explicit `Result` handling. `unwrap` and `expect` are panic paths: they
   extract `Ok` or `Some` values, but panic on `Err` or `None` instead of
   preserving normal error flow. Use them only for startup fail-fast, controlled
@@ -190,9 +188,9 @@ Async boundaries must be intentional.
 
 - External request/response shapes are protocol data. Preserve the fields
   required for round-trip correctness.
-- Never narrow external responses into lossy structs unless raw-payload
-  retention preserves auditability and the narrowed shape preserves the protocol
-  contract.
+- Narrowed external-response structs must preserve the protocol contract,
+  including unknown fields when required for round-trip correctness. Logging
+  or archiving the original payload does not compensate for a broken contract.
 - Events streamed to clients must remain stable, explicit, and easy to audit.
   Adding or changing event fields is a cross-boundary change.
 - Streamed events must make terminal state explicit: every stream ends in a

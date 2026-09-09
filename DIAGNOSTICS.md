@@ -14,6 +14,11 @@ Terminal output, CLI output, comments, SQLite rows, and inferred state are not
 durable diagnostics. They may repeat facts, but the service log must contain
 the authoritative evidence.
 
+Service logs record compact operational evidence, not complete external
+request/response payloads. Complete external-payload auditing is deferred;
+these logs do not support full payload reconstruction. The payload prohibitions
+below apply regardless of log level.
+
 ## Useful Logs
 
 A useful log records at least one of these facts:
@@ -118,6 +123,32 @@ elapsed milliseconds, and bounded stdout/stderr diagnostics on failure.
 Every spawned task must have durable visibility for start or acceptance, normal
 completion, normal error, panic when detectable, and cancellation or join
 failure when detectable.
+
+### Annotation Cancellation
+
+`maintenance.annotation_cancellation_requested` records rebuild or shutdown
+signalling. The existing `rebuild_all.drain_started` and
+`annotator_http.call.started` events include `annotation_cancel_requested`
+(boolean) and `annotation_cancel_reason` (`None` or `Some("rebuild")`,
+`Some("shutdown")`, `Some("storage_paused")`, or
+`Some("cancellation_owner_dropped")`). The drain event samples the gate after
+cancellation is signalled; the call-start event samples the client's receiver
+before HTTP polling and does not prove a request reached the server.
+
+For in-flight requests, `annotator_http.call.cancelled` records `reason`,
+`elapsed_ms`, and `remote_outcome="unknown"`. Worker `wave_cancelled` and
+`cycle_cancelled` events under `annotation_worker` identify discarded results
+and stopped storage work. Cancellation consumes no retry or failure accounting;
+actual producer failures remain logged as `annotation_worker.discarded_failure`.
+Transaction cancellation or rollback failure retains its own storage diagnostics.
+Cancellation events depend on the work in progress; an idle worker need not
+emit a request-cancelled event.
+
+`rebuild_all.drained` reports elapsed milliseconds until all storage leases are
+released; other admitted work may still delay this boundary after annotation
+cancellation. `rebuild_all.completed` means storage clearing finished and
+background ingestion resumed. Neither local HTTP cancellation nor these
+rebuild events confirm that the remote server released inference resources.
 
 ## Required Context
 

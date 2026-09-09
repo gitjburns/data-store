@@ -59,8 +59,10 @@ start, fill in at least the following:
   terminal state. The server validates this section but never reads it.
 
 - **`[inference].device`** / **`device_index`** — the accelerator backend for the
-  in-process models (ColBERT always, plus dense and the reranker when their
-  `backend = "local"`). There is no CPU fallback.
+  retrieval models configured with `backend = "local"`. Local inference requires
+  the matching compiled accelerator feature and has no CPU fallback. When dense,
+  ColBERT, and the reranker all use HTTP, accelerator initialization is skipped;
+  `[inference]` remains required but its device selection is unused.
 
 - **`[storage].corpus_root`** — the root that corpus-relative ingest references
   address.
@@ -71,7 +73,12 @@ start, fill in at least the following:
 - **`[docling].python_path`** and **`docling_path`** — the Python environment and
   the Docling executable launched for PDF-to-markdown conversion.
 
-- **`[models.colbert].path`** — the local ColBERT-Zero model artifact directory.
+- **`[models.colbert].backend`** — required, selecting `local` or `http` without
+  fallback. Local requires an absolute `path` to ColBERT-Zero artifacts. HTTP
+  requires `endpoint`, `model`, an absolute `tokenizer_file_path`, and positive
+  `timeout_seconds`, with optional `api_key_file_path`. Fields belonging to the
+  unused backend must be absent. Both require `dimension = 128` and positive
+  `query_max_tokens` / `document_max_tokens` no greater than 518.
 
 - **`[models.dense].backend`** — required, selecting the dense embedding backend.
   The `local` backend requires `path` + `max_tokens`; the `http` backend requires
@@ -107,11 +114,33 @@ start, fill in at least the following:
   once at startup and are strictly validated (unknown keys or invalid values are
   fatal); an edit takes effect only after a service restart.
 
+### Remote ColBERT
+
+Serve `lightonai/ColBERT-Zero` on the inference host with vLLM 0.28.0:
+
+```sh
+vllm serve lightonai/ColBERT-Zero --runner pooling --hf-overrides '{"architectures":["ColBERTModernBertModel"]}' --pooler-config.task token_embed
+```
+
+Set `[models.colbert].backend = "http"`, remove `path`, and set `endpoint` to
+the full HTTP(S) URL ending in `/pooling`. The URL must not contain credentials,
+query parameters, or a fragment. Set `model = "lightonai/ColBERT-Zero"` and
+`tokenizer_file_path` to an absolute local path to that checkpoint's
+`tokenizer.json`. The existing local tokenizer can be reused when it matches
+the served checkpoint and revision; local model weights are not needed.
+
+The app formats and tokenizes inputs locally, sends token IDs for document and
+query inference, and retains document token matrices for CPU MaxSim scoring.
+Startup validates remote document/query inference and CPU scoring before
+reporting inference readiness; an unreachable endpoint or invalid matrix fails
+startup.
+
 ### Owner-only secret files
 
 The admin token file, the annotator API-key file (`.annotator-api-key`), the
-dense HTTP-backend API-key file (`.data-store-dense-api-key`), and any reranker
-API-key file hold secrets. The service writes the admin token file with `0600`
+dense HTTP-backend API-key file (`.data-store-dense-api-key`), ColBERT HTTP-backend
+API-key file (`.data-store-colbert-api-key`), and any reranker API-key file hold
+secrets. The service writes the admin token file with `0600`
 (owner read/write only); create the API-key files with the same restriction
 yourself (config-dir-relative, like the admin token file). `.gitignore` already
 excludes `config.toml`, `.data-store-admin-token`, `.annotator-api-key`,
@@ -158,8 +187,12 @@ then resumes automatic ingestion with fresh parses, embeddings, and annotations.
 The database schema, original corpus files, models, configuration, and service
 logs remain intact. No storage setup or migration is required.
 
-The command waits for current storage work to drain before receiving an
-Operation ID. This initial request uses `[client].operation_timeout_seconds`;
+Rebuild closes storage admission and cancels annotation HTTP requests, stops
+further annotation dispatch, and discards unfinished results. The scheduler
+finishes its admitted cycle. The command waits for storage leases to be released
+before receiving an Operation ID; cancellation does not guarantee the inference
+server immediately stops its own work. This initial request uses
+`[client].operation_timeout_seconds`;
 a timeout or disconnect does not cancel server work. If acceptance was not
 received, consult health and the service log for the last known state.
 

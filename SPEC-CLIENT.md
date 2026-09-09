@@ -278,11 +278,15 @@ runs asynchronously. The client:
 4. Renders the terminal operation record (§5.2).
 
 `rebuild-all` first prints `Waiting for current storage work to finish before
-acceptance...`. The server drains admitted work before persisting the Operation
-and returning `202`; clearing then runs asynchronously. The initial POST uses
-the existing `[client].operation_timeout_seconds`. A timeout or disconnect does
-not cancel server work; if acceptance was not received, consult health and the
-service log for the last known state.
+acceptance...`. The server cancels annotation HTTP requests and stops further
+annotation dispatch. Cancelled results are discarded and uncommitted writes
+rolled back; other admitted storage work still drains. Only after all storage
+leases are released does the server persist the Operation and return `202`;
+clearing then runs asynchronously. The initial POST uses the existing
+`[client].operation_timeout_seconds`. A CLI timeout or disconnect does not cancel
+the rebuild; if acceptance was not received, consult health and the service log
+for the last known state. Cancelling annotation HTTP requests locally does not
+confirm that remote inference has stopped.
 
 Each poll re-reads the admin token and is itself bounded by
 `[client].operation_timeout_seconds` (the per-request timeout). The poll
@@ -292,7 +296,9 @@ NDJSON, no streaming, and no stream-timeout** anywhere in the client.
 **`shutdown` is not an operation.** It prints the same
 `POST <url>` progress line, POSTs to `/shutdown`, receives a `202` with
 **no body**, prints `Shutdown signalled (HTTP 202)`, and is **never
-polled**.
+polled**. The server cancels annotation requests and stops new annotation
+dispatch; this confirmation does not mean local cleanup or remote inference
+termination has completed.
 
 The progress line is printed **only** by the async admin POSTs and
 `shutdown`: read commands and `query` print no progress line.

@@ -25,10 +25,10 @@ supplement canonical IDs without creating records or changing HTTP contracts.
 Stage outcomes distinguish received, validated, staged, committed, and published
 state. `DIAGNOSTICS.md` defines the fields, measurements, and level policy.
 
-### Architectural invariant: async is confined to the transport shell
+### Architectural invariant: async is confined to HTTP boundaries
 
-Async/`tokio` lives **only** in the HTTP transport. Every piece of lifecycle
-machinery is synchronous OS-thread work over `rusqlite`:
+Async/`tokio` is confined to HTTP serving and annotator HTTP I/O. Every piece of
+lifecycle machinery is synchronous OS-thread work over `rusqlite`:
 
 - the acquisition/parse/gate scheduler (`src/scheduler.rs`) runs on one
   `std::thread`;
@@ -36,6 +36,10 @@ machinery is synchronous OS-thread work over `rusqlite`:
   `std::thread`;
 - the importer, activation, snapshotting, projection builders, and the query
   pipeline are all synchronous functions.
+
+The annotator's HTTP client also uses async request futures internally so rebuild
+and shutdown can cancel network waits. Its synchronous producer interface owns
+a shared single-worker Tokio runtime for HTTP I/O; no SQLite work runs there.
 
 HTTP handlers that touch the pipeline do so inside `spawn_blocking`: the query
 handler and every administrative Operation run as detached blocking tasks. SQLite
@@ -116,12 +120,19 @@ recorded additive).
 
 ### 1.2 Rebuild maintenance
 
-`POST /rebuild-all` closes a shared admission gate, drains admitted HTTP requests
-and detached admin tasks, and parks both workers at cycle boundaries. Only then
-does it persist the pending `rebuild_all` Operation and return `202`. Draining
+`POST /rebuild-all` closes a shared admission gate and signals annotation
+cancellation. The annotation worker stops dispatch, cancels outstanding HTTP
+waits, discards unfinished results, and rolls back uncommitted writes. Its lease
+remains held until all producer threads and local writes stop. Other admitted
+HTTP/admin work drains, and the scheduler parks at a cycle boundary. Only then
+does the service persist the pending `rebuild_all` Operation and return `202`. Draining
 and detached clearing run synchronously behind `spawn_blocking`. Client timeout
 or disconnect does not cancel the work. Health, Operation polling, and shutdown
 remain available.
+
+Cancellation is a control outcome, not a provider failure or retry-budget charge.
+The watch signal resets only after clearing succeeds and the storage generation
+advances. `DIAGNOSTICS.md` documents the cancellation fields and terminal events.
 
 With storage users drained, the operation clears application data while
 preserving schema and its own Operation, deletes the artifact and staging trees,
@@ -155,8 +166,7 @@ store. Policy, all as code constants and never operator-tunable:
 - `foreign_keys=ON` applied per connection (not in the DDL).
 - `busy_timeout` and statement deadlines are code constants
   (`BUSY_TIMEOUT_MS = 5_000`, `STATEMENT_DEADLINE_MS = 5_000`), not config.
-- Its own `PRAGMA user_version`, starting at **1**. Nothing has ever run, so the
-  version stays 1.
+- Its own `PRAGMA user_version`, starting at **1**.
 - A fresh connection per operation; writes go through the shared IMMEDIATE
   transaction helpers (`begin_write_transaction`/`commit_transaction`/
   `abort_transaction`), reads through `begin_read_transaction`.
@@ -413,7 +423,8 @@ than build-sealed. `[policies]` config holds their **paths only**
   the query graph channel (Section 6). Shipped neutral: both fuzzy classes
   disabled.
 - **`policies/annotator-naming.toml`** — the `rules` list composed into the
-  entity/relation producer prompts (Section 3.1). Shipped empty.
+  entity/relation producer prompts (Section 3.1). The repository policy supplies
+  naming guidance; an empty list is valid.
 
 Both are **loaded once at startup and fatal on invalid** (`src/main.rs`); each
 is content-hashed over its **parsed canonical serialization**
@@ -758,7 +769,7 @@ database connections. Slots are poison-recovered on read.
 ## 8. Model runtime
 
 `InferenceRuntime` (`src/inference/mod.rs`) is initialized once at startup and
-holds the selected device plus three model runtimes:
+holds the three selected retrieval backends and an optional local accelerator:
 
 - **Dense embedding** (`src/inference/dense_backend.rs`). An enum, not a trait:
   `DenseEmbeddingBackend::Local(DenseEmbeddingRuntime)` (the in-process Qwen3
@@ -773,40 +784,47 @@ holds the selected device plus three model runtimes:
   per-entry `index`, validates every returned vector (dimension against the
   configured width, all values finite, finite nonzero norm), and L2-normalizes
   client-side so both backends preserve the unit-norm invariant.
-- **ColBERT late-interaction** (`src/inference/colbert.rs`). Document token
-  matrices are embedded at projection-build time and persisted
-  (`unit_multivector_projections`); at query time MaxSim decodes the stored
-  matrices and embeds only the **query** live.
+- **ColBERT late-interaction** (`src/inference/colbert_backend.rs`).
+  `ColbertBackend::Local` loads ColBERT-Zero through Candle;
+  `ColbertBackend::Http` sends document and query token IDs to vLLM's `/pooling`
+  endpoint with `task = token_embed`. Both use the same local formatting and
+  tokenization contract. The HTTP backend loads a matching `tokenizer.json` but
+  no local model weights, validates indexed 128-dimensional token matrices, and
+  normalizes their rows. Document matrices are persisted in
+  `unit_multivector_projections`. With the HTTP backend, queries embed only the
+  query and perform MaxSim against stored matrices on the CPU; startup checks
+  batched remote embedding and CPU scoring. Backend selection is exclusive,
+  with no fallback or implicit HTTP retry.
 - **Reranker** (`src/inference/reranker_backend.rs`). An enum, not a trait:
   `RerankerBackend::Local` (ModernBERT sequence classifier on the local
   accelerator) or `RerankerBackend::Http` (Cohere-compatible remote client).
   Exactly one instance exists and the variants are **exclusive — there is no
   cross-backend fallback**.
 
-**Accelerator selection is explicit, with NO CPU fallback**
-(`src/inference/device.rs`). Config selects `cuda:N` or `metal:N`; support is
-compiled in via the `cuda`/`metal` cargo features, and a binary built without
-the matching feature fails device initialization with an explicit
-build-feature error rather than degrading to CPU.
+**Accelerator initialization is conditional.** If any retrieval backend is local,
+`[inference]` selects its CUDA or Metal device and the binary must include the
+matching Cargo feature; local model inference has no CPU fallback. If dense,
+ColBERT, and reranker backends are all HTTP, startup skips accelerator
+initialization. The required `[inference]` settings are then unused; local
+tokenization and remote-ColBERT MaxSim need only the CPU.
 
 **Model-call gate.** One process-global `ExclusiveGate` serializes access to
 the shared accelerator-backed runtimes. Acquisition discipline is
 **caller-side and backend-aware**: callers acquire the gate (per model role,
 via `acquire_model_call_gate_on`) only around a live **local** model call, for
-the duration of that call. For the reranker and the dense embedder — both
-config-selected backends — the acquiring site guards the acquire behind
-`uses_local_model_gate()`, which is `true` only for the Local variant. On the
-**local** dense path the scheduler's projection build and the query embedding
+the duration of that work. For all three retrieval backends, the acquiring site
+guards acquisition behind `uses_local_model_gate()`, which is `true` only for
+the Local variant. On the **local** dense path the scheduler's projection build
+and the query embedding
 (`src/scheduler.rs`, `src/query/execute.rs`) each take the dense-role permit
-around the embed and drop it before the following SQL reads; MaxSim's live query
-embedding and the Local reranker acquire the same way. The **HTTP** dense
-backend and the HTTP reranker are network I/O and **acquire nothing** — the gate
-must never be held across the round-trip. `uses_local_model_gate()` is the
-predicate deciding which path a backend takes, and it acquires nothing itself.
+around local dense work; local ColBERT batches and query scoring use their own
+permits. All **HTTP** backends and CPU MaxSim acquire no accelerator permit.
+The gate must never be held across an HTTP round-trip. The predicate acquires
+nothing itself.
 
 **HTTP dense backend** (`src/inference/dense_backend.rs`). When
 `[models.dense].backend = http` the endpoint/model/timeout come from config and
-an optional bearer key is loaded once at build time from an **owner-only**
+an optional bearer key is loaded once at startup from an **owner-only**
 `api_key_file_path` (the `.data-store-dense-api-key` convention, permission-
 checked exactly like the reranker/annotator keys and never logged). Startup does
 **no** local artifact validation or model load for this backend — it runs a
@@ -835,13 +853,17 @@ the commit). The annotation worker (`src/annotations/worker.rs`) fans out
 `ANNOTATOR_CONCURRENT_CALLS = 32` producer calls per wave under a
 prepare/dispatch/commit split, then commits each result serially; the pre-paid /
 post-paid deferral ruling keeps its writes off the hot writer lock during the
-fan-out, and a `wave_abandoned_shutdown` WARN records a wave dropped for
-crash-orphan adoption when shutdown lands before dispatch.
+fan-out. Rebuild/shutdown cancellation joins the outstanding calls, discards
+unfinished results, and rolls back uncommitted writes before releasing admission.
 
-**Annotator** (`src/annotations/llm_client.rs`). A separate, blocking,
-OpenAI-compatible chat-completions client shared by the three annotation
-producers — one external endpoint, no fallback endpoint, and no relationship
-to the local model-call gate. It is **not readiness-critical**: a client load
+**Annotator** (`src/annotations/llm_client.rs`). A synchronous producer interface
+over cancellable async OpenAI-compatible HTTP, shared by the three annotation
+producers. One owned Tokio runtime services HTTP I/O; lifecycle and SQLite work
+remain on synchronous worker threads. A maintenance watch cancels the complete
+send/body wait on rebuild or shutdown. Dropping the request reports local
+cancellation with `remote_outcome = unknown`, not proof that remote inference
+stopped. There is one external endpoint, no fallback, and no local model-call
+gate. It is **not readiness-critical**: a client load
 failure (e.g. a bad key file) parks the annotation worker instead of failing
 startup (Section 3.1).
 

@@ -65,21 +65,34 @@ original status codes.
 
 - **Query console** (the primary view): query text, constraints (`sourceIds`,
   `governanceDomains`), `maxFinalEvidenceUnits`, evidence-policy toggles, debug
-  toggle. Results render simple-first (rank, role and content-type badges,
-  score, text projection; context units also badge their inclusion reasons)
-  with anchor units visually distinct from assembly-added context units (score
-  presence is the discriminator). A unit without a text projection renders a
-  labelled body-derived summary (section path/heading, table
-  caption/shape/headers/markdown, row position, figure and image-region text,
-  page number) in its place; the raw body JSON in the expansion stays
-  authoritative. Each unit expands to full provenance (ids, content type,
-  locators, body JSON, reasons). Every `unitId` and `sourceId` is a
-  navigation link.
-- **Assembly trace panel** per query: policy id/version/hash, applied rules
-  grouped by anchor, rejected hits/units, budget.
-- **Debug diagnostics panel** (only when the request set `debug`): per-stage
-  latency table, fused candidate pool with per-channel provenance, MaxSim and
-  reranker score tables.
+  toggle. Primary results are ranked server-supplied passages (`results`), with
+  source locations and status, section path, physical PDF page numbers, full
+  passage text, and an explicit marker when the server truncated the passage.
+  Missing source or page information is labelled unavailable.
+- **Retrieval provenance** appears on each passage without requiring debug.
+  Server-supplied channels are labelled Semantic search, Keyword search, and
+  Annotations. Annotation contribution distinguishes no annotation matches,
+  overlap with other candidate lists, and additional candidate matches; it does
+  not claim annotations improved relevance. Previews show up to three distinct
+  annotation explanations and three dense-match descriptions. Annotation paths
+  distinguish direct entity matches, relationship evidence, and related entity
+  mentions while preserving relationship direction. Dense descriptions
+  distinguish direct passage, section-guided, and document-scoped context matches.
+  Missing provenance is explicitly unavailable.
+- **Retrieval details** expands each passage's complete per-unit channels,
+  graph and dense matches, relationship-support links, context-unit links, and
+  provenance JSON. Context units receive no inferred retrieval match. Canonical
+  section IDs link to the unit explorer; section-window and chunk IDs remain
+  text because they have no detail endpoint.
+- **Evidence and diagnostics** expands the evidence pack, assembly trace, debug
+  diagnostics when requested, and complete response JSON. Evidence units retain
+  role/content-type badges, scores for anchors, context inclusion reasons,
+  text projections or labelled body-derived summaries, and raw body/provenance
+  details. Unit and source IDs link to their respective views. The assembly
+  trace shows policy id/version/hash, rules grouped by anchor, rejected
+  hits/units, and budget. Debug diagnostics show per-stage latency, complete
+  eligible channel membership (`channelHits`), the fused candidate pool labelled
+  with its single **representative channel**, MaxSim, and reranker scores.
 - **Unit explorer**: unit detail plus relationships with direction/type
   filters; related units are click-through links.
 - **Source view**: locations, freshness, active parse.

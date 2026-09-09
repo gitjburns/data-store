@@ -79,10 +79,12 @@ slot. Neither gates service readiness.
 
 ### 1.3 HTTP transport shell
 
-An Axum HTTP server (async, Tokio multi-thread runtime) is the **only** async
-surface. It is a thin transport shell: the query pipeline and all admin work run
-on blocking threads. The route surface is summarized in §6; PROTOCOL.md is the
-exhaustive contract.
+The Axum HTTP server uses a Tokio multi-thread runtime as a thin transport shell:
+the query pipeline and all admin work run on blocking threads. The annotator
+also uses async HTTP internally, on an owned single-worker runtime, so rebuild
+and shutdown can cancel network waits. Its producer interface, worker lifecycle,
+and SQLite work remain synchronous. The route surface is summarized in §6;
+PROTOCOL.md is the exhaustive contract.
 
 ### 1.4 Snapshot / restore / deletion lifecycle
 
@@ -189,8 +191,13 @@ streaming transport.
 
 | Key | Meaning |
 | --- | --- |
-| `device` | Accelerator backend: `cuda` or `metal`. **CPU fallback is intentionally unsupported.** |
+| `device` | Accelerator backend for local models: `cuda` or `metal`. **Local inference has no CPU fallback.** |
 | `device_index` | Device index passed to the selected backend. |
+
+Both keys remain required. They are used only when at least one of dense,
+ColBERT, or reranker selects `local`, which also requires the matching Cargo
+feature. When all three select `http`, startup skips accelerator initialization;
+tokenization and remote-ColBERT MaxSim run on the CPU.
 
 ### 2.6 `[storage]`
 
@@ -240,14 +247,29 @@ and can trigger dominance gating on change.
 | `timeout_seconds` | `http` | External embeddings request timeout. > 0. Forbidden for `local`. |
 | `api_key_file_path` | optional (`http` only) | Owner-only file holding the bearer API key (e.g. `.data-store-dense-api-key`). Relative resolves against the config directory. |
 
-`[models.colbert]`:
+`[models.colbert]` — backend-exclusive; **no fallback between backends.**
 
-| Key | Meaning |
-| --- | --- |
-| `path` | Local ColBERT-Zero model directory. Absolute. |
-| `dimension` | Expected ColBERT token-vector width. > 0. |
-| `query_max_tokens` | ColBERT query input token cap. > 0. |
-| `document_max_tokens` | ColBERT document/unit input token cap. > 0. |
+| Key | Required when | Meaning |
+| --- | --- | --- |
+| `backend` | always | `local` (Candle ColBERT-Zero) or `http` (vLLM token embeddings). |
+| `dimension` | always | ColBERT-Zero token-vector width: `128`. |
+| `query_max_tokens` | always | Query input token cap, from 1 through 518. |
+| `document_max_tokens` | always | Document input token cap, from 1 through 518. |
+| `path` | `local` | Absolute local model directory. Forbidden for `http`. |
+| `endpoint` | `http` | Full HTTP(S) route ending in `/pooling`; no URL credentials, query, or fragment. Forbidden for `local`. |
+| `model` | `http` | Non-empty served model name. Forbidden for `local`. |
+| `tokenizer_file_path` | `http` | Absolute path to `tokenizer.json` matching the served checkpoint. Forbidden for `local`. |
+| `timeout_seconds` | `http` | Positive request timeout. Forbidden for `local`. |
+| `api_key_file_path` | optional (`http` only) | Owner-only bearer-key file; relative paths resolve against the config directory. |
+
+The HTTP adapter sends locally formatted token IDs with `task = token_embed`.
+It validates indexed token matrices and normalizes each row. Document matrices
+are persisted; query-time HTTP inference embeds the query, then CPU MaxSim
+scores stored document matrices. Startup verifies a document batch, query
+embedding, and CPU scoring; failure prevents readiness. There is no implicit
+HTTP retry. This backend loads a tokenizer but no local model weights; an
+existing local ColBERT-Zero tokenizer can be reused when it matches the served
+checkpoint. See INSTALL.md for the `lightonai/ColBERT-Zero` serving command.
 
 `[models.reranker]` — backend-exclusive; **no fallback between backends.**
 `backend` is `local` or `http`. Validation requires each backend's fields and
@@ -411,10 +433,13 @@ degraded diagnostic never makes a running service report unavailable.
 ### 4.5 Graceful shutdown
 
 Shutdown is driven **only** by `POST /shutdown` → `AppState::request_shutdown`,
-which signals a cross-thread latch. **There is no OS-signal handling.** On the
-signal (or on a transport error in the serve loop) the service requests shutdown,
-then joins the scheduler and annotation worker, waits for any accepted rebuild
-owner to reach a terminal boundary, cleans up the token file, and stops.
+which signals a cross-thread latch and annotation cancellation. **There is no
+OS-signal handling.** On the signal (or on a transport error in the serve loop)
+the service requests shutdown. Annotation dispatch stops, outstanding HTTP waits
+are cancelled, and unfinished results are discarded with uncommitted writes
+rolled back. Local cancellation does not prove remote inference has stopped.
+The service joins the scheduler and annotation worker, waits for any accepted
+rebuild owner to reach a terminal boundary, cleans up the token file, and stops.
 
 ### 4.6 Daemonization handoff
 
@@ -521,14 +546,23 @@ needs the domain verdict must read the parse run, not just the Operation status.
 
 ### 5.1 Rebuild all
 
-`POST /rebuild-all` pauses storage admission, drains admitted HTTP and detached
-admin work, and parks the ingestion and annotation workers at cycle boundaries.
+`POST /rebuild-all` pauses storage admission and signals annotation cancellation
+before draining. The annotation worker stops dispatching, cancels outstanding
+HTTP waits, discards unfinished results, and rolls back uncommitted writes. It
+retains its storage lease until producer threads and local writes have stopped;
+clearing cannot race a late write. Admitted HTTP and detached admin work still
+drain, and the ingestion scheduler parks at a cycle boundary.
 New storage-dependent requests and overlapping rebuilds return `503`; health,
 Operation polling, and shutdown remain available.
 After draining, the service persists the pending rebuild Operation and returns
 `202`; clearing continues on a detached blocking task. Client timeout or
 disconnect does not cancel server work. Health and the service log preserve the
 last known state when the client does not receive acceptance.
+
+Cancellation does not consume annotation output retries or count as a producer
+failure. The cancellation watch resets after clearing and advancing the storage
+generation. DIAGNOSTICS.md defines the cancellation and drain events; local
+cancellation alone cannot establish whether the remote endpoint stopped inference.
 
 The operation clears application tables and the lexical index, retaining the
 schema and current rebuild Operation; deletes `fabric/artifacts/` and
@@ -1008,7 +1042,9 @@ empty).
   in annotation health. Restart, rebuild-all, or producer identity change
   re-arms the budget.
 - **Call recovery.** Network, HTTP, and completion-envelope failures end the
-  cycle after every current-wave result is committed. The next cycle retries
+  cycle after every current-wave result is committed, unless maintenance or
+  shutdown cancels the wave. Cancelled results are discarded without consuming
+  output retries or counting as producer failures (§5.1). The next cycle retries
   after the existing 30-second delay, subject to the shared 60-second ceiling;
   persistent call failures remain retry-eligible indefinitely. Failure logs
   preserve the original error plus failure class and output-failure count.
@@ -1138,9 +1174,10 @@ an immediate 503. (§7.)
 
 A process-global exclusive gate serializes live **local** accelerator calls.
 The discipline is caller-side: acquire immediately before a live local model
-call (dense query embed, ColBERT scoring, local reranker), release immediately
+call (local dense query embed, local ColBERT scoring, local reranker), release immediately
 after — never held across SQL reads, and **never held across HTTP backends**
-(network I/O must not starve the accelerator gate).
+(network I/O must not starve the accelerator gate). The HTTP ColBERT backend's
+CPU MaxSim also takes no accelerator permit.
 
 ### 14.5 Sealed policy documents
 

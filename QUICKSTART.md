@@ -10,12 +10,16 @@ repo root as working directory; the built binaries are
 ## 1. Build
 
 ```sh
+cargo build --release                     # All retrieval models use HTTP
 cargo build --release --features metal    # Apple accelerator
 cargo build --release --features cuda     # NVIDIA accelerator
 ```
 
-There is no CPU fallback: the binary must be built with the feature matching
-`[inference].device`, or device init fails at startup.
+Choose one build. When dense, ColBERT, and the reranker all use `backend = "http"`,
+retrieval requires no local accelerator; ColBERT MaxSim runs on the CPU.
+`[inference]` remains required but its device selection is unused. Any local
+retrieval backend requires the feature matching `[inference].device`; local
+models have no CPU fallback.
 
 ## 2. Configure
 
@@ -29,7 +33,12 @@ misspelled keys anywhere in `config.toml` are fatal at startup. Relative paths
 resolve against the config file's directory. Config is startup-only: any edit
 requires a service restart.
 
-API-key files for HTTP backends (dense, reranker, annotator) are owner-only
+For remote ColBERT, select `backend = "http"`, remove `path`, and configure the
+full `/pooling` endpoint, served model, timeout, and absolute local
+`tokenizer_file_path` matching the served checkpoint. See **INSTALL.md**, Remote
+ColBERT, for the vLLM serving command and configuration requirements.
+
+API-key files for HTTP backends (dense, ColBERT, reranker, annotator) are owner-only
 secret files named in config, e.g.:
 
 ```sh

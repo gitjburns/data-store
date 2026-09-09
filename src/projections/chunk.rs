@@ -90,11 +90,9 @@ INSERT INTO chunk_projections (
 /// `chunk_projections` holds exactly this parse's current chunk set and the
 /// Chunk envelope is `fresh`.
 ///
-/// `tokenizer` is CALLER-SUPPLIED (§C6b): the integration agent passes the
-/// ColBERT tokenizer runtime handle so the chunk token cap is measured against
-/// the same tokenizer the multivector channel uses. Token counting mirrors the
-/// harvested `units.rs` `count_tokens` (`encode(text, true).len()`); this
-/// builder never constructs its own tokenizer.
+/// `tokenizer` supplies the ColBERT vocabulary and special-token convention.
+/// A per-build copy disables truncation and padding to measure complete,
+/// normalized targeting text without changing the inference runtime's settings.
 ///
 /// Atomicity and lifecycle: everything runs on the CALLER's transaction. We
 /// open a `building` Chunk envelope, delete prior chunk rows, extract and split
@@ -414,6 +412,16 @@ fn split_units_into_chunks(
     units: &[ChunkableUnit],
     tokenizer: &Tokenizer,
 ) -> Result<Vec<BuiltChunk>, ApiError> {
+    // Length accounting must see the complete input, independently of inference
+    // truncation/padding settings. Keep the shared model tokenizer unchanged.
+    let mut counter = tokenizer.clone();
+    counter
+        .with_truncation(None)
+        .map_err(|source| ApiError::UnitSplitting {
+            message: format!("failed to disable chunk tokenizer truncation: {source}"),
+        })?;
+    counter.with_padding(None);
+    let tokenizer = &counter;
     let max_tokens = MAX_UNIT_TOKENS as usize;
     let min_chars = MIN_SEARCH_UNIT_CHARS as usize;
     let mut chunks = Vec::new();
@@ -463,6 +471,20 @@ fn split_units_into_chunks(
     }
 
     flush_chunk(&mut current, &mut chunks, min_chars);
+    // Both emission paths normalize text. Recount their exact output and enforce
+    // the cap before any chunk rows are persisted by the caller's transaction.
+    for chunk in &mut chunks {
+        chunk.token_count = count_tokens(tokenizer, &chunk.targeting_text)?;
+        if chunk.token_count > max_tokens {
+            return Err(ApiError::UnitSplitting {
+                message: format!(
+                    "chunk starting at unit {:?} has {} tokens after normalization, exceeding {max_tokens}",
+                    chunk.input_unit_ids.first(),
+                    chunk.token_count
+                ),
+            });
+        }
+    }
     Ok(chunks)
 }
 
@@ -514,9 +536,8 @@ impl ChunkAccumulator {
     }
 }
 
-/// Join two targeting-text fragments with a blank line, mirroring the
-/// `"{}\n\n{}"` block join harvested from `units.rs`. The separator is part of
-/// the token-cap accounting because it is part of the persisted targeting text.
+/// Retain block separation during accumulation. Counting and final emission both
+/// collapse the separator through the same targeting-text normalization.
 fn join_text(left: &str, right: &str) -> String {
     format!("{left}\n\n{right}")
 }
@@ -599,9 +620,9 @@ impl ChunkAccumulator {
     }
 }
 
-/// Split a single sentence too long for the cap into word runs, harvested from
-/// `units.rs::split_long_text_by_words`. Each run stays under the cap; a word
-/// run that survives the min-char drop becomes one chunk carrying `unit_id`.
+/// Pack sentence words under the token cap, splitting an individually oversized
+/// word at UTF-8 boundaries. All fragments retain the unit's canonical identity
+/// and remain subject to the existing minimum-character filter.
 fn split_long_text_by_words(
     unit_id: &str,
     text: &str,
@@ -621,7 +642,21 @@ fn split_long_text_by_words(
             push_built_chunk(chunks, unit_id, content, token_count, min_chars);
             current_words.clear();
         }
-        current_words.push(word);
+        if candidate_tokens > max_tokens {
+            // Any preceding words have been flushed. Keep the final fitting
+            // suffix available to join subsequent words, just like an ordinary
+            // word; only full fragments are emitted inside the helper.
+            let suffix =
+                split_oversized_word(unit_id, word, tokenizer, max_tokens, min_chars, chunks)
+                    .map_err(|source| ApiError::UnitSplitting {
+                        message: format!(
+                            "failed to split oversized word in unit {unit_id}: {source}"
+                        ),
+                    })?;
+            current_words.push(suffix);
+        } else {
+            current_words.push(word);
+        }
     }
 
     if !current_words.is_empty() {
@@ -631,6 +666,62 @@ fn split_long_text_by_words(
     }
 
     Ok(())
+}
+
+/// Emit measured prefixes of an oversized word and return its fitting suffix for
+/// normal word accumulation. Offsets address the original UTF-8 text, so splitting
+/// never decodes token IDs or loses bytes before the existing min-char filter.
+fn split_oversized_word<'a>(
+    unit_id: &str,
+    word: &'a str,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+    min_chars: usize,
+    chunks: &mut Vec<BuiltChunk>,
+) -> Result<&'a str, ApiError> {
+    if count_tokens(tokenizer, word)? <= max_tokens {
+        return Ok(word);
+    }
+    let boundaries: Vec<usize> = word
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(word.len()))
+        .collect();
+    let mut start = 0;
+    loop {
+        // The entire remainder is known to exceed the cap. Search only shorter,
+        // nonempty prefixes. Token counts need not be monotone: remembering only
+        // measured fits may underfill a chunk, but never permits an oversized one.
+        let mut low = start + 1;
+        let mut high = boundaries.len() - 1;
+        let mut fitting = None;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let fragment = &word[boundaries[start]..boundaries[middle]];
+            let token_count = count_tokens(tokenizer, fragment)?;
+            if token_count <= max_tokens {
+                fitting = Some((middle, token_count));
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let (end, token_count) = fitting.ok_or_else(|| ApiError::UnitSplitting {
+            message: format!(
+                "could not find a nonempty UTF-8 prefix within the {max_tokens}-token cap for unit {unit_id} at byte {}",
+                boundaries[start]
+            ),
+        })?;
+        let fragment = &word[boundaries[start]..boundaries[end]];
+        push_built_chunk(chunks, unit_id, fragment.to_owned(), token_count, min_chars);
+        // Always advance, even if the unchanged minimum-length policy discarded
+        // this fragment. The suffix remains contiguous with the emitted prefix.
+        start = end;
+        let suffix = &word[boundaries[start]..];
+        if count_tokens(tokenizer, suffix)? <= max_tokens {
+            return Ok(suffix);
+        }
+    }
 }
 
 /// Build the candidate text for adding one word to the current word run
@@ -731,15 +822,13 @@ fn split_sentences(text: &str) -> Vec<&str> {
     results
 }
 
-/// Count model tokens for one candidate via the CALLER-SUPPLIED tokenizer,
-/// mirroring `units.rs::count_tokens` (`encode(text, true).len()`). The count is
-/// identity-relevant ONLY as the §22 `tokenCount` recorded on the chunk row; it
-/// is not an independent chunker-identity input, because the tokenizer itself is
-/// supplied by the caller rather than fixed by this builder. `add_special_tokens
-/// = true` matches the harvested behavior so the cap is measured the same way.
+/// Measure the normalized targeting text, including special tokens, with the
+/// build's untruncated, unpadded counter. Candidate decisions and stored counts
+/// must describe the same bytes; tokenization is not additive across joins.
 fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize, ApiError> {
+    let normalized = normalize_targeting_text(text);
     tokenizer
-        .encode(text, true)
+        .encode(normalized.as_str(), true)
         .map(|encoding| encoding.len())
         .map_err(|source| ApiError::UnitSplitting {
             message: format!("tokenization failed during chunk splitting: {source}"),

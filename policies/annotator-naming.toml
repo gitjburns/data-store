@@ -14,7 +14,7 @@
 # as a semantic change to how annotations are produced, not a cosmetic tweak.
 #
 # An EMPTY list is the valid NEUTRAL document: no additional naming guidance is
-# composed into producer prompts. This shipped document is neutral.
+# composed into producer prompts.
 rules = [
   "Entity types come from this preferred set when applicable: person, organization, location, work, chapter, concept, event, date, group, species, technology. Use 'work' for books, films, and other titled works.",
   "Name a person by the fullest form the text gives.",

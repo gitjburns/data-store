@@ -357,11 +357,11 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 | `[logging]` | File-backed service logging. |
 | `[admin]` | Admin token file location. |
 | `[client]` | Bundled CLI settings (server validates, never reads at runtime). |
-| `[inference]` | Accelerator selection for model runtimes. |
+| `[inference]` | Accelerator selection for local retrieval models. Required but unused when dense, ColBERT, and the reranker all use HTTP; no local accelerator is initialized in that mode. |
 | `[storage]` | Corpus root and service-owned index root. |
 | `[connectors.filesystem]` | Governance domain stamped on acquired sources. |
 | `[docling]` | Docling executable and PDF conversion controls. |
-| `[models]` | Model backends: `[models.dense]` and `[models.reranker]` each pick an exclusive `backend` (`local` = on-accelerator artifacts + token limits; `http` = remote OpenAI-/Cohere-compatible endpoint, model, timeout, and optional key file); ColBERT and the annotator alongside. |
+| `[models]` | Dense, ColBERT, and reranker each select an exclusive `local` or `http` backend. Remote ColBERT uses vLLM `/pooling` token inference, a matching local tokenizer, persisted document matrices, and CPU MaxSim; no local ColBERT weights are loaded. The annotator uses an external chat-completions endpoint. See **INSTALL.md** for backend fields. |
 | `[policies]` | Paths to the two operator-editable policy documents (entity-match ruleset, annotator naming rules); config holds paths only, and edits require a restart. |
 
 See **INSTALL.md** for the annotated example and the required absolute paths.

@@ -924,9 +924,15 @@ Clear the corpus's stored state and resume automatic ingestion. Protected.
 `operationType: rebuild_all` and target `corpus`.
 
 The service rejects new storage-dependent requests with `503`
-`service_unavailable`, drains admitted requests and admin tasks, and parks
-ingestion and annotation workers after their current cycles. Health, Operation
-polling, and shutdown remain available. An overlapping rebuild returns `503`.
+`service_unavailable` and cancels in-flight annotation HTTP requests, preventing
+further annotation dispatch. The annotation worker joins its producer threads,
+discards cancelled results without retry or failure accounting, and rolls back
+uncommitted writes before releasing its storage lease. Actual failures remain
+diagnosable. Other admitted storage work still drains, and the scheduler parks
+between cycles; storage is cleared only after all leases are released. Local
+HTTP cancellation does not establish that remote inference has stopped.
+Health, Operation polling, and shutdown remain available. An overlapping
+rebuild returns `503`.
 Only after draining finishes does the service persist the pending Operation and
 return `202`; clearing runs on a detached task. A client timeout or disconnect
 does not cancel server work. If acceptance was not received, the outcome may be
@@ -958,6 +964,11 @@ Operation** — it returns an immediate confirmation and signals the shutdown
 latch; **no Operation row is written** and there is nothing to poll. (This route
 is a recorded extra-spec additive; the §34.6 operation-type set has no shutdown
 value, consistent with it not being tracked async work.)
+
+Shutdown cancels annotation HTTP requests and stops further annotation dispatch.
+The worker joins producers, discards cancelled results, and rolls back
+uncommitted writes before releasing storage. Confirmation acknowledges the
+shutdown signal, not completed local cleanup or termination of remote inference.
 
 **Request body** — none.
 
