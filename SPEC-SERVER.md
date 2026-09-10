@@ -64,18 +64,18 @@ cycle publishes health counters (§7).
 
 A separate **annotation worker** thread runs beside the scheduler. It is
 discovery-based: each cycle it examines active sources and builds the MVP
-semantic annotation types (entity, relation, summary) for units that lack them,
+semantic annotation types (entity, relation, summary) for source excerpts that lack them,
 reusing memoized producer output (`annotation_memo`) on a memo-key hit and
-retrying previously failed rows under the failure-class policy in §13. Only
-invalid output consumes the per-run budget and escalates sampling temperature.
-Annotation producers call an external
-OpenAI-compatible chat-completions endpoint (`[models.annotator]`).
+retrying failed chains under the independent execution and malformed-output
+budgets in §13. Only malformed outputs advance sampling temperature.
+Single-goal stages call the external OpenAI-compatible chat-completions endpoint
+(`[models.annotator]`) with thinking, structured output, and streaming diagnostics.
 
-The annotation worker is **deliberately not readiness-critical.** A bad key or
-config file **parks** the worker (annotations disabled for the run) while the
+The annotation worker is **deliberately not readiness-critical.** Client-load
+failures, such as an unreadable API-key file, **park** it for the run while the
 process keeps serving; an unreachable endpoint degrades annotations visibly
 through freshness rows, worker logs, and the diagnostic-only annotation health
-slot. Neither gates service readiness.
+slot. Invalid service configuration remains fatal at startup (§2).
 
 ### 1.3 HTTP transport shell
 
@@ -117,14 +117,15 @@ express (positivity, absolute-path requirements, per-backend required/forbidden
 field sets) are checked in `ServiceConfig::validate` and fail startup with an
 `InvalidConfig` message naming the offending key.
 
-**Config holds external facts only** (spec §35). Retrieval and chunker tunables
+**Config holds operational settings**, including annotation retry policy.
+Retrieval and chunker tunables
 that were once configuration (top-k, RRF constants, candidate-pool sizes,
 chunker limits) have moved to **versioned, hashed policy documents** (the
 RetrievalProfile and chunker configuration folded into their config hashes), not
 this file. Config may hold the path to an active policy document, not its
 values.
 
-The sections below document each `[section]` and its keys as external facts. See
+The sections below document each `[section]` and its supported keys. See
 `config.example.toml` for a complete annotated example.
 
 ### 2.1 `[server]`
@@ -158,6 +159,12 @@ token usage and finish metadata are optional reported facts, never estimates.
 Counters label their scope; elapsed, gate-wait, dispatch-wait, and persistence
 times describe separate boundaries. `DIAGNOSTICS.md` defines the log contract.
 
+Annotator calls log stage identity, periodic streaming progress, and terminal
+measurements, including partial work on timeout or cancellation. Answer and
+reasoning characters are counted separately; token counts come from provider
+usage when supplied. Retry logs identify both failure counters, their limits,
+eligibility delay, and next action. Model payloads are not retained in these logs.
+
 **Forbidden log data.** API keys, bearer/admin tokens, prompt text, model
 outputs, document contents, and vector values never enter the service log.
 Logs carry bounded diagnostics only — compact boundary facts such as character
@@ -183,10 +190,11 @@ validates** this section (so `deny_unknown_fields` accepts the shared file) but
 
 | Key | Meaning |
 | --- | --- |
-| `operation_timeout_seconds` | The CLI's per-request / total-poll timeout the client applies to one operation. Must be > 0. |
+| `operation_timeout_seconds` | Timeout for each CLI HTTP request, including each individual Operation poll. Must be > 0. |
 
-This is a **CLI request/poll timeout, not a stream timeout**: the fabric has no
-streaming transport.
+The polling loop has no overall deadline; it continues until a terminal status
+or request failure. The client-facing API uses JSON responses and polling;
+internal annotator SSE streams use the separate model-call timeout (§2.9).
 
 ### 2.5 `[inference]`
 
@@ -294,9 +302,18 @@ as failed for later retry under §13; there is no fallback model or endpoint.
 | --- | --- |
 | `endpoint` | Full chat-completions route URL (not a base URL). Non-empty. |
 | `model` | Model name sent in request bodies. Non-empty. |
-| `timeout_seconds` | Whole-request timeout for one producer call. > 0. |
+| `timeout_seconds` | Whole-request timeout for each single-goal model call, including thinking. > 0. |
 | `api_key_file_path` | Optional owner-only file holding the bearer API key. |
-| `max_input_chars` | Producer input budget in characters; larger section groups split deterministically before invocation. Sized from the endpoint model's context window. > 0. |
+| `max_input_chars` | Source-excerpt cap in Unicode characters; oversized units split without dropping text. Prompts and prior-stage output are additional. > 0. |
+| `annotation_max_retries` | Required nonnegative integer; malformed-output retries after the initial attempt. `0` disables this category's retries. |
+| `annotation_retry_interval_seconds` | Required positive fixed interval for malformed-output retries; no backoff ceiling applies. |
+| `execution_max_retries` | Required nonnegative integer; execution-failure retries after the initial attempt. `0` disables this category's retries. |
+| `execution_retry_initial_delay_seconds` | Required positive initial execution-failure backoff. |
+| `execution_retry_max_delay_seconds` | Required positive execution-failure ceiling, at least the initial delay. Independent of `MAX_BACKOFF_MS`. |
+
+The retry settings are required without runtime defaults and enter application
+configuration identity. Shipped values are listed in README's annotation settings
+and `config.example.toml`. Counter, temperature, and scheduling semantics are in §13.
 
 ### 2.10 `[policies]`
 
@@ -309,7 +326,7 @@ inlined into config).
 | Key | Meaning |
 | --- | --- |
 | `entity_match_file_path` | Path to the graph-entry entity-match ruleset (§14.3 fuzzy-match classes and caps). Required. Relative resolves against the config directory. |
-| `annotator_naming_file_path` | Path to the annotator naming-rules document composed into the entity/relation producer prompts (§13). Required. Relative resolves against the config directory. |
+| `annotator_naming_file_path` | Required path to the retained annotator naming-rules document. Loaded, validated, hashed, and versioned, but not applied to current annotation prompts (§13). Relative resolves against the config directory. |
 
 Both documents are **strict TOML** (`deny_unknown_fields`), **loaded once at
 startup**, and **fatal on invalid** — an unknown key or out-of-range value halts
@@ -317,11 +334,9 @@ startup with a config error naming the document. Each is **content-hashed over
 its parsed canonical serialization**, so comment- and whitespace-only edits do
 not change a document's identity. Both content hashes fold into
 `ApplicationIdentity` (§15.3). Because config is startup-only, **editing a policy
-document requires a service restart to take effect**. A neutral posture — both
-fuzzy classes disabled, an empty naming-rule list — is a valid default that is
-byte-identical to no policy; `policies/entity-match.toml` ships neutral, while
-the in-repo `policies/annotator-naming.toml` carries the commissioning corpus's
-authored rules (not an empty list).
+document requires a service restart to take effect**. The entity-match document
+ships with both fuzzy classes disabled. An empty naming-rule list is valid;
+changing naming rules changes application identity, not producer memo identity.
 
 System-assigned versioning of these documents is recorded in the append-only
 `policy_versions` table with a `policy.changed` event per advance (§3, §16).
@@ -384,7 +399,7 @@ seam; the QER audit tier that writes it is deferred — see §19.)
 | `--setup-storage` | Create/validate the **fabric hot plane** schema, then exit. A single deliberate operator action; the only path that creates or validates schema. |
 | `--foreground` | Keep the service attached to the terminal instead of daemonizing. |
 | `--smoke-dense` | Run inference readiness smoke checks without binding HTTP, then exit. |
-| `--annotation-dry-run <groups-per-source>` | Run the annotation dry-run mode (§4.7), sampling the first N section groups per source per type. Positive integer; a missing or non-positive value is a fatal CLI error. Service binary only — the `data-store` client rejects it as an unknown argument, same as `--setup-storage`. |
+| `--annotation-dry-run <groups-per-source>` | Run the annotation dry-run mode (§4.7), sampling the first N excerpts per source per type. Positive integer; a missing or non-positive value is a fatal CLI error. Service binary only — the `data-store` client rejects it as an unknown argument, same as `--setup-storage`. |
 
 An unknown argument is a fatal CLI error.
 
@@ -478,12 +493,9 @@ with the failure visible.
 
 ### 4.7 Annotation dry-run mode
 
-`--annotation-dry-run <groups-per-source>` runs a deliberately truncated,
-inspection-only mode whose purpose is **authoring the corpus-dependent operator
-rulesets (§2.10) from observed vocabulary before paying for full annotation and
-embedding**: it parses the corpus, sample-annotates a bounded slice, and serves
-the vocabulary route for inspection — nothing more. The mode always runs
-foreground (it never daemonizes).
+`--annotation-dry-run <groups-per-source>` parses the corpus, samples bounded
+excerpts, and serves the vocabulary route for inspection before full annotation
+and embedding. The mode always runs foreground (it never daemonizes).
 
 Startup sequence, in order:
 
@@ -516,7 +528,7 @@ start adopts this state through the §13.5 no-blind-retry guard's
 existing ready runs, so **Docling conversion is never re-paid**.
 
 Sampling annotates with the **entity and relation** producers only, over the
-**first N section groups per source per type** in plan order (N is the CLI
+**first N excerpts per source per type** in plan order (N is the CLI
 argument); the **summary producer is excluded** — sampling exists to surface
 naming and predicate vocabulary. The sampled annotations are ordinary
 `semantic_annotations` rows on parses that are never activated, so vocabulary
@@ -569,8 +581,8 @@ After draining, the service persists the pending rebuild Operation and returns
 disconnect does not cancel server work. Health and the service log preserve the
 last known state when the client does not receive acceptance.
 
-Cancellation does not consume annotation output retries or count as a producer
-failure. The cancellation watch resets after clearing and advancing the storage
+Cancellation consumes neither retry budget and is not a producer failure.
+The cancellation watch resets after clearing and advancing the storage
 generation. DIAGNOSTICS.md defines the cancellation and drain events; local
 cancellation alone cannot establish whether the remote endpoint stopped inference.
 
@@ -662,8 +674,10 @@ Components:
   the shape is a per-system map, not a single global bucket), each with the
   cycle's `as_of`.
 - **`annotation`** (diagnostic-only) — the annotation worker's own slot:
-  `parked` (+ detail) and last-cycle freshness counts, corpus-aggregate (not
-  source-system keyed), with an `as_of`.
+  `parked` (+ detail) and counts from the last completed cycle, including
+  exhausted work, with an `as_of`. Counts are corpus-aggregate, not
+  source-system keyed. Current model-call progress is in the service log (§2.2);
+  `GET /sync/status` reports only the scheduler snapshot.
 - **`search_admission`** (diagnostic-only) — the search admission gate window
   (`max_in_flight` / `in_flight`) via `AdmissionGate::snapshot`.
 
@@ -780,18 +794,17 @@ stale wreckage from a crash, never live work.
 
 ### 9.2 Knob-free adaptive cadence
 
-The detection cadence is **knob-free** (spec §35): no cadence, interval, or
-backlog configuration key exists anywhere in the config surface. Growth
-factors and smoothing weights are code constants. Quiet cycles grow the delay
+The detection cadence is **knob-free** (spec §35): its interval, growth factors,
+and smoothing weights are code constants. Quiet cycles grow the delay
 multiplicatively, observed changes pull it down, and undrained backlog or failed
 cycles increase it. All paths, including the scan-duration floor, obey the shared
 60-second backoff ceiling (`src/util.rs::MAX_BACKOFF_MS`). Cadence logs report
 changes after applying the ceiling; `cadence_ms` publishes the effective delay.
 
-The same ceiling applies to dense HTTP retry sleeps and annotation cycle/retry
-delays; their shorter 2/4/8-second and 30-second waits remain shorter. This bounds
-sleep between attempts/cycles, not work duration, request timeouts, or total
-retry lifetime. Long-running cycle work can still delay the next scan.
+The same ceiling applies to dense HTTP retry sleeps. Annotation retries use
+their own configured intervals and execution-backoff ceiling (§13). These delay
+limits do not bound request timeouts or work duration; long-running cycle work
+can still delay the next scan.
 
 ### 9.3 Backpressure events
 
@@ -1051,67 +1064,77 @@ The annotation worker (§1.2) builds the MVP semantic annotation types
 activation or the sync pipeline (the §21.4 policy's MVP blocking set is
 empty).
 
-- **Freshness state machine.** `building` → `fresh`, with `failed` (producer
-  failure, retried by later worker passes) and `stale`. Transitions are
-  status-guarded and append `annotation.*` events atomically.
-- **Output retry budget.** Each invocation allows one initial attempt plus
-  **10 output retries per process run**. Only received output rejected by
-  annotation validation spends the budget; reopening a failed row does not.
-  Temperature is `min(0.1 × prior invalid outputs, 1.0)`, starting at 0.0.
-  Call and internal failures neither spend output retries nor raise temperature.
-  Exhausted invocations are skipped, ERROR-logged once, and counted per cycle
-  in annotation health. Restart, rebuild-all, or producer identity change
-  re-arms the budget.
-- **Call recovery.** Network, HTTP, and completion-envelope failures end the
-  cycle after every current-wave result is committed, unless maintenance or
-  shutdown cancels the wave. Cancelled results are discarded without consuming
-  output retries or counting as producer failures (§5.1). The next cycle retries
-  after the existing 30-second delay, subject to the shared 60-second ceiling;
-  persistent call failures remain retry-eligible indefinitely. Failure logs
-  preserve the original error plus failure class and output-failure count.
-- **Parse-scoped readability.** Annotations are parse-scoped and readable only
-  for the source's **current active parse**, enforced in the read SQL itself.
-- **Eligibility: pure function of target content.** A producer's model input
-  (the USER content) is *exactly* the ordered text of its target units — no
-  corpus context, no neighbors, no metadata, no synthesized headings. This
-  input purity is what makes every producer memoization-eligible, and it is
-  **untouched** by the naming-rules composition below: naming rules are producer
-  *instruction* (identity-bearing configuration, folded into the SYSTEM prompt),
-  never corpus content.
-- **Naming-rule prompt composition.** The entity and relation producers compose
-  the annotator naming-rules document (§2.10) into their base system prompt as
-  `"\n\nNaming rules:\n"` followed by one `- `-prefixed line per rule in
-  document order, when the rule list is non-empty; an **empty document yields
-  the byte-identical bare prompt** (an identity-stable no-op). The composed
-  prompt folds into the producer's `promptHash` and thus its producer identity
-  hash. The **summary producer never composes** naming rules.
-- **Two keys, two scopes (§21.2).** Every annotation carries two canonical
-  SHA-256 keys derived from one shared material:
-  - The **content key** hashes the **annotation type** crossed with the
-    **ordered per-target content hashes** (each target's `textHash`, falling
-    back to `bodyHash`) — **no producer identity**. Discovery **satisfaction**
-    and **reopenable** classification decide from the content key alone: a
-    content key already fresh under *any* producer identity is left satisfied,
-    and a `failed`/`building` row with no fresh sibling is reopened for the
-    current producer. This is what lets a model switch re-annotate only the
-    frontier, not the whole corpus.
-  - The **memoization key** additionally folds in the **producer identity hash**
-    (which folds the composed prompt above); it keys the identity-scoped
-    `annotation_memo` cache, so a producer identity or configuration change
-    changes the memo key and invalidates reuse. On completion the annotation's
-    stored memoization key is **re-stamped to the completing producer** (the
-    content key is unchanged by construction). One cache row caches one full
-    producer invocation output; memo rows deliberately survive parse archival
-    and hot cleanup — cross-parse reuse is the cache's purpose (§15.10).
-- **Memoization honesty.** Reuse is recorded through the Provenance
-  memoization fields: a re-minted annotation carries `memoized` and a
-  per-item `memoizedFrom` naming the originating annotation. An auditor can
-  always tell whether the model actually ran. Completed model-run rows also
-  record the effective sampling temperature in provenance (base or
-  retry-ladder value); temperature is deliberately not identity-bearing.
-- **Exclusive external endpoint.** Producer calls go to the single configured
-  OpenAI-compatible endpoint (§2.9); a failure parks the annotation `failed`
-  for a later retry under the policy above — no fallback model or endpoint.
+- **Excerpt coverage.** Each invocation consumes one source fragment bounded by
+  `max_input_chars`. Oversized units are split losslessly at paragraph,
+  sentence, whitespace, or Unicode-character boundaries. Provenance
+  `inputRefs[].textRange` records start/end Unicode scalar offsets
+  (end-exclusive) and the exact UTF-8 text hash.
+- **Single-goal chains.** Entity discovery precedes entity typing; statement
+  selection precedes per-statement relationship formation and supporting
+  quotation selection; summaries cover individual excerpts. Downstream requests
+  receive that excerpt and bounded prior-stage outputs from the same chain.
+  Prompts and schemas are defined in `src/annotations/stages.rs`; operator
+  naming rules are not appended.
+- **Concurrency.** Up to 32 independent chains run per worker wave. Dependent
+  stages within a chain execute sequentially; SQLite writes remain serial on
+  the owning worker thread.
+- **Model-call contract.** Every call enables thinking, requests strict
+  JSON-schema output, and streams over SSE with a 150,000-token output allowance
+  including reasoning. The configured `timeout_seconds` applies to each call.
+  A terminal `[DONE]`, `finish_reason = stop`, and nonempty final content are
+  required before stage parsing. The endpoint is exclusive, with no fallback.
+- **Structural validation.** Required fields, source substrings, name mappings,
+  and receipt indexes are checked. Relation bodies retain `evidenceQuotes`.
+  Semantic verification is not implemented; structural acceptance does not
+  establish factual correctness.
+- **Freshness and atomic completion.** `building` → `fresh`, with `failed`
+  and `stale`, remains status-guarded with atomic `annotation.*` events.
+  A completed chain commits its output set and any memo entry together. Empty
+  outputs record fresh coverage without a memo entry. Intermediate stages are
+  not checkpointed; failed or interrupted chains restart as a whole.
+- **Location-specific completion.** `content_key_hash` includes annotation type,
+  target unit IDs, source-unit content hashes, and fragment ranges/text hashes.
+  Only fresh coverage satisfies the current plan; failed/building rows without
+  a fresh sibling are reopenable. Producer identity is excluded, so changing
+  the model does not invalidate already-fresh coverage.
+- **Content-based reuse.** `memoization_key_hash` excludes target unit IDs and
+  includes producer identity: stage prompts/schemas, model/endpoint, excerpt
+  cap, and generation controls. Equal content can reuse output at another
+  location while preserving that location's annotation references. Pending
+  duplicate memo keys are flushed before another cache lookup. Memo rows
+  survive parse archival and cleanup (§15.10).
+- **Provenance and publication.** Re-minted annotations carry `memoized` and
+  per-item `memoizedFrom`; completion stamps the running producer's memo key.
+  Actual sampling temperature is recorded separately from producer identity.
+  Existing annotations remain intact; legacy keys cannot satisfy new excerpt
+  coverage. Summary/graph publication requires the current plan's keys to be
+  fresh and the parse to remain active; unrelated legacy failed rows do not
+  block it. Reads serve only the source's current active parse.
+- **Independent retry budgets.** Per-annotation, per-process counters separate
+  malformed outputs from execution failures. The latter includes network,
+  HTTP/protocol errors, token-limit termination, and internal producer faults.
+  `annotation_max_retries` and `execution_max_retries` each permit that many
+  retries after the initial attempt. Work is exhausted when either counter
+  exceeds its allowance; `0` disables retries for that category.
+- **Retry timing.** Malformed outputs use the fixed
+  `annotation_retry_interval_seconds`, with no backoff ceiling. Execution
+  delays double from `execution_retry_initial_delay_seconds` to
+  `execution_retry_max_delay_seconds`. Neither path is capped by
+  `MAX_BACKOFF_MS`. Eligibility is tracked per annotation with a monotonic
+  timer; ineligible work is skipped. Short waits wake the worker before its
+  ordinary discovery interval; long waits permit intervening scans.
+- **Retry sampling.** Temperature starts at `0.0` and becomes
+  `min(invalid_outputs / annotation_max_retries, 1.0)`. The zero-limit case
+  performs no division or malformed-output retry. Execution failures do not
+  advance temperature. Retry settings enter application configuration identity,
+  not producer memo identity.
+- **Failure lifecycle.** Call failures stop scheduling further waves; current-wave
+  results follow the normal storage and cancellation rules. Exhausted work stays
+  failed, is ERROR-logged once, and contributes to the existing health count.
+  Cancellation and scheduling deferrals spend neither budget. Counters and
+  timers reset on restart or rebuild; they are not persisted. Logs retain the
+  specific error, both counters and limits, retry delay, remaining wait, and
+  next action.
 
 ---
 

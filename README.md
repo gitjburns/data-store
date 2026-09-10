@@ -100,32 +100,25 @@ API-key files).
 readiness-critical components: `inference` and `sync`. Everything else reported by
 health is diagnostic-only and never makes a running service report unavailable.
 
-**Tuning the rulesets (inspect, then adjust).** Two policy documents shape
-retrieval and annotation without changing code: the entity-match ruleset
-(graph-entry fuzzy matching) and the annotator naming rules (composed into the
-entity/relation producer prompts). A neutral posture — an empty naming-rule list,
-both fuzzy-match classes disabled — is the valid default; the in-repo
-annotator-naming document is authored for the commissioning corpus from its
-observed vocabulary, while entity-match remains neutral. Author them from the
-corpus's own observed vocabulary: read `GET /annotations/vocabulary`
-(`--vocabulary <entity|relation>`) to see the grouped entity/relation
-vocabulary, edit the documents under `policies/`, then restart the service —
-config is startup-only, so edits take effect on the next start. The service
-content-hashes each document (ignoring comments and whitespace) and appends a
-system-assigned version to an internal registry on every change; editing the
-naming document changes producer identity, which invalidates memoized producer
-output and re-annotates the frontier.
+**Annotation work.** Source units become bounded excerpts; oversized units are
+split without dropping text. Each model request has one goal: entity names then
+types; source statements then relationships then supporting quotations; or an
+excerpt summary. Each call enables thinking, requests structured JSON, and allows
+up to 150,000 output tokens including reasoning. Outputs receive structural
+validation; semantic verification is not implemented. Existing annotations remain
+intact, while new excerpt identities create new annotation work.
 
-On a **fresh corpus**, the intended first step is the **annotation dry-run
-mode**: `data-store-service --annotation-dry-run <N>` parses the corpus and
-sample-annotates only the first `<N>` section groups per source per type
-(entity and relation; no summaries, no embeddings), then serves the vocabulary
-route so you can author the rulesets from observed vocabulary **before**
-committing to full annotation. Inspect with `--vocabulary <entity|relation>
-all` (the sampled parses are not active, so scope `all` is required), edit the
-documents, then start normally — the normal start adopts the dry-run's parses
-without re-converting them and completes ingestion under the final rulesets.
-See **INSTALL.md** section 5 for the full procedure.
+**Operator policies.** The entity-match document controls graph-entry fuzzy
+matching. Inspect vocabulary with `--vocabulary <entity|relation>` before editing
+it. Both policy documents remain required, validated, content-hashed, and
+versioned at startup. The annotator-naming document is not applied to the current
+single-goal prompts; editing it does not change producer memo identity.
+
+**Annotation dry run.** `data-store-service --annotation-dry-run <N>` parses the
+corpus and samples the first `<N>` excerpts per source per type (entity and
+relation; no summaries or embeddings). Inspect them with
+`--vocabulary <entity|relation> all`: sampled parses are not active. Normal
+startup adopts those parses without re-converting them and completes ingestion.
 
 ## The HTTP surface at a glance
 
@@ -161,7 +154,8 @@ PROTOCOL.md is the contract of record. This is the map.
 
 ## The polling admin model
 
-There is NO NDJSON and no streaming anywhere in this service.
+The service's client-facing API uses JSON responses and Operation polling.
+Internal annotator model calls stream to expose generation progress in the log.
 
 Every mutating admin route runs its work asynchronously. The route returns
 `202 Accepted` with an operation id:
@@ -222,6 +216,13 @@ Components that publish no counters serialize an empty array.
   gate readiness. The `fabric` and `annotation` counters (held, serving-stale,
   stuck-building, access-lost, unparseable-mime, verification-halted, annotation
   freshness, retry exhaustion, and so on) are surfaced for observation only.
+
+`--sync-status` reports ingestion, not annotation completion. `--health` shows
+annotation counts from the last completed cycle, with their measurement time.
+For current model activity, read the file configured by `logging.file_path`
+(`logs/data-store.log` as shipped): stage starts, streaming progress, measured
+usage, failures, retry delays, and exhaustion are recorded there. Missing token
+usage remains unknown; character counts are not token estimates.
 
 ## Known deviations (stated where an operator meets them)
 
@@ -378,3 +379,34 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 | `[policies]` | Paths to the two operator-editable policy documents (entity-match ruleset, annotator naming rules); config holds paths only, and edits require a restart. |
 
 See **INSTALL.md** for the annotated example and the required absolute paths.
+
+### Annotation settings
+
+These `[models.annotator]` settings are required; the shipped values are:
+
+| Setting | Value | Meaning |
+| --- | ---: | --- |
+| `max_input_chars` | 2000 | Source text per excerpt, in Unicode characters; prompts and prior-stage output are additional. |
+| `timeout_seconds` | 120 | Deadline for each model call, including thinking. |
+| `annotation_max_retries` | 10 | Malformed-output retries after the initial attempt. |
+| `annotation_retry_interval_seconds` | 5 | Fixed malformed-output retry interval, with no backoff ceiling. |
+| `execution_max_retries` | 10 | Execution-failure retries after the initial attempt. |
+| `execution_retry_initial_delay_seconds` | 5 | Initial execution-failure retry delay. |
+| `execution_retry_max_delay_seconds` | 300 | Execution-failure backoff ceiling. |
+
+The two failure counters are independent. Execution failures include timeouts,
+HTTP/protocol errors, token-limit termination, and internal producer failures.
+Their delay doubles up to the configured ceiling; it is independent of the
+shared 60-second limit used elsewhere. Malformed outputs use their fixed interval.
+Both limits allow `0` to disable that category's retries. Delays must be positive,
+and the execution ceiling must be at least the initial delay.
+
+Temperature starts at `0.0` and becomes
+`min(malformed_output_failures / annotation_max_retries, 1.0)` on retries;
+execution failures do not advance it. With a zero annotation retry allowance,
+no temperature division or malformed-output retry occurs.
+
+Once either counter exceeds its allowance, the annotation remains failed and
+is skipped as exhausted. Cancellation and scheduling deferrals spend neither
+budget. Counters and eligibility timers reset on restart or rebuild; failed
+chains restart as a whole, without intermediate-stage checkpoints.

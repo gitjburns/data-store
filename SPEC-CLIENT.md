@@ -346,6 +346,10 @@ count is printed as `count <label> [<sourceSystem>]: <value> (as of
 marker, and the optional `sourceSystem` scopes fabric counts to their
 owner.
 
+The annotation component reports counts from the last completed worker cycle,
+including exhausted work. Current model-call activity, retry delays, and failures
+are recorded in the server's configured service log; the CLI does not stream them.
+
 ### 5.2 Operation records (`operation`, and every async admin command)
 
 Prints the operation `id`, `type`, `status`, `target` (object type +
@@ -442,6 +446,9 @@ as pretty JSON.
 Renders the sync scheduler snapshot: `fabricReady` (`yes`/`no`), optional
 `detail`, and the `pending` / `inFlight` / `failed` / `coalescedTotal`
 counters, plus optional `cadenceMs` and `lastSuccessAt`.
+
+These counters cover ingestion only. An empty sync queue does not establish
+annotation completion; inspect the annotation component through `health` (§5.1).
 
 ### 5.9 `vocabulary` (`vocab`)
 

@@ -125,8 +125,8 @@ pub(crate) struct ProducedAnnotation {
     pub(crate) confidence: Option<f64>,
 }
 
-/// Preserve the failed boundary so only rejected model output consumes the
-/// worker's output retry budget; call and routing faults do not change sampling.
+/// Preserve the failed boundary for independent execution/output retry budgets.
+/// Only malformed output changes sampling; cancellation consumes neither budget.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InvocationFailure {
     /// Operator cancellation is neither rejected model output nor a call fault.

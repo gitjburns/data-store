@@ -404,12 +404,10 @@ pub(crate) fn mark_failed(
 /// Retry rationale (§35, §13.5): LLM/network failures are NON-deterministic,
 /// so the worker's cycle-level retry of a failed annotation does not violate
 /// the §13.5 no-blind-retry rule, which governs DETERMINISTIC failures on
-/// identical input. The worker budgets rejected model output per invocation
-/// per run: one initial attempt plus `ANNOTATION_RETRY_CAP` output retries.
-/// Reopening a row does not spend that budget; call and internal failures do
-/// not consume it. This function only records one reopen; the caller owns
-/// output accounting after the producer result. Every retry leaves this event
-/// and a log line.
+/// identical input. The worker owns independent per-run execution and malformed-
+/// output allowances and their timers. Reopening spends neither budget; the
+/// caller accounts for the observed producer result. Every reopen leaves this
+/// event and a log line.
 pub(crate) fn retry_failed(tx: &Transaction<'_>, annotation_id: &str) -> Result<(), ApiError> {
     let updated = tx
         .execute(RETRY_FAILED_SQL, params![annotation_id])

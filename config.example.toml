@@ -235,6 +235,16 @@ timeout_seconds = 120
 # split without dropping text; prompts and intermediate results are additional.
 max_input_chars = 2000
 
+# Independent per-annotation retry allowances; zero disables that category.
+# Counters and retry timers reset on restart or rebuild.
+annotation_max_retries = 10
+# Fixed malformed-output retry interval; execution backoff never caps it.
+annotation_retry_interval_seconds = 5
+execution_max_retries = 10
+# Execution failures double the delay from this initial value to the ceiling.
+execution_retry_initial_delay_seconds = 5
+execution_retry_max_delay_seconds = 300
+
 [policies]
 # Paths to the operator-editable external policy documents. Config holds the
 # PATH to a policy document, never its values; each document is loaded once at

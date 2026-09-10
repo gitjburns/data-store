@@ -252,6 +252,13 @@ struct ModelIdentity {
     /// Resolved PATH of the annotator API-key file, never its contents.
     #[serde(skip_serializing_if = "Option::is_none")]
     annotator_api_key_file_path: Option<String>,
+    // Operational retry policy belongs to the audit identity, not producer
+    // memo identity. Each call's actual retry temperature is recorded in provenance.
+    annotator_annotation_max_retries: u32,
+    annotator_annotation_retry_interval_seconds: u64,
+    annotator_execution_max_retries: u32,
+    annotator_execution_retry_initial_delay_seconds: u64,
+    annotator_execution_retry_max_delay_seconds: u64,
 }
 
 impl ConfigurationIdentity {
@@ -342,6 +349,20 @@ impl ConfigurationIdentity {
                     .api_key_file_path
                     .as_deref()
                     .map(path_string),
+                annotator_annotation_max_retries: config.models.annotator.annotation_max_retries,
+                annotator_annotation_retry_interval_seconds: config
+                    .models
+                    .annotator
+                    .annotation_retry_interval_seconds,
+                annotator_execution_max_retries: config.models.annotator.execution_max_retries,
+                annotator_execution_retry_initial_delay_seconds: config
+                    .models
+                    .annotator
+                    .execution_retry_initial_delay_seconds,
+                annotator_execution_retry_max_delay_seconds: config
+                    .models
+                    .annotator
+                    .execution_retry_max_delay_seconds,
             },
             policy_entity_match_file_path: path_string(&config.policies.entity_match_file_path),
             policy_annotator_naming_file_path: path_string(

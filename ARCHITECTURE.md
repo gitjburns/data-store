@@ -249,10 +249,10 @@ The scheduler (`src/scheduler.rs`) drives one `std::thread` scan/drain loop at a
 detection is what re-pends a failed row. Cadence is an internal EMA with no
 operator knob — it backs off multiplicatively after change-free cycles, when the
 queue will not drain, and after failed cycles, and tightens when work appears.
-The shared `MAX_BACKOFF_MS` in `src/util.rs` caps every backoff sleep at 60 seconds,
-including the scan-duration floor, dense HTTP retries, and annotation cycle/retry
-delays. Shorter waits remain shorter. The ceiling bounds sleep, not work duration,
-request timeouts, or total retry lifetime; cadence logs report only delay changes.
+The shared `MAX_BACKOFF_MS` in `src/util.rs` caps scheduler waits, including the
+scan-duration floor, and dense HTTP retry backoff at 60 seconds. Annotation
+retries use independent configured timing (Section 3.1). The ceiling bounds
+sleep, not work duration or request timeouts; cadence logs report delay changes.
 
 ```
 detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ gate / activate
@@ -373,63 +373,90 @@ After activation, the annotation worker takes over.
 
 ### 3.1 Post-activation annotation build
 
-The annotation worker (`src/annotations/worker.rs`) is a **single dedicated
-`std::thread`**. Each cycle it discovers which active parses need annotations —
-the required set is the `post_activation_types` of the sealed **§21.4
-required-annotation-set policy** (`src/annotations/policy.rs`, one of the three
-sealed policy documents in Section 6). Discovery works two keys derived from one
-shared `KeyMaterial` (`src/annotations/memo.rs`):
+The annotation worker (`src/annotations/worker.rs`) is one dedicated
+`std::thread`. It discovers work for active parses using the sealed policy's
+`post_activation_types` (`src/annotations/policy.rs`).
 
-- The **content key** (`content_key_hash`, denormalized onto
-  `semantic_annotations` and indexed by `(parse_id, content_key_hash)`) hashes
-  the annotation type × the ordered per-target content hashes
-  (`COALESCE(text_hash, body_hash)`) — **no producer identity**. Discovery
-  **satisfaction** (`store::content_key_hashes_for_parse`) and **reopenable**
-  classification (`store::reopenable_rows_for_parse`) decide from the content
-  key alone: a content key already fresh under *any* producer identity is left
-  satisfied; a `failed`/`building` row with no fresh sibling is reopened for the
-  current producer. This is what makes a model switch re-annotate only the
-  frontier, not the whole corpus.
-- The **memoization key** (`memoization_key_hash`) additionally folds in the
-  producer identity hash and keys the identity-scoped `annotation_memo` cache,
-  so a producer identity or configuration change invalidates reuse. On
-  completion the row's stored `memoization_key_hash` is **re-stamped to the
-  completing producer** (`store::complete_fresh`); the content key is unchanged
-  by construction.
+**Excerpts and stages.** `producer::build_invocation_plan` and
+`excerpt::split_text` partition each evidence-bearing unit without dropping
+text. Each invocation contains one fragment bounded by `max_input_chars`.
+Splitting prefers paragraph, sentence, then whitespace boundaries, with a
+Unicode-character cut when necessary. Provenance `inputRefs[].textRange`
+records start/end Unicode scalar offsets (end-exclusive) and an exact UTF-8
+text hash. Section ownership groups discovery; it does not enlarge requests.
 
-The three producers (`entity`, `relation`, `summary`) call one external
-OpenAI-compatible chat-completions endpoint (`src/annotations/llm_client.rs`);
-the entity and relation producers compose the annotator naming-rules document
-(Section 3.2) into their system prompt, folding it into their producer identity
-hash. Producers write `semantic_annotations`; the worker then builds the two
-**annotation-derived projections** for the source's active parse — **summary,
-then graph** (`view::build_summary`, `graph::build_graph_projection`) —
-completing the graph entity mentions/edges that the query-time graph channel
-consumes. Entity names, entity types, and relation predicates all pass the
-single normalizer (`normalize_entity_name`) at every derived boundary
-(projection build, deletion-gate verification, restore rebuild); the stored
-`semantic_annotations` remain verbatim.
+`src/annotations/stages.rs` defines the prompts and schemas;
+`src/annotations/chains.rs` runs one goal per call:
 
-The worker loads its client **inside** the thread: a bad key file **parks** the
-worker (annotations disabled for the run) instead of failing startup. A parked
-worker is diagnostic-only and never gates readiness.
+- Entity names → entity types.
+- Source statements → relationships per selected statement → supporting
+  quotations in bounded candidate batches.
+- One summary per excerpt.
 
-Rejected model output is **budgeted per invocation per process run**: one
-initial attempt plus `ANNOTATION_RETRY_CAP = 10` output retries. Accounting
-advances only after received output fails annotation validation, never when a
-failed row is reopened. Exhaustion emits one
-`annotation_worker.retry_exhausted` ERROR and a per-cycle `exhausted` health
-count; restart, rebuild-all, or producer identity change re-arms the budget.
-Temperature is `min(0.1 × prior invalid outputs, 1.0)`, starting at 0.0;
-call and internal failures neither consume output retries nor raise temperature.
-Effective temperature remains in completed provenance and call logs, outside
-producer identity.
+Later requests use the source excerpt and prior outputs from that chain.
+Intermediate candidate arrays are also bounded by the configured excerpt cap.
+Shape checks validate required fields, source substrings, name mappings, and
+receipt indexes. Relations retain `evidenceQuotes`. Semantic verification is
+not implemented.
 
-Network, HTTP, and completion-envelope failures are **call failures**. After
-one, the worker commits every result from the current wave and ends the cycle.
-The next cycle retries after the existing 30-second delay, subject to the shared
-60-second ceiling. Persistent call failures remain retry-eligible indefinitely.
-Failure logs retain the original error plus its class and output-failure count.
+A completed chain commits its output set and any memo entry in one worker
+transaction. Empty results record fresh coverage without a memo entry.
+Intermediate results are not checkpointed; a failed or interrupted chain
+restarts as a whole.
+
+**Completion and reuse.** Shared `KeyMaterial` in `src/annotations/memo.rs`
+contains source-unit content hashes, exact fragment ranges/text hashes, and
+annotation type:
+
+- `content_key_hash` additionally includes target unit IDs, identifying
+  completion at each canonical source location without producer identity.
+  `store::fresh_content_key_hashes_for_parse` supplies completed coverage;
+  failed/building rows without a fresh sibling are reopenable.
+- `memoization_key_hash` excludes target unit IDs and includes producer identity,
+  allowing equal source content at different locations to reuse output with
+  their own annotation references. Producer identity covers ordered stage
+  prompts/schemas, model/endpoint, excerpt cap, and generation controls.
+  Completion stamps the running producer's memo key onto its annotation rows.
+
+The worker flushes a pending duplicate memo key before preparing another request
+for it, so the next lookup can reuse the committed result. Legacy whole-group
+annotations remain intact; their keys cannot satisfy new fragment coverage.
+
+After every required key in the current excerpt plan has fresh output, and the
+parse is still active, the worker builds summary then graph projections in one
+transaction. Legacy failed rows outside that plan do not block publication.
+Derived names, entity types, and predicates use `normalize_entity_name`;
+stored annotation strings retain their producer output.
+
+**Retries.** Two counters in `AnnotationRetryState` track failed chain attempts
+per annotation and process run. Malformed outputs use
+`annotation_max_retries` and the fixed `annotation_retry_interval_seconds`.
+Execution failures (call/protocol failures, token-limit termination, and internal
+producer faults) use `execution_max_retries`; their delay doubles from
+`execution_retry_initial_delay_seconds` to `execution_retry_max_delay_seconds`.
+Annotation intervals have no ceiling; neither path uses `MAX_BACKOFF_MS`.
+
+A category is exhausted when its failure count exceeds its retry allowance.
+Zero permits the initial attempt only. Exhaustion skips the annotation, emits
+`annotation_worker.retry_exhausted`, and contributes to the `exhausted` health
+count. Cancellation and scheduling deferrals consume neither allowance.
+Counters and timers reset on restart or rebuild; they are not persisted.
+
+Temperature starts at zero and scales as
+`min(invalid_outputs / annotation_max_retries, 1.0)`, with a zero-limit guard.
+Execution failures do not advance it. Actual temperature is recorded in call
+logs and completed provenance. Retry settings enter application configuration
+identity, not producer memo identity.
+
+`RetryDelay` tracks monotonic eligibility per annotation. Ineligible work is
+skipped; the next cycle wakes for the earliest encountered retry or ordinary
+discovery interval, whichever is sooner. A call failure ends the cycle after
+the current wave's results are recorded. Failure logs retain source errors,
+both counters and limits, the delay, remaining wait, and next action. See
+README's annotation settings for shipped values.
+
+The worker loads its client inside the thread. A client-load failure parks it
+for the run; annotation health is diagnostic-only and never gates readiness.
 
 ### 3.2 Operator policy documents and the auto-versioning registry
 
@@ -445,9 +472,10 @@ than build-sealed. `[policies]` config holds their **paths only**
   `token_prefix.{enabled,min_token_len}`, `max_fuzzy_candidates`) consumed by
   the query graph channel (Section 6). Shipped neutral: both fuzzy classes
   disabled.
-- **`policies/annotator-naming.toml`** — the `rules` list composed into the
-  entity/relation producer prompts (Section 3.1). The repository policy supplies
-  naming guidance; an empty list is valid.
+- **`policies/annotator-naming.toml`** — retained as a required, validated and
+  versioned document, but not applied to the single-goal annotation prompts.
+  Its hash remains in application identity; edits do not change producer memo
+  identity. An empty rule list is valid.
 
 Both are **loaded once at startup and fatal on invalid** (`src/main.rs`); each
 is content-hashed over its **parsed canonical serialization**
@@ -762,8 +790,10 @@ database connections. Slots are poison-recovered on read.
   fabric counts (held, serving-stale, stuck-`building`, access-lost,
   unparseable-mime, verification-halted). Each count carries an **as-of** label
   so an operator never reads a count without knowing when it was taken.
-- The **annotation worker** publishes its own `AnnotationHealth` slot (parked
-  state, freshness counts).
+- The **annotation worker** publishes `AnnotationHealth`: parked state and counts
+  from the last completed cycle, including exhausted work. This slot is not
+  live per-call progress; streaming measurements are recorded in the service log.
+  `GET /sync/status` reads only the scheduler's slot.
 - **Readiness = {inference, sync}** —
   `inference_component.ready && sync_component.ready`. The fabric and annotation
   counts are **diagnostic-only** and NEVER gate readiness; a degraded diagnostic
@@ -873,15 +903,19 @@ transaction, the scheduler's `projection_build` writer lock is held **across the
 HTTP fan-out** — a pre-existing take-the-caller's-tx property, accepted pending
 the banked structural fix (embed before opening the transaction, lock only for
 the commit). The annotation worker (`src/annotations/worker.rs`) fans out
-`ANNOTATOR_CONCURRENT_CALLS = 32` producer calls per wave under a
-prepare/dispatch/commit split, then commits each result serially; the pre-paid /
+up to `ANNOTATOR_CONCURRENT_CALLS = 32` independent producer chains per wave.
+Dependent stage calls within each chain are sequential, with no nested fan-out.
+The prepare/dispatch/commit split commits each chain's result serially; the pre-paid /
 post-paid deferral ruling keeps its writes off the hot writer lock during the
 fan-out. Rebuild/shutdown cancellation joins the outstanding calls, discards
 unfinished results, and rolls back uncommitted writes before releasing admission.
 
 **Annotator** (`src/annotations/llm_client.rs`). A synchronous producer interface
-over cancellable async OpenAI-compatible HTTP, shared by the three annotation
-producers. One owned Tokio runtime services HTTP I/O; lifecycle and SQLite work
+over cancellable async OpenAI-compatible HTTP. Each stage requests thinking,
+strict JSON-schema output, and an SSE stream under the configured call timeout.
+The output-token allowance includes reasoning. Acceptance requires a terminal
+`[DONE]`, `finish_reason = stop`, and nonempty final content before stage parsing.
+One owned Tokio runtime services HTTP I/O; lifecycle and SQLite work
 remain on synchronous worker threads. A maintenance watch cancels the complete
 send/body wait on rebuild or shutdown. Dropping the request reports local
 cancellation with `remote_outcome = unknown`, not proof that remote inference
@@ -889,6 +923,13 @@ stopped. There is one external endpoint, no fallback, and no local model-call
 gate. It is **not readiness-critical**: a client load
 failure (e.g. a bad key file) parks the annotation worker instead of failing
 startup (Section 3.1).
+
+Stream diagnostics retain measured answer/reasoning character counts, received
+bytes, provider response ID, finish reason, and provider token usage when supplied.
+Progress is logged periodically while chunks arrive; terminal measurements also
+survive timeouts and cancellation. Reasoning text is counted and discarded;
+model payloads are not logged. These measurements do not provide full request or
+response reconstruction.
 
 ## 9. Recorded architecture-level deviations
 

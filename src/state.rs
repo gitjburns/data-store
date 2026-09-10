@@ -274,10 +274,8 @@ pub struct AnnotationCycleCounts {
     /// Items deferred this cycle because the hot-plane writer lock was held
     /// (typically by a scheduler projection build); re-attempted next cycle.
     pub deferred: u64,
-    /// Failed rows skipped this cycle because their per-run reopen budget is
-    /// spent (worker `ANNOTATION_RETRY_CAP`, user-ruled 2026-07-21). Exhausted
-    /// work stays durably `failed`; a restart or producer identity change
-    /// re-arms it.
+    /// Failed rows skipped because either configured per-run retry allowance is
+    /// spent. Work stays durably `failed`; restart or rebuild resets the counters.
     pub exhausted: u64,
 }
 

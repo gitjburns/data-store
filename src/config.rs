@@ -547,6 +547,18 @@ pub struct AnnotatorModelConfig {
     /// Maximum source-excerpt length in Unicode characters. Prompts and prior
     /// stage outputs are additional; this is not a model token-budget estimate.
     pub max_input_chars: usize,
+    /// Malformed-output retry allowance per annotation; zero permits only the
+    /// initial attempt. This budget also determines the temperature ramp.
+    pub annotation_max_retries: u32,
+    /// Fixed delay after malformed output, independent of execution backoff.
+    pub annotation_retry_interval_seconds: u64,
+    /// Execution-failure retry allowance, independent of malformed outputs;
+    /// zero disables retries for execution failures.
+    pub execution_max_retries: u32,
+    /// Delay after the first execution failure; later failures double it.
+    pub execution_retry_initial_delay_seconds: u64,
+    /// Ceiling for execution backoff only; must cover the initial delay.
+    pub execution_retry_max_delay_seconds: u64,
 }
 
 impl AnnotatorModelConfig {
@@ -674,6 +686,27 @@ impl ServiceConfig {
             "models.annotator.max_input_chars",
             self.models.annotator.max_input_chars,
         )?;
+        // Zero retry allowances are valid, but enabled retry paths must never
+        // become a busy loop. The annotation interval has no execution ceiling.
+        require_positive_u64(
+            "models.annotator.annotation_retry_interval_seconds",
+            self.models.annotator.annotation_retry_interval_seconds,
+        )?;
+        require_positive_u64(
+            "models.annotator.execution_retry_initial_delay_seconds",
+            self.models.annotator.execution_retry_initial_delay_seconds,
+        )?;
+        require_positive_u64(
+            "models.annotator.execution_retry_max_delay_seconds",
+            self.models.annotator.execution_retry_max_delay_seconds,
+        )?;
+        if self.models.annotator.execution_retry_max_delay_seconds
+            < self.models.annotator.execution_retry_initial_delay_seconds
+        {
+            return Err(ApiError::InvalidConfig {
+                message: "models.annotator.execution_retry_max_delay_seconds must be at least models.annotator.execution_retry_initial_delay_seconds".to_string(),
+            });
+        }
         // Optional, but an explicit empty path would resolve to the config
         // directory itself; fail at startup like the reranker's key path.
         if let Some(api_key_file_path) = self.models.annotator.api_key_file_path.as_ref() {
