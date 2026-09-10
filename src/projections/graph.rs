@@ -897,6 +897,7 @@ fn graph_producer(input_annotation_ids: &[String]) -> Provenance {
                 .map(|id| ProvenanceInputRef {
                     object_type: ProvenanceObjectType::SemanticAnnotation,
                     id: id.clone(),
+                    text_range: None,
                 })
                 .collect(),
         ),

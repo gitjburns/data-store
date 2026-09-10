@@ -494,6 +494,7 @@ fn colbert_producer_provenance(units: &[UnitText]) -> Provenance {
         .map(|unit| ProvenanceInputRef {
             object_type: ProvenanceObjectType::ContentUnit,
             id: unit.unit_id.clone(),
+            text_range: None,
         })
         .collect::<Vec<_>>();
 

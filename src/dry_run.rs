@@ -31,7 +31,7 @@
 //! FIDELITY — the per-item build sequence mirrors `annotations::worker`'s
 //! `build_source`/`prepare_work_item`/`complete_build` for a SINGLE item: the
 //! CA2-P1 two-key stamping (memo key + content key on `NewAnnotation`), the
-//! CA2-P3 naming-rules threading (through the identity hash / memo key), and the
+//! single-goal producer contracts (through the identity hash / memo key), and the
 //! empty-result `[]` marker convention (a producer that found nothing still
 //! completes its building row with an empty JSON-array body so the key is
 //! satisfied and not rebuilt). Execution is SERIAL (no waves — sampling is small);
@@ -54,7 +54,6 @@ use crate::error::ApiError;
 use crate::hot_plane;
 use crate::maintenance::AnnotationCancellation;
 use crate::model::Provenance;
-use crate::policy::AnnotatorNamingPolicy;
 use crate::scheduler::{self, DryRunReadyParse};
 use crate::state::ShutdownSignal;
 
@@ -67,8 +66,8 @@ const TX_LOG_NAMESPACE: &str = "dry_run";
 const SAMPLED_KINDS: [ProducerKind; 2] = [ProducerKind::Entity, ProducerKind::Relation];
 
 /// Everything the mode driver needs. Grouped so the entry `run` keeps a short
-/// signature; each field is threaded straight from the main-loop wiring (config
-/// load, policy load). Deliberately carries NO `ProjectionRuntime`,
+/// signature; each field is threaded straight from the main-loop config wiring.
+/// Deliberately carries NO `ProjectionRuntime`,
 /// `CutoverRegistry`, or `ApplicationIdentity`: the dry-run pass truncates
 /// before every gate-continuation step that consumes them, and a
 /// `ProjectionRuntime` is constructible only from an initialized
@@ -82,8 +81,6 @@ pub(crate) struct DryRunInputs {
     pub(crate) annotator: AnnotatorModelConfig,
     /// Config-file parent directory, for resolving the annotator's api-key file.
     pub(crate) config_root: PathBuf,
-    /// The operator naming rules (CA2-P3), identity-bearing for entity/relation.
-    pub(crate) naming_policy: AnnotatorNamingPolicy,
     /// Section groups per source per type to sample (the CLI's argument).
     pub(crate) groups_per_source: usize,
 }
@@ -162,7 +159,6 @@ pub(crate) fn run(
     // mode's purpose (unlike the normal worker, where annotations are
     // non-critical and a client load failure only parks the worker).
     let client = AnnotatorClient::load(&inputs.annotator, &inputs.config_root, cancellation)?;
-    let naming_rules = inputs.naming_policy.rules.as_slice();
 
     // Phase 2: sample the first N section groups per source per type. Serial —
     // sampling is small (bounded by groups_per_source), so no wave machinery.
@@ -190,7 +186,6 @@ pub(crate) fn run(
         let counts = sample_source(
             &inputs.index_root,
             &inputs.annotator,
-            naming_rules,
             &client,
             ready,
             inputs.groups_per_source,
@@ -235,7 +230,6 @@ pub(crate) fn run(
 fn sample_source(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     ready: &DryRunReadyParse,
     groups_per_source: usize,
@@ -252,7 +246,8 @@ fn sample_source(
             &ready.parse_run_id,
             config.max_input_chars,
         )?;
-        let present_keys = store::content_key_hashes_for_parse(&connection, &ready.parse_run_id)?;
+        let present_keys =
+            store::fresh_content_key_hashes_for_parse(&connection, &ready.parse_run_id)?;
         let reopenable = store::reopenable_rows_for_parse(&connection, &ready.parse_run_id)?;
         (plan, present_keys, reopenable)
     };
@@ -289,7 +284,6 @@ fn sample_source(
             sample_item(
                 index_root,
                 config,
-                naming_rules,
                 client,
                 ready,
                 kind,
@@ -318,7 +312,6 @@ fn sample_source(
 fn sample_item(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     ready: &DryRunReadyParse,
     kind: ProducerKind,
@@ -328,12 +321,11 @@ fn sample_item(
     counts: &mut SampleCounts,
 ) -> Result<(), ApiError> {
     // Two-key derivation (CA2-P1): the memo key folds producer identity (cache
-    // scope — includes the CA2-P3 composed-prompt hash); the content key does not
+    // scope — includes the single-goal prompt contracts); the content key does not
     // (satisfaction scope). Both read on a short-lived connection.
     let (memo_key, content_key) = {
         let connection = hot_plane::open_read(index_root)?;
-        let memo_key =
-            memo::memoization_key_hash(&connection, kind, config, naming_rules, invocation)?;
+        let memo_key = memo::memoization_key_hash(&connection, kind, config, invocation)?;
         let content_key = memo::content_key_hash(&connection, kind, invocation)?;
         (memo_key, content_key)
     };
@@ -348,15 +340,7 @@ fn sample_item(
         return Ok(());
     }
 
-    let request = new_annotation_request(
-        config,
-        naming_rules,
-        ready,
-        kind,
-        invocation,
-        &memo_key,
-        &content_key,
-    )?;
+    let request = new_annotation_request(config, ready, kind, invocation, &memo_key, &content_key)?;
 
     // Memo lookup on a read connection dropped before any write (worker discipline).
     let cached = {
@@ -433,13 +417,7 @@ fn sample_item(
         return Ok(());
     }
     counts.producer_calls += 1;
-    let result = producer::invoke(
-        kind,
-        client,
-        invocation,
-        naming_rules,
-        llm_client::PRODUCER_TEMPERATURE,
-    );
+    let result = producer::invoke(kind, client, invocation, llm_client::PRODUCER_TEMPERATURE);
     // Cancellation can arrive after the response or during validation. Its output
     // and provider errors must not be persisted as fresh annotations or failures,
     // but an already-observed error remains part of the diagnostic record.
@@ -465,7 +443,6 @@ fn sample_item(
             if !complete_build(
                 index_root,
                 config,
-                naming_rules,
                 kind,
                 &request,
                 &building_id,
@@ -538,12 +515,10 @@ fn sample_item(
 /// Assemble the `NewAnnotation` request for one sampled item: the invocation's
 /// ordered target unit ids are exactly the resulting annotation's `targetUnitIds`,
 /// and the planned producer provenance plus BOTH keys are carried up front
-/// (CA2-P1 two-key stamping; CA2-P3 naming rules feed the provenance identity).
+/// (CA2-P1 two-key stamping; prompt contracts feed the provenance identity).
 /// Mirrors `worker::new_annotation_request`.
-#[allow(clippy::too_many_arguments)]
 fn new_annotation_request(
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     ready: &DryRunReadyParse,
     kind: ProducerKind,
     invocation: &Invocation,
@@ -555,7 +530,7 @@ fn new_annotation_request(
         .iter()
         .map(|target| target.unit_id.clone())
         .collect::<Vec<_>>();
-    let provenance = producer::planned_provenance(kind, config, naming_rules, &invocation.targets)?;
+    let provenance = producer::planned_provenance(kind, config, &invocation.targets)?;
     Ok(NewAnnotation {
         source_id: ready.source_id.clone(),
         parse_id: ready.parse_run_id.clone(),
@@ -663,7 +638,6 @@ fn remint_from_memo(
 fn complete_build(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     kind: ProducerKind,
     request: &NewAnnotation,
     building_id: &str,
@@ -719,9 +693,8 @@ fn complete_build(
             });
         }
         // Cache write atomic with the truth it caches (ruling D.2). The producer
-        // identity hash is recomputed from config plus the CA2-P3 naming rules —
-        // the same composed-prompt identity the memo key was derived under.
-        let identity_hash = kind.identity_hash(config, naming_rules)?;
+        // identity uses the same single-goal prompt contracts as the memo key.
+        let identity_hash = kind.identity_hash(config)?;
         memo::record(
             &tx,
             memo_key,

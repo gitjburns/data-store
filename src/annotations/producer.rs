@@ -1,31 +1,21 @@
-//! CAb: the shared producer contract — input purity, invocation planning,
-//! §20 provenance assembly, and the per-kind dispatch shared by the entity,
-//! relation, and summary producers.
+//! Bounded annotation excerpts, single-goal producer chains, and source lineage.
 //!
-//! INPUT PURITY (binding cluster contract). A producer's prompt content is
-//! EXACTLY the ordered text of its target units — nothing else. No corpus
-//! context, no neighboring units, no source or parse metadata, no headings
-//! synthesized from structure. This purity is what makes every producer
-//! memoization-eligible (spec §21.3): the invocation's ordered input unit set
-//! fully determines the model input, so identical input sets reuse identical
-//! results. `invoke` therefore assembles the user content from the target
-//! texts alone.
+//! Each invocation consumes one exact source fragment. Later requests may use
+//! that fragment and earlier outputs from the same chain; they never borrow
+//! unrelated corpus context. The final output set commits atomically through
+//! the existing worker. Interrupted chains restart as a whole.
 //!
-//! Identity chain (ruling 4). For one invocation, the ordered input unit set
-//! IS the resulting annotations' `targetUnitIds` IS the basis stage 3 hashes
-//! into the §21.2 memo key. This module exposes that set (`Invocation.targets`)
-//! and the producer identity (`identity_hash`); stage 3 computes the key.
-
-use std::borrow::Cow;
+//! Source-unit hashes, fragment offsets, and exact text hashes identify coverage;
+//! the ordered stage contracts additionally identify reusable producer output.
 
 use rusqlite::Connection;
 use serde_json::json;
-use tracing::warn;
+use tracing::debug;
 
 use crate::annotations::{
-    entity,
-    llm_client::{AnnotatorClient, CompletionFailure},
-    relation, summary,
+    chains, excerpt,
+    llm_client::{AnnotatorClient, ENABLE_THINKING, MAX_COMPLETION_TOKENS},
+    stages::Stage,
 };
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
@@ -49,12 +39,25 @@ FROM content_units
 WHERE parse_id = ?1
 ORDER BY sequence_index IS NULL, sequence_index, id";
 
-/// One target unit contributing its text to a producer invocation. `unit_id`
-/// becomes a `targetUnitIds` entry; `text` is the pure input text (ruling 2).
+/// Exact input slice of an immutable canonical unit. Offsets are Unicode scalar
+/// positions, end-exclusive; they distinguish fragments even when text repeats.
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationTarget {
     pub(crate) unit_id: String,
     pub(crate) text: String,
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+}
+
+impl InvocationTarget {
+    /// Use the same exact slice descriptor for memo identity and recorded lineage.
+    pub(crate) fn text_range(&self) -> model::provenance::ProvenanceTextRange {
+        model::provenance::ProvenanceTextRange {
+            start_char: self.start_char,
+            end_char: self.end_char,
+            text_hash: crate::canonical::sha256_hex_bytes(self.text.as_bytes()),
+        }
+    }
 }
 
 /// What a single invocation covers. `split_index` distinguishes the
@@ -68,13 +71,12 @@ pub(crate) enum InvocationKind {
         section_unit_id: String,
         split_index: u32,
     },
-    /// Summary scope: the whole document's evidence-bearing units in order.
+    /// Summary scope: one excerpt in the document's reading order.
     Document { split_index: u32 },
 }
 
-/// One planned producer call. `targets` is ordered; its unit ids are exactly
-/// the resulting annotations' `targetUnitIds` and the stage-3 memo-key basis
-/// (ruling 4). The producer sends only the joined target texts (input purity).
+/// One atomic producer chain. The planner supplies exactly one source fragment;
+/// all outputs retain its unit reference and precise range in their provenance.
 #[derive(Debug, Clone)]
 pub(crate) struct Invocation {
     pub(crate) kind: InvocationKind,
@@ -90,6 +92,12 @@ impl Invocation {
             &crate::util::diagnostic_id("invocation"),
         );
         context.record("target_units", self.targets.len() as u64);
+        if let Some(target) = self.targets.first() {
+            context.record("unit_id", target.unit_id.as_str());
+            context.record("excerpt_start_char", target.start_char as u64);
+            context.record("excerpt_end_char", target.end_char as u64);
+            context.record("excerpt_chars", target.text.chars().count() as u64);
+        }
         match &self.kind {
             InvocationKind::SectionGroup {
                 section_unit_id,
@@ -184,152 +192,54 @@ impl ProducerKind {
         }
     }
 
-    /// Producer version. Bumped when the producer's output contract or prompt
-    /// semantics change in a way that must invalidate prior memo reuse.
+    /// Version 2 identifies excerpt-scoped, single-goal chains and their receipts.
     pub(crate) fn producer_version(self) -> &'static str {
-        "1"
+        "2"
     }
 
-    /// This producer's BASE system prompt (a named external-language constant
-    /// per PRINCIPLES; the text lives in the per-producer module). Every call
-    /// path — sending and hashing alike — must go through `prompt`, which
-    /// composes the operator naming rules onto this base; this accessor exists
-    /// only as the composition input.
-    fn base_prompt(self) -> &'static str {
+    /// Ordered single-goal contracts contributing to this producer's identity.
+    pub(crate) fn stages(self) -> &'static [Stage] {
         match self {
-            Self::Entity => entity::SYSTEM_PROMPT,
-            Self::Relation => relation::SYSTEM_PROMPT,
-            Self::Summary => summary::SYSTEM_PROMPT,
+            Self::Entity => &[Stage::EntityNames, Stage::EntityTypes],
+            Self::Relation => &[Stage::Statements, Stage::Relations, Stage::Evidence],
+            Self::Summary => &[Stage::Summary],
         }
     }
 
-    /// The EFFECTIVE system prompt: the base prompt composed with the
-    /// operator's naming rules (CA2-P3, user-ruled 2026-07-19). SINGLE SOURCE
-    /// OF TRUTH for the prompt bytes — the live producer call path (`invoke`)
-    /// and `prompt_hash` (and through it `identity_hash` and the §21.2 memo
-    /// key) all read this one function, so the hashed prompt and the sent
-    /// prompt are the same bytes by construction.
-    ///
-    /// Naming rules govern entity/relation NAMING only, so Summary is
-    /// deliberately excluded: its arm returns the bare base prompt regardless
-    /// of the rule list, which keeps the summary producer's prompt hash — and
-    /// therefore its `identity_hash` output bytes — unchanged by any
-    /// naming-policy edit.
-    ///
-    /// EMPTY-IS-BYTE-IDENTICAL (CA2 ruling 7): with an empty rule list the
-    /// composed prompt is the bare `SYSTEM_PROMPT` with ZERO appended
-    /// characters (`Cow::Borrowed`), so shipping the neutral (empty) naming
-    /// document changes no producer identity and invalidates no memo entries.
-    ///
-    /// Input purity (§21.3 / D8) is untouched: naming rules are producer
-    /// INSTRUCTION (identity-bearing configuration, like the model name or
-    /// endpoint), not corpus context — the USER content stays exactly the
-    /// ordered target-unit text.
-    pub(crate) fn prompt(self, naming_rules: &[String]) -> Cow<'static, str> {
-        match self {
-            Self::Entity | Self::Relation => compose_naming_rules(self.base_prompt(), naming_rules),
-            Self::Summary => Cow::Borrowed(self.base_prompt()),
-        }
-    }
-
-    /// Canonical §16.2 hash over the producer's identity:
-    /// {producerName, producerVersion, modelName, promptHash, endpoint}.
-    ///
-    /// This is the producer-configuration identity that feeds both the §21.2
-    /// memo key and the provenance `configHash`. Changing the model, the
-    /// endpoint, the prompt, or the input cap changes this hash, which
-    /// invalidates memo reuse — old annotations are no longer considered
-    /// equivalent to what this producer would now emit.
-    ///
-    /// `maxInputChars` is part of the identity because the input cap changes
-    /// what a producer's prompt can contain: it drives the deterministic
-    /// split/truncation of oversized section groups and documents, so the same
-    /// target units under a different cap produce a different model input.
-    /// It is therefore producer configuration, and a change to it must
-    /// invalidate memo reuse just like a prompt or model change.
-    ///
-    /// `naming_rules` (CA2-P3, user-ruled 2026-07-19): `promptHash` here is the
-    /// COMPOSED prompt's hash, so the operator naming policy is
-    /// identity-bearing — editing it changes this hash, which invalidates memo
-    /// reuse, and under CONTENT-scoped satisfaction (CA2-P1) the re-annotation
-    /// lands only at the frontier (new/changed content, re-parses, failed-row
-    /// retries), never as a corpus-wide rebuild. Summary composes nothing (see
-    /// `prompt`), so its identity bytes never move with the naming policy.
-    pub(crate) fn identity_hash(
-        self,
-        config: &AnnotatorModelConfig,
-        naming_rules: &[String],
-    ) -> Result<String, ApiError> {
-        let prompt_hash = self.prompt_hash(naming_rules)?;
-        let identity = json!({
+    /// Hash every generation-affecting contract, including schemas and output limits.
+    /// Naming policy is intentionally not composed into these single-goal prompts.
+    pub(crate) fn identity_hash(self, config: &AnnotatorModelConfig) -> Result<String, ApiError> {
+        let schemas = self
+            .stages()
+            .iter()
+            .map(|stage| stage.schema())
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::canonical::canonical_sha256_hex(&json!({
             "producerName": self.producer_name(),
             "producerVersion": self.producer_version(),
             "modelName": config.model,
-            "promptHash": prompt_hash,
+            "promptHash": self.prompt_hash()?,
+            "outputSchemas": schemas,
             "endpoint": config.endpoint,
             "maxInputChars": config.max_input_chars,
-        });
-        crate::canonical::canonical_sha256_hex(&identity)
+            "maxCompletionTokens": MAX_COMPLETION_TOKENS,
+            "enableThinking": ENABLE_THINKING,
+        }))
     }
 
-    /// Canonical content hash of the EFFECTIVE (composed) prompt text,
-    /// recorded as provenance `promptHash` and folded into the producer
-    /// identity. Hashes exactly what `prompt` returns — the same function
-    /// `invoke` sends — so hashed and sent bytes can never diverge.
-    fn prompt_hash(self, naming_rules: &[String]) -> Result<String, ApiError> {
-        crate::canonical::canonical_sha256_hex(&serde_json::Value::String(
-            self.prompt(naming_rules).into_owned(),
-        ))
-    }
-
-    /// Parse this producer's raw model output into zero or more produced
-    /// annotations. An empty result is valid (e.g. no entities found); a
-    /// malformed response is an error carrying bounded diagnostics.
-    fn parse_output(self, raw: &str) -> Result<Vec<ProducedAnnotation>, ApiError> {
-        match self {
-            Self::Entity => entity::parse_output(raw),
-            Self::Relation => relation::parse_output(raw),
-            Self::Summary => summary::parse_output(raw),
-        }
-    }
-
-    /// A compact purpose label for the client's request logs.
-    fn request_purpose(self) -> &'static str {
-        self.producer_name()
+    /// Hash the ordered stage names and exact prompts, rather than one composite task.
+    fn prompt_hash(self) -> Result<String, ApiError> {
+        let prompts = self
+            .stages()
+            .iter()
+            .map(|stage| (stage.name(), stage.prompt()))
+            .collect::<Vec<_>>();
+        crate::canonical::canonical_sha256_hex_of(&prompts)
     }
 }
 
-/// Compose the operator naming rules onto a base system prompt (CA2-P3,
-/// user-ruled 2026-07-19). The composition format is FIXED and canonical:
-/// with a non-empty rule list, exactly `"\n\nNaming rules:\n"` is appended,
-/// followed by the rules in document order, each as a `- ` line, joined by
-/// single newlines with no trailing newline. Changing this format is a
-/// producer-identity change for every non-empty naming document.
-///
-/// With an EMPTY rule list the base is returned BORROWED — zero appended
-/// characters — which is the CA2 ruling-7 identity-stability invariant: the
-/// neutral (empty) naming document composes to the byte-identical existing
-/// prompt, so landing this composition changes no producer identity and
-/// invalidates no memo entries.
-fn compose_naming_rules(base: &'static str, naming_rules: &[String]) -> Cow<'static, str> {
-    if naming_rules.is_empty() {
-        return Cow::Borrowed(base);
-    }
-    let mut composed = String::from(base);
-    composed.push_str("\n\nNaming rules:\n");
-    for (index, rule) in naming_rules.iter().enumerate() {
-        if index > 0 {
-            composed.push('\n');
-        }
-        composed.push_str("- ");
-        composed.push_str(rule);
-    }
-    Cow::Owned(composed)
-}
-
-/// Read `parse_id`'s content units and group them into the invocation plan
-/// used by ALL three producers (entity/relation consume the section groups,
-/// summary consumes the single document composite; `invoke` selects which).
+/// Plan one bounded fragment per invocation for all three producer kinds.
+/// Section ownership groups discovery/dry-run work; it never enlarges a request.
 ///
 /// Section grouping. Each `text_section` unit owns the evidence-bearing units
 /// contained beneath it, where containment is the `primary_parent_id` chain
@@ -346,13 +256,8 @@ fn compose_naming_rules(base: &'static str, naming_rules: &[String]) -> Cow<'sta
 ///   - caption     -> body.text
 ///   - code_block  -> body.code
 ///
-/// Splitting. A group whose joined text would exceed `max_input_chars` is
-/// split deterministically into consecutive runs of WHOLE units, each run
-/// under the cap, numbered by ascending `split_index`. A single unit larger
-/// than the cap cannot be split across units, so its text is explicitly
-/// truncated at the cap (with a warn log) rather than silently dropped or sent
-/// oversized — truncation is explicit per PRINCIPLES. The Document invocation
-/// covers all evidence-bearing units in sequence order and splits the same way.
+/// Large units are partitioned losslessly before section/document enumeration.
+/// Entity/relation and summary plans share exactly the same fragment boundaries.
 pub(crate) fn build_invocation_plan(
     conn: &Connection,
     parse_id: &str,
@@ -395,24 +300,29 @@ pub(crate) fn build_invocation_plan(
             // pure and avoids blank invocation inputs.
             continue;
         }
-        let target = InvocationTarget {
-            unit_id: unit.id.clone(),
-            text,
-        };
-        document.push(target.clone());
+        for fragment in excerpt::split_text(&text, max_input_chars)? {
+            let target = InvocationTarget {
+                unit_id: unit.id.clone(),
+                text: fragment.text,
+                start_char: fragment.start_char,
+                end_char: fragment.end_char,
+            };
+            // Both producer routes own their fragment until worker discovery consumes it.
+            document.push(target.clone());
 
-        match owning_section(unit.id.as_str(), &parent_of, &section_ids) {
-            Some(section_id) => {
-                let key = section_id.to_string();
-                section_targets
-                    .entry(key.clone())
-                    .or_insert_with(|| {
-                        section_order.push(key.clone());
-                        Vec::new()
-                    })
-                    .push(target);
+            match owning_section(unit.id.as_str(), &parent_of, &section_ids) {
+                Some(section_id) => {
+                    let key = section_id.to_string();
+                    section_targets
+                        .entry(key.clone())
+                        .or_insert_with(|| {
+                            section_order.push(key.clone());
+                            Vec::new()
+                        })
+                        .push(target);
+                }
+                None => leading.push(target),
             }
-            None => leading.push(target),
         }
     }
 
@@ -423,32 +333,32 @@ pub(crate) fn build_invocation_plan(
     // the plan follows reading order.
     if let Some(first) = leading.first() {
         let group_key = first.unit_id.clone();
-        push_section_splits(&mut invocations, &group_key, leading, max_input_chars);
+        push_section_splits(&mut invocations, &group_key, leading)?;
     }
     for section_id in section_order {
         let targets = section_targets.remove(&section_id).unwrap_or_default();
-        push_section_splits(&mut invocations, &section_id, targets, max_input_chars);
+        push_section_splits(&mut invocations, &section_id, targets)?;
     }
 
-    // The single Document composite over all evidence-bearing units, split the
-    // same way. Emitted after section groups; `invoke` routes summary here.
-    push_document_splits(&mut invocations, document, max_input_chars);
+    // Summary remains excerpt-scoped; no request reconstructs the large document.
+    push_document_splits(&mut invocations, document)?;
+
+    debug!(
+        event = "annotator_plan.completed",
+        parse_id,
+        invocations = invocations.len(),
+        max_input_chars,
+        "bounded annotation excerpt plan prepared"
+    );
 
     Ok(invocations)
 }
 
-/// Assemble §20 provenance for a planned (about-to-run) invocation of `kind`.
-/// `producerType` is Model; `modelName` and `endpoint`-derived `configHash`
-/// come from config; `promptHash` is the COMPOSED prompt's content hash
-/// (CA2-P3 — the same bytes `invoke` sends and `identity_hash` folds);
-/// `inputRefs` are ContentUnit references for the ordered targets. The
-/// memoization fields and confidence are left None here — they are filled by
-/// the stage-3 worker on completion (confidence) and on memo reuse
-/// (memoized/memoizedFrom).
+/// Record the chain identity and exact source slices before work starts. Empty
+/// results retain this same coverage, so a no-entities result still covers its excerpt.
 pub(crate) fn planned_provenance(
     kind: ProducerKind,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     targets: &[InvocationTarget],
 ) -> Result<model::Provenance, ApiError> {
     let input_refs = targets
@@ -456,6 +366,7 @@ pub(crate) fn planned_provenance(
         .map(|target| ProvenanceInputRef {
             object_type: ProvenanceObjectType::ContentUnit,
             id: target.unit_id.clone(),
+            text_range: Some(target.text_range()),
         })
         .collect::<Vec<_>>();
 
@@ -463,10 +374,10 @@ pub(crate) fn planned_provenance(
         producer_type: ProducerType::Model,
         producer_name: kind.producer_name().to_string(),
         producer_version: Some(kind.producer_version().to_string()),
-        config_hash: Some(kind.identity_hash(config, naming_rules)?),
+        config_hash: Some(kind.identity_hash(config)?),
         model_name: Some(config.model.clone()),
         model_version: None,
-        prompt_hash: Some(kind.prompt_hash(naming_rules)?),
+        prompt_hash: Some(kind.prompt_hash()?),
         // Planned provenance predates the call: the effective sampling
         // temperature is stamped at completion (`completed_provenance`), and
         // memo reuses honestly keep None (no call ran).
@@ -479,10 +390,7 @@ pub(crate) fn planned_provenance(
     })
 }
 
-/// Run one producer against one invocation: assemble the pure user content
-/// (the ordered target texts joined by blank lines — INPUT PURITY, nothing
-/// else), call the shared client, and dispatch strict parsing to the
-/// producer's module.
+/// Run an excerpt's dependent request chain before returning any persisted outputs.
 ///
 /// Kind/invocation compatibility: Entity and Relation consume `SectionGroup`
 /// invocations; Summary consumes `Document` invocations. A mismatch is a
@@ -498,7 +406,6 @@ pub(crate) fn invoke(
     kind: ProducerKind,
     client: &AnnotatorClient,
     invocation: &Invocation,
-    naming_rules: &[String],
     temperature: f64,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     if let Some(reason) = client.cancellation().reason() {
@@ -517,40 +424,19 @@ pub(crate) fn invoke(
         }
     }
 
-    // Input purity: the user content is exactly the ordered target texts,
-    // joined by a blank line, with no other tokens. Blank-line joining keeps
-    // unit boundaries legible to the model without adding structural metadata.
-    let user_content = invocation
-        .targets
-        .iter()
-        .map(|target| target.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    // The sent system prompt is the COMPOSED prompt from `ProducerKind::prompt`
-    // — the same function `prompt_hash` reads — so the bytes sent here are the
-    // bytes the recorded promptHash/identity cover, by construction (CA2-P3).
-    let system_prompt = kind.prompt(naming_rules);
-    // Call/envelope failures provide no annotation output to judge. Only the
-    // strict parser below can charge a rejected response to the output budget.
-    let raw = client
-        .complete(
-            kind.request_purpose(),
-            &system_prompt,
-            &user_content,
-            temperature,
-        )
-        .map_err(|failure| match failure {
-            CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
-            CompletionFailure::Request(source) => InvocationFailure::Call(source),
-        })?;
-    // A response that raced operator cancellation is discarded before parsing
-    // and can never be charged as invalid output by the serial worker.
-    if let Some(reason) = client.cancellation().reason() {
-        return Err(InvocationFailure::Cancelled(reason));
+    // Never accidentally reassemble a large section into one request. The
+    // planner, memo key, and provenance all describe this single exact fragment.
+    let [target] = invocation.targets.as_slice() else {
+        return Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
+            message: "annotation invocation must contain exactly one source excerpt".to_string(),
+        }));
+    };
+    if target.text.trim().is_empty() {
+        // A lossless partition may retain a whitespace-only fragment. Mark its
+        // coverage through the normal empty-result path without spending inference.
+        return Ok(Vec::new());
     }
-    kind.parse_output(&raw)
-        .map_err(InvocationFailure::InvalidOutput)
+    chains::run(kind, client, &target.text, temperature)
 }
 
 /// Choose which invocations a producer consumes. Exposed so the stage-3 worker
@@ -642,107 +528,45 @@ fn evidence_text(unit: &ContentUnit) -> Option<String> {
     }
 }
 
-/// Split one section group's ordered targets into `SectionGroup` invocations,
-/// each under `max_input_chars`, and push them onto the plan.
+/// Enumerate already-bounded fragments without recombining neighboring units.
 fn push_section_splits(
     invocations: &mut Vec<Invocation>,
     section_unit_id: &str,
     targets: Vec<InvocationTarget>,
-    max_input_chars: usize,
-) {
-    for (split_index, run) in split_targets(targets, max_input_chars, section_unit_id)
-        .into_iter()
-        .enumerate()
-    {
+) -> Result<(), ApiError> {
+    for (split_index, target) in targets.into_iter().enumerate() {
         invocations.push(Invocation {
             kind: InvocationKind::SectionGroup {
                 section_unit_id: section_unit_id.to_string(),
-                split_index: split_index as u32,
+                split_index: checked_split_index(split_index)?,
             },
-            targets: run,
+            targets: vec![target],
         });
     }
+    Ok(())
 }
 
-/// Split the document composite into `Document` invocations, each under
-/// `max_input_chars`, and push them onto the plan.
+/// Give each summary the same bounded excerpt used by entity/relation producers.
 fn push_document_splits(
     invocations: &mut Vec<Invocation>,
     targets: Vec<InvocationTarget>,
-    max_input_chars: usize,
-) {
-    for (split_index, run) in split_targets(targets, max_input_chars, "document")
-        .into_iter()
-        .enumerate()
-    {
+) -> Result<(), ApiError> {
+    for (split_index, target) in targets.into_iter().enumerate() {
         invocations.push(Invocation {
             kind: InvocationKind::Document {
-                split_index: split_index as u32,
+                split_index: checked_split_index(split_index)?,
             },
-            targets: run,
+            targets: vec![target],
         });
     }
+    Ok(())
 }
 
-/// Split ordered targets deterministically into consecutive runs of whole
-/// units whose joined length stays under `max_input_chars`.
-///
-/// Joined length accounts for the `\n\n` separators `invoke` inserts, so the
-/// budget matches what is actually sent. A single unit larger than the cap
-/// cannot share a run with any other unit and cannot be split across units, so
-/// its text is truncated at the cap (explicit, warn-logged) and it forms its
-/// own run — never dropped and never sent oversized. `group_label` is a log
-/// facet only. Returns an empty vec for empty input (no invocation planned).
-fn split_targets(
-    targets: Vec<InvocationTarget>,
-    max_input_chars: usize,
-    group_label: &str,
-) -> Vec<Vec<InvocationTarget>> {
-    let mut runs: Vec<Vec<InvocationTarget>> = Vec::new();
-    let mut current: Vec<InvocationTarget> = Vec::new();
-    let mut current_chars = 0usize;
-    let separator_chars = 2; // "\n\n" between consecutive targets in a run.
-
-    for mut target in targets {
-        let mut unit_chars = target.text.chars().count();
-
-        // A single oversized unit is explicitly truncated at the cap; it can
-        // never fit otherwise, and silent oversized sends or drops are both
-        // forbidden (PRINCIPLES: truncation must be explicit).
-        if unit_chars > max_input_chars {
-            warn!(
-                event = "annotator_plan.unit_truncated",
-                group = group_label,
-                unit_id = %target.unit_id,
-                unit_chars,
-                max_input_chars,
-                "annotation producer input unit exceeds max_input_chars; truncating at cap"
-            );
-            target.text = target.text.chars().take(max_input_chars).collect();
-            unit_chars = target.text.chars().count();
-        }
-
-        let added = if current.is_empty() {
-            unit_chars
-        } else {
-            current_chars + separator_chars + unit_chars
-        };
-        if !current.is_empty() && added > max_input_chars {
-            // Current run is full; start a fresh run with this unit.
-            runs.push(std::mem::take(&mut current));
-            current_chars = 0;
-        }
-        current_chars = if current.is_empty() {
-            unit_chars
-        } else {
-            current_chars + separator_chars + unit_chars
-        };
-        current.push(target);
-    }
-    if !current.is_empty() {
-        runs.push(current);
-    }
-    runs
+/// Keep diagnostic invocation indexes lossless even for pathological input sizes.
+fn checked_split_index(index: usize) -> Result<u32, ApiError> {
+    u32::try_from(index).map_err(|_| ApiError::AnnotationProducer {
+        message: format!("annotation excerpt count exceeds the supported index range: {index}"),
+    })
 }
 
 /// Read one parse's content units in reading order (bounded by the parse's
@@ -832,17 +656,7 @@ fn plan_unit(row: PlanUnitRow, parse_id: &str) -> Result<ContentUnit, ApiError> 
 
 // --- Shared strict output-parsing helpers ---------------------------------
 //
-// The three producers all: tolerate a surrounding Markdown code fence, then
-// strictly deserialize a bare JSON object, then validate non-empty strings and
-// optional confidence bounds. These helpers live here (rather than in a new
-// module) because the CAb scope is fixed to these five files; they are
-// `pub(crate)` so entity/relation/summary share one implementation instead of
-// duplicating the rule three times.
-
-/// Bounded diagnostic length for a malformed model response embedded in an
-/// error. The full output is never included (DIAGNOSTICS forbidden-data rules
-/// treat full model output as off-limits); this cap bounds even the excerpt.
-const MALFORMED_EXCERPT_CHARS: usize = 500;
+// Shared shape checks keep stage-specific parsing and diagnostic behavior aligned.
 
 /// Strip a single optional surrounding Markdown code fence from a model
 /// response and trim surrounding whitespace.
@@ -871,9 +685,8 @@ pub(crate) fn strip_optional_code_fence(raw: &str) -> &str {
     }
 }
 
-/// Strictly deserialize a producer response, mapping a parse failure to
-/// `ApiError::AnnotationProducer` with a bounded excerpt of the ORIGINAL raw
-/// output (never the full text). `producer` labels which producer failed.
+/// Preserve the parser's error and output size without copying the response body
+/// into durable diagnostics. The owning chain supplies the single-goal stage name.
 pub(crate) fn strict_from_str<T: serde::de::DeserializeOwned>(
     json_text: &str,
     producer: &str,
@@ -881,8 +694,8 @@ pub(crate) fn strict_from_str<T: serde::de::DeserializeOwned>(
 ) -> Result<T, ApiError> {
     serde_json::from_str(json_text).map_err(|source| ApiError::AnnotationProducer {
         message: format!(
-            "{producer} producer returned malformed output: {source}; output_excerpt={}",
-            malformed_excerpt(raw)
+            "{producer} producer returned malformed output: {source}; output_chars={}",
+            raw.chars().count()
         ),
     })
 }
@@ -893,49 +706,10 @@ pub(crate) fn validate_non_empty(value: &str, field: &str, raw: &str) -> Result<
     if value.trim().is_empty() {
         return Err(ApiError::AnnotationProducer {
             message: format!(
-                "annotation producer returned empty {field}; output_excerpt={}",
-                malformed_excerpt(raw)
+                "annotation producer returned empty {field}; output_chars={}",
+                raw.chars().count()
             ),
         });
     }
     Ok(())
-}
-
-/// Validate an optional confidence lies within [0,1]. An out-of-range value is
-/// an error, never clamped: clamping would silently fabricate a calibrated
-/// value the model did not report (accuracy principle). A non-finite value is
-/// equally rejected.
-pub(crate) fn validate_confidence(
-    confidence: Option<f64>,
-    field: &str,
-    raw: &str,
-) -> Result<(), ApiError> {
-    let Some(value) = confidence else {
-        return Ok(());
-    };
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(ApiError::AnnotationProducer {
-            message: format!(
-                "annotation producer returned {field} {value} outside [0,1]; output_excerpt={}",
-                malformed_excerpt(raw)
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Bounded, escaped single-line excerpt of a malformed model response for
-/// diagnostics. Never the full output; control characters are escaped so the
-/// excerpt cannot corrupt a log line.
-fn malformed_excerpt(raw: &str) -> String {
-    let escaped = raw
-        .trim()
-        .chars()
-        .flat_map(|character| character.escape_default())
-        .take(MALFORMED_EXCERPT_CHARS)
-        .collect::<String>();
-    if raw.trim().chars().count() > MALFORMED_EXCERPT_CHARS {
-        return format!("{escaped}...");
-    }
-    escaped
 }

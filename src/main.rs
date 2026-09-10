@@ -783,10 +783,6 @@ async fn run_http_service(
                     annotation_index_root,
                     annotation_annotator,
                     annotation_config_root,
-                    // CA2-P3: the operator-loaded naming rules compose into the entity/
-                    // relation producer prompts (identity-bearing); the document moves
-                    // here — its content hash was already folded into identity capture.
-                    annotator_naming_policy.document,
                     Arc::clone(&shutdown_signal),
                     Arc::clone(&maintenance),
                     annotation_health,
@@ -1128,8 +1124,8 @@ async fn run_annotation_dry_run_mode(
         );
     };
 
-    // Operator policy documents: same strict load-or-die posture as the
-    // normal path; the naming rules feed the sampled producers directly.
+    // Operator policy documents retain the normal path's strict validation and
+    // application identity registration; single-goal producer prompts are separate.
     let entity_match_policy = policy::load_entity_match_policy(
         &config
             .policies
@@ -1230,7 +1226,6 @@ async fn run_annotation_dry_run_mode(
         docling: config.docling.clone(),
         annotator: config.models.annotator.clone(),
         config_root: config.config_root().to_path_buf(),
-        naming_policy: annotator_naming_policy.document,
         groups_per_source,
     };
 

@@ -69,6 +69,20 @@ pub(crate) enum ProducerType {
 pub(crate) struct ProvenanceInputRef {
     pub(crate) object_type: ProvenanceObjectType,
     pub(crate) id: String,
+    /// Annotation excerpts identify the exact canonical text slice they consumed.
+    /// Absent on whole-object references and records produced before excerpting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text_range: Option<ProvenanceTextRange>,
+}
+
+/// Unicode scalar offsets into the unit's evidence text; end is exclusive.
+/// The hash covers the exact UTF-8 slice, without trimming or normalization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProvenanceTextRange {
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+    pub(crate) text_hash: String,
 }
 
 /// Spec §20 `ProvenanceInputRef.objectType`. Closed set of referenceable

@@ -116,17 +116,10 @@ WHERE source_id = ?1
   AND freshness_status = 'fresh'
   AND deleted_at IS NULL";
 
-/// Read the CONTENT key hash of every non-deleted annotation of a parse,
-/// regardless of freshness. This is the discovery worker's set-difference
-/// input: the content keys already present for the parse, so it can compute
-/// which required annotations are still missing. CA2 (user-ruled 2026-07-19):
-/// satisfaction is content-scoped — a model switch leaves the content key
-/// unchanged, so already-annotated content stays satisfied and only the
-/// frontier is (re-)annotated. (The identity-scoped memo key still keys the
-/// memo CACHE lookup in `memo::lookup`; the two scopes are deliberately split.)
+/// Only fresh records satisfy coverage; stale, failed, and building rows do not.
 const SELECT_CONTENT_KEYS_FOR_PARSE_SQL: &str = "
 SELECT content_key_hash FROM semantic_annotations
-WHERE parse_id = ?1 AND deleted_at IS NULL";
+WHERE parse_id = ?1 AND deleted_at IS NULL AND freshness_status = 'fresh'";
 
 /// Read every reopenable row of a parse: `failed` and `building` rows whose
 /// CONTENT key has NO `fresh` sibling. A content key with a fresh row is
@@ -521,13 +514,9 @@ pub(crate) fn fresh_for_active_parse(
     Ok(annotations)
 }
 
-/// Read the CONTENT key hash of every non-deleted annotation of one parse,
-/// regardless of freshness. This is the discovery worker's set-difference
-/// input: the content keys already present, so the worker can compute which
-/// required annotations remain to be built. CA2 (user-ruled 2026-07-19):
-/// satisfaction keys on content, not producer identity, so a model switch
-/// re-annotates only the frontier while the memo CACHE stays identity-scoped.
-pub(crate) fn content_key_hashes_for_parse(
+/// Read completed coverage for discovery and projection admission. Completion
+/// depends on the current excerpt plan, not on unrelated legacy failed rows.
+pub(crate) fn fresh_content_key_hashes_for_parse(
     conn: &Connection,
     parse_id: &str,
 ) -> Result<std::collections::HashSet<String>, ApiError> {

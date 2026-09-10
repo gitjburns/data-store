@@ -102,9 +102,6 @@ use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::model::{ProducerType, Provenance, SemanticAnnotationType};
-// The CA2 operator policy module (crate root), distinct from the §21.4
-// `crate::annotations::policy` module imported above.
-use crate::policy::AnnotatorNamingPolicy;
 use crate::primitives::utc_now;
 use crate::projections::{envelope, graph, view};
 use crate::state::{AnnotationCycleCounts, AnnotationHealth, ShutdownSignal};
@@ -195,18 +192,12 @@ const PROJECTION_BUILD_PRODUCER_VERSION: &str = "1";
 /// of failing process startup (annotations are non-critical by the CAd
 /// ruling). The caller (main) owns the JoinHandle and joins it on shutdown so
 /// the worker's clean stop is observable.
-///
-/// `naming_policy` is the operator's annotator-naming document, loaded once at
-/// startup by the main-loop wiring (CA2). Its ordered rules compose into the
-/// Entity/Relation producer prompts (CA2-P3) and are identity-bearing: they
-/// flow into every prompt, promptHash, identity_hash, and memo-key derivation
-/// this worker performs. The document is fixed for the process lifetime, like
-/// `annotator_config`.
+/// Producer prompts contain only their single annotation goal; operator naming
+/// rules are not appended to requests or incorporated into producer memo identity.
 pub(crate) fn start(
     index_root: PathBuf,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
-    naming_policy: AnnotatorNamingPolicy,
     shutdown: Arc<ShutdownSignal>,
     maintenance: Arc<crate::maintenance::MaintenanceGate>,
     // C10b diagnostic-only health slot the worker publishes into each cycle (and
@@ -230,7 +221,6 @@ pub(crate) fn start(
                     index_root,
                     annotator_config,
                     config_root,
-                    naming_policy,
                     shutdown,
                     maintenance,
                     health_slot,
@@ -280,7 +270,6 @@ fn run_worker(
     index_root: PathBuf,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
-    naming_policy: AnnotatorNamingPolicy,
     shutdown: Arc<ShutdownSignal>,
     maintenance: Arc<crate::maintenance::MaintenanceGate>,
     health_slot: Arc<Mutex<AnnotationHealth>>,
@@ -288,9 +277,6 @@ fn run_worker(
     info!(
         event = "annotation_worker.thread_started",
         index_root = %index_root.display(),
-        // Bounded fact only: the naming-rule COUNT — operator rule text never
-        // enters logs (same discipline as `policy.loaded`).
-        naming_rule_count = naming_policy.rules.len(),
         "annotation worker thread started"
     );
 
@@ -387,7 +373,6 @@ fn run_worker(
         match run_cycle(
             &index_root,
             &annotator_config,
-            &naming_policy.rules,
             &client,
             &shutdown,
             &mut output_retries,
@@ -431,7 +416,6 @@ fn run_worker(
 fn run_cycle(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
     output_retries: &mut RetryState,
@@ -466,15 +450,7 @@ fn run_cycle(
         context.record("parse_id", source.active_parse_id.as_str());
         context.record("source_paths", source.source_paths.as_str());
         let _entered = context.enter();
-        match build_source(
-            index_root,
-            config,
-            naming_rules,
-            client,
-            source,
-            shutdown,
-            output_retries,
-        ) {
+        match build_source(index_root, config, client, source, shutdown, output_retries) {
             Ok((source_counts, flow)) => {
                 if let BuildFlow::Cancelled(reason) = flow {
                     return cancelled_cycle(reason);
@@ -517,7 +493,8 @@ fn run_cycle(
                 // like a per-source annotation fault: a broken projection build
                 // for one source must not stall the rest of the cycle, and the
                 // stateless next cycle re-attempts it.
-                match build_annotation_derived_projections(index_root, source, cancellation) {
+                match build_annotation_derived_projections(index_root, source, config, cancellation)
+                {
                     Ok(BuildFlow::Cancelled(reason)) => return cancelled_cycle(reason),
                     Ok(BuildFlow::Deferred) => {
                         // The projection build (a pre-paid boundary) hit writer
@@ -989,7 +966,6 @@ struct PendingBuild {
 fn build_source(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
@@ -1010,15 +986,15 @@ fn build_source(
             &source.active_parse_id,
             config.max_input_chars,
         )?;
-        let work_items = enumerate_work_items(&connection, config, naming_rules, &plan)?;
-        // Present CONTENT keys (any status) drive the absent-entirely test; the
-        // reopenable map holds one reusable row per unsatisfied CONTENT key
+        let work_items = enumerate_work_items(&connection, config, &plan)?;
+        // Only fresh CONTENT keys satisfy coverage. The reopenable map holds
+        // one reusable row per unsatisfied CONTENT key
         // (failed rows and crash-orphaned building rows alike). CA2 (user-ruled
         // 2026-07-19): satisfaction/reopen are content-scoped, so a model switch
         // re-annotates only the frontier; the memo CACHE lookup in
         // `prepare_work_item` still keys on the identity-scoped memo key.
         let present_keys =
-            store::content_key_hashes_for_parse(&connection, &source.active_parse_id)?;
+            store::fresh_content_key_hashes_for_parse(&connection, &source.active_parse_id)?;
         let reopenable = store::reopenable_rows_for_parse(&connection, &source.active_parse_id)?;
         (work_items, present_keys, reopenable)
     };
@@ -1043,6 +1019,25 @@ fn build_source(
         if !is_unsatisfied {
             // SATISFIED (a fresh row exists for the content key): nothing to do.
             continue;
+        }
+
+        // Equal text at another location has a distinct completion key but may
+        // share this memo. Commit its pending producer before looking up the
+        // cache again, avoiding duplicate paid calls and colliding memo INSERTs.
+        if pending.iter().any(|build| build.item.key == item.key) {
+            let flow = flush_pending_wave(
+                index_root,
+                config,
+                client,
+                source,
+                &mut pending,
+                &mut counts,
+                output_retries,
+                shutdown,
+            )?;
+            if flow != BuildFlow::Continue {
+                return Ok((counts, flow));
+            }
         }
 
         let context = item.invocation.log_context();
@@ -1133,7 +1128,6 @@ fn build_source(
         match prepare_work_item(
             index_root,
             config,
-            naming_rules,
             source,
             &item,
             reopened,
@@ -1151,7 +1145,6 @@ fn build_source(
                     let flow = dispatch_and_commit_wave(
                         index_root,
                         config,
-                        naming_rules,
                         client,
                         source,
                         &mut pending,
@@ -1171,7 +1164,6 @@ fn build_source(
                 let flow = flush_pending_wave(
                     index_root,
                     config,
-                    naming_rules,
                     client,
                     source,
                     &mut pending,
@@ -1193,7 +1185,6 @@ fn build_source(
     let flow = flush_pending_wave(
         index_root,
         config,
-        naming_rules,
         client,
         source,
         &mut pending,
@@ -1215,7 +1206,6 @@ fn build_source(
 fn flush_pending_wave(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     source: &ActiveSource,
     pending: &mut Vec<PendingBuild>,
@@ -1229,7 +1219,6 @@ fn flush_pending_wave(
     dispatch_and_commit_wave(
         index_root,
         config,
-        naming_rules,
         client,
         source,
         pending,
@@ -1267,7 +1256,6 @@ enum PreparedItem {
 fn prepare_work_item(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     source: &ActiveSource,
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
@@ -1290,7 +1278,6 @@ fn prepare_work_item(
         let flow = remint_from_memo(
             index_root,
             config,
-            naming_rules,
             source,
             item,
             reopened,
@@ -1321,15 +1308,7 @@ fn prepare_work_item(
 
     // Memo MISS: pass the PRE-PAID `build_open` boundary (durable in-flight
     // truth) and buffer for the concurrent producer wave.
-    let opened = open_producer_build(
-        index_root,
-        config,
-        naming_rules,
-        source,
-        item,
-        reopened,
-        cancellation,
-    )?;
+    let opened = open_producer_build(index_root, config, source, item, reopened, cancellation)?;
     // A cancelled open leaves no new work to dispatch and must not count as
     // contention. The admission lease keeps this signal latched until we exit.
     if let Some(reason) = cancellation.reason() {
@@ -1376,7 +1355,6 @@ fn prepare_work_item(
 fn enumerate_work_items(
     conn: &Connection,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     plan: &[Invocation],
 ) -> Result<Vec<WorkItem>, ApiError> {
     let policy = policy::active_policy()?;
@@ -1388,13 +1366,10 @@ fn enumerate_work_items(
             if !producer::invocation_matches_kind(kind, invocation) {
                 continue;
             }
-            // Both keys derive from one shared material builder in `memo`: the
-            // memo key folds in producer identity (cache scope) — which, per
-            // CA2-P3, includes the COMPOSED prompt's hash, so a naming-policy
-            // edit invalidates memo reuse — the content key does not
-            // (satisfaction scope, never sees the rules). (CA2, user-ruled
-            // 2026-07-19.)
-            let key = memo::memoization_key_hash(conn, kind, config, naming_rules, invocation)?;
+            // Both keys share content material. Only the memo key includes the
+            // producer's single-goal prompt contracts; changing a prompt prevents
+            // cache reuse without making already-fresh content unsatisfied.
+            let key = memo::memoization_key_hash(conn, kind, config, invocation)?;
             let content_key = memo::content_key_hash(conn, kind, invocation)?;
             items.push(WorkItem {
                 kind,
@@ -1440,7 +1415,6 @@ fn reopen_or_insert_building(
 fn remint_from_memo(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     source: &ActiveSource,
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
@@ -1450,7 +1424,7 @@ fn remint_from_memo(
     if let Some(reason) = cancellation.reason() {
         return Ok(BuildFlow::Cancelled(reason));
     }
-    let request = new_annotation_request(config, naming_rules, source, item)?;
+    let request = new_annotation_request(config, source, item)?;
 
     let mut connection = hot_plane::open_write(index_root)?;
     // PRE-PAID boundary: nothing has been produced yet, so writer contention is
@@ -1546,7 +1520,6 @@ fn remint_from_memo(
 fn open_producer_build(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     source: &ActiveSource,
     item: &WorkItem,
     reopened: Option<&store::ReopenableRow>,
@@ -1555,7 +1528,7 @@ fn open_producer_build(
     if cancellation.reason().is_some() {
         return Ok(None);
     }
-    let request = new_annotation_request(config, naming_rules, source, item)?;
+    let request = new_annotation_request(config, source, item)?;
 
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = match hot_plane::begin_write_transaction_if_free(
@@ -1619,7 +1592,6 @@ fn open_producer_build(
 fn dispatch_and_commit_wave(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     client: &AnnotatorClient,
     source: &ActiveSource,
     pending: &mut Vec<PendingBuild>,
@@ -1662,8 +1634,7 @@ fn dispatch_and_commit_wave(
                 .iter()
                 .map(|build| {
                     // Shared `&client` crosses the scope boundary by reference (Sync);
-                    // `item.kind`/`item.invocation` are borrowed for this scope only,
-                    // as is the shared `naming_rules` slice (immutable, Sync).
+                    // `item.kind`/`item.invocation` are borrowed for this scope only.
                     scope.spawn(move || {
                         // Scoped threads do not inherit tracing's thread-local span.
                         let _entered = build.log_context.enter();
@@ -1675,7 +1646,6 @@ fn dispatch_and_commit_wave(
                             build.item.kind,
                             client,
                             &build.item.invocation,
-                            naming_rules,
                             build.effective_temperature,
                         )
                     })
@@ -1802,7 +1772,6 @@ fn dispatch_and_commit_wave(
                 match complete_build(
                     index_root,
                     config,
-                    naming_rules,
                     source,
                     &build.item,
                     &build.request,
@@ -1867,14 +1836,12 @@ fn dispatch_and_commit_wave(
 /// final provenance records the concrete confidence plus the effective
 /// sampling temperature the producer call ran at; the memo entry caches the
 /// full item array keyed by the shared memo key.
-// Ten positional args after threading `&ShutdownSignal` for the post-paid
-// contention wait, the CA2-P3 naming rules, and the effective temperature;
-// codebase-standard `allow` rather than an unrelated refactor.
+// Completion carries persistence ownership, cancellation, and effective sampling
+// temperature explicitly so paid output follows the worker's serial write boundary.
 #[allow(clippy::too_many_arguments)]
 fn complete_build(
     index_root: &Path,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     source: &ActiveSource,
     item: &WorkItem,
     request: &NewAnnotation,
@@ -1972,10 +1939,8 @@ fn complete_build(
             }
 
             // Cache write atomic with the truth it caches (ruling D.2). The
-            // producer identity hash is recomputed from config plus the CA2-P3
-            // naming rules — the same composed-prompt identity the memo key was
-            // derived under — so the cache row records the exact identity.
-            let identity_hash = item.kind.identity_hash(config, naming_rules)?;
+            // identity uses the same single-goal prompt contracts as the memo key.
+            let identity_hash = item.kind.identity_hash(config)?;
             memo::record(
                 tx,
                 &item.key,
@@ -2072,7 +2037,6 @@ fn fail_build(
 /// plus memo key are carried up front (§21 rule 3).
 fn new_annotation_request(
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     source: &ActiveSource,
     item: &WorkItem,
 ) -> Result<NewAnnotation, ApiError> {
@@ -2082,8 +2046,7 @@ fn new_annotation_request(
         .iter()
         .map(|target| target.unit_id.clone())
         .collect::<Vec<_>>();
-    let provenance =
-        producer::planned_provenance(item.kind, config, naming_rules, &item.invocation.targets)?;
+    let provenance = producer::planned_provenance(item.kind, config, &item.invocation.targets)?;
 
     Ok(NewAnnotation {
         source_id: source.source_id.clone(),
@@ -2199,10 +2162,9 @@ fn read_active_sources(conn: &Connection) -> Result<Vec<ActiveSource>, ApiError>
 ///      the cycle-start read) because a supersession can land mid-cycle; a
 ///      pointer that no longer names `active_parse_id` skips the build so no
 ///      summary/graph envelope is ever materialized for a non-active parse.
-///   2. Annotation-completeness: if ANY required annotation of the parse is
-///      still `failed` or `building` (a crash orphan), the annotation build is
-///      incomplete this cycle — the projections would materialize a partial
-///      graph/summary — so the build is skipped and re-attempted next cycle.
+///   2. Every required key in the current excerpt plan must have fresh output.
+///      Legacy failed/building rows outside that plan remain historical records
+///      and cannot block publication of a fully completed new plan.
 ///
 /// IDEMPOTENCE: each projection type is `envelope::delete_for_parse`-swept
 /// immediately before its builder (rebuild replaces rather than accumulates),
@@ -2225,6 +2187,7 @@ fn read_active_sources(conn: &Connection) -> Result<Vec<ActiveSource>, ApiError>
 fn build_annotation_derived_projections(
     index_root: &Path,
     source: &ActiveSource,
+    config: &AnnotatorModelConfig,
     cancellation: &AnnotationCancellation,
 ) -> Result<BuildFlow, ApiError> {
     if let Some(reason) = cancellation.reason() {
@@ -2246,7 +2209,7 @@ fn build_annotation_derived_projections(
                 "skipping annotation-derived projection build; parse is no longer active"
             );
             false
-        } else if !parse_annotations_complete(&connection, &source.active_parse_id)? {
+        } else if !parse_annotations_complete(&connection, &source.active_parse_id, config)? {
             // Some required annotation is still failed/building: the annotation
             // build is incomplete, so building projections now would materialize
             // a partial summary/graph. Skip; the next cycle re-attempts.
@@ -2380,15 +2343,27 @@ fn read_active_parse_id(conn: &Connection, source_id: &str) -> Result<Option<Str
     .map(Option::flatten)
 }
 
-/// Whether every required annotation of the parse is fresh — i.e. no `failed`
-/// or crash-orphaned `building` row remains (see guard 2). Reuses the discovery
-/// reader `store::reopenable_rows_for_parse`, which returns exactly the
-/// failed/building rows with no fresh sibling: an empty result means the
-/// annotation build is complete for the parse, so its annotation-derived
-/// projections may build. This is the "annotations are fresh" precondition the
-/// summary/graph builders assume.
-fn parse_annotations_complete(conn: &Connection, parse_id: &str) -> Result<bool, ApiError> {
-    Ok(store::reopenable_rows_for_parse(conn, parse_id)?.is_empty())
+/// Admit projections only after every current excerpt/type has fresh coverage.
+/// Old grouping keys may retain failed rows, but they no longer describe owed work.
+fn parse_annotations_complete(
+    conn: &Connection,
+    parse_id: &str,
+    config: &AnnotatorModelConfig,
+) -> Result<bool, ApiError> {
+    let fresh = store::fresh_content_key_hashes_for_parse(conn, parse_id)?;
+    let plan = producer::build_invocation_plan(conn, parse_id, config.max_input_chars)?;
+    let policy = policy::active_policy()?;
+    for annotation_type in &policy.post_activation_types {
+        let kind = producer_kind_for(*annotation_type)?;
+        for invocation in &plan {
+            if producer::invocation_matches_kind(kind, invocation)
+                && !fresh.contains(&memo::content_key_hash(conn, kind, invocation)?)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Record a durable `projection.failed` audit marker after the annotation-derived

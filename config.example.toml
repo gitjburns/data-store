@@ -231,10 +231,9 @@ timeout_seconds = 120
 # Optional owner-only file containing the API key sent as a bearer token.
 # Relative paths resolve from this config file's directory.
 #api_key_file_path = ".annotator-api-key"
-# Producer input budget in characters: section groups larger than this are
-# split deterministically before invocation. External fact: size from the
-# endpoint model's context window.
-max_input_chars = 24000
+# Maximum source-excerpt length in Unicode characters. Oversized units are
+# split without dropping text; prompts and intermediate results are additional.
+max_input_chars = 2000
 
 [policies]
 # Paths to the operator-editable external policy documents. Config holds the

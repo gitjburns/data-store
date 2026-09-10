@@ -544,9 +544,8 @@ pub struct AnnotatorModelConfig {
     pub timeout_seconds: u64,
     /// Optional owner-only file holding the bearer API key.
     pub api_key_file_path: Option<PathBuf>,
-    /// Producer input budget in characters: section groups larger than this
-    /// are split deterministically before invocation. External fact sized
-    /// from the endpoint model's context window (spec §35).
+    /// Maximum source-excerpt length in Unicode characters. Prompts and prior
+    /// stage outputs are additional; this is not a model token-budget estimate.
     pub max_input_chars: usize,
 }
 

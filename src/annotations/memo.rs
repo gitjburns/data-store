@@ -1,24 +1,21 @@
 //! CAc: §21.2 memoization cache — content-keyed reuse of producer results,
 //! recorded honestly through the Provenance memoization fields (§21.3).
 //!
-//! The cache is keyed by `memoization_key_hash` (§21.2): a canonical SHA-256
-//! over the ordered per-target content hashes, the annotation type, and the
-//! producer identity hash. Because a producer's input is EXACTLY the ordered
-//! text of its target units (CAb input purity), an identical key means an
-//! identical model input under an identical producer configuration, so the
-//! prior output can be re-minted without re-invoking the model.
+//! Cache identity covers source-unit hashes, exact fragment ranges/text hashes,
+//! annotation type, and the producer's ordered stage contracts. One memo entry
+//! reuses a complete chain; intermediate requests are not persisted separately.
 //!
 //! CA2 KEY SPLIT (user-ruled 2026-07-19). Two keys derive from ONE shared
-//! `KeyMaterial` (ordered target content hashes × annotation type):
-//!   - the CONTENT KEY (`content_key_hash`) hashes that material alone and
-//!     scopes SATISFACTION and reopenable classification (in `store`/`worker`),
-//!     so a model switch re-annotates only the frontier, not the whole corpus;
+//! `KeyMaterial` (unit hashes × source slices × annotation type):
+//!   - the CONTENT KEY (`content_key_hash`) also includes target unit IDs, so
+//!     each source location gets its own completion and provenance; producer
+//!     identity is excluded, keeping model changes scoped to unfinished work;
 //!   - the MEMO KEY (`memoization_key_hash`) hashes that material PLUS the
 //!     producer identity hash and stays the CACHE key here — cross-identity
 //!     reuse must remain impossible (memoization honesty).
 //!
-//! The memo key's output bytes are UNCHANGED from the pre-CA2 formula; only its
-//! construction now flows through the shared material builder.
+//! Fragment keys intentionally differ from legacy whole-group keys. Existing
+//! records remain intact, but cannot stand in for a fragment's precise coverage.
 //!
 //! One cache ROW caches one producer INVOCATION's full output — an array of
 //! produced items — because a single invocation can yield many annotations
@@ -100,15 +97,13 @@ struct PersistedMemoItem {
     original_annotation_id: String,
 }
 
-/// The canonical material shared by BOTH keys of one invocation: the ordered
-/// per-target content hash list (textHash-or-bodyHash of each target's content
-/// unit, in target order) and the annotation type wire name. This is the SINGLE
-/// SOURCE OF TRUTH the content key and the memo key both derive from (CA2-P1,
-/// user-ruled 2026-07-19) — the content key hashes exactly this material, the
-/// memo key hashes this material PLUS the producer identity hash. Building it
-/// once guarantees the two keys can never drift in their shared ingredients.
+/// Shared coverage identity. Unit hashes alone cannot distinguish two fragments
+/// of the same unit, so both satisfaction and memo reuse include the exact slices.
 struct KeyMaterial {
+    // Location affects completion, not reusable model output for identical input.
+    target_unit_ids: Vec<String>,
     target_content_hashes: Vec<String>,
+    source_slices: Vec<crate::model::provenance::ProvenanceTextRange>,
     annotation_type: String,
 }
 
@@ -126,21 +121,24 @@ fn key_material(
     }
     let annotation_type = annotation_type_wire_name(kind.annotation_type())?;
     Ok(KeyMaterial {
+        target_unit_ids: invocation
+            .targets
+            .iter()
+            .map(|target| target.unit_id.clone())
+            .collect(),
         target_content_hashes,
+        source_slices: invocation
+            .targets
+            .iter()
+            .map(|target| target.text_range())
+            .collect(),
         annotation_type,
     })
 }
 
-/// Compute the CA2 CONTENT KEY hash for one planned invocation: canonical
-/// SHA-256 over `{targetContentHashes, annotationType}` — the memo-key material
-/// MINUS the producer identity hash. This key scopes SATISFACTION and reopenable
-/// classification (`store`/`worker`) to target CONTENT alone, so an
-/// annotator-model change re-annotates only the frontier (new/changed content,
-/// re-parses, failed-row retries) instead of the whole corpus. The memo CACHE
-/// stays identity-scoped (see `memoization_key_hash`): a model switch annotates
-/// the frontier, but cross-identity cache reuse remains impossible because
-/// memoization honesty forbids re-minting one model's output as another's.
-/// (CA2 ruling, user-approved 2026-07-19.)
+/// Identify completion at this canonical source location, independently of the
+/// producer. Equal text in another unit may reuse its memo but still needs its
+/// own annotation rows; otherwise graph evidence loses the second location.
 pub(crate) fn content_key_hash(
     conn: &Connection,
     kind: ProducerKind,
@@ -150,42 +148,24 @@ pub(crate) fn content_key_hash(
     content_key_hash_from_material(&material)
 }
 
-/// Compute the §21.2 memoization key hash for one planned invocation: canonical
-/// SHA-256 over `{targetContentHashes, annotationType, producerIdentityHash}`.
-/// Byte-identical to the pre-CA2 formula for identical inputs — the derivation
-/// was restructured to share `KeyMaterial` with the content key, but the hashed
-/// document is unchanged (canonical §16.2 sorts keys, so field order in the
-/// `json!` literal is irrelevant to the bytes). The added `producerIdentityHash`
-/// ingredient is what keeps the memo CACHE identity-scoped: a producer identity
-/// or configuration change changes this key and invalidates reuse, so one
-/// model's output is never re-minted as another's (memoization honesty).
-///
-/// `naming_rules` (CA2-P3, user-ruled 2026-07-19) flows in ONLY through the
-/// producer-identity-hash ingredient — `identity_hash` folds the COMPOSED
-/// prompt's hash — so an operator naming-policy edit changes this key
-/// (invalidating Entity/Relation memo reuse) while the key document gains no
-/// new field. With an EMPTY rule list the composed prompt is byte-identical to
-/// the bare prompt, so the identity hash — and therefore this key's output
-/// bytes — are unchanged. The CONTENT key below never sees the rules:
-/// satisfaction stays content-scoped exactly as CA2-P1 left it.
+/// Add producer identity to the shared fragment coverage key. A model, prompt,
+/// schema, or generation-contract change cannot reuse another producer's output.
 pub(crate) fn memoization_key_hash(
     conn: &Connection,
     kind: ProducerKind,
     config: &AnnotatorModelConfig,
-    naming_rules: &[String],
     invocation: &Invocation,
 ) -> Result<String, ApiError> {
     let material = key_material(conn, kind, invocation)?;
-    let producer_identity_hash = kind.identity_hash(config, naming_rules)?;
+    let producer_identity_hash = kind.identity_hash(config)?;
 
-    // Canonical §16.2 serialization (sorted keys, NFC strings) makes this key
-    // deterministic across processes: the same inputs always hash identically.
-    // This document — and thus the output bytes — is UNCHANGED from the pre-CA2
-    // formula; only its construction now flows through `KeyMaterial`.
+    // Repeated identical text at different offsets remains separate coverage.
+    // Legacy whole-group keys cannot satisfy or reuse a new fragment's output.
     let key_document = json!({
         "targetContentHashes": material.target_content_hashes,
         "annotationType": material.annotation_type,
         "producerIdentityHash": producer_identity_hash,
+        "sourceSlices": material.source_slices,
     });
     crate::canonical::canonical_sha256_hex(&key_document)
 }
@@ -195,8 +175,10 @@ pub(crate) fn memoization_key_hash(
 /// but kept symmetric with the memo path) does not re-read the unit hashes.
 fn content_key_hash_from_material(material: &KeyMaterial) -> Result<String, ApiError> {
     let key_document = json!({
+        "targetUnitIds": material.target_unit_ids,
         "targetContentHashes": material.target_content_hashes,
         "annotationType": material.annotation_type,
+        "sourceSlices": material.source_slices,
     });
     crate::canonical::canonical_sha256_hex(&key_document)
 }

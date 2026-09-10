@@ -521,6 +521,7 @@ fn input_refs(
         .map(|id| crate::model::ProvenanceInputRef {
             object_type,
             id: id.clone(),
+            text_range: None,
         })
         .collect()
 }

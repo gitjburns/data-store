@@ -806,6 +806,7 @@ fn new_projection(source_id: &str, parse_id: &str, chunks: &[StoredChunk]) -> Ne
         .map(|chunk| ProvenanceInputRef {
             object_type: ProvenanceObjectType::RetrievalProjection,
             id: chunk.projection_id.clone(),
+            text_range: None,
         })
         .collect::<Vec<_>>();
 
