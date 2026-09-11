@@ -209,6 +209,11 @@ Success means structural validation passed, not semantic verification or databas
 commit. Persistence remains recorded in the service log under the parent
 annotation context. Cancellation leaves the remote outcome unknown.
 
+`annotation_stage.entity_decisions` records candidate, accepted, and rejected
+counts after exact candidate accounting passes. Rejection is a successful model
+decision; only accepted entities contribute to the stage's output-item count.
+Rejected names and reasons remain in the transcript response.
+
 ## Implementation Guidance
 
 Prefer local, direct fixes:

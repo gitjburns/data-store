@@ -388,7 +388,7 @@ text hash. Section ownership groups discovery; it does not enlarge requests.
 `src/annotations/stages.rs` defines the prompts and schemas;
 `src/annotations/chains.rs` runs one goal per call:
 
-- Entity names → entity types.
+- Entity candidate names → accepted types or explicit rejections.
 - Source statements → relationships per selected statement → supporting
   quotations in bounded candidate batches.
 - One summary per excerpt.
@@ -398,6 +398,14 @@ Intermediate candidate arrays are also bounded by the configured excerpt cap.
 Shape checks validate required fields, source substrings, name mappings, and
 receipt indexes. Relations retain `evidenceQuotes`. Semantic verification is
 not implemented.
+
+Entity typing requires both `entities` (`name`, `entityType`) and `rejected`
+(`name`, `reason`) arrays. Their combined names must match the supplied candidate
+multiset exactly. Only accepted items become annotations; rejected names and
+reasons remain in the call transcript. Empty names skip typing, and all-rejected
+output uses existing successful empty coverage. Rejection is not a retryable
+failure. Missing/excess names, empty required text, and an accepted
+`NOT_AN_ENTITY` type are malformed outputs.
 
 A completed chain commits its output set and any memo entry in one worker
 transaction. Empty results record fresh coverage without a memo entry.

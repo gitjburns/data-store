@@ -91,8 +91,8 @@ pub(crate) fn run(
     }
 }
 
-/// Separate finding names from classifying them, preserving the exact name
-/// multiset across classification so a stage cannot silently change coverage.
+/// Find candidates, then classify or explicitly reject them. Both decision lists
+/// must account for the exact input multiset before any entity is produced.
 fn entities(
     client: &AnnotatorClient,
     passage: &str,
@@ -124,13 +124,20 @@ fn entities(
             &input,
             temperature,
             |raw| {
-                let mut typed = entity::parse_output(raw)?;
+                let typed = entity::parse_output(raw)?;
                 let mut remaining = BTreeMap::<&str, usize>::new();
                 for name in batch {
                     *remaining.entry(name.as_str()).or_default() += 1;
                 }
-                for annotation in &mut typed {
-                    let name = annotation_text(annotation, "name")?;
+                // Rejections satisfy candidate accounting but never become
+                // annotations. Duplicated input names still require one decision
+                // per occurrence, across both lists rather than independently.
+                let decided_names = typed
+                    .entities
+                    .iter()
+                    .map(|entity| entity.name.as_str())
+                    .chain(typed.rejected.iter().map(|rejected| rejected.name.as_str()));
+                for name in decided_names {
                     let count = remaining.get_mut(name).ok_or_else(|| {
                         output_error(
                             Stage::EntityTypes,
@@ -144,12 +151,18 @@ fn entities(
                         ));
                     }
                     *count -= 1;
-                    annotation.confidence = None;
                 }
                 if remaining.values().any(|count| *count != 0) {
                     return Err(output_error(Stage::EntityTypes, "omitted a supplied name"));
                 }
-                Ok(typed)
+                info!(
+                    event = "annotation_stage.entity_decisions",
+                    candidates = batch.len(),
+                    accepted = typed.entities.len(),
+                    rejected = typed.rejected.len(),
+                    "entity candidate accounting passed; rejected candidates produce no annotations"
+                );
+                Ok(typed.into_annotations())
             },
             Vec::len,
         )?;

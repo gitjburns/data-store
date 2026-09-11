@@ -39,25 +39,64 @@ cadence:
   │ ACQUIRE  │   raw bytes land in the content-addressed artifact store first
   └────┬─────┘
        ▼
-  ┌──────────┐   Docling conversion → canonical units; one parse run per attempt
-  │  PARSE   │
+  ┌──────────┐   PDF: Docling; plain text: text worker. Imported bundles become
+  │  PARSE   │   canonical units; invalid bundles leave a failed parse run.
   └────┬─────┘
        ▼
-  ┌──────────────┐   the gate admits at most ONE active parse per source. A parse
-  │ GATE/ACTIVATE│   is activated, HELD for disposition, or recorded a failed parse
+  ┌──────────────┐   chunks, lexical index, passage/section dense vectors,
+  │ PROJECTIONS  │   persisted ColBERT token matrices, and derived views
   └────┬─────────┘
        ▼
-  ┌──────────────┐   post-activation, the annotation worker builds semantic
-  │  ANNOTATE    │   annotations on its own; annotation freshness is tracked
+  ┌──────────────┐   one active parse per source; dominance checks can hold
+  │ GATE/ACTIVATE│   a valid candidate for disposition instead of activating it
   └────┬─────────┘
+       ├──────────► RETRIEVE: POST /query serves the active parse
        ▼
-  ┌──────────┐   POST /query returns cited passages and canonical evidence from
-  │ RETRIEVE │   the lexical, dense, and graph channels
-  └──────────┘
+  ┌──────────────┐   a separate worker runs entity, relation, and summary chains;
+  │  ANNOTATE    │   publishes summary/graph projections after required work completes
+  └────┬─────────┘
+       └──────────► published graph evidence enriches retrieval
 ```
 
 Only one parse is ever active per source: unit reads honor the active-parse gate,
 so a non-active parse's units are never served.
+
+Retrieval does not wait for annotation completion. Lexical and dense candidates
+from active parses combine with available graph candidates, then pass through
+ColBERT scoring, passage construction, and reranking to produce cited evidence.
+
+### Annotation request chains
+
+Each evidence-bearing unit is split into excerpts bounded by `max_input_chars`,
+without dropping oversized-unit tails. Entity, relation, and summary work use
+separate chains. Within a chain, model requests run sequentially; the server
+validates each response before passing its output to the next request.
+
+- **Entities:** extract candidate names from the excerpt, then send the same
+  excerpt and bounded batches of those names for classification or rejection.
+  Typing returns `entities` entries with `name`/`entityType` and `rejected`
+  entries with `name`/`reason`. Together, the lists must account for every
+  supplied name occurrence exactly once. Unknown names, omissions, excess
+  duplicates, empty required text, and accepted `NOT_AN_ENTITY` types fail
+  validation. Only accepted entries become entity annotations.
+- **Relations:** select source statements, form relationship triples for each
+  selected statement, then request supporting quotations for bounded batches of
+  those relationships. Later calls include the original excerpt. The server
+  checks statement/quotation substrings and complete receipt-index accounting;
+  empty quotation lists are permitted.
+- **Summaries:** request one summary per excerpt and validate its response shape.
+
+Empty name extraction skips typing. An entirely rejected candidate set also
+produces no entities. Both are successful empty results: the worker records fresh
+coverage so the excerpt is not retried merely because it has no annotations.
+Rejection reasons remain in `logs/annotator.log`; rejected candidates produce no
+entity rows. Model judgments are not independently verified for semantic accuracy.
+
+Intermediate results stay in memory. A completed chain commits its annotation set
+and any memo entry together; a failed chain restarts without intermediate
+checkpoints, under the retry policy below. Prompt/schema changes alter memo
+identity for new or unfinished work, while completed coverage remains fresh.
+Existing annotations are not automatically reclassified or removed.
 
 ## Operating model
 
@@ -100,13 +139,9 @@ API-key files).
 readiness-critical components: `inference` and `sync`. Everything else reported by
 health is diagnostic-only and never makes a running service report unavailable.
 
-**Annotation work.** Source units become bounded excerpts; oversized units are
-split without dropping text. Each model request has one goal: entity names then
-types; source statements then relationships then supporting quotations; or an
-excerpt summary. Each call enables thinking, requests structured JSON, and allows
-up to 150,000 output tokens including reasoning. Outputs receive structural
-validation; semantic verification is not implemented. Existing annotations remain
-intact, while new excerpt identities create new annotation work.
+**Annotation work.** The worker runs the [annotation request chains](#annotation-request-chains)
+over bounded excerpts. Each call enables thinking, requests structured JSON
+without streaming, and allows up to 150,000 output tokens including reasoning.
 
 **Operator policies.** The entity-match document controls graph-entry fuzzy
 matching. Inspect vocabulary with `--vocabulary <entity|relation>` before editing

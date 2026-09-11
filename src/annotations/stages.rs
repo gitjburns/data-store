@@ -6,11 +6,16 @@ const ENTITY_NAMES_SCHEMA: &str = r#"{
   "type":"object","properties":{"names":{"type":"array","items":{"type":"string","minLength":1}}},
   "required":["names"],"additionalProperties":false
 }"#;
+// Classification accounts for all candidates even when none become annotations.
+const ENTITY_TYPES_PROMPT: &str = "Classify each supplied candidate using the passage. If it is a named entity in this passage, return its name and entityType in entities. Otherwise, return its name and a brief reason in rejected. Preserve names exactly as supplied. Account for every supplied candidate occurrence exactly once across the two lists. Either list may be empty; if no candidates are valid entities, return an empty entities list and reject every candidate. Use rejected for negative decisions, never an entity type as a rejection label.";
 const ENTITY_TYPES_SCHEMA: &str = r#"{
   "type":"object","properties":{"entities":{"type":"array","items":{
     "type":"object","properties":{"name":{"type":"string","minLength":1},"entityType":{"type":"string","minLength":1}},
     "required":["name","entityType"],"additionalProperties":false
-  }}},"required":["entities"],"additionalProperties":false
+  }},"rejected":{"type":"array","items":{
+    "type":"object","properties":{"name":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1}},
+    "required":["name","reason"],"additionalProperties":false
+  }}},"required":["entities","rejected"],"additionalProperties":false
 }"#;
 const STATEMENTS_SCHEMA: &str = r#"{
   "type":"object","properties":{"sentences":{"type":"array","items":{"type":"string","minLength":1}}},
@@ -62,11 +67,9 @@ impl Stage {
     pub(crate) fn prompt(self) -> &'static str {
         match self {
             Self::EntityNames => {
-                "List the named entities mentioned in the passage, using the names as written."
+                "List the named entities mentioned in the passage, using the names as written. Return an empty names array if no named entities are present."
             }
-            Self::EntityTypes => {
-                "Assign an entity type to each supplied name in the context of the passage."
-            }
+            Self::EntityTypes => ENTITY_TYPES_PROMPT,
             Self::Statements => {
                 "Copy only declarative sentences that explicitly assert a relationship between entities in the passage. Exclude questions. Return an empty list if no sentence qualifies."
             }
