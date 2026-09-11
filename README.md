@@ -226,10 +226,12 @@ usage remains unknown; character counts are not token estimates.
 
 Full annotator requests, reasoning, responses, and success/failure reasons are
 written to `logs/annotator.log`, relative to the config directory. It appends
-readable blocks for normal annotation work and dry runs, independently of the
-service-log level. Match `call_id` across both logs. REQUEST and RESPONSE blocks
-show complete exchanges; RESULT blocks report structural validation or the
-failure/cancellation reason. Calls use `stream: false`; no chunk or generation-
+one readable group per call as calls finish, for both normal work and dry runs,
+independently of the service-log level. Match `call_id` across both logs. Each
+group contains REQUEST, RESPONSE, and RESULT together, including structural
+validation or the failure/cancellation reason. Unfinished groups are buffered in
+memory and can be lost on process termination; call starts remain in the service
+log. Calls use `stream: false`; no chunk or generation-
 progress records are written. A timeout or cancellation before body receipt is
 reported without a partial response. Database commits remain
 separate service-log events. Transcript open/write failures appear in the service

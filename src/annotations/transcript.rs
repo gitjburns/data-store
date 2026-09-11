@@ -16,20 +16,22 @@ use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 use crate::util::{LogContext, diagnostic_id};
 
 /// One append-only sink shared by all clones of an annotator client. Holding the
-/// lock across a complete block prevents concurrent producer lines interleaving.
+/// lock across a complete call group prevents concurrent exchanges interleaving.
 #[derive(Debug)]
 pub(crate) struct Transcript {
     path: PathBuf,
     file: Mutex<Option<File>>,
 }
 
-/// Keep request, response, and validation under one identity, including retries.
+/// One producer owns the buffered exchange until the terminal result consumes it.
+/// Logging context is owned separately so no lock is held while the model runs.
 pub(crate) struct TranscriptCall<'sink> {
     sink: &'sink Transcript,
     id: String,
     pub(crate) stage: &'static str,
-    pub(crate) context: LogContext,
     started_at: Instant,
+    request: Option<String>,
+    response: Option<String>,
 }
 
 impl Transcript {
@@ -57,23 +59,26 @@ impl Transcript {
         }
     }
 
-    /// Establish the parent context before HTTP and retain it through validation.
-    pub(crate) fn call(&self, stage: &'static str) -> TranscriptCall<'_> {
+    /// Return independent owners for mutable transcript data and immutable tracing
+    /// context, both carrying the same identity through HTTP and validation.
+    pub(crate) fn call(&self, stage: &'static str) -> (TranscriptCall<'_>, LogContext) {
         let id = diagnostic_id("call");
         let context = LogContext::new("model_call", &id);
         context.record("model_role", "annotator");
         context.record("call_purpose", stage);
         context.record("stage", stage);
-        TranscriptCall {
+        let call = TranscriptCall {
             sink: self,
             id,
             stage,
-            context,
             started_at: Instant::now(),
-        }
+            request: None,
+            response: None,
+        };
+        (call, context)
     }
 
-    /// Write and flush while holding one lock; report every failed block through
+    /// Write and flush the whole group under one lock; report every failure through
     /// the service log without recursively writing to the failed transcript sink.
     fn append(&self, block: &str) -> io::Result<()> {
         let mut guard = self
@@ -89,9 +94,10 @@ impl Transcript {
 }
 
 impl TranscriptCall<'_> {
-    /// Print payloads directly rather than serializing them into logging fields.
-    /// Matching end markers delimit source text containing newlines.
-    pub(crate) fn block(&self, kind: &str, body: &str) {
+    /// Append exactly once after validation, failure, or cancellation. Buffering
+    /// keeps related sections contiguous without serializing model execution;
+    /// abrupt process termination can lose a call whose result is not yet known.
+    pub(crate) fn result(self, outcome: &str, reason: &str) {
         let mut timestamp = String::new();
         if let Err(source) =
             tracing_subscriber::fmt::time::SystemTime.format_time(&mut Writer::new(&mut timestamp))
@@ -100,36 +106,41 @@ impl TranscriptCall<'_> {
                 call_id = %self.id, "failed to format annotator transcript time");
         }
         let block = format!(
-            "\n===== ANNOTATOR {kind} — {} =====\nTime: {timestamp}\nStage: {}\nElapsed: {} ms\n\n{body}\n===== END {kind} — {} =====\n",
+            "\n===== ANNOTATOR CALL — {} =====\nTime: {timestamp}\nStage: {}\nElapsed: {} ms\n\nREQUEST\n{}\n\nRESPONSE\n{}\n\nRESULT\n{outcome}\n{reason}\n===== END CALL — {} =====\n",
             self.id,
             self.stage,
             self.started_at.elapsed().as_millis(),
+            self.request.as_deref().unwrap_or("No request prepared."),
+            self.response.as_deref().unwrap_or("No response received."),
             self.id,
         );
         if let Err(source) = self.sink.append(&block) {
             error!(event = "annotator_transcript.write_failed", path = %self.sink.path.display(),
-                call_id = %self.id, stage = self.stage, block_kind = kind, error = %source,
-                "annotator transcript block could not be written");
+                call_id = %self.id, stage = self.stage, block_kind = "CALL", error = %source,
+                "annotator transcript group could not be written");
         }
     }
 
     /// Render all fields from the actual request object, including strings that
-    /// carry prompts or stage input, without a second JSON serialization layer.
-    pub(crate) fn request(&self, endpoint: &str, request: &impl serde::Serialize) {
+    /// carry prompts or stage input, and retain them until the call has a result.
+    pub(crate) fn request(&mut self, endpoint: &str, request: &impl serde::Serialize) {
         match serde_json::to_value(request) {
             Ok(value) => {
                 let mut body = format!("POST {endpoint}\n\n");
                 render_value(&value, 0, &mut body);
-                self.block("REQUEST", &body);
+                self.request = Some(body);
             }
-            Err(source) => error!(event = "annotator_transcript.serialization_failed",
-                call_id = %self.id, error = %source, "could not render annotator request"),
+            Err(source) => {
+                self.request = Some(format!("Request could not be rendered: {source}"));
+                error!(event = "annotator_transcript.serialization_failed",
+                    call_id = %self.id, error = %source, "could not render annotator request");
+            }
         }
     }
 
     /// Render the complete provider response once, including reasoning, usage,
-    /// unknown fields, and errors. A failed receive has no complete body to print.
-    pub(crate) fn response(&self, status: Option<u16>, bytes: Option<&[u8]>, outcome: &str) {
+    /// unknown fields, and errors; retain it for the same group as validation.
+    pub(crate) fn response(&mut self, status: Option<u16>, bytes: Option<&[u8]>, outcome: &str) {
         let mut body = format!(
             "HTTP status: {}\nHTTP/protocol result: {outcome}\n\n",
             status.map_or_else(|| "not received".to_string(), |status| status.to_string())
@@ -150,13 +161,7 @@ impl TranscriptCall<'_> {
             },
             None => body.push_str("No complete response body received.\n"),
         }
-        self.block("RESPONSE", &body);
-    }
-
-    /// State acceptance only after structural validation; HTTP completion alone
-    /// never establishes valid output or successful database persistence.
-    pub(crate) fn result(&self, outcome: &str, reason: &str) {
-        self.block("RESULT", &format!("{outcome}\n{reason}"));
+        self.response = Some(body);
     }
 }
 

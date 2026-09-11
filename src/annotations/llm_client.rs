@@ -27,7 +27,7 @@ use super::transcript::{Transcript, TranscriptCall};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
-use crate::util::truncate_diagnostic_text;
+use crate::util::{LogContext, truncate_diagnostic_text};
 
 /// Stable adapter-mode label carried in this client's boundary logs, mirroring
 /// the reranker's `adapter_mode` field. The event names use an
@@ -390,8 +390,9 @@ impl AnnotatorClient {
         })
     }
 
-    /// Start a transcript identity that the chain retains through output validation.
-    pub(crate) fn start_call(&self, stage: &'static str) -> TranscriptCall<'_> {
+    /// Give the chain ownership of its transcript buffer and tracing context
+    /// until output validation supplies the terminal result.
+    pub(crate) fn start_call(&self, stage: &'static str) -> (TranscriptCall<'_>, LogContext) {
         self.transcript.call(stage)
     }
 
@@ -419,13 +420,13 @@ impl AnnotatorClient {
     /// and returns a distinct outcome so the worker does not count a failed attempt.
     pub(crate) fn complete(
         &self,
-        call: &TranscriptCall<'_>,
+        call: &mut TranscriptCall<'_>,
+        context: &LogContext,
         system_prompt: &str,
         user_content: &str,
         output_schema: &serde_json::Value,
         temperature: f64,
     ) -> Result<String, CompletionFailure> {
-        let context = &call.context;
         let request_purpose = call.stage;
         let entered = context.enter();
         let started_at = Instant::now();
@@ -562,7 +563,7 @@ impl AnnotatorClient {
     /// waits suspend; response decoding remains synchronous on the producer thread.
     async fn send_and_parse(
         &self,
-        call: &TranscriptCall<'_>,
+        call: &mut TranscriptCall<'_>,
         system_prompt: &str,
         user_content: &str,
         output_schema: &serde_json::Value,

@@ -317,15 +317,24 @@ fn run_stage<T>(
     parse: impl FnOnce(&str) -> Result<T, ApiError>,
     item_count: impl FnOnce(&T) -> usize,
 ) -> Result<T, InvocationFailure> {
-    let call = client.start_call(stage.name());
+    let (mut call, context) = client.start_call(stage.name());
     // The synchronous stage owns this context through HTTP and validation. The
     // HTTP future is polled on this same producer thread, never on a Tokio worker.
-    let _entered = call.context.enter();
+    // Context and payload buffer have distinct owners: HTTP can fill the buffer
+    // while the stage retains its tracing scope through validation and one flush.
+    let _entered = context.enter();
     let result = (|| {
         check_cancellation(client)?;
         let schema = stage.schema().map_err(InvocationFailure::Internal)?;
         let raw = client
-            .complete(&call, stage.prompt(), input, &schema, temperature)
+            .complete(
+                &mut call,
+                &context,
+                stage.prompt(),
+                input,
+                &schema,
+                temperature,
+            )
             .map_err(|failure| match failure {
                 CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
                 CompletionFailure::Request(error) => InvocationFailure::Call(error),

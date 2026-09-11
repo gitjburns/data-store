@@ -931,11 +931,14 @@ Call starts and terminal outcomes remain in the service log; no generation-
 progress events are emitted.
 
 `src/annotations/transcript.rs` owns the separate append-only `logs/annotator.log`
-under the config directory. Client clones share its writer lock; each readable
-block is written and flushed without interleaving producer threads. Both service
+under the config directory. Each call owns a mutable transcript buffer separately
+from its tracing context. The terminal result consumes that buffer and appends
+REQUEST, RESPONSE, and RESULT as one contiguous group. Client clones share the
+writer lock, held only for the group's write and flush. Both service
 and dry-run clients capture full requests before authentication is attached and
-retain complete response bodies before parsing. The transcript prints REQUEST,
-RESPONSE, and RESULT blocks; no chunk records are emitted. Cancellation or a
+retain complete response bodies before parsing. No chunk records are emitted.
+Unfinished groups can be lost on process termination; call-start diagnostics
+remain in the service log. Cancellation or a
 failed receive can leave no complete body, which is reported explicitly.
 A call context spans HTTP and structural validation;
 the transcript's RESULT distinguishes success, failure, and cancellation from

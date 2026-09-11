@@ -195,11 +195,14 @@ request bodies, received response data, reasoning, output, and stage outcomes.
 Authentication credentials remain excluded. Both normal work and dry runs append
 readable text blocks independently of the service-log level.
 
-Annotator calls use `stream: false`. Carry one `call_id` through REQUEST,
-RESPONSE, and RESULT blocks. Print the complete response, including rejected
+Annotator calls use `stream: false`. Buffer each call's REQUEST and RESPONSE;
+append them with RESULT as one contiguous group when the outcome is known.
+Carry one `call_id` through the group. Print the complete response, including rejected
 output; report explicitly when cancellation or a receive failure leaves no
-complete body. Do not emit chunk or generation-progress records. Each block is
-written under one shared lock and flushed before releasing it. Report transcript
+complete body. Do not emit chunk or generation-progress records. Each group is
+written under one shared lock and flushed before releasing it; never hold the
+file lock during model calls. Abrupt process termination can lose unfinished
+groups; service-log call-start records remain. Report transcript
 open/write failures in the service log without changing annotation outcomes.
 
 Success means structural validation passed, not semantic verification or database
