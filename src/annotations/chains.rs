@@ -336,15 +336,9 @@ fn run_stage<T>(
     let result = (|| {
         check_cancellation(client)?;
         let schema = stage.schema().map_err(InvocationFailure::Internal)?;
+        let prompt = stage.prompt();
         let raw = client
-            .complete(
-                &mut call,
-                &context,
-                stage.prompt(),
-                input,
-                &schema,
-                temperature,
-            )
+            .complete(&mut call, &context, &prompt, input, &schema, temperature)
             .map_err(|failure| match failure {
                 CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
                 CompletionFailure::Request(error) => InvocationFailure::Call(error),

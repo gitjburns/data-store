@@ -38,6 +38,17 @@ const SUMMARY_SCHEMA: &str = r#"{
   "required":["summary"],"additionalProperties":false
 }"#;
 
+// Prose makes each existing schema's final-answer shape explicit to the model;
+// these instructions do not add generation goals or alter schema validation.
+const ENTITY_NAMES_FORMAT: &str = r#"Return a JSON object with exactly one field, "names", containing an array of nonempty strings. If no named entities are present, return {"names":[]}."#;
+const ENTITY_TYPES_FORMAT: &str = r#"Return a JSON object with exactly two fields, "entities" and "rejected", both arrays. Each entities item must have exactly "name" and "entityType", both nonempty strings. Each rejected item must have exactly "name" and "reason", both nonempty strings. Include both arrays even when one is empty."#;
+const STATEMENTS_FORMAT: &str = r#"Return a JSON object with exactly one field, "sentences", containing an array of nonempty strings. If no sentence qualifies, return {"sentences":[]}."#;
+const RELATIONS_FORMAT: &str = r#"Return a JSON object with exactly one field, "relations", containing an array of objects. Each object must have exactly "subject", "predicate", and "object", all nonempty strings. If there are no relationships, return {"relations":[]}."#;
+const EVIDENCE_FORMAT: &str = r#"Return a JSON object with exactly one field, "evidence", containing an array of objects. Each object must have exactly "relationship_index", a nonnegative integer identifying the supplied relationship, and "quotes", an array of nonempty strings. Include an entry for every supplied relationship index; use an empty quotes array when no supporting quotation is found."#;
+const SUMMARY_FORMAT: &str =
+    r#"Return a JSON object with exactly one field, "summary", containing a nonempty string."#;
+const FINAL_ANSWER_FORMAT: &str = "Your final answer must contain only the specified JSON object, without Markdown fences or commentary.";
+
 /// Each stage has one semantic goal; schemas constrain representation only.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Stage {
@@ -62,10 +73,10 @@ impl Stage {
         }
     }
 
-    /// Keep the tested instructions identical in hashing and live generation;
-    /// naming policy and verification instructions are not appended to a stage.
-    pub(crate) fn prompt(self) -> &'static str {
-        match self {
+    /// Compose task and final-answer instructions identically for live requests
+    /// and producer hashing, so cached output cannot cross a prompt change.
+    pub(crate) fn prompt(self) -> String {
+        let task = match self {
             Self::EntityNames => {
                 "List the named entities mentioned in the passage, using the names as written. Return an empty names array if no named entities are present."
             }
@@ -80,7 +91,16 @@ impl Stage {
                 "Copy verbatim source quotations that support each supplied relationship. Return an empty quotes array where no supporting quotation can be found."
             }
             Self::Summary => "Write a concise summary of the passage.",
-        }
+        };
+        let output_format = match self {
+            Self::EntityNames => ENTITY_NAMES_FORMAT,
+            Self::EntityTypes => ENTITY_TYPES_FORMAT,
+            Self::Statements => STATEMENTS_FORMAT,
+            Self::Relations => RELATIONS_FORMAT,
+            Self::Evidence => EVIDENCE_FORMAT,
+            Self::Summary => SUMMARY_FORMAT,
+        };
+        format!("{task}\n\n{output_format}\n\n{FINAL_ANSWER_FORMAT}")
     }
 
     /// Decode owned contract data explicitly; a broken schema is a local error,
