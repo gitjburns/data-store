@@ -10,7 +10,8 @@ use crate::annotations::{
     entity,
     llm_client::{AnnotatorClient, CompletionFailure},
     producer::{
-        InvocationFailure, ProducedAnnotation, ProducerKind, strict_from_str, validate_non_empty,
+        InvocationFailure, ProducedAnnotation, ProducerKind, source_text_matches, strict_from_str,
+        validate_non_empty,
     },
     relation,
     stages::Stage,
@@ -172,8 +173,8 @@ fn entities(
 }
 
 /// Select statements before forming triples, then attach receipts separately.
-/// Selected statements may clean up formatting; quotations still require exact
-/// source matching. Neither check establishes semantic correctness.
+/// Statements and quotations share forgiving source matching that tolerates
+/// damaged spacing and punctuation. This does not establish semantic correctness.
 fn relations(
     client: &AnnotatorClient,
     passage: &str,
@@ -186,10 +187,16 @@ fn relations(
         temperature,
         |raw| {
             let response: StatementsResponse = strict_from_str(raw, Stage::Statements.name(), raw)?;
-            // Statements are model-selected text, not verified quotations. Allow
-            // formatting cleanup; downstream requests still receive the source excerpt.
+            // Compare letters/digits without trusting extracted word boundaries;
+            // downstream requests still receive the original source excerpt.
             for statement in &response.sentences {
                 validate_non_empty(statement, "sentences[]", raw)?;
+                if !source_text_matches(passage, statement) {
+                    return Err(output_error(
+                        Stage::Statements,
+                        "selected statement does not match the source after ignoring spacing and punctuation",
+                    ));
+                }
             }
             Ok(response.sentences)
         },
@@ -269,10 +276,12 @@ fn attach_evidence(
                     *seen = true;
                     for quote in &item.quotes {
                         validate_non_empty(quote, "evidence[].quotes[]", raw)?;
-                        if !passage.contains(quote) {
+                        // Use the same comparison as statement selection so model
+                        // formatting repairs do not cause a retry of the chain.
+                        if !source_text_matches(passage, quote) {
                             return Err(output_error(
                                 Stage::Evidence,
-                                "quotation is not a verbatim source substring",
+                                "quotation does not match the source after ignoring spacing and punctuation",
                             ));
                         }
                     }

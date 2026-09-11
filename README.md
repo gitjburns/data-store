@@ -81,10 +81,12 @@ validates each response before passing its output to the next request.
   validation. Only accepted entries become entity annotations.
 - **Relations:** select source statements, form relationship triples for each
   selected statement, then request supporting quotations for bounded batches of
-  those relationships. Later calls include the original excerpt. Selected
-  statements may clean up formatting; validation requires nonempty strings,
-  without exact source matching. Supporting quotations must be source substrings,
-  with complete receipt-index accounting; empty quotation lists are permitted.
+  those relationships. Later calls include the original excerpt. Statements and
+  quotations match the source after retaining only letters and digits, ignoring
+  punctuation, whitespace, and word boundaries. This permits repairs such as
+  `senta letter` → `sent a letter.` without changing stored text. Nonempty-text
+  validation and complete receipt-index accounting remain; empty quotation lists
+  are permitted.
 - **Summaries:** request one summary per excerpt and validate its response shape.
 
 Empty name extraction skips typing. An entirely rejected candidate set also

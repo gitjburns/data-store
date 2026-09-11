@@ -700,6 +700,20 @@ pub(crate) fn strict_from_str<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Match source text using only letters and digits, deliberately ignoring word
+/// boundaries because extraction can join or split words. This is a forgiving
+/// comparison only: source and model text remain unchanged. Punctuation-only
+/// output cannot satisfy the check through an empty substring.
+pub(crate) fn source_text_matches(source: &str, selected: &str) -> bool {
+    let letters_and_digits = |text: &str| {
+        text.chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>()
+    };
+    let selected = letters_and_digits(selected);
+    !selected.is_empty() && letters_and_digits(source).contains(&selected)
+}
+
 /// Reject an empty (or whitespace-only) required string field. Empty required
 /// strings are a malformed result, not a valid annotation.
 pub(crate) fn validate_non_empty(value: &str, field: &str, raw: &str) -> Result<(), ApiError> {
