@@ -121,11 +121,15 @@ impl TranscriptCall<'_> {
         }
     }
 
-    /// Render all fields from the actual request object, including strings that
-    /// carry prompts or stage input, and retain them until the call has a result.
+    /// Keep prompts and request settings in the transcript while omitting the
+    /// schema and transport flag. This display copy never changes the HTTP body.
     pub(crate) fn request(&mut self, endpoint: &str, request: &impl serde::Serialize) {
         match serde_json::to_value(request) {
-            Ok(value) => {
+            Ok(mut value) => {
+                if let Some(fields) = value.as_object_mut() {
+                    fields.remove("response_format");
+                    fields.remove("stream");
+                }
                 let mut body = format!("POST {endpoint}\n\n");
                 render_value(&value, 0, &mut body);
                 self.request = Some(body);
@@ -138,28 +142,51 @@ impl TranscriptCall<'_> {
         }
     }
 
-    /// Render the complete provider response once, including reasoning, usage,
-    /// unknown fields, and errors; retain it for the same group as validation.
-    pub(crate) fn response(&mut self, status: Option<u16>, bytes: Option<&[u8]>, outcome: &str) {
+    /// Show only answer, reasoning, and provider token counts. Absent/malformed
+    /// fields stay unavailable; the grouped RESULT owns the failure explanation.
+    pub(crate) fn response(&mut self, bytes: Option<&[u8]>) {
+        let response = bytes.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+        let message = response
+            .as_ref()
+            .and_then(|value| value.pointer("/choices/0/message"));
+        let content = message
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str);
+        // Providers use either spelling; this is the same protocol distinction
+        // checked by the client, which still rejects supplying both at once.
+        let reasoning = message.and_then(|message| {
+            message
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .or_else(|| message.get("reasoning_content").and_then(Value::as_str))
+        });
         let mut body = format!(
-            "HTTP status: {}\nHTTP/protocol result: {outcome}\n\n",
-            status.map_or_else(|| "not received".to_string(), |status| status.to_string())
+            "Content:\n{}\n\nReasoning:\n{}\n\n",
+            content.unwrap_or("unavailable"),
+            reasoning.unwrap_or("unavailable"),
         );
-        match bytes {
-            Some(bytes) => match serde_json::from_slice::<Value>(bytes) {
-                Ok(value) => render_value(&value, 0, &mut body),
-                Err(_) => match std::str::from_utf8(bytes) {
-                    Ok(text) => body.push_str(text),
-                    Err(_) => {
-                        body.push_str("INVALID UTF-8 RESPONSE (hex)\n");
-                        for byte in bytes {
-                            // Formatting into String cannot encounter an I/O failure.
-                            let _ = write!(body, "{byte:02x} ");
-                        }
-                    }
-                },
-            },
-            None => body.push_str("No complete response body received.\n"),
+        for (label, path) in [
+            ("Completion tokens", "/usage/completion_tokens"),
+            (
+                "Reasoning tokens",
+                "/usage/completion_tokens_details/reasoning_tokens",
+            ),
+            ("Prompt tokens", "/usage/prompt_tokens"),
+            ("Total tokens", "/usage/total_tokens"),
+        ] {
+            let count = response
+                .as_ref()
+                .and_then(|value| value.pointer(path))
+                .and_then(Value::as_u64);
+            // Formatting into String cannot encounter an I/O failure.
+            match count {
+                Some(count) => {
+                    let _ = writeln!(body, "{label}: {count}");
+                }
+                None => {
+                    let _ = writeln!(body, "{label}: unavailable");
+                }
+            }
         }
         self.response = Some(body);
     }

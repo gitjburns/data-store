@@ -942,9 +942,13 @@ progress events are emitted.
 under the config directory. Each call owns a mutable transcript buffer separately
 from its tracing context. The terminal result consumes that buffer and appends
 REQUEST, RESPONSE, and RESULT as one contiguous group. Client clones share the
-writer lock, held only for the group's write and flush. Both service
-and dry-run clients capture full requests before authentication is attached and
-retain complete response bodies before parsing. No chunk records are emitted.
+writer lock, held only for the group's write and flush. Both service and dry-run
+clients filter a display copy of the request, omitting `response_format` and
+`stream` while retaining temperature. Complete response bodies remain available
+for protocol parsing; the transcript prints only content, reasoning, and the four
+provider token counts specified in `DIAGNOSTICS.md`. Missing values remain
+unavailable. Display filtering does not change requests or validation.
+No chunk records are emitted.
 Unfinished groups can be lost on process termination; call-start diagnostics
 remain in the service log. Cancellation or a
 failed receive can leave no complete body, which is reported explicitly.

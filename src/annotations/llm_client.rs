@@ -6,7 +6,7 @@
 //! model or endpoint: a call failure becomes `ApiError::AnnotationProducer`,
 //! and the annotation worker parks the affected annotation as `failed` for a
 //! later retry pass. Maintenance cancellation is a separate outcome and does
-//! not consume a failure retry. Full exchanges go to the dedicated annotator
+//! not consume a failure retry. Selected exchange fields go to the annotator
 //! transcript; the service log retains compact boundary facts.
 
 use std::{
@@ -135,14 +135,13 @@ struct ChatMessage<'request> {
     content: &'request str,
 }
 
-/// Retain the complete response before decoding so protocol failures still have
-/// their full body in the transcript. Cancellation may leave no body available.
+/// Retain the complete response before decoding so selected transcript fields
+/// remain available on protocol failure. Cancellation may leave no body available.
 #[derive(Default)]
 struct CompletedResponse {
     content: String,
     body: Vec<u8>,
     body_received: bool,
-    status: Option<u16>,
     content_chars: usize,
     reasoning_chars: usize,
     response_id: Option<String>,
@@ -214,7 +213,7 @@ impl CompletedResponse {
             self.content = content.to_string();
         }
         // Providers expose reasoning through either name; counting both would
-        // misrepresent measured output. The transcript retains the full response.
+        // misrepresent measured output. Supplying both remains a protocol error.
         let reasoning = optional_response_text(message, "reasoning")?;
         let reasoning_content = optional_response_text(message, "reasoning_content")?;
         if reasoning.is_some() && reasoning_content.is_some() {
@@ -415,7 +414,7 @@ impl AnnotatorClient {
     /// records what actually ran. Every request failure — transport error,
     /// timeout, non-2xx status, unreadable or malformed body, or a missing
     /// choice/content — is an `ApiError::AnnotationProducer` carrying
-    /// endpoint/model/status and protocol-boundary context. Full payloads go only
+    /// endpoint/model/status and protocol-boundary context. Selected payloads go only
     /// to the annotator transcript. Maintenance cancellation drops the HTTP future
     /// and returns a distinct outcome so the worker does not count a failed attempt.
     pub(crate) fn complete(
@@ -490,16 +489,9 @@ impl AnnotatorClient {
         // This measurement record survives cancellation and decoding/transport
         // failures; unavailable usage stays absent rather than being estimated.
         response.log_measurements(started_at);
-        // Print the entire body even when protocol validation rejected it. A
-        // cancelled/failed receive is explicitly distinguished from an empty body.
-        call.response(
-            response.status,
-            response.body_received.then_some(response.body.as_slice()),
-            &match &result {
-                Ok(()) => "complete; structural validation pending".to_string(),
-                Err(failure) => failure.to_string(),
-            },
-        );
+        // Transcript field selection is presentation-only. Protocol validation and
+        // the terminal failure reason remain authoritative in the caller's RESULT.
+        call.response(response.body_received.then_some(response.body.as_slice()));
         match &result {
             Ok(()) => {
                 info!(
@@ -617,7 +609,6 @@ impl AnnotatorClient {
             )
         })?;
         let status = response.status();
-        completed.status = Some(status.as_u16());
         // The existing cancellation race covers the complete send/body wait.
         // Publish bytes before validation so even rejected responses are readable.
         completed.body = response
@@ -636,7 +627,8 @@ impl AnnotatorClient {
         completed.body_received = true;
         if !status.is_success() {
             let body = &completed.body;
-            // Keep the service error bounded; the transcript retains the full body.
+            // Preserve provider rejection details in the bounded terminal error;
+            // the transcript displays selected response fields and that RESULT.
             let detail = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(envelope) => provider_error_detail(&envelope),
                 Err(source) => format!(

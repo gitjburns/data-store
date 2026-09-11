@@ -259,8 +259,11 @@ For current model activity, read the file configured by `logging.file_path`
 usage, failures, retry delays, and exhaustion are recorded there. Missing token
 usage remains unknown; character counts are not token estimates.
 
-Full annotator requests, reasoning, responses, and success/failure reasons are
-written to `logs/annotator.log`, relative to the config directory. It appends
+Annotator requests omit `response_format` and `stream` from the transcript while
+retaining temperature. Responses show only content, reasoning, completion tokens,
+reasoning tokens, prompt tokens, and total tokens; missing fields are unavailable.
+Content and reasoning are retained in full. The transcript is written to
+`logs/annotator.log`, relative to the config directory. It appends
 one readable group per call as calls finish, for both normal work and dry runs,
 independently of the service-log level. Match `call_id` across both logs. Each
 group contains REQUEST, RESPONSE, and RESULT together, including structural

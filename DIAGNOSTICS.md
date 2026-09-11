@@ -15,7 +15,7 @@ durable diagnostics. They may repeat facts, but the service log must contain
 the authoritative evidence.
 
 Service logs record compact operational evidence, not complete external
-request/response payloads. Full annotator exchanges belong in the separate
+request/response payloads. Selected annotator exchange fields belong in the separate
 `logs/annotator.log` transcript described below. Broader external-payload
 auditing remains deferred. Payload prohibitions apply regardless of log level.
 
@@ -190,16 +190,19 @@ times, and bounded diagnostics instead.
 
 ### Annotator transcript
 
-`logs/annotator.log`, relative to the config directory, records complete annotator
-request bodies, received response data, reasoning, output, and stage outcomes.
+`logs/annotator.log`, relative to the config directory, records annotator requests
+without `response_format` or `stream`; temperature remains included. Responses
+show only content, reasoning, completion tokens, reasoning tokens, prompt tokens,
+and total tokens. Missing or malformed fields display as unavailable. This is a
+selected-field transcript, not a complete external-payload archive.
 Authentication credentials remain excluded. Both normal work and dry runs append
 readable text blocks independently of the service-log level.
 
 Annotator calls use `stream: false`. Buffer each call's REQUEST and RESPONSE;
 append them with RESULT as one contiguous group when the outcome is known.
-Carry one `call_id` through the group. Print the complete response, including rejected
-output; report explicitly when cancellation or a receive failure leaves no
-complete body. Do not emit chunk or generation-progress records. Each group is
+Carry one `call_id` through the group. Keep content and reasoning untruncated;
+record success or the specific failure/cancellation reason in RESULT.
+Do not emit chunk or generation-progress records. Each group is
 written under one shared lock and flushed before releasing it; never hold the
 file lock during model calls. Abrupt process termination can lose unfinished
 groups; service-log call-start records remain. Report transcript
