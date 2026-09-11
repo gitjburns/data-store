@@ -792,7 +792,7 @@ database connections. Slots are poison-recovered on read.
   so an operator never reads a count without knowing when it was taken.
 - The **annotation worker** publishes `AnnotationHealth`: parked state and counts
   from the last completed cycle, including exhausted work. This slot is not
-  live per-call progress; streaming measurements are recorded in the service log.
+  live per-call progress; call starts and outcomes are recorded in the service log.
   `GET /sync/status` reads only the scheduler's slot.
 - **Readiness = {inference, sync}** —
   `inference_component.ready && sync_component.ready`. The fabric and annotation
@@ -912,9 +912,10 @@ unfinished results, and rolls back uncommitted writes before releasing admission
 
 **Annotator** (`src/annotations/llm_client.rs`). A synchronous producer interface
 over cancellable async OpenAI-compatible HTTP. Each stage requests thinking,
-strict JSON-schema output, and an SSE stream under the configured call timeout.
-The output-token allowance includes reasoning. Acceptance requires a terminal
-`[DONE]`, `finish_reason = stop`, and nonempty final content before stage parsing.
+strict JSON-schema output, and a complete response (`stream: false`) under the
+configured call timeout. The output-token allowance includes reasoning.
+Acceptance requires one choice at index zero, `finish_reason = stop`, and
+nonempty message content before stage parsing.
 One owned Tokio runtime services HTTP I/O; lifecycle and SQLite work
 remain on synchronous worker threads. A maintenance watch cancels the complete
 send/body wait on rebuild or shutdown. Dropping the request reports local
@@ -924,12 +925,22 @@ gate. It is **not readiness-critical**: a client load
 failure (e.g. a bad key file) parks the annotation worker instead of failing
 startup (Section 3.1).
 
-Stream diagnostics retain measured answer/reasoning character counts, received
+Response diagnostics retain measured answer/reasoning character counts, received
 bytes, provider response ID, finish reason, and provider token usage when supplied.
-Progress is logged periodically while chunks arrive; terminal measurements also
-survive timeouts and cancellation. Reasoning text is counted and discarded;
-model payloads are not logged. These measurements do not provide full request or
-response reconstruction.
+Call starts and terminal outcomes remain in the service log; no generation-
+progress events are emitted.
+
+`src/annotations/transcript.rs` owns the separate append-only `logs/annotator.log`
+under the config directory. Client clones share its writer lock; each readable
+block is written and flushed without interleaving producer threads. Both service
+and dry-run clients capture full requests before authentication is attached and
+retain complete response bodies before parsing. The transcript prints REQUEST,
+RESPONSE, and RESULT blocks; no chunk records are emitted. Cancellation or a
+failed receive can leave no complete body, which is reported explicitly.
+A call context spans HTTP and structural validation;
+the transcript's RESULT distinguishes success, failure, and cancellation from
+database persistence. Open/write failures are reported in the service log and do
+not change annotation outcomes.
 
 ## 9. Recorded architecture-level deviations
 

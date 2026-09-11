@@ -317,28 +317,66 @@ fn run_stage<T>(
     parse: impl FnOnce(&str) -> Result<T, ApiError>,
     item_count: impl FnOnce(&T) -> usize,
 ) -> Result<T, InvocationFailure> {
-    check_cancellation(client)?;
-    let schema = stage.schema().map_err(InvocationFailure::Internal)?;
-    let raw = client
-        .complete(stage.name(), stage.prompt(), input, &schema, temperature)
-        .map_err(|failure| match failure {
-            CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
-            CompletionFailure::Request(error) => InvocationFailure::Call(error),
-        })?;
-    check_cancellation(client)?;
-    let result = parse(&raw).map_err(InvocationFailure::InvalidOutput);
+    let call = client.start_call(stage.name());
+    // The synchronous stage owns this context through HTTP and validation. The
+    // HTTP future is polled on this same producer thread, never on a Tokio worker.
+    let _entered = call.context.enter();
+    let result = (|| {
+        check_cancellation(client)?;
+        let schema = stage.schema().map_err(InvocationFailure::Internal)?;
+        let raw = client
+            .complete(&call, stage.prompt(), input, &schema, temperature)
+            .map_err(|failure| match failure {
+                CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
+                CompletionFailure::Request(error) => InvocationFailure::Call(error),
+            })?;
+        check_cancellation(client)?;
+        parse(&raw).map_err(InvocationFailure::InvalidOutput)
+    })();
     match &result {
-        Ok(value) => info!(
-            event = "annotation_stage.validated",
-            stage = stage.name(),
-            output_items = item_count(value),
-            verification = "not_performed",
-            "annotation stage passed structural validation",
-        ),
-        Err(failure) => error!(
+        Ok(value) => {
+            let output_items = item_count(value);
+            call.result("SUCCESS", &format!(
+                "Structural validation passed; {output_items} output items.\nSemantic verification was not performed.\nDatabase persistence is a separate annotation outcome."
+            ));
+            info!(
+                event = "annotation_stage.validated",
+                stage = stage.name(),
+                output_items,
+                verification = "not_performed",
+                "annotation stage passed structural validation",
+            );
+        }
+        Err(InvocationFailure::InvalidOutput(failure)) => {
+            call.result("FAILURE — structural validation", &failure.to_string());
+            error!(
             event = "annotation_stage.validation_failed", stage = stage.name(),
             error = %failure, "annotation stage failed structural validation",
-        ),
+            );
+        }
+        Err(InvocationFailure::Cancelled(reason)) => {
+            call.result(
+                "CANCELLED",
+                &format!(
+                    "Reason: {}\nRemote inference outcome is unknown.",
+                    reason.label()
+                ),
+            );
+            info!(
+                event = "annotation_stage.cancelled",
+                stage = stage.name(),
+                reason = reason.label(),
+                "annotation stage cancelled"
+            );
+        }
+        Err(failure) => {
+            call.result(
+                "FAILURE",
+                &format!("Class: {}\nReason: {failure}", failure.class()),
+            );
+            error!(event = "annotation_stage.failed", stage = stage.name(),
+                error = %failure, "annotation stage failed before structural validation");
+        }
     }
     result
 }

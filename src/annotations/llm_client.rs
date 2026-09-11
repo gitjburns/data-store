@@ -6,9 +6,8 @@
 //! model or endpoint: a call failure becomes `ApiError::AnnotationProducer`,
 //! and the annotation worker parks the affected annotation as `failed` for a
 //! later retry pass. Maintenance cancellation is a separate outcome and does
-//! not consume a failure retry. Prompt content and model output are external-language
-//! payloads and never enter the service log (DIAGNOSTICS forbidden-data
-//! rules); logs carry only compact boundary facts.
+//! not consume a failure retry. Full exchanges go to the dedicated annotator
+//! transcript; the service log retains compact boundary facts.
 
 use std::{
     fmt, fs,
@@ -24,6 +23,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
+use super::transcript::{Transcript, TranscriptCall};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
@@ -66,6 +66,8 @@ pub(crate) struct AnnotatorClient {
     max_input_chars: usize,
     api_key: Option<String>,
     api_key_file_path: Option<PathBuf>,
+    // Producer clones must share one writer lock for indivisible transcript blocks.
+    transcript: Arc<Transcript>,
 }
 
 /// Cancellation must reach the worker without being counted as a provider failure.
@@ -92,7 +94,7 @@ impl fmt::Debug for AnnotatorClient {
 }
 
 /// The tested annotation contract enables thinking and constrains each stage's
-/// final answer with its own schema. Streaming exposes activity before completion.
+/// final answer with its own schema. Internal calls return one complete response.
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest<'request> {
     model: &'request str,
@@ -100,16 +102,9 @@ struct ChatCompletionRequest<'request> {
     temperature: f64,
     max_completion_tokens: u64,
     stream: bool,
-    stream_options: StreamOptions,
     response_format: ResponseFormat<'request>,
     // vLLM's request-local template option leaves other endpoint clients alone.
     chat_template_kwargs: ChatTemplateKwargs,
-}
-
-/// Request provider measurements in the terminal streaming usage event.
-#[derive(Debug, Serialize)]
-struct StreamOptions {
-    include_usage: bool,
 }
 
 /// Standard structured-output envelope; the stage owns the schema contents.
@@ -140,19 +135,19 @@ struct ChatMessage<'request> {
     content: &'request str,
 }
 
-/// Retain measurements outside the cancellable future, including partial work
-/// on timeout. Reasoning text is counted and discarded, never stored or logged.
+/// Retain the complete response before decoding so protocol failures still have
+/// their full body in the transcript. Cancellation may leave no body available.
 #[derive(Default)]
 struct CompletedResponse {
     content: String,
+    body: Vec<u8>,
+    body_received: bool,
+    status: Option<u16>,
     content_chars: usize,
     reasoning_chars: usize,
-    received_bytes: usize,
-    events: usize,
     response_id: Option<String>,
     usage: Option<CompletionUsage>,
     finish_reason: Option<String>,
-    done: bool,
 }
 
 /// Optional provider measurements remain absent when the endpoint omits them.
@@ -171,47 +166,29 @@ struct CompletionTokenDetails {
 }
 
 impl CompletedResponse {
-    /// Decode complete SSE events only; raw external fields are inspected before
-    /// conversion so malformed values cannot leak model text through serde errors.
-    fn accept_event(&mut self, data: &[u8]) -> Result<(), String> {
-        self.events += 1;
-        if data == b"[DONE]" {
-            self.done = true;
-            return Ok(());
-        }
-        let event: serde_json::Value = serde_json::from_slice(data).map_err(|source| {
-            format!(
-                "stream event JSON decoding failed: {source}; event_bytes={}",
-                data.len()
-            )
-        })?;
+    /// Decode one completed chat response. Retain its original body separately;
+    /// protocol errors expose compact context to the service log, not payloads.
+    fn accept_body(&mut self) -> Result<(), String> {
+        let event: serde_json::Value = serde_json::from_slice(&self.body)
+            .map_err(|source| format!("response JSON decoding failed: {source}"))?;
         if event.get("error").is_some_and(|error| !error.is_null()) {
             return Err(format!(
-                "provider stream error: {}",
+                "provider response error: {}",
                 provider_error_detail(&event)
             ));
         }
-        if let Some(id) = optional_stream_text(&event, "id")? {
+        if let Some(id) = optional_response_text(&event, "id")? {
             // Response IDs and termination labels are protocol metadata, never
             // free-form model text. Validate before exposing them to logging.
             validate_protocol_label(id, "id")?;
-            if self
-                .response_id
-                .as_deref()
-                .is_some_and(|previous| previous != id)
-            {
-                return Err("stream response id changed between events".to_string());
-            }
-            if self.response_id.is_none() {
-                self.response_id = Some(id.to_string());
-            }
+            self.response_id = Some(id.to_string());
         }
         if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
             self.usage = Some(CompletionUsage::deserialize(usage).map_err(|source| {
                 // Type errors may contain offending strings; log only structural
                 // source context, never that externally supplied value.
                 format!(
-                    "stream usage decoding failed: category={:?}, line={}, column={}",
+                    "response usage decoding failed: category={:?}, line={}, column={}",
                     source.classify(),
                     source.line(),
                     source.column()
@@ -221,54 +198,46 @@ impl CompletedResponse {
         let choices = event
             .get("choices")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "stream event requires a choices array".to_string())?;
-        for choice in choices {
-            if choice.get("index").and_then(serde_json::Value::as_u64) != Some(0) {
-                return Err(
-                    "stream returned an unexpected choice index; requested one completion"
-                        .to_string(),
-                );
-            }
-            let delta = choice
-                .get("delta")
-                .filter(|delta| delta.is_object())
-                .ok_or_else(|| "stream choice requires a delta object".to_string())?;
-            if let Some(content) = optional_stream_text(delta, "content")? {
-                if self.finish_reason.is_some() && !content.is_empty() {
-                    return Err("stream appended content after finishing its choice".to_string());
-                }
-                self.content_chars += content.chars().count();
-                self.content.push_str(content);
-            }
-            // vLLM deployments expose reasoning through either field name. A
-            // single delta must not supply both, which would double-count it.
-            let reasoning = optional_stream_text(delta, "reasoning")?;
-            let reasoning_content = optional_stream_text(delta, "reasoning_content")?;
-            if reasoning.is_some() && reasoning_content.is_some() {
-                return Err("stream delta supplied both reasoning fields".to_string());
-            }
-            if let Some(reasoning) = reasoning.or(reasoning_content) {
-                self.reasoning_chars += reasoning.chars().count();
-            }
-            if let Some(reason) = optional_stream_text(choice, "finish_reason")? {
-                validate_protocol_label(reason, "finish_reason")?;
-                if self.finish_reason.is_some() {
-                    return Err("stream finished its choice more than once".to_string());
-                }
-                self.finish_reason = Some(reason.to_string());
-            }
+            .ok_or_else(|| "response requires a choices array".to_string())?;
+        let [choice] = choices.as_slice() else {
+            return Err("response must contain exactly one completion choice".to_string());
+        };
+        if choice.get("index").and_then(serde_json::Value::as_u64) != Some(0) {
+            return Err("response returned an unexpected choice index; expected zero".to_string());
+        }
+        let message = choice
+            .get("message")
+            .filter(|message| message.is_object())
+            .ok_or_else(|| "response choice requires a message object".to_string())?;
+        if let Some(content) = optional_response_text(message, "content")? {
+            self.content_chars = content.chars().count();
+            self.content = content.to_string();
+        }
+        // Providers expose reasoning through either name; counting both would
+        // misrepresent measured output. The transcript retains the full response.
+        let reasoning = optional_response_text(message, "reasoning")?;
+        let reasoning_content = optional_response_text(message, "reasoning_content")?;
+        if reasoning.is_some() && reasoning_content.is_some() {
+            return Err("response message supplied both reasoning fields".to_string());
+        }
+        if let Some(reasoning) = reasoning.or(reasoning_content) {
+            self.reasoning_chars = reasoning.chars().count();
+        }
+        if let Some(reason) = optional_response_text(choice, "finish_reason")? {
+            validate_protocol_label(reason, "finish_reason")?;
+            self.finish_reason = Some(reason.to_string());
         }
         Ok(())
     }
 
-    /// Report measured activity and terminal facts without reasoning or answer
-    /// payloads; the caller's model-call context supplies stage and call identity.
-    fn log_measurements(&self, checkpoint: &str, started_at: Instant) {
+    /// Report completed-response measurements without reasoning or answer
+    /// payloads; a failed whole-body receive leaves the byte count unknown.
+    /// The caller's model-call context supplies stage and call identity.
+    fn log_measurements(&self, started_at: Instant) {
         info!(
-            event = "annotator_http.stream.measurements",
-            checkpoint,
-            received_bytes = self.received_bytes,
-            stream_events = self.events,
+            event = "annotator_http.response.measurements",
+            response_body_received = self.body_received,
+            received_bytes = self.body_received.then_some(self.body.len()),
             output_chars = self.content_chars,
             reasoning_chars = self.reasoning_chars,
             provider_response_id = self.response_id.as_deref(),
@@ -284,22 +253,21 @@ impl CompletedResponse {
                 .and_then(|usage| usage.completion_tokens_details.as_ref())
                 .and_then(|details| details.reasoning_tokens),
             finish_reason = self.finish_reason.as_deref(),
-            terminal_event_received = self.done,
             elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "annotator stream measurements"
+            "annotator response measurements"
         );
     }
 }
 
 /// Validate optional external text without echoing a malformed value into errors.
-fn optional_stream_text<'event>(
+fn optional_response_text<'event>(
     event: &'event serde_json::Value,
     key: &str,
 ) -> Result<Option<&'event str>, String> {
     match event.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(text)) => Ok(Some(text)),
-        Some(_) => Err(format!("stream field {key} must be a string or null")),
+        Some(_) => Err(format!("response field {key} must be a string or null")),
     }
 }
 
@@ -312,7 +280,7 @@ fn validate_protocol_label(value: &str, field: &str) -> Result<(), String> {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:/".contains(&byte))
     {
         return Err(format!(
-            "stream field {field} is not a compact protocol identifier"
+            "response field {field} is not a compact protocol identifier"
         ));
     }
     Ok(())
@@ -418,7 +386,13 @@ impl AnnotatorClient {
             max_input_chars: config.max_input_chars,
             api_key,
             api_key_file_path,
+            transcript: Arc::new(Transcript::open(config_root)),
         })
+    }
+
+    /// Start a transcript identity that the chain retains through output validation.
+    pub(crate) fn start_call(&self, stage: &'static str) -> TranscriptCall<'_> {
+        self.transcript.call(stage)
     }
 
     /// Expose the same maintenance signal used by HTTP calls to stop worker dispatch.
@@ -433,29 +407,29 @@ impl AnnotatorClient {
     }
 
     /// Run one chat-completions call and return the first choice's message
-    /// content verbatim. `request_purpose` identifies the producer/invocation
+    /// content verbatim. `call` identifies the producer stage and transcript
     /// for logs; `temperature` is the per-call sampling temperature (the base
     /// `PRODUCER_TEMPERATURE` for first attempts, retry-escalated values from
     /// the worker's ladder), logged and sent verbatim so the audit trail
     /// records what actually ran. Every request failure — transport error,
     /// timeout, non-2xx status, unreadable or malformed body, or a missing
     /// choice/content — is an `ApiError::AnnotationProducer` carrying
-    /// endpoint/model/status and protocol-boundary context. Prompt text and model
-    /// output are never logged. Maintenance cancellation drops the HTTP future
+    /// endpoint/model/status and protocol-boundary context. Full payloads go only
+    /// to the annotator transcript. Maintenance cancellation drops the HTTP future
     /// and returns a distinct outcome so the worker does not count a failed attempt.
     pub(crate) fn complete(
         &self,
-        request_purpose: &str,
+        call: &TranscriptCall<'_>,
         system_prompt: &str,
         user_content: &str,
         output_schema: &serde_json::Value,
         temperature: f64,
     ) -> Result<String, CompletionFailure> {
-        let context = crate::util::model_call_context("annotator", request_purpose);
+        let context = &call.context;
+        let request_purpose = call.stage;
         let entered = context.enter();
         let started_at = Instant::now();
-        // Char count is a safe compact shape fact; the content itself is a
-        // forbidden log payload.
+        // Keep service-log fields compact; the separate transcript owns payloads.
         let input_chars = system_prompt.chars().count() + user_content.chars().count();
         // Snapshot the client's own receiver before polling HTTP. Comparing this
         // with the drain event distinguishes observed cancellation from intent;
@@ -475,7 +449,7 @@ impl AnnotatorClient {
             max_completion_tokens = MAX_COMPLETION_TOKENS,
             enable_thinking = ENABLE_THINKING,
             structured_output = true,
-            streaming = true,
+            streaming = false,
             "annotator chat-completions call started"
         );
         // Async polling enters the span only while running, rather than retaining
@@ -487,6 +461,7 @@ impl AnnotatorClient {
             let mut cancellation = self.cancellation.clone();
             let mut cancelled = pin!(cancellation.cancelled());
             let mut request = pin!(self.send_and_parse(
+                call,
                 system_prompt,
                 user_content,
                 output_schema,
@@ -513,7 +488,17 @@ impl AnnotatorClient {
         let _entered = context.enter();
         // This measurement record survives cancellation and decoding/transport
         // failures; unavailable usage stays absent rather than being estimated.
-        response.log_measurements("terminal", started_at);
+        response.log_measurements(started_at);
+        // Print the entire body even when protocol validation rejected it. A
+        // cancelled/failed receive is explicitly distinguished from an empty body.
+        call.response(
+            response.status,
+            response.body_received.then_some(response.body.as_slice()),
+            &match &result {
+                Ok(()) => "complete; structural validation pending".to_string(),
+                Err(failure) => failure.to_string(),
+            },
+        );
         match &result {
             Ok(()) => {
                 info!(
@@ -524,7 +509,7 @@ impl AnnotatorClient {
                     model = %self.model,
                     temperature,
                     input_chars,
-                    // Output length only; content is a forbidden log payload.
+                    // Full output is retained in the separate transcript.
                     output_chars = response.content_chars,
                     provider_response_id = response.response_id.as_deref(),
                     prompt_tokens = response.usage.as_ref().and_then(|usage| usage.prompt_tokens),
@@ -577,6 +562,7 @@ impl AnnotatorClient {
     /// waits suspend; response decoding remains synchronous on the producer thread.
     async fn send_and_parse(
         &self,
+        call: &TranscriptCall<'_>,
         system_prompt: &str,
         user_content: &str,
         output_schema: &serde_json::Value,
@@ -597,10 +583,7 @@ impl AnnotatorClient {
             ],
             temperature,
             max_completion_tokens: MAX_COMPLETION_TOKENS,
-            stream: true,
-            stream_options: StreamOptions {
-                include_usage: true,
-            },
+            stream: false,
             response_format: ResponseFormat {
                 r#type: "json_schema",
                 json_schema: OutputSchema {
@@ -613,6 +596,8 @@ impl AnnotatorClient {
                 enable_thinking: ENABLE_THINKING,
             },
         };
+        // Capture the actual request shape before credentials are attached.
+        call.request(&self.endpoint, &request);
         let mut request_builder = self.client.post(&self.endpoint).json(&request);
         if let Some(api_key) = &self.api_key {
             request_builder = request_builder.bearer_auth(api_key);
@@ -621,7 +606,7 @@ impl AnnotatorClient {
         // Transport-level failure (DNS, connect, TLS, timeout) surfaces before
         // any HTTP status exists.
         let started_at = Instant::now();
-        let mut response = request_builder.send().await.map_err(|source| {
+        let response = request_builder.send().await.map_err(|source| {
             self.call_error(
                 None,
                 &format!(
@@ -631,24 +616,31 @@ impl AnnotatorClient {
             )
         })?;
         let status = response.status();
-        if !status.is_success() {
-            let body = response.bytes().await.map_err(|source| {
+        completed.status = Some(status.as_u16());
+        // The existing cancellation race covers the complete send/body wait.
+        // Publish bytes before validation so even rejected responses are readable.
+        completed.body = response
+            .bytes()
+            .await
+            .map_err(|source| {
                 self.call_error(
                     Some(status),
                     &format!(
-                        "provider rejection body read failed: {}",
+                        "response body read failed: {}",
                         crate::util::error_chain(&source)
                     ),
                 )
-            })?;
-            completed.received_bytes += body.len();
-            // Rejection messages are operational diagnostics. Successful stream
-            // parse failures never use this body-excerpt path.
-            let detail = match serde_json::from_slice::<serde_json::Value>(&body) {
+            })?
+            .to_vec();
+        completed.body_received = true;
+        if !status.is_success() {
+            let body = &completed.body;
+            // Keep the service error bounded; the transcript retains the full body.
+            let detail = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(envelope) => provider_error_detail(&envelope),
                 Err(source) => format!(
                     "error-body JSON decoding failed: {source}; body_excerpt={}",
-                    bounded_error_text(&String::from_utf8_lossy(&body))
+                    bounded_error_text(&String::from_utf8_lossy(body))
                 ),
             };
             return Err(self.call_error(
@@ -657,71 +649,21 @@ impl AnnotatorClient {
             ));
         }
         info!(
-            event = "annotator_http.response.started",
+            event = "annotator_http.response.received",
             status = status.as_u16(),
             elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "annotator streaming response headers received"
+            "annotator response body received"
         );
-        let mut pending = Vec::new();
-        let mut event = Vec::new();
-        let mut progress_at = Instant::now();
-        while let Some(chunk) = response.chunk().await.map_err(|source| {
-            self.call_error(
-                Some(status),
-                &format!(
-                    "stream body read failed: {}",
-                    crate::util::error_chain(&source)
-                ),
-            )
-        })? {
-            completed.received_bytes += chunk.len();
-            pending.extend_from_slice(&chunk);
-            // Buffer bytes until a full line arrives: UTF-8 characters and SSE
-            // frames may both be divided across arbitrary HTTP chunks.
-            let mut consumed = 0;
-            while let Some(offset) = pending[consumed..].iter().position(|byte| *byte == b'\n') {
-                let end = consumed + offset;
-                let line = pending[consumed..end]
-                    .strip_suffix(b"\r")
-                    .unwrap_or(&pending[consumed..end]);
-                if line.is_empty() {
-                    if !event.is_empty() {
-                        completed
-                            .accept_event(&event)
-                            .map_err(|detail| self.call_error(Some(status), &detail))?;
-                        event.clear();
-                    }
-                } else if let Some(data) = line.strip_prefix(b"data:") {
-                    let data = data.strip_prefix(b" ").unwrap_or(data);
-                    if !event.is_empty() {
-                        event.push(b'\n');
-                    }
-                    event.extend_from_slice(data);
-                }
-                consumed = end + 1;
-                if completed.done {
-                    break;
-                }
-            }
-            pending.drain(..consumed);
-            if completed.done {
-                break;
-            }
-            if progress_at.elapsed() >= Duration::from_secs(10) {
-                completed.log_measurements("progress", started_at);
-                progress_at = Instant::now();
-            }
-        }
-        // Neither EOF nor a token-limit finish is a complete annotation. Require
-        // explicit protocol termination before exposing content to stage parsers.
-        if !completed.done {
-            return Err(self.call_error(Some(status), "stream ended without terminal [DONE] event"));
-        }
+        completed
+            .accept_body()
+            .map_err(|detail| self.call_error(Some(status), &detail))?;
+        // A token-limit finish is still an execution failure. Only a complete,
+        // nonempty answer proceeds to the stage's structural parser.
         if completed.finish_reason.as_deref() != Some("stop") {
             return Err(self.call_error(
                 Some(status),
                 &format!(
-                    "stream ended with finish_reason={}; expected stop",
+                    "response ended with finish_reason={}; expected stop",
                     completed.finish_reason.as_deref().unwrap_or("missing"),
                 ),
             ));
@@ -729,7 +671,7 @@ impl AnnotatorClient {
         if completed.content.trim().is_empty() {
             return Err(self.call_error(
                 Some(status),
-                "stream completed without final assistant content",
+                "response completed without final assistant content",
             ));
         }
         Ok(())

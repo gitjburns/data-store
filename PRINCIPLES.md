@@ -35,7 +35,8 @@ data that is not accurate is misleading. Neither condition alone is sufficient.
 
 Service logs preserve compact operational evidence under `DIAGNOSTICS.md`.
 Complete external-payload auditing is deferred; service logs do not provide
-complete request/response reconstruction.
+complete request/response reconstruction. The dedicated annotator transcript
+retains full annotator exchanges under `DIAGNOSTICS.md`.
 
 Rules:
 

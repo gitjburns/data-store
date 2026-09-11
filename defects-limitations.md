@@ -1,75 +1,63 @@
 # Defects and limitations
 
-Recorded from source inspection on 2026-09-08. This register tracks defects,
+Recorded from source inspection on 2026-09-08; D04–D06 descriptions reconciled
+with annotation source on 2026-09-10. This register tracks defects,
 limitations, and proposed enhancements. Proposed remedies are directions for future
 design approval, not approved implementation plans. Their retrieval-quality and
 performance benefits have not been measured.
 
 | ID | Finding | Status |
 | --- | --- | --- |
-| D04 | Annotation input sizing uses characters and truncates oversized units | Open |
-| D05 | Annotation output structure is enforced after generation | Open |
+| D04 | Annotation input sizing lacks a complete-request token budget | Open |
+| D05 | Annotation requests lacked structured-output schemas | Resolved in code; endpoint enforcement unverified |
 | D06 | Annotation selection is exhaustive rather than selective | Open |
 | D07 | Graph traversal cannot follow connections across documents | Open |
 | D08 | Derived-data rebuilding is too coarse | Open |
 | D09 | Graph entry lacks semantic matching through entity embeddings | Open |
 
-## D04 — Character-based annotation budgets and incomplete oversized-unit coverage
+## D04 — Character-based annotation budgets
 
-**Current behavior.** `split_targets` in
-[src/annotations/producer.rs](src/annotations/producer.rs) groups input using
-`max_input_chars`. If one unit exceeds the cap, its text is truncated to the
-first allowed characters and `annotator_plan.unit_truncated` is logged. The
-remainder is not emitted as another invocation. The budget applies to target
-text rather than the complete tokenized request, including its system prompt.
+**Current behavior.** `build_invocation_plan` in
+[src/annotations/producer.rs](src/annotations/producer.rs) uses `split_text` in
+[src/annotations/excerpt.rs](src/annotations/excerpt.rs) to partition source text
+without dropping oversized-unit tails. Each invocation contains one excerpt
+bounded by `max_input_chars`, with exact fragment ranges recorded in provenance.
+The cap measures source characters, not the complete tokenized request;
+system prompts and prior-stage output are additional input.
 
 **Impact.** Character counts do not establish model token counts or predict
-request cost reliably. Large requests can still be expensive, and annotations
-from a truncated unit do not cover its omitted tail. Cancellation improves
-control of unfinished work but does not fix its input size or coverage.
+request cost reliably. Lossless splitting resolves omitted tails but does not
+establish a token budget for the complete request.
 
 **Proposed remedy.** Budget requests using the annotator's actual tokenizer,
-including prompt overhead. Split oversized units into explicit fragments instead
-of dropping the tail. Fragment identity and coverage must participate in
-invocation planning, provenance, memoization, and satisfaction accounting; simply
-reusing the same unit ID for several partial inputs is insufficient.
+including prompts and prior-stage output. Preserve exact fragment identity and
+coverage in planning, provenance, memoization, and satisfaction accounting.
 
-**Resolution criteria.** Every intended character has recorded coverage;
-requests obey the real token budget; partial output cannot mark an entire unit
-complete; memo entries distinguish different fragments; token counts are measured
-rather than estimated from characters.
+**Resolution criteria.** Complete requests obey the real token budget, measured
+with the annotator's tokenizer. Budgeting preserves source coverage and cannot
+let partial output satisfy an entire unit or conflate distinct fragments.
 
-## D05 — Annotation schema validation occurs after generation
+## D05 — Structured-output schemas for annotation requests
 
 **Current behavior.** `ChatCompletionRequest` in
-[src/annotations/llm_client.rs](src/annotations/llm_client.rs) sends the model,
-messages, temperature, and thinking-control extension, but no structured-output
-schema. `ProducerKind::parse_output` in
-[src/annotations/producer.rs](src/annotations/producer.rs) dispatches to the
-strict entity, relation, and summary parsers after the response arrives.
+[src/annotations/llm_client.rs](src/annotations/llm_client.rs) sends
+`response_format.type = "json_schema"` with `strict: true` and the stage-specific
+schema defined in [src/annotations/stages.rs](src/annotations/stages.rs).
+Application-side output validation remains required.
 
-**Impact.** A request can consume inference time and then fail because its output
-contains missing fields, invalid types, or malformed JSON. Such rejected outputs
-consume the worker's output-retry budget. Missing relation `object` fields were
-observed during the session; those observations do not establish a current
-failure rate for a different model or server configuration.
-
-**Proposed remedy.** Supply a producer-specific structured-output schema where
-the deployed endpoint supports it. Verify its compatibility with each existing
-parser, including empty results and optional values. Keep application-side
-validation and full error context.
-
-**Resolution criteria.** Generated shapes agree with the strict parsers;
-unsupported schema behavior fails visibly; malformed-output retry rates can be
-compared. Schema conformance must not be represented as factual correctness or
-evidence that an extracted relationship is supported by the source.
+**Status.** The missing request-schema defect is resolved in code. Enforcement
+by the deployed endpoint, compatibility of generated outputs with application
+validation, and effects on malformed-output retry rates remain unverified.
+Schema conformance does not establish factual correctness or source support
+for an extracted relationship.
 
 ## D06 — Annotation work is not selected by retrieval value
 
 **Current behavior.** The policy in
 [src/annotations/policy.rs](src/annotations/policy.rs) requires entity, relation,
-and summary annotations after activation. The producer plan assigns entity and
-relation work to section groups and summary work to document groups. Discovery
+and summary annotations after activation. The producer plan assigns each type
+one source excerpt per invocation. Section/document labels organize routing and
+discovery; they do not combine excerpts into larger requests. Discovery
 in [src/annotations/worker.rs](src/annotations/worker.rs) schedules the matching
 work across eligible active sources. Satisfaction checks and memoization avoid
 repeating completed inputs, but do not select which new inputs merit annotation.

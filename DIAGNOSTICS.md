@@ -15,9 +15,9 @@ durable diagnostics. They may repeat facts, but the service log must contain
 the authoritative evidence.
 
 Service logs record compact operational evidence, not complete external
-request/response payloads. Complete external-payload auditing is deferred;
-these logs do not support full payload reconstruction. The payload prohibitions
-below apply regardless of log level.
+request/response payloads. Full annotator exchanges belong in the separate
+`logs/annotator.log` transcript described below. Broader external-payload
+auditing remains deferred. Payload prohibitions apply regardless of log level.
 
 ## Useful Logs
 
@@ -114,7 +114,7 @@ operation, phase, local identifiers, and source error at WARN/ERROR.
 
 Every model call and startup smoke check must log model role, call purpose,
 start, success, normal error, elapsed milliseconds, compact input shape facts,
-and configured limits. Keep model payloads out of logs.
+and configured limits. Keep model payloads out of the service log.
 
 Every external process call must log executable identity, purpose, start,
 configured timeout, process ID when available, completion status or timeout,
@@ -174,7 +174,7 @@ explicit.
 
 ## Forbidden Log Data
 
-Never log:
+Except for annotator payloads in the dedicated transcript below, never log:
 
 - admin tokens;
 - document contents or full markdown;
@@ -187,6 +187,24 @@ Never log:
 
 Use compact identifiers, counts, dimensions, hashes, paths, statuses, elapsed
 times, and bounded diagnostics instead.
+
+### Annotator transcript
+
+`logs/annotator.log`, relative to the config directory, records complete annotator
+request bodies, received response data, reasoning, output, and stage outcomes.
+Authentication credentials remain excluded. Both normal work and dry runs append
+readable text blocks independently of the service-log level.
+
+Annotator calls use `stream: false`. Carry one `call_id` through REQUEST,
+RESPONSE, and RESULT blocks. Print the complete response, including rejected
+output; report explicitly when cancellation or a receive failure leaves no
+complete body. Do not emit chunk or generation-progress records. Each block is
+written under one shared lock and flushed before releasing it. Report transcript
+open/write failures in the service log without changing annotation outcomes.
+
+Success means structural validation passed, not semantic verification or database
+commit. Persistence remains recorded in the service log under the parent
+annotation context. Cancellation leaves the remote outcome unknown.
 
 ## Implementation Guidance
 

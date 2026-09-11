@@ -24,5 +24,6 @@ pub(crate) mod relation;
 pub(crate) mod stages;
 pub(crate) mod store;
 pub(crate) mod summary;
+pub(crate) mod transcript;
 pub(crate) mod vocabulary;
 pub(crate) mod worker;

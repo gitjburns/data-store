@@ -155,7 +155,7 @@ PROTOCOL.md is the contract of record. This is the map.
 ## The polling admin model
 
 The service's client-facing API uses JSON responses and Operation polling.
-Internal annotator model calls stream to expose generation progress in the log.
+Internal annotator model calls return complete responses without streaming.
 
 Every mutating admin route runs its work asynchronously. The route returns
 `202 Accepted` with an operation id:
@@ -220,9 +220,20 @@ Components that publish no counters serialize an empty array.
 `--sync-status` reports ingestion, not annotation completion. `--health` shows
 annotation counts from the last completed cycle, with their measurement time.
 For current model activity, read the file configured by `logging.file_path`
-(`logs/data-store.log` as shipped): stage starts, streaming progress, measured
+(`logs/data-store.log` as shipped): stage starts, completions, measured
 usage, failures, retry delays, and exhaustion are recorded there. Missing token
 usage remains unknown; character counts are not token estimates.
+
+Full annotator requests, reasoning, responses, and success/failure reasons are
+written to `logs/annotator.log`, relative to the config directory. It appends
+readable blocks for normal annotation work and dry runs, independently of the
+service-log level. Match `call_id` across both logs. REQUEST and RESPONSE blocks
+show complete exchanges; RESULT blocks report structural validation or the
+failure/cancellation reason. Calls use `stream: false`; no chunk or generation-
+progress records are written. A timeout or cancellation before body receipt is
+reported without a partial response. Database commits remain
+separate service-log events. Transcript open/write failures appear in the service
+log; authentication credentials are excluded from the transcript.
 
 ## Known deviations (stated where an operator meets them)
 
