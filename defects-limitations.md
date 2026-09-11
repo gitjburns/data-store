@@ -13,7 +13,7 @@ performance benefits have not been measured.
 | D06 | Annotation selection is exhaustive rather than selective | Open |
 | D07 | Graph traversal cannot follow connections across documents | Open |
 | D08 | Derived-data rebuilding is too coarse | Open |
-| D09 | Graph entry lacks semantic matching through entity embeddings | Open |
+| D09 | Semantic entity retrieval, independent annotation publication, and document progress | Open |
 
 ## D04 — Character-based annotation budgets
 
@@ -131,7 +131,7 @@ cannot be served as fresh; operations report accepted, progress, and terminal
 outcomes; interrupted work has an explicit recovery path. This requires a
 separate design and operational contract before implementation.
 
-## D09 — Entity embeddings for semantic graph entry
+## D09 — Semantic entity retrieval, independent publication, and annotation progress
 
 **Current behavior.** `candidate_entity_names` and `graph_channel` in
 [src/query/channels.rs](src/query/channels.rs) find graph entry points using
@@ -163,6 +163,40 @@ matching. Embedding identity, freshness, cache publication, and snapshot/restore
 coverage must follow the existing projection lifecycle. Evaluate additional
 useful matches and false positives rather than treating vector similarity as
 proof of relevance.
+
+### Independent publication
+
+**Current behavior.** `parse_annotations_complete` in
+[src/annotations/worker.rs](src/annotations/worker.rs) requires fresh coverage
+for every planned excerpt and required annotation type before the worker builds
+summary and graph projections. Unfinished summaries can therefore delay graph
+publication even when its entity and relation inputs are ready.
+
+**Required behavior.** Publish each annotation-derived retrieval representation
+when its own required inputs are ready, without waiting for unrelated annotation
+types. Define dependencies explicitly and preserve consistent query snapshots,
+active-parse identity, freshness, and cache publication. Operators must be able
+to distinguish completed annotation work from pending retrieval publication.
+
+### Per-document annotation progress
+
+**Current behavior.** Operators have no per-document annotation percentage.
+The worker already enumerates planned work and checks fresh content keys, but
+those completion facts are not exposed as live document progress.
+
+**Required behavior.** Expose each document's annotation percentage, completed
+and total required work, and a breakdown by annotation type. Base completion on
+the current parse's authoritative work plan and durably satisfied coverage,
+including successful empty results, explicit rejection of all candidates, and
+completed memo reuse. Model-call counts, output-item counts, and retries must
+not inflate progress; different chains can require different numbers of calls.
+
+Update progress as work completes, without waiting for the document or worker
+cycle to finish. Show pending, running, failed, and retry-exhausted work distinctly,
+with an as-of time. Unknown totals and documents with no required work must be
+explicit. Recompute from durable coverage after restart; identify parse or plan
+changes that alter the denominator. The percentage measures work completion,
+not estimated time remaining, and must not imply retrieval publication is ready.
 
 **Relationship to D07.** Semantic graph entry does not establish that similarly
 named entities in different documents are identical. Cross-document entity

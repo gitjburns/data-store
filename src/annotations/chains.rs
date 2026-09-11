@@ -171,8 +171,9 @@ fn entities(
     Ok(annotations)
 }
 
-/// Select source statements before forming triples, then attach receipts in a
-/// separate request. Exact source matching is structural, not semantic verification.
+/// Select statements before forming triples, then attach receipts separately.
+/// Selected statements may clean up formatting; quotations still require exact
+/// source matching. Neither check establishes semantic correctness.
 fn relations(
     client: &AnnotatorClient,
     passage: &str,
@@ -185,14 +186,10 @@ fn relations(
         temperature,
         |raw| {
             let response: StatementsResponse = strict_from_str(raw, Stage::Statements.name(), raw)?;
+            // Statements are model-selected text, not verified quotations. Allow
+            // formatting cleanup; downstream requests still receive the source excerpt.
             for statement in &response.sentences {
                 validate_non_empty(statement, "sentences[]", raw)?;
-                if !passage.contains(statement) {
-                    return Err(output_error(
-                        Stage::Statements,
-                        "selected sentence is not a verbatim source substring",
-                    ));
-                }
             }
             Ok(response.sentences)
         },

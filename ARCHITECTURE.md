@@ -395,9 +395,11 @@ text hash. Section ownership groups discovery; it does not enlarge requests.
 
 Later requests use the source excerpt and prior outputs from that chain.
 Intermediate candidate arrays are also bounded by the configured excerpt cap.
-Shape checks validate required fields, source substrings, name mappings, and
-receipt indexes. Relations retain `evidenceQuotes`. Semantic verification is
-not implemented.
+Shape checks validate required fields, name mappings, and receipt indexes.
+Selected statements require nonempty text but may differ from the source's
+formatting; no exact substring check applies to them. Supporting quotations
+still require exact source substrings. Relations retain `evidenceQuotes`.
+Semantic verification is not implemented.
 
 Entity typing requires both `entities` (`name`, `entityType`) and `rejected`
 (`name`, `reason`) arrays. Their combined names must match the supplied candidate
