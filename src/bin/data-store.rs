@@ -26,8 +26,8 @@ mod serve;
 #[path = "../query/provenance.rs"]
 mod provenance;
 use provenance::{
-    AnnotationContribution, DenseRepresentation, DenseRetrievalMatch, GraphMatch, GraphReach,
-    MatchClass, RetrievalChannel, RetrievalProvenance,
+    AnnotationContribution, AnnotationMatch, AnnotationRepresentation, DenseRepresentation,
+    DenseRetrievalMatch, GraphMatch, GraphReach, MatchClass, RetrievalChannel, RetrievalProvenance,
 };
 
 // Share health observations with the server; clients render its classification
@@ -1897,10 +1897,11 @@ fn health_section(observations: &HealthObservations) -> (u8, &'static str) {
     match observations {
         HealthObservations::Ingestion { .. } => (0, "Ingestion"),
         HealthObservations::Annotations { .. } => (1, "Annotations"),
-        HealthObservations::Corpus { .. } => (2, "Corpus"),
-        HealthObservations::Queries { .. } => (3, "Queries"),
-        HealthObservations::Models { .. } => (4, "Models"),
-        HealthObservations::Logging { .. } => (5, "Logging"),
+        HealthObservations::Projections { .. } => (2, "Projections"),
+        HealthObservations::Corpus { .. } => (3, "Corpus"),
+        HealthObservations::Queries { .. } => (4, "Queries"),
+        HealthObservations::Models { .. } => (5, "Models"),
+        HealthObservations::Logging { .. } => (6, "Logging"),
     }
 }
 
@@ -1929,7 +1930,7 @@ fn render_health(mut response: HealthResponse) {
             component
                 .summary
                 .as_ref()
-                .map_or(6, |summary| health_section(&summary.observations).0)
+                .map_or(7, |summary| health_section(&summary.observations).0)
         };
         (priority(left), order(left)).cmp(&(priority(right), order(right)))
     });
@@ -2015,6 +2016,18 @@ fn render_health_observations(component: &HealthComponent, observations: &Health
                 println!("             No completed cycle reported");
             }
         }
+        HealthObservations::Projections {
+            activity,
+            measured_at,
+            documents,
+        } => {
+            println!("Worker: {activity}");
+            render_projection_documents(
+                documents.as_deref(),
+                measured_at.as_deref(),
+                "             ",
+            );
+        }
         HealthObservations::Corpus {
             source_systems,
             measured_at,
@@ -2072,6 +2085,61 @@ fn render_health_observations(component: &HealthComponent, observations: &Health
         HealthObservations::Logging { level, file_path } => {
             println!("{} · {file_path}", level.to_uppercase());
         }
+    }
+}
+
+/// Render the publication owner's measured input versions without inferring completion from counts.
+fn render_projection_documents(
+    documents: Option<&[health_types::ProjectionDocumentProgress]>,
+    measured_at: Option<&str>,
+    indent: &str,
+) {
+    println!(
+        "{indent}Publication inventory as of: {}",
+        measured_at.unwrap_or("not reported")
+    );
+    let Some(documents) = documents else {
+        println!("{indent}Publication coverage: unavailable (inventory not measured)");
+        return;
+    };
+    if documents.is_empty() {
+        println!("{indent}Publication coverage: no documents in the measured inventory");
+        return;
+    }
+    for document in documents {
+        println!(
+            "{indent}Document {}: {}",
+            document.source_id, document.activity
+        );
+        println!("{indent}  Parse: {}", document.parse_id);
+        if document.source_paths.is_empty() {
+            println!("{indent}  Paths: not reported");
+        } else {
+            for path in &document.source_paths {
+                println!("{indent}  Path: {path}");
+            }
+        }
+        // Missing embedding observations are distinct from measured zero publication counts.
+        for (label, counts) in [
+            ("Graph", Some(&document.graph)),
+            ("Summary", Some(&document.summary)),
+            ("Embeddings", document.embeddings.as_ref()),
+        ] {
+            match counts {
+                Some(counts) => println!(
+                    "{indent}  {label}: {} published · {} pending · {} failed",
+                    counts.published, counts.pending, counts.failed
+                ),
+                None => println!("{indent}  {label}: not measured"),
+            }
+        }
+        if let Some(detail) = &document.detail {
+            println!("{indent}  {detail}");
+        }
+        println!(
+            "{indent}  As of: {}",
+            document.measured_at.as_deref().unwrap_or("not reported")
+        );
     }
 }
 
@@ -2338,10 +2406,10 @@ fn render_retrieval_provenance(provenance: Option<&RetrievalProvenance>) {
     let contribution = match provenance.annotation_contribution {
         AnnotationContribution::None => "No annotation-based candidate matches in this passage",
         AnnotationContribution::Overlap => {
-            "Annotation matches also found by keyword or semantic search"
+            "Annotation matches also found by keyword or source semantic search"
         }
         AnnotationContribution::AdditionalMatches => {
-            "Annotations supplied candidate matches absent from keyword and semantic search"
+            "Annotations supplied candidate matches absent from keyword and source semantic search"
         }
     };
     println!("  Contribution: {contribution}");
@@ -2354,6 +2422,17 @@ fn render_retrieval_provenance(provenance: Option<&RetrievalProvenance>) {
         .collect();
     for matched in matches {
         println!("  Annotation: {}", graph_match_description(matched));
+    }
+    for (index, unit) in provenance.matched_units.iter().enumerate() {
+        // Display ordinals scope character offsets without repeating the full raw JSON identities.
+        let descriptions: std::collections::BTreeSet<String> = unit
+            .annotation_matches
+            .iter()
+            .map(annotation_match_description)
+            .collect();
+        for description in descriptions {
+            println!("  Matched unit {}: {description}", index + 1);
+        }
     }
     if !provenance.context_unit_ids.is_empty() {
         println!("  Includes surrounding context beyond the retrieved matches");
@@ -2379,12 +2458,33 @@ fn dense_match_description(matched: &DenseRetrievalMatch) -> String {
     }
 }
 
+/// Show matched representation and source scope without exposing annotation bodies or artifact IDs.
+fn annotation_match_description(matched: &AnnotationMatch) -> String {
+    let origin = match matched.representation {
+        AnnotationRepresentation::Source => "source dense retrieval",
+        _ => "annotation retrieval",
+    };
+    // Legacy scope describes the annotation's original targeting, not a newly inferred exact range.
+    let legacy_scope = if matched.exact_annotation_range {
+        ""
+    } else {
+        " · legacy scope: whole unit"
+    };
+    format!(
+        "{origin} ({}) · source characters [{}, {}){legacy_scope}",
+        matched.representation.label(),
+        matched.excerpt.start_char,
+        matched.excerpt.end_char,
+    )
+}
+
 /// Translate the shared channel enum into reader-facing search names.
 fn channel_label(channel: &RetrievalChannel) -> &'static str {
     match channel {
-        RetrievalChannel::Dense => "Semantic search",
+        RetrievalChannel::Dense => "Source semantic search",
         RetrievalChannel::Lexical => "Keyword search",
-        RetrievalChannel::Graph => "Annotations",
+        RetrievalChannel::Graph => "Annotation graph",
+        RetrievalChannel::Semantic => "Annotation semantic search",
     }
 }
 
@@ -2394,6 +2494,7 @@ fn graph_match_description(matched: &GraphMatch) -> String {
         MatchClass::Exact => "exact match",
         MatchClass::Acronym => "acronym match",
         MatchClass::TokenPrefix => "token-prefix match",
+        MatchClass::Semantic => "semantic match",
     };
     let entry = format!("\"{}\" ({match_kind})", matched.matched_entity);
     let (relationship, reach) = match &matched.reach {

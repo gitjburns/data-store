@@ -10,6 +10,7 @@ mod reranker_backend;
 mod tensor_ops;
 
 use crate::{
+    canonical::canonical_sha256_hex_of,
     config::{ColbertBackendKind, DenseBackendKind, RerankerBackendKind, ServiceConfig},
     error::ApiError,
 };
@@ -17,7 +18,9 @@ use crate::{
 pub use artifacts::ModelArtifactSet;
 // Retained inference API (pinned contract); consumed at C6c/C6e/C7c.
 #[allow(unused_imports)]
-pub use colbert::{ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime};
+pub use colbert::{
+    ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime, PreparedColbertQuery,
+};
 pub use colbert_backend::ColbertBackend;
 pub use dense::DenseEmbeddingRuntime;
 pub use dense_backend::{DenseEmbeddingBackend, HttpDenseClient};
@@ -35,6 +38,8 @@ pub struct InferenceRuntime {
     pub dense: DenseEmbeddingBackend,
     pub colbert: ColbertBackend,
     pub reranker: RerankerBackend,
+    /// Cached identity of vector-producing configuration, tokenization, and input formatting.
+    pub embedding_identity: String,
 }
 
 impl InferenceRuntime {
@@ -207,12 +212,17 @@ impl InferenceRuntime {
         };
         progress("reranker_ready")?;
 
+        progress("embedding_identity_computing")?;
+        let embedding_identity = embedding_identity(config, &dense, &colbert)?;
+        progress("embedding_identity_ready")?;
+
         Ok(Self {
             device,
             artifacts,
             dense,
             colbert,
             reranker,
+            embedding_identity,
         })
     }
 
@@ -227,6 +237,89 @@ impl InferenceRuntime {
         details.extend(self.colbert.health_details());
         details.extend(self.reranker.health_details());
         details
+    }
+}
+
+/// Hash only vector-producing inputs once; operational changes must not invalidate persisted vectors.
+fn embedding_identity(
+    config: &ServiceConfig,
+    dense_backend: &DenseEmbeddingBackend,
+    colbert_backend: &ColbertBackend,
+) -> Result<String, ApiError> {
+    let tokenizer = serde_json::to_value(colbert_backend.tokenizer()).map_err(|source| {
+        ApiError::InferenceInit {
+            message: format!("failed to serialize ColBERT tokenizer identity: {source}"),
+        }
+    })?;
+    let tokenizer_hash = canonical_sha256_hex_of(&TokenizerIdentityValue::from_json(tokenizer))
+        .map_err(|source| ApiError::InferenceInit {
+            message: format!("failed to hash ColBERT tokenizer identity: {source}"),
+        })?;
+    let dense = &config.models.dense;
+    let colbert = &config.models.colbert;
+    // Formatter outputs bind the identity to their authoritative prefixes/markers instead of copies.
+    let identity = serde_json::json!({
+        "version": 1,
+        "dense": {
+            "backend": dense_backend.backend_kind(),
+            "path": dense.path,
+            "endpoint": dense.endpoint,
+            "model": dense.model,
+            "dimension": dense.dimension,
+            "pooling": dense.pooling,
+            "maxTokens": dense.max_tokens,
+            "queryFormat": dense::format_dense_query_text(""),
+            "documentFormat": dense::format_dense_passage_text("")
+        },
+        "colbert": {
+            "backend": colbert_backend.backend_kind(),
+            "path": colbert.path,
+            "endpoint": colbert.endpoint,
+            "model": colbert.model,
+            "dimension": colbert.dimension,
+            "queryMaxTokens": colbert.query_max_tokens,
+            "documentMaxTokens": colbert.document_max_tokens,
+            "tokenizerHash": tokenizer_hash,
+            "queryFormat": colbert::format_query(""),
+            "documentFormat": colbert::format_document("")
+        }
+    });
+    canonical_sha256_hex_of(&identity).map_err(|source| ApiError::InferenceInit {
+        message: format!("failed to hash embedding runtime identity: {source}"),
+    })
+}
+
+/// Preserve byte-distinct token spellings through the repository's NFC-normalizing canonical hash.
+#[derive(serde::Serialize)]
+enum TokenizerIdentityValue {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(Vec<u8>),
+    Array(Vec<Self>),
+    Object(Vec<(Vec<u8>, Self)>),
+}
+
+impl TokenizerIdentityValue {
+    /// Canonicalize key ordering without Unicode normalization changing tokenizer vocabulary meaning.
+    fn from_json(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(value),
+            serde_json::Value::Number(value) => Self::Number(value),
+            serde_json::Value::String(value) => Self::String(value.into_bytes()),
+            serde_json::Value::Array(values) => {
+                Self::Array(values.into_iter().map(Self::from_json).collect())
+            }
+            serde_json::Value::Object(values) => {
+                let mut entries: Vec<_> = values
+                    .into_iter()
+                    .map(|(key, value)| (key.into_bytes(), Self::from_json(value)))
+                    .collect();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                Self::Object(entries)
+            }
+        }
     }
 }
 

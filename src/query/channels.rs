@@ -18,24 +18,26 @@
 //! for scope; enforce scope at candidate generation" (§38) — there is NO
 //! scope post-filter anywhere in this module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, error, info};
 
+use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
 use crate::model::ContentType;
 use crate::model::body::{TextBlockBody, TextBlockRole};
 use crate::policy::EntityMatchPolicy;
 use crate::primitives::bm25::build_bm25_queries;
-use crate::primitives::fusion::{Bm25Match, DenseMatch, fuse_matches};
+use crate::primitives::fusion::{Bm25Match, DenseMatch};
 use crate::projections::dense_cache::DensePlane;
 use crate::projections::graph::{
     EdgeDirection, entity_names_for_parse, mentions_for_name, normalize_entity_name, one_hop_edges,
 };
 use crate::projections::lexical::match_chunks;
+use crate::projections::section_dense::SectionDenseWindow;
 use crate::query::model::{RetrievalChannel, RetrievalHit, RetrievalHitType};
 use crate::query::profile::RetrievalProfile;
 use crate::query::provenance::{
@@ -72,6 +74,12 @@ struct DenseChunkHit {
     source_id: String,
 }
 
+/// Keep the scored-row count without retaining a score record for every persisted vector.
+struct DenseChannelOutcome {
+    hits: Vec<DenseChunkHit>,
+    scored_count: usize,
+}
+
 /// One chunk-grained lexical candidate before chunk→unit resolution: the chunk
 /// id, its BM25 rank (lower is more relevant, per FTS5 `bm25()`), and the parse
 /// it came from.
@@ -82,64 +90,88 @@ struct LexicalChunkHit {
     source_id: String,
 }
 
-/// Score captured fine chunks once, highest cosine first. The direct branch
-/// takes its existing global shortlist; section nomination reuses all scores so
-/// passages outside that shortlist can still be discovered through a section.
-///
-/// DP1/scope: reads only the captured planes on the passed parses — no
-/// connection is opened here, no out-of-scope parse is scanned. Cosine reuses
-/// each plane's precomputed row norms (`DensePlane::norms`); a query vector with
-/// a non-finite or zero norm yields no dense candidates (all cosines are
-/// undefined), which is a benign empty result, not an error. Vector VALUES are
-/// never logged (forbidden).
+/// Scan captured passage rows with bounded storage buffers, retaining only the
+/// direct shortlist. Equal cosines preserve captured parse and chunk scan order,
+/// matching the prior stable global sort. Invalid query norms remain an empty
+/// dense result; persisted-data corruption is an explicit query failure.
 fn dense_channel(
+    conn: &Connection,
     query_id: &str,
     parses: &[CapturedParse],
     query_vector: &[f32],
-) -> Vec<DenseChunkHit> {
+    limit: usize,
+    chunk_unit_map: &HashMap<String, Vec<String>>,
+) -> Result<DenseChannelOutcome, ApiError> {
     let started_at = Instant::now();
     let query_norm = l2_norm(query_vector);
     let mut hits: Vec<DenseChunkHit> = Vec::new();
+    let mut scored_count = 0;
 
     // A zero/non-finite query norm makes every cosine undefined; skip scoring
     // and return empty rather than emitting NaNs into fusion.
     if query_norm > 0.0 && query_norm.is_finite() {
         for parse in parses {
-            let Some(plane) = parse.dense_plane.as_ref() else {
-                continue;
-            };
-            // Dimension mismatch means the query embedding does not belong to
-            // this plane's model; scoring it would be meaningless, so skip the
-            // plane rather than score across incompatible dimensions.
+            let plane = parse
+                .dense_plane
+                .as_ref()
+                .ok_or_else(|| ApiError::ServiceUnavailable {
+                    message: format!(
+                        "passage dense projection missing for source {} parse {}",
+                        parse.source_id, parse.parse_id
+                    ),
+                })?;
             if plane.dimension() != query_vector.len() {
-                continue;
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "passage dense query dimension mismatch for source {} parse {}",
+                        parse.source_id, parse.parse_id
+                    ),
+                });
             }
-            let dimension = plane.dimension();
-            let vectors = plane.vectors();
-            let chunk_ids = plane.chunk_ids();
-            let norms = plane.norms();
-            let mut parse_hits: Vec<DenseChunkHit> = Vec::with_capacity(plane.row_count());
-            for row in 0..plane.row_count() {
-                let row_vector = &vectors[row * dimension..(row + 1) * dimension];
-                let dot: f32 = row_vector
+            plane.visit_vectors(conn, |row| {
+                if row.parse_id != parse.parse_id || !chunk_unit_map.contains_key(&row.chunk_id) {
+                    return Err(ApiError::StorageOperation {
+                        message: format!(
+                            "dense chunk {} has no input-unit mapping in captured parse {}",
+                            row.chunk_id, parse.parse_id
+                        ),
+                    });
+                }
+                let dot: f32 = row
+                    .vector
                     .iter()
                     .zip(query_vector.iter())
                     .map(|(left, right)| left * right)
                     .sum();
                 // Row norms are finite and strictly positive (loader guarantee),
                 // so the only divisor risk is the query norm, already excluded.
-                let similarity = dot / (norms[row] * query_norm);
-                parse_hits.push(DenseChunkHit {
-                    chunk_id: chunk_ids[row].clone(),
-                    similarity,
-                    parse_id: parse.parse_id.clone(),
-                    source_id: parse.source_id.clone(),
-                });
-            }
-            hits.extend(parse_hits);
+                let similarity = dot / (row.norm * query_norm);
+                if !similarity.is_finite() {
+                    return Err(ApiError::StorageOperation {
+                        message: format!(
+                            "non-finite passage cosine for chunk {} in parse {}",
+                            row.chunk_id, parse.parse_id
+                        ),
+                    });
+                }
+                scored_count += 1;
+                let position =
+                    hits.partition_point(|hit| hit.similarity.total_cmp(&similarity).is_ge());
+                if position < limit {
+                    hits.insert(
+                        position,
+                        DenseChunkHit {
+                            chunk_id: row.chunk_id.clone(),
+                            similarity,
+                            parse_id: parse.parse_id.clone(),
+                            source_id: parse.source_id.clone(),
+                        },
+                    );
+                    hits.truncate(limit);
+                }
+                Ok(())
+            })?;
         }
-        // Preserve the fine branch's cosine ordering before its separate cap.
-        hits.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
     }
 
     debug!(
@@ -147,10 +179,11 @@ fn dense_channel(
         query_id,
         parse_count = parses.len(),
         hit_count = hits.len(),
+        scored_count,
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "dense channel candidate generation completed"
     );
-    hits
+    Ok(DenseChannelOutcome { hits, scored_count })
 }
 
 /// Lexical retrieval channel (§24.3): FTS5/BM25 candidate generation over the
@@ -377,6 +410,21 @@ struct SectionNominations {
     evidence: HashMap<String, DenseRetrievalMatch>,
     window_count: usize,
     section_units_without_fine_vectors: usize,
+    fine_chunks_rescored: usize,
+}
+
+/// Only shortlisted section windows own payload bytes; their parse identity is
+/// borrowed from the immutable query capture for later canonical nomination.
+struct SectionWindowCandidate<'a> {
+    similarity: f32,
+    parse: &'a CapturedParse,
+    window: SectionDenseWindow,
+}
+
+/// Best fine matches are retained only for member units of shortlisted windows.
+struct SectionFineMatches {
+    chunks: HashMap<String, DenseChunkHit>,
+    scored_count: usize,
 }
 
 /// Rank section windows globally, then nominate only canonical units actually
@@ -385,14 +433,16 @@ struct SectionNominations {
 /// cannot nominate the chunk's other units.
 fn section_nominations(
     conn: &Connection,
+    store: &ArtifactStore,
     parses: &[CapturedParse],
     query_vector: &[f32],
-    best_chunks: &HashMap<&str, &DenseChunkHit>,
+    chunk_unit_map: &HashMap<String, Vec<String>>,
     owners: &mut HashMap<String, CandidateUnit>,
     profile: &RetrievalProfile,
 ) -> Result<SectionNominations, ApiError> {
     let query_norm = l2_norm(query_vector);
-    let mut windows = Vec::new();
+    let mut windows: Vec<SectionWindowCandidate<'_>> = Vec::new();
+    let limit = profile.section_candidate_limit as usize;
     for parse in parses {
         let plane = parse.dense_plane.as_ref().ok_or_else(|| ApiError::ServiceUnavailable {
             message: format!("source {} parse {} requires rebuilding passage and section dense projections; run data-store --config <config-path> --rebuild-all", parse.source_id, parse.parse_id),
@@ -415,7 +465,7 @@ fn section_nominations(
         if query_norm <= 0.0 || !query_norm.is_finite() {
             continue;
         }
-        for window in &sections.windows {
+        plane.visit_sections(conn, store, |window| {
             let dot: f32 = window
                 .vector
                 .iter()
@@ -431,31 +481,51 @@ fn section_nominations(
                     ),
                 });
             }
-            windows.push((similarity, parse, window));
-        }
+            // Bound retained payloads before scanning the next artifact window.
+            // This comparator is the previous global section-sort order.
+            let position = windows.partition_point(|entry| {
+                entry
+                    .similarity
+                    .total_cmp(&similarity)
+                    .reverse()
+                    .then_with(|| entry.parse.parse_id.cmp(&parse.parse_id))
+                    .then_with(|| entry.window.window_id.cmp(&window.window_id))
+                    .is_le()
+            });
+            if position < limit {
+                windows.insert(
+                    position,
+                    SectionWindowCandidate {
+                        similarity,
+                        parse,
+                        // The visitor releases its window after returning; only a
+                        // shortlisted window needs an owned copy for nomination.
+                        window: window.clone(),
+                    },
+                );
+                windows.truncate(limit);
+            }
+            Ok(())
+        })?;
     }
-    windows.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| left.1.parse_id.cmp(&right.1.parse_id))
-            .then_with(|| left.2.window_id.cmp(&right.2.window_id))
-    });
-    windows.truncate(profile.section_candidate_limit as usize);
+    let fine_matches = best_section_chunks(conn, parses, &windows, query_vector, chunk_unit_map)?;
     let mut output = SectionNominations {
         units: Vec::new(),
         evidence: HashMap::new(),
         window_count: windows.len(),
         section_units_without_fine_vectors: 0,
+        fine_chunks_rescored: fine_matches.scored_count,
     };
-    for (_, parse, window) in windows {
+    for candidate in windows {
+        let parse = candidate.parse;
+        let window = candidate.window;
         let mut candidates = Vec::new();
         for unit_id in &window.input_unit_ids {
             validate_candidate_unit(conn, owners, unit_id, &parse.source_id, &parse.parse_id)?;
             if !owners[unit_id].eligible {
                 continue;
             }
-            let Some(chunk) = best_chunks.get(unit_id.as_str()) else {
+            let Some(chunk) = fine_matches.chunks.get(unit_id.as_str()) else {
                 // Section context includes code and short leaves that the fine
                 // chunker excludes. Without a fine cosine these units cannot
                 // seed a section-guided passage, but their context is retained.
@@ -470,7 +540,7 @@ fn section_nominations(
                     ),
                 });
             }
-            candidates.push((unit_id, *chunk));
+            candidates.push((unit_id, chunk));
         }
         candidates.sort_by(|left, right| {
             right
@@ -499,6 +569,100 @@ fn section_nominations(
         }
     }
     Ok(output)
+}
+
+/// Rescore fine rows only for shortlisted section memberships, retaining one best
+/// match per member. A chunk shared across a window boundary cannot nominate units
+/// outside that window; section_nominations checks canonical ownership afterward.
+fn best_section_chunks(
+    conn: &Connection,
+    parses: &[CapturedParse],
+    windows: &[SectionWindowCandidate<'_>],
+    query_vector: &[f32],
+    chunk_unit_map: &HashMap<String, Vec<String>>,
+) -> Result<SectionFineMatches, ApiError> {
+    let selected_parses: HashSet<&str> = windows
+        .iter()
+        .map(|entry| entry.parse.parse_id.as_str())
+        .collect();
+    let selected_units: HashSet<&str> = windows
+        .iter()
+        .flat_map(|entry| entry.window.input_unit_ids.iter().map(String::as_str))
+        .collect();
+    let mut chunks: HashMap<String, DenseChunkHit> = HashMap::new();
+    let mut scored_count = 0;
+    let query_norm = l2_norm(query_vector);
+    for parse in parses {
+        if !selected_parses.contains(parse.parse_id.as_str()) {
+            continue;
+        }
+        let plane = parse
+            .dense_plane
+            .as_ref()
+            .ok_or_else(|| ApiError::ServiceUnavailable {
+                message: format!(
+                    "section fine-scoring plane missing for source {} parse {}",
+                    parse.source_id, parse.parse_id
+                ),
+            })?;
+        plane.visit_vectors(conn, |row| {
+            let units =
+                chunk_unit_map
+                    .get(&row.chunk_id)
+                    .ok_or_else(|| ApiError::StorageOperation {
+                        message: format!(
+                            "dense chunk {} has no input-unit mapping in parse {}",
+                            row.chunk_id, parse.parse_id
+                        ),
+                    })?;
+            if !units
+                .iter()
+                .any(|unit_id| selected_units.contains(unit_id.as_str()))
+            {
+                return Ok(());
+            }
+            let dot: f32 = row
+                .vector
+                .iter()
+                .zip(query_vector)
+                .map(|(left, right)| left * right)
+                .sum();
+            let similarity = dot / (row.norm * query_norm);
+            if !similarity.is_finite() {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "non-finite section fine cosine for chunk {} in parse {}",
+                        row.chunk_id, parse.parse_id
+                    ),
+                });
+            }
+            scored_count += 1;
+            for unit_id in units {
+                if selected_units.contains(unit_id.as_str())
+                    && chunks
+                        .get(unit_id)
+                        .is_none_or(|current| similarity.total_cmp(&current.similarity).is_gt())
+                {
+                    // Keep the first equal-score row to preserve the original
+                    // stable cosine order across captured parses and chunk IDs.
+                    chunks.insert(
+                        unit_id.clone(),
+                        DenseChunkHit {
+                            chunk_id: row.chunk_id.clone(),
+                            similarity,
+                            parse_id: parse.parse_id.clone(),
+                            source_id: parse.source_id.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(SectionFineMatches {
+        chunks,
+        scored_count,
+    })
 }
 
 /// Combine two unit lists with equal-weight RRF, retaining a single dense vote
@@ -587,55 +751,67 @@ fn unit_hit(
         rank: Some(rank as u32),
         matched_projection_id: None,
         matched_annotation_id: None,
+        source_excerpt: None,
+        annotation_matches: Vec::new(),
         explanation: None,
         graph_matches: Vec::new(),
         dense_matches: Vec::new(),
     }
 }
 
-/// Fused ranking input and the eligible channel records that explain its origin.
-pub(crate) struct ChannelFusionOutcome {
-    pub(crate) pool: Vec<RetrievalHit>,
+/// Eligible source and graph candidates retain their channel scores and attribution
+/// until annotation retrieval performs the single outer fusion.
+pub(crate) struct ChannelCandidates {
     pub(crate) channel_hits: Vec<RetrievalHit>,
 }
 
-/// Fuse all channels on the captured snapshot, independently of final result count.
-/// Explicit headers/footers are excluded before eligible ranks and channel caps;
-/// RRF deduplicates canonical units before applying the ColBERT candidate cap.
-pub(crate) fn fused_channels(
+/// Collect eligible channels from one captured snapshot. Passage and section
+/// representations merge within the dense channel; outer fusion belongs to the
+/// annotation retrieval layer, where semantic annotations and graph matches combine.
+// Separate borrows preserve caller ownership of the read snapshot, artifact store,
+// captured scope, and query/model inputs at this storage boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_channels(
     conn: &Connection,
+    store: &ArtifactStore,
     query_id: &str,
     parses: &[CapturedParse],
     query_vector: &[f32],
     query_text: &str,
     graph_hits: &[RetrievalHit],
     profile: &RetrievalProfile,
-) -> Result<ChannelFusionOutcome, ApiError> {
+) -> Result<ChannelCandidates, ApiError> {
     let started_at = Instant::now();
     let candidate_limit = profile.default_max_candidates_per_channel as usize;
-    let fused_limit = profile.colbert_candidate_pool_size as usize;
     info!(
-        event = "query.fusion.started",
+        event = "query.channels.started",
         query_id,
         parse_count = parses.len(),
-        fused_limit,
         candidate_limit,
         rrf_k = profile.rrf_k,
         graph_input_hits = graph_hits.len(),
-        "dense, lexical, and graph fusion started"
+        "dense, lexical, and graph candidate collection started"
     );
 
-    // Preserve the failed read stage across every early return from fusion.
+    // Preserve the failed read stage across every early return from collection.
     let mut stage = "lexical_retrieval";
-    let result: Result<ChannelFusionOutcome, ApiError> = (|| {
-        let all_dense_hits = dense_channel(query_id, parses, query_vector);
-        let dense_hits = &all_dense_hits[..all_dense_hits.len().min(candidate_limit)];
+    let result: Result<ChannelCandidates, ApiError> = (|| {
         let lexical_hits = lexical_channel(conn, query_id, parses, query_text, candidate_limit)?;
 
         // Grain-change boundary: chunk-grained hits → unit-grained matches. Fusion
         // keys on unit_id, so resolution MUST precede fusion (design rule, §6/§38).
         stage = "chunk_unit_mapping";
         let chunk_unit_map = load_chunk_unit_map(conn, parses)?;
+        stage = "dense_retrieval";
+        let dense = dense_channel(
+            conn,
+            query_id,
+            parses,
+            query_vector,
+            candidate_limit,
+            &chunk_unit_map,
+        )?;
+        let dense_hits = dense.hits.as_slice();
         stage = "unit_ownership";
         let mut owners = build_unit_owner_index(
             conn,
@@ -665,23 +841,6 @@ pub(crate) fn fused_channels(
             matched.rank = index + 1;
         }
         stage = "section_dense_retrieval";
-        // All fine chunks are cosine-sorted. Keeping the first occurrence gives
-        // each unit its best fine score without expanding section target mappings.
-        let mut best_chunks = HashMap::new();
-        for chunk in &all_dense_hits {
-            let units =
-                chunk_unit_map
-                    .get(&chunk.chunk_id)
-                    .ok_or_else(|| ApiError::StorageOperation {
-                        message: format!(
-                            "dense chunk {} has no input-unit mapping in parse {}",
-                            chunk.chunk_id, chunk.parse_id
-                        ),
-                    })?;
-            for unit_id in units {
-                best_chunks.entry(unit_id.as_str()).or_insert(chunk);
-            }
-        }
         let section_started = Instant::now();
         info!(
             event = "query.channel.section_dense.started",
@@ -692,9 +851,10 @@ pub(crate) fn fused_channels(
         );
         let sections = section_nominations(
             conn,
+            store,
             parses,
             query_vector,
-            &best_chunks,
+            &chunk_unit_map,
             &mut owners,
             profile,
         )?;
@@ -702,6 +862,7 @@ pub(crate) fn fused_channels(
         let section_units = sections.units.len();
         let section_windows = sections.window_count;
         let section_units_without_fine_vectors = sections.section_units_without_fine_vectors;
+        let section_fine_chunks_rescored = sections.fine_chunks_rescored;
         let combined_dense = merge_dense_representations(&dense_matches, &sections.units, profile);
         let dense_provenance =
             dense_evidence(&dense_matches, dense_hits, &chunk_unit_map, sections);
@@ -709,7 +870,8 @@ pub(crate) fn fused_channels(
         info!(
             event = "query.channel.section_dense.completed",
             query_id,
-            fine_chunks_scored = all_dense_hits.len(),
+            fine_chunks_scored = dense.scored_count,
+            section_fine_chunks_rescored,
             direct_units,
             section_windows,
             section_units,
@@ -730,20 +892,8 @@ pub(crate) fn fused_channels(
                 graph_eligible.push(hit);
             }
         }
-        let graph_matches: Vec<(&str, usize)> = graph_eligible
-            .iter()
-            .enumerate()
-            .map(|(index, hit)| (hit.hit_id.as_str(), index + 1))
-            .collect();
-        let fused = fuse_matches(
-            &dense_matches,
-            &lexical_matches,
-            &graph_matches,
-            fused_limit,
-            profile.rrf_k,
-        );
-        // Keep original channel scores/explanations separately: a fused ordinal score
-        // must not erase the graph traversal evidence or lexical/dense attribution.
+        // Preserve channel scores and complete attribution for the outer fusion;
+        // graph evidence remains available when semantic annotation retrieval joins it.
         let mut channel_hits = Vec::new();
         for matched in &dense_matches {
             let mut hit = unit_hit(
@@ -766,40 +916,8 @@ pub(crate) fn fused_channels(
             ));
         }
         channel_hits.extend(graph_eligible.iter().map(|hit| (*hit).clone()));
-        let pool = fused
-            .iter()
-            .map(|matched| {
-                let channel = if matched.dense_rank.is_some() {
-                    RetrievalChannel::Dense
-                } else if matched.bm25_rank.is_some() {
-                    RetrievalChannel::Lexical
-                } else {
-                    RetrievalChannel::Graph
-                };
-                let mut hit = unit_hit(
-                    &matched.unit_id,
-                    &owners[&matched.unit_id],
-                    channel,
-                    matched.score,
-                    matched.rank,
-                );
-                if matched.dense_rank.is_some() {
-                    hit.dense_matches = dense_provenance[&matched.unit_id].clone();
-                }
-                if matched.graph_rank.is_some()
-                    && let Some(graph) = graph_eligible
-                        .iter()
-                        .find(|graph| graph.hit_id == matched.unit_id)
-                {
-                    hit.explanation = graph.explanation.clone();
-                    hit.graph_matches = graph.graph_matches.clone();
-                }
-                hit
-            })
-            .collect::<Vec<_>>();
-
         info!(
-            event = "query.fusion.completed",
+            event = "query.channels.completed",
             query_id,
             dense_units = dense_matches.len(),
             lexical_units = lexical_matches.len(),
@@ -815,19 +933,18 @@ pub(crate) fn fused_channels(
             dense_limit_excluded,
             lexical_limit_excluded,
             candidate_limit,
-            fused_limit,
-            fused_hits = pool.len(),
+            retained_channel_hits = channel_hits.len(),
             elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "dense, lexical, and graph fusion completed"
+            "dense, lexical, and graph candidate collection completed"
         );
-        Ok(ChannelFusionOutcome { pool, channel_hits })
+        Ok(ChannelCandidates { channel_hits })
     })();
     result.inspect_err(|source| {
-        error!(event = "query.fusion.failed", query_id, stage,
+        error!(event = "query.channels.failed", query_id, stage,
             parse_count = parses.len(), error = %source,
             error_chain = %crate::util::error_chain(source),
             elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "retrieval channel fusion failed");
+            "retrieval channel candidate collection failed");
     })
 }
 
@@ -985,7 +1102,7 @@ fn l2_norm(vector: &[f32]) -> f32 {
 // ===========================================================================
 // Graph channel (C7b-2) — D9 semantic-graph traversal with three-tier ordering.
 //
-// The pipeline generates graph hits before passing them to `fused_channels`.
+// The pipeline generates graph hits before passing them to `collect_channels`.
 // Graph ordering is retained as its ordinal RRF contribution. This channel
 // reads mentions/edges ONLY within the passed `&[CapturedParse]`, so scope is
 // enforced at the entity lookup (§6, §38) with no ranked post-filter — and it
@@ -1016,6 +1133,7 @@ fn match_class_label(class: MatchClass) -> &'static str {
         MatchClass::Exact => "exact",
         MatchClass::Acronym => "acronym",
         MatchClass::TokenPrefix => "token_prefix",
+        MatchClass::Semantic => "semantic",
     }
 }
 
@@ -1354,6 +1472,8 @@ fn graph_hit(candidate: &GraphUnitCandidate, score: f64, rank: usize) -> Retriev
         matched_projection_id: None,
         matched_annotation_id: None,
         explanation: Some(explanation),
+        source_excerpt: None,
+        annotation_matches: Vec::new(),
         graph_matches: candidate.graph_matches.iter().cloned().collect(),
         dense_matches: Vec::new(),
     }
@@ -1412,7 +1532,7 @@ fn record_graph_unit(
 
 /// Graph retrieval channel (§24.3, D9): semantic-graph traversal from
 /// entity-name matches, tiered by the D9 ordering. The pipeline passes these
-/// ranked hits to `fused_channels` alongside dense and lexical candidates.
+/// ranked hits to `collect_channels` alongside dense and lexical candidates.
 ///
 /// Contract (mirrors C7b-1):
 /// - `conn` is already inside the per-query DEFERRED read transaction (DP1,
@@ -1481,6 +1601,7 @@ pub(crate) fn graph_channel(
     query_text: &str,
     hop_budget: usize,
     policy: &EntityMatchPolicy,
+    semantic_names: &[(String, String)],
 ) -> Result<Vec<RetrievalHit>, ApiError> {
     let started_at = Instant::now();
 
@@ -1541,10 +1662,24 @@ pub(crate) fn graph_channel(
                     MatchClass::Acronym => acronym_matched += 1,
                     MatchClass::TokenPrefix => token_prefix_matched += 1,
                     // Exact is never produced by the fuzzy selector.
-                    MatchClass::Exact => {}
+                    MatchClass::Exact | MatchClass::Semantic => {}
                 }
             }
             parse_matches.extend(fuzzy);
+        }
+
+        // Semantic entry is scoped to this captured parse and never displaces
+        // a stronger spelling-based classification of the same stored entity.
+        for (_, name) in semantic_names
+            .iter()
+            .filter(|(parse_id, _)| parse_id == &parse.parse_id)
+        {
+            if !parse_matches.iter().any(|matched| matched.name == *name) {
+                parse_matches.push(MatchedName {
+                    class: MatchClass::Semantic,
+                    name: name.clone(),
+                });
+            }
         }
 
         // Pass 1 — direct mentions (tier 2). Every matched entity's mention units

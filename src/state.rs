@@ -20,7 +20,8 @@ use crate::{
     projections::dense_cache::DenseCache,
     types::{
         AnnotationDocumentProgress, AnnotationSummary, HealthBackend, HealthComponent, HealthCount,
-        HealthObservations, HealthResponse, HealthStatus, HealthSummary,
+        HealthObservations, HealthResponse, HealthStatus, HealthSummary, ProjectionActivity,
+        ProjectionDocumentProgress,
     },
 };
 
@@ -88,6 +89,9 @@ pub struct AppState {
     // distinct slot because a distinct thread owns it; poison-recovered on read
     // exactly like sync_health.
     annotation_health: Arc<Mutex<AnnotationHealth>>,
+    // A separate synchronous owner publishes projection coverage; annotation
+    // completion cannot stand in for searchable projection publication.
+    projection_health: Arc<Mutex<ProjectionHealth>>,
     // Shared active dense cache (§1.6 successor): the C7 dense retrieval
     // channel scores against this same process-global plane cache the
     // scheduler populates on activation. Held as an `Arc` so the `/query`
@@ -250,6 +254,16 @@ pub struct AnnotationHealth {
     pub inventory_measured_at: Option<String>,
 }
 
+/// Diagnostic-only observations owned by the projection worker. Counts remain
+/// tied to their source/parse measurement when a later discovery attempt fails.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionHealth {
+    pub activity: ProjectionActivity,
+    pub detail: Option<String>,
+    pub measured_at: Option<String>,
+    pub documents: Option<Vec<ProjectionDocumentProgress>>,
+}
+
 /// Per-cycle freshness counts of one annotation discovery/build cycle (C10b),
 /// mirroring the worker's `CycleTotals` accounting so an operator sees the last
 /// cycle without reading logs.
@@ -269,8 +283,6 @@ pub struct AnnotationCycleCounts {
     pub failed: u64,
     /// Whole-source faults skipped this cycle.
     pub source_failures: u64,
-    /// Annotation-derived projection builds that failed this cycle.
-    pub projection_failures: u64,
     /// Crash-orphaned `building` rows adopted for completion this cycle (§21
     /// crash-recovery evidence).
     pub orphans_adopted: u64,
@@ -449,6 +461,7 @@ impl AppState {
         sync_health: Arc<Mutex<SyncHealth>>,
         fabric_health: Arc<Mutex<FabricHealth>>,
         annotation_health: Arc<Mutex<AnnotationHealth>>,
+        projection_health: Arc<Mutex<ProjectionHealth>>,
         dense_cache: Arc<DenseCache>,
         cutover_registry: Arc<CutoverRegistry>,
         application_identity: ApplicationIdentity,
@@ -474,6 +487,7 @@ impl AppState {
             sync_health,
             fabric_health,
             annotation_health,
+            projection_health,
             dense_cache,
             cutover_registry,
             search_admission,
@@ -522,6 +536,20 @@ impl AppState {
         annotations.measured_at = None;
         annotations.documents = None;
         annotations.inventory_measured_at = None;
+        drop(annotations);
+        let mut projections =
+            self.projection_health
+                .lock()
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("cannot clear projection health after rebuild-all: {source}"),
+                })?;
+        projections.documents = None;
+        projections.measured_at = None;
+        // Clearing derived state cannot restart a worker that became unavailable.
+        if projections.activity != ProjectionActivity::Unavailable {
+            projections.activity = ProjectionActivity::Discovering;
+            projections.detail = None;
+        }
         Ok(())
     }
 
@@ -807,6 +835,7 @@ impl AppState {
         // service report unavailable (invariant 1).
         let fabric_component = self.fabric_component();
         let annotation_component = self.annotation_component();
+        let projection_component = self.projection_component();
         let admission_component = self.admission_component();
         // Components that gate readiness determine the top-level flag:
         // inference and the sync scheduler's fabric-plane readiness (the
@@ -822,6 +851,7 @@ impl AppState {
             logging_component,
             fabric_component,
             annotation_component,
+            projection_component,
             admission_component,
         ];
 
@@ -935,6 +965,73 @@ impl AppState {
             details: readiness_details("diagnostic-only", details),
             counts,
             summary: Some(annotation_health_summary(&snapshot)),
+        }
+    }
+
+    /// Report the publication worker's measured scope without opening SQLite or
+    /// turning optional annotation projection failures into service unavailability.
+    fn projection_component(&self) -> HealthComponent {
+        let snapshot = match self.projection_health.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                error!(
+                    event = "health.projection_slot_poisoned",
+                    "projection health lock poisoned; reporting last published observations"
+                );
+                poisoned.into_inner().clone()
+            }
+        };
+        let mut problems = Vec::new();
+        if let Some(detail) = &snapshot.detail {
+            problems.push(detail.clone());
+        }
+        let failed: u64 = snapshot
+            .documents
+            .iter()
+            .flatten()
+            .map(|document| {
+                document.graph.failed
+                    + document.summary.failed
+                    + document.embeddings.map_or(0, |counts| counts.failed)
+            })
+            .sum();
+        if failed > 0 {
+            problems.push(format!(
+                "{failed} projection publications failed in their last document measurements"
+            ));
+        }
+        let status = if !problems.is_empty()
+            || matches!(
+                snapshot.activity,
+                ProjectionActivity::Unavailable
+                    | ProjectionActivity::Stopped
+                    | ProjectionActivity::RetryWait
+            ) {
+            HealthStatus::Attention
+        } else if snapshot.documents.is_none() {
+            HealthStatus::Unreported
+        } else {
+            HealthStatus::Normal
+        };
+        HealthComponent {
+            name: "projections".to_owned(),
+            ready: true,
+            details: readiness_details(
+                "diagnostic-only",
+                vec![format!("worker {}", snapshot.activity)],
+            ),
+            // Per-document counts retain their individual measurement times in
+            // the typed summary; they are not recast as one current aggregate.
+            counts: Vec::new(),
+            summary: Some(HealthSummary {
+                status,
+                problems,
+                observations: HealthObservations::Projections {
+                    activity: snapshot.activity,
+                    measured_at: snapshot.measured_at,
+                    documents: snapshot.documents,
+                },
+            }),
         }
     }
 
@@ -1450,7 +1547,6 @@ fn annotation_health_summary(snapshot: &AnnotationHealth) -> HealthSummary {
     let last_cycle = snapshot.last_cycle.as_ref().map(|cycle| {
         for (label, count) in [
             ("source failures", cycle.source_failures),
-            ("projection failures", cycle.projection_failures),
             ("storage deferrals", cycle.deferred),
         ] {
             if count > 0 {
@@ -1630,7 +1726,7 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
         Some(cycle) => {
             details.push(format!(
                 "last cycle (as of {as_of}): sources {} expected {} missing {} built {} \
-                 memoized {} failed {} source-failures {} projection-failures {} \
+                 memoized {} failed {} source-failures {} \
                  orphans-adopted {} deferred {} exhausted {}",
                 cycle.sources_examined,
                 cycle.expected,
@@ -1639,7 +1735,6 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
                 cycle.memoized,
                 cycle.failed,
                 cycle.source_failures,
-                cycle.projection_failures,
                 cycle.orphans_adopted,
                 cycle.deferred,
                 cycle.exhausted,
@@ -1652,7 +1747,6 @@ fn annotation_health_view(snapshot: &AnnotationHealth) -> (Vec<String>, Vec<Heal
                 ("memoized", cycle.memoized),
                 ("failed", cycle.failed),
                 ("source_failures", cycle.source_failures),
-                ("projection_failures", cycle.projection_failures),
                 ("orphans_adopted", cycle.orphans_adopted),
                 ("deferred", cycle.deferred),
                 ("exhausted", cycle.exhausted),

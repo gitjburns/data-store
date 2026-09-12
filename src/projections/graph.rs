@@ -56,8 +56,7 @@ use super::envelope::{self, NewProjection, ProjectionType};
 use crate::error::ApiError;
 use crate::ids::new_retrieval_projection_id;
 use crate::model::{
-    ProducerType, Provenance, ProvenanceInputRef, ProvenanceObjectType, SemanticAnnotation,
-    SemanticAnnotationType,
+    ProducerType, Provenance, ProvenanceInputRef, ProvenanceObjectType, SemanticAnnotationType,
 };
 
 /// Stable producer name recorded in the graph projection's Provenance (§20).
@@ -213,9 +212,233 @@ fn lowered_then_nfc(nfc: &str) -> String {
 /// is metadata, not identity, so a name that
 /// appears with two entityTypes is still ONE node — the first-seen type is kept
 /// and the divergence is logged, never used to split the node).
-struct MentionAccumulator {
-    unit_ids: std::collections::BTreeSet<String>,
-    entity_type: Option<String>,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MentionAccumulator {
+    pub(crate) unit_ids: std::collections::BTreeSet<String>,
+    pub(crate) entity_type: Option<String>,
+}
+
+/// The annotation fields consumed by graph derivation, independent of whether
+/// the committed input came from a live row or a verified snapshot record.
+struct GraphAnnotation {
+    id: String,
+    annotation_type: SemanticAnnotationType,
+    target_unit_ids: Vec<String>,
+    body: Value,
+}
+
+/// One graph's derived content and the exact annotations consumed, including
+/// empty markers. Shared derivation keeps builds, verification, and restoration
+/// on the same normalization, direction, and marker rules.
+#[derive(Default)]
+pub(crate) struct GraphPayload {
+    pub(crate) mentions: BTreeMap<String, MentionAccumulator>,
+    pub(crate) edges: Vec<DerivedEdge>,
+    pub(crate) input_annotation_ids: Vec<String>,
+    entity_annotation_count: usize,
+    relation_annotation_count: usize,
+    skipped_entity_markers: usize,
+    skipped_relation_markers: usize,
+    entity_type_divergences: usize,
+}
+
+/// The published graph captured by a snapshot. Reconstructed rows retain this
+/// envelope's identity; annotations committed later are not graph inputs yet.
+pub(crate) struct CapturedGraph {
+    pub(crate) projection_id: String,
+    pub(crate) source_id: String,
+    pub(crate) parse_id: String,
+    pub(crate) payload: GraphPayload,
+}
+
+/// Derive graph content before opening an envelope or modifying payload rows.
+/// Both archived and live callers validate input ownership/freshness first.
+fn derive_graph(annotations: &[GraphAnnotation]) -> Result<GraphPayload, ApiError> {
+    // Partition into the two semantic types this builder consumes; all other
+    // annotation types are irrelevant to the graph channel and are ignored.
+    let entity_annotations: Vec<&GraphAnnotation> = annotations
+        .iter()
+        .filter(|a| a.annotation_type == SemanticAnnotationType::Entity)
+        .collect();
+    let relation_annotations: Vec<&GraphAnnotation> = annotations
+        .iter()
+        .filter(|a| a.annotation_type == SemanticAnnotationType::Relation)
+        .collect();
+
+    // Accumulate mentions and derive edge rows OUTSIDE the envelope, so a
+    // corrupt annotation body fails the build before any envelope row exists.
+    // Each helper also reports how many empty-marker rows (body EXACTLY `[]`) it
+    // skipped; the counts are surfaced in the success log below.
+    let AccumulatedMentions {
+        mentions,
+        skipped_markers: skipped_entity_markers,
+        entity_type_divergences,
+    } = accumulate_mentions(&entity_annotations)?;
+    let DerivedEdges {
+        edges,
+        skipped_markers: skipped_relation_markers,
+    } = derive_edges(&relation_annotations)?;
+
+    // Record the actual derivation order: entity inputs then relation inputs,
+    // preserving each group's read order. First-seen entity_type metadata depends
+    // on that order, so sorting lineage would lose part of the published input
+    // identity. Empty markers remain inputs even though they emit no graph rows.
+    // Legacy envelopes stored sorted IDs; their original read order is unknown.
+    let input_annotation_ids: Vec<String> = entity_annotations
+        .iter()
+        .chain(relation_annotations.iter())
+        .map(|a| a.id.clone())
+        .collect();
+
+    Ok(GraphPayload {
+        mentions,
+        edges,
+        input_annotation_ids,
+        entity_annotation_count: entity_annotations.len(),
+        relation_annotation_count: relation_annotations.len(),
+        skipped_entity_markers,
+        skipped_relation_markers,
+        entity_type_divergences,
+    })
+}
+
+/// Reconstruct a published graph from its recorded input sequence. Fresh inputs
+/// outside that sequence remain archived annotations, not implicit graph updates.
+/// Legacy sorted sequences retain their recorded order; missing historical order
+/// cannot be recovered from the annotations' current storage order.
+pub(crate) fn derive_captured_graph(
+    projection: &Value,
+    annotations: &BTreeMap<&str, &Value>,
+) -> Result<CapturedGraph, ApiError> {
+    let projection_id = archived_graph_text(projection, "id")?.to_owned();
+    let source_id = archived_graph_text(projection, "source_id")?.to_owned();
+    let parse_id = archived_graph_text(projection, "parse_id")?.to_owned();
+    if archived_graph_text(projection, "projection_type")? != "graph_projection"
+        || archived_graph_text(projection, "freshness_status")? != "fresh"
+        || !projection.get("deleted_at").is_some_and(Value::is_null)
+    {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "captured graph {projection_id} is not a fresh, non-deleted graph projection"
+            ),
+        });
+    }
+    let input_ids: Vec<String> = parse_json_column(
+        archived_graph_text(projection, "input_annotation_ids_json")?,
+        &format!("input annotation ids of captured graph {projection_id}"),
+    )?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for id in &input_ids {
+        if !seen.insert(id) {
+            return Err(ApiError::StorageOperation {
+                message: format!("captured graph {projection_id} repeats annotation input {id}"),
+            });
+        }
+        let record = annotations
+            .get(id.as_str())
+            .ok_or_else(|| ApiError::StorageOperation {
+                message: format!(
+                    "captured graph {projection_id} references missing annotation {id}"
+                ),
+            })?;
+        if archived_graph_text(record, "source_id")? != source_id
+            || archived_graph_text(record, "parse_id")? != parse_id
+            || archived_graph_text(record, "freshness_status")? != "fresh"
+            || !record.get("deleted_at").is_some_and(Value::is_null)
+        {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "captured graph {projection_id} annotation {id} has mismatched source/parse or is not fresh and non-deleted"
+                ),
+            });
+        }
+        let annotation_type = match archived_graph_text(record, "annotation_type")? {
+            "entity" => SemanticAnnotationType::Entity,
+            "relation" => SemanticAnnotationType::Relation,
+            other => {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "captured graph {projection_id} references annotation {id} of unsupported type {other}"
+                    ),
+                });
+            }
+        };
+        inputs.push(GraphAnnotation {
+            id: id.clone(),
+            annotation_type,
+            target_unit_ids: parse_json_column(
+                archived_graph_text(record, "target_unit_ids_json")?,
+                &format!("target unit ids of captured graph annotation {id}"),
+            )?,
+            // Preserve [] exactly so empty markers take the same counted path
+            // as live graph builds instead of failing an object-only decoder.
+            body: parse_json_column(
+                archived_graph_text(record, "body_json")?,
+                &format!("body of captured graph annotation {id}"),
+            )?,
+        });
+    }
+    let payload = derive_graph(&inputs)?;
+    Ok(CapturedGraph {
+        projection_id,
+        source_id,
+        parse_id,
+        payload,
+    })
+}
+
+/// Require an archived scalar column without coercing null or missing input into
+/// a usable graph identity; callers attach snapshot/restore boundary context.
+fn archived_graph_text<'a>(record: &'a Value, column: &str) -> Result<&'a str, ApiError> {
+    record
+        .get(column)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::StorageOperation {
+            message: format!("archived graph input has no string {column} column"),
+        })
+}
+
+/// Rebuild payload rows under the already restored envelope identity. This does
+/// not open a new projection or change its lifecycle: the caller restores and
+/// commits that envelope together with the reconstructed payload.
+pub(crate) fn restore_captured_graph(
+    tx: &Transaction<'_>,
+    graph: &CapturedGraph,
+) -> Result<(usize, usize), ApiError> {
+    let started = Instant::now();
+    debug!(event = "graph.restore_started", projection_id = %graph.projection_id,
+        source_id = %graph.source_id, parse_id = %graph.parse_id,
+        "captured graph payload restoration starting");
+    let result = persist_payload(
+        tx,
+        &graph.projection_id,
+        &graph.source_id,
+        &graph.parse_id,
+        &graph.payload.mentions,
+        &graph.payload.edges,
+    );
+    match result {
+        Ok(()) => {
+            info!(event = "graph.restore_staged", projection_id = %graph.projection_id,
+                source_id = %graph.source_id, parse_id = %graph.parse_id,
+                input_annotations = graph.payload.input_annotation_ids.len(),
+                skipped_entity_markers = graph.payload.skipped_entity_markers,
+                skipped_relation_markers = graph.payload.skipped_relation_markers,
+                entity_type_divergences = graph.payload.entity_type_divergences,
+                mention_rows = graph.payload.mentions.len(), edge_rows = graph.payload.edges.len(),
+                persistence = "pending_commit", elapsed_ms = started.elapsed().as_millis() as u64,
+                "captured graph payload restored under its recorded projection identity");
+            Ok((graph.payload.mentions.len(), graph.payload.edges.len()))
+        }
+        Err(source) => {
+            error!(event = "graph.restore_failed", projection_id = %graph.projection_id,
+                source_id = %graph.source_id, parse_id = %graph.parse_id,
+                error = %source, elapsed_ms = started.elapsed().as_millis() as u64,
+                "captured graph payload restore failed before commit");
+            Err(source)
+        }
+    }
 }
 
 /// Build the graph projection for a parse: open a `GraphProjection` envelope,
@@ -265,52 +488,28 @@ pub(crate) fn build_graph_projection(
     // so this builder trusts the returned set. Filter to the requested parse
     // defensively so a caller passing a non-active parse_id materializes an
     // empty graph rather than another parse's annotations.
-    let annotations: Vec<SemanticAnnotation> =
+    let annotations: Vec<GraphAnnotation> =
         crate::annotations::store::fresh_for_active_parse(conn, source_id)?
             .into_iter()
             .filter(|annotation| annotation.parse_id == parse_id)
+            .map(|annotation| GraphAnnotation {
+                id: annotation.id,
+                annotation_type: annotation.annotation_type,
+                target_unit_ids: annotation.target_unit_ids,
+                body: annotation.body,
+            })
             .collect();
 
-    // Partition into the two semantic types this builder consumes; all other
-    // annotation types are irrelevant to the graph channel and are ignored.
-    let entity_annotations: Vec<&SemanticAnnotation> = annotations
-        .iter()
-        .filter(|a| a.annotation_type == SemanticAnnotationType::Entity)
-        .collect();
-    let relation_annotations: Vec<&SemanticAnnotation> = annotations
-        .iter()
-        .filter(|a| a.annotation_type == SemanticAnnotationType::Relation)
-        .collect();
-
-    // Accumulate mentions and derive edge rows OUTSIDE the envelope, so a
-    // corrupt annotation body fails the build before any envelope row exists.
-    // Each helper also reports how many empty-marker rows (body EXACTLY `[]`) it
-    // skipped; the counts are surfaced in the success log below.
-    let AccumulatedMentions {
+    let GraphPayload {
         mentions,
-        skipped_markers: skipped_entity_markers,
-        entity_type_divergences,
-    } = accumulate_mentions(&entity_annotations)?;
-    let DerivedEdges {
         edges,
-        skipped_markers: skipped_relation_markers,
-    } = derive_edges(&relation_annotations)?;
-
-    // input_annotation_ids = every entity+relation annotation consumed, so the
-    // envelope's lineage names exactly the annotations this graph was built
-    // from (spec §22 inputAnnotationIds). Deterministic order (sorted) so
-    // repeated builds over the same set produce identical envelope payloads.
-    // DELIBERATE: skipped empty-marker rows REMAIN in this lineage — the builder
-    // consumed them (it read and classified each), and the skip is made visible
-    // via the logged `skipped_entity_markers`/`skipped_relation_markers` counts,
-    // not by omitting them from lineage.
-    let mut input_annotation_ids: Vec<String> = entity_annotations
-        .iter()
-        .chain(relation_annotations.iter())
-        .map(|a| a.id.clone())
-        .collect();
-    input_annotation_ids.sort();
-    input_annotation_ids.dedup();
+        input_annotation_ids,
+        entity_annotation_count,
+        relation_annotation_count,
+        skipped_entity_markers,
+        skipped_relation_markers,
+        entity_type_divergences,
+    } = derive_graph(&annotations)?;
 
     let producer = graph_producer(&input_annotation_ids);
     let request = NewProjection {
@@ -353,8 +552,8 @@ pub(crate) fn build_graph_projection(
         source_id,
         parse_id,
         projection_id = %projection_id,
-        entity_annotation_count = entity_annotations.len(),
-        relation_annotation_count = relation_annotations.len(),
+        entity_annotation_count,
+        relation_annotation_count,
         skipped_entity_markers,
         skipped_relation_markers,
         entity_type_divergences,
@@ -369,11 +568,12 @@ pub(crate) fn build_graph_projection(
 /// One derived edge row awaiting insertion: the normalized endpoint pair, the
 /// predicate as relation_type, and the relation annotation's target units. Held
 /// as an intermediate so all bodies are validated before the envelope opens.
-struct DerivedEdge {
-    from_normalized_name: String,
-    to_normalized_name: String,
-    relation_type: String,
-    target_unit_ids: Vec<String>,
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DerivedEdge {
+    pub(crate) from_normalized_name: String,
+    pub(crate) to_normalized_name: String,
+    pub(crate) relation_type: String,
+    pub(crate) target_unit_ids: Vec<String>,
 }
 
 /// Mentions and diagnostic counts for one build; individual annotation details
@@ -406,7 +606,7 @@ struct AccumulatedMentions {
 /// skips (`derive_edges` here, `crate::projections::view::build_summary`); the
 /// worker's must-stay-in-step banner names all three.
 fn accumulate_mentions(
-    entity_annotations: &[&SemanticAnnotation],
+    entity_annotations: &[&GraphAnnotation],
 ) -> Result<AccumulatedMentions, ApiError> {
     // BTreeMap keyed by normalized name → deterministic mention-row emission
     // order (name ascending) independent of annotation read order.
@@ -498,7 +698,7 @@ struct DerivedEdges {
 /// (`crate::annotations::worker::complete_build`) and the two sibling consumer
 /// skips (`accumulate_mentions` here, `crate::projections::view::build_summary`);
 /// the worker's must-stay-in-step banner names all three.
-fn derive_edges(relation_annotations: &[&SemanticAnnotation]) -> Result<DerivedEdges, ApiError> {
+fn derive_edges(relation_annotations: &[&GraphAnnotation]) -> Result<DerivedEdges, ApiError> {
     let mut edges = Vec::with_capacity(relation_annotations.len());
     let mut skipped_markers: usize = 0;
     for annotation in relation_annotations {
@@ -822,7 +1022,7 @@ pub(crate) fn entity_names_for_parse(
 /// NOT reaching here is the by-design empty-marker (`[]`), which `accumulate_
 /// mentions` skips and counts BEFORE calling this; that visible, counted skip is
 /// not a malformed body and is not this function's concern.
-fn entity_name(annotation: &SemanticAnnotation) -> Result<String, ApiError> {
+fn entity_name(annotation: &GraphAnnotation) -> Result<String, ApiError> {
     annotation
         .body
         .get("name")
@@ -840,7 +1040,7 @@ fn entity_name(annotation: &SemanticAnnotation) -> Result<String, ApiError> {
 /// entityType is METADATA (D9), so an absent or non-string value is not an
 /// error — it simply yields `None` (the mention row's entity_type column is
 /// nullable). A whitespace-only value is treated as absent.
-fn entity_type(annotation: &SemanticAnnotation) -> Option<String> {
+fn entity_type(annotation: &GraphAnnotation) -> Option<String> {
     annotation
         .body
         .get("entityType")
@@ -856,7 +1056,7 @@ fn entity_type(annotation: &SemanticAnnotation) -> Option<String> {
 /// loudly rather than being silently dropped. The by-design empty-marker (`[]`)
 /// body never reaches here — `derive_edges` skips and counts it BEFORE calling
 /// this; that visible, counted skip is not a malformed body.
-fn relation_triple(annotation: &SemanticAnnotation) -> Result<(String, String, String), ApiError> {
+fn relation_triple(annotation: &GraphAnnotation) -> Result<(String, String, String), ApiError> {
     let field = |name: &str| -> Result<String, ApiError> {
         annotation
             .body

@@ -1,9 +1,13 @@
 //! Section context vectors are immutable targeting artifacts, never canonical evidence.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io::{BufReader, Read};
 use std::time::Instant;
 
 use rusqlite::{Connection, Transaction, params};
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -35,6 +39,10 @@ SELECT id, source_id, content_type,
        CASE WHEN length(CAST(body_json AS BLOB)) <= ?2 THEN body_json END
 FROM content_units WHERE parse_id = ?1
 ORDER BY sequence_index IS NULL, sequence_index, id LIMIT ?3";
+const CANONICAL_LEAF_SQL: &str = "
+SELECT content_type,
+       CASE WHEN length(CAST(body_json AS BLOB)) <= ?4 THEN body_json END
+FROM content_units WHERE id = ?1 AND source_id = ?2 AND parse_id = ?3";
 const ENVELOPE_SQL: &str = "
 SELECT source_id, projection_type, freshness_status,
        CASE WHEN length(CAST(payload_uri AS BLOB)) <= ?3 THEN payload_uri END,
@@ -55,6 +63,24 @@ pub(crate) struct SectionDensePlane {
     pub(crate) model_name: String,
     pub(crate) model_pooling: String,
     pub(crate) windows: Vec<SectionDenseWindow>,
+}
+
+/// Captured immutable section publication; vector and canonical-text bytes stay
+/// on storage so activation does not require a corpus-sized heap allocation.
+#[derive(Debug)]
+pub(crate) struct SectionDenseReference {
+    pub(crate) source_id: String,
+    pub(crate) parse_id: String,
+    pub(crate) dimension: usize,
+    pub(crate) window_count: usize,
+    payload_uri: String,
+}
+
+/// Envelope inputs are temporary validation metadata, never cached vector state.
+struct SectionDenseEnvelope {
+    source_id: String,
+    payload_uri: String,
+    input_unit_ids: Vec<String>,
 }
 
 /// Exact heading-prefixed model input and its canonical targets, bounded at build time.
@@ -218,14 +244,11 @@ pub(crate) fn build_section_dense(
     result.inspect_err(|source| error!(event = "section_dense.build.failed", source_id, parse_id, error = %source, elapsed_ms = started.elapsed().as_millis() as u64, "section dense build failed"))
 }
 
-/// Return None only for a legacy parse without a section envelope; damaged or
-/// unfinished planes must never masquerade as an empty, valid representation.
-pub(crate) fn load_section_dense(
+/// Resolve one fresh section envelope without reading its vector payload.
+fn read_section_envelope(
     conn: &Connection,
-    store: &ArtifactStore,
     parse_id: &str,
-    expected_dimension: usize,
-) -> Result<Option<SectionDensePlane>, ApiError> {
+) -> Result<Option<SectionDenseEnvelope>, ApiError> {
     let mut statement = conn
         .prepare(ENVELOPE_SQL)
         .map_err(|source| failure(format!("prepare section envelope for {parse_id}: {source}")))?;
@@ -267,7 +290,6 @@ pub(crate) fn load_section_dense(
             "section payload URI missing or exceeds {MAX_ENVELOPE_BYTES} bytes for {parse_id}"
         ))
     })?;
-    let plane = read_section_payload(store, &uri, &source_id, parse_id, expected_dimension)?;
     let inputs = inputs.ok_or_else(|| {
         failure(format!(
             "section envelope inputs missing or exceed {MAX_ENVELOPE_BYTES} bytes for {parse_id}"
@@ -275,13 +297,582 @@ pub(crate) fn load_section_dense(
     })?;
     let inputs: Vec<String> = serde_json::from_str(&inputs)
         .map_err(|source| failure(format!("section envelope inputs for {parse_id}: {source}")))?;
-    if inputs != plane_input_ids(&plane) {
+    Ok(Some(SectionDenseEnvelope {
+        source_id,
+        payload_uri: uri,
+        input_unit_ids: inputs,
+    }))
+}
+
+/// Validate persisted sections incrementally before publishing a small active handle.
+pub(crate) fn load_section_dense_reference(
+    conn: &Connection,
+    store: &ArtifactStore,
+    parse_id: &str,
+    dimension: usize,
+) -> Result<Option<SectionDenseReference>, ApiError> {
+    let Some(envelope) = read_section_envelope(conn, parse_id)? else {
+        return Ok(None);
+    };
+    let mut canonical = CanonicalSectionInputs::new(conn, &envelope.source_id, parse_id)?;
+    let mut reference = SectionDenseReference {
+        source_id: envelope.source_id,
+        parse_id: parse_id.to_owned(),
+        dimension,
+        window_count: 0,
+        payload_uri: envelope.payload_uri,
+    };
+    reference.window_count = stream_section_payload(store, &reference, |window| {
+        canonical.validate_window(conn, &reference, window)
+    })?;
+    canonical.finish(&reference.parse_id)?;
+    let ids: BTreeSet<&str> = canonical.ordered.iter().map(String::as_str).collect();
+    if envelope
+        .input_unit_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        != ids.into_iter().collect::<Vec<_>>()
+    {
         return Err(failure(format!(
             "section envelope input membership differs from payload for {parse_id}"
         )));
     }
-    validate_plane(conn, &plane)?;
-    Ok(Some(plane))
+    Ok(Some(reference))
+}
+
+/// Score one window at a time from the captured artifact. The caller's transaction
+/// must still resolve the same envelope, and only a successful return authenticates
+/// provisional callback results against the complete artifact hash.
+pub(crate) fn visit_section_dense(
+    conn: &Connection,
+    store: &ArtifactStore,
+    reference: &SectionDenseReference,
+    mut visit: impl FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    let envelope = read_section_envelope(conn, &reference.parse_id)?.ok_or_else(|| {
+        failure(format!(
+            "captured section envelope disappeared for {}",
+            reference.parse_id
+        ))
+    })?;
+    if envelope.payload_uri != reference.payload_uri || envelope.source_id != reference.source_id {
+        return Err(failure(format!(
+            "section publication differs from captured handle for {}",
+            reference.parse_id
+        )));
+    }
+    let expected: BTreeSet<&str> = envelope.input_unit_ids.iter().map(String::as_str).collect();
+    let mut seen = BTreeSet::new();
+    let count = stream_section_payload(store, reference, |window| {
+        for id in &window.input_unit_ids {
+            if !expected.contains(id.as_str()) {
+                return Err(failure(format!(
+                    "section window {} has unexpected input {id}",
+                    window.window_id
+                )));
+            }
+            seen.insert(id.clone());
+        }
+        visit(window)
+    })?;
+    if count != reference.window_count || seen.len() != expected.len() {
+        return Err(failure(format!(
+            "section count/input membership differs for {}",
+            reference.parse_id
+        )));
+    }
+    Ok(())
+}
+
+/// Canonical validation keeps only capped input IDs and one current leaf body.
+/// Group order matches build_windows, including sections interleaved in source order.
+struct CanonicalSectionInputs {
+    ordered: Vec<String>,
+    next_index: usize,
+    offset: usize,
+    current: Option<Leaf>,
+}
+
+impl CanonicalSectionInputs {
+    /// Recover canonical section grouping without retaining the document's text.
+    fn new(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Self, ApiError> {
+        let mut positions = BTreeMap::new();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        visit_leaves(conn, source_id, parse_id, |leaf| {
+            let index = *positions.entry(leaf.section_id).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[index].push(leaf.id);
+            Ok(())
+        })?;
+        Ok(Self {
+            ordered: groups.into_iter().flatten().collect(),
+            next_index: 0,
+            offset: 0,
+            current: None,
+        })
+    }
+
+    /// Require continuous UTF-8 coverage in build order and reconstruct each
+    /// heading-prefixed input exactly; a split leaf stays loaded until consumed.
+    fn validate_window(
+        &mut self,
+        conn: &Connection,
+        reference: &SectionDenseReference,
+        window: &SectionDenseWindow,
+    ) -> Result<(), ApiError> {
+        let mut text = heading_prefix(&window.section_path);
+        for (index, fragment) in window.fragments.iter().enumerate() {
+            if self.current.is_none() {
+                let id = self.ordered.get(self.next_index).ok_or_else(|| {
+                    failure(format!(
+                        "section plane {} has unexpected fragments",
+                        reference.parse_id
+                    ))
+                })?;
+                self.current = Some(read_canonical_leaf(conn, reference, id)?);
+            }
+            let leaf = self.current.as_ref().ok_or_else(|| {
+                failure(format!(
+                    "section canonical cursor missing for {}",
+                    reference.parse_id
+                ))
+            })?;
+            if leaf.id != fragment.unit_id
+                || self.offset != fragment.start_byte
+                || leaf.section_id != window.section_id
+                || leaf.section_path != window.section_path
+            {
+                return Err(failure(format!(
+                    "section window {} canonical order/ancestry differs at {}",
+                    window.window_id, fragment.unit_id
+                )));
+            }
+            let part = leaf
+                .text
+                .get(fragment.start_byte..fragment.end_byte)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "section window {} has invalid UTF-8 range for {}",
+                        window.window_id, leaf.id
+                    ))
+                })?;
+            // Malformed fragment metadata must not expand a bounded window into
+            // an unbounded canonical-text buffer before the equality check.
+            if text
+                .len()
+                .checked_add(part.len())
+                .and_then(|length| length.checked_add(if index == 0 { 0 } else { 2 }))
+                .is_none_or(|length| length > window.targeting_text.len())
+            {
+                return Err(failure(format!(
+                    "section window {} canonical fragments exceed its input text",
+                    window.window_id
+                )));
+            }
+            if index != 0 {
+                text.push_str("\n\n");
+            }
+            text.push_str(part);
+            self.offset = fragment.end_byte;
+            if self.offset == leaf.text.len() {
+                self.next_index += 1;
+                self.offset = 0;
+                self.current = None;
+            }
+        }
+        if text != window.targeting_text {
+            return Err(failure(format!(
+                "section window {} input differs from canonical fragments",
+                window.window_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// A clean end of JSON is insufficient when eligible canonical text is omitted.
+    fn finish(&self, parse_id: &str) -> Result<(), ApiError> {
+        if self.next_index != self.ordered.len() || self.offset != 0 {
+            return Err(failure(format!(
+                "section plane {parse_id} omits canonical text"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Read the single canonical leaf currently needed by streaming coverage checks.
+fn read_canonical_leaf(
+    conn: &Connection,
+    reference: &SectionDenseReference,
+    id: &str,
+) -> Result<Leaf, ApiError> {
+    let (kind, body) = conn
+        .query_row(
+            CANONICAL_LEAF_SQL,
+            params![id, reference.source_id, reference.parse_id, MAX_CELL_BYTES],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .map_err(|source| failure(format!("read canonical section leaf {id}: {source}")))?;
+    let body = body.ok_or_else(|| {
+        failure(format!(
+            "section leaf {id} exceeds {MAX_CELL_BYTES} body bytes"
+        ))
+    })?;
+    let kind: ContentType = serde_json::from_value(Value::String(kind))
+        .map_err(|source| failure(format!("section leaf type {id}: {source}")))?;
+    let body = serde_json::from_str(&body)
+        .map_err(|source| failure(format!("section leaf body {id}: {source}")))?;
+    let text = eligible_text(kind, &body)
+        .ok_or_else(|| failure(format!("section leaf {id} is no longer eligible")))?;
+    let (section_id, section_path) = read_section(conn, &reference.parse_id, id)?;
+    Ok(Leaf {
+        id: id.to_owned(),
+        text,
+        section_id,
+        section_path,
+    })
+}
+
+/// Decode each window with a bounded record buffer and a dimension-limited vector.
+/// The artifact store authenticates the full stream before its count is accepted.
+fn stream_section_payload(
+    store: &ArtifactStore,
+    reference: &SectionDenseReference,
+    mut visit: impl FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
+) -> Result<usize, ApiError> {
+    store.with_verified_reader(&reference.payload_uri, None, |reader| {
+        let remaining = Cell::new(MAX_ENVELOPE_BYTES);
+        let reader = SectionRecordReader {
+            reader: BufReader::new(reader),
+            remaining: &remaining,
+        };
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let mut callback_error = None;
+        let result = SectionPayloadSeed {
+            reference,
+            remaining: &remaining,
+            visit: &mut visit,
+            callback_error: &mut callback_error,
+        }
+        .deserialize(&mut deserializer);
+        let count = match result {
+            Ok(count) => count,
+            Err(source) => {
+                return Err(callback_error.unwrap_or_else(|| {
+                    failure(format!(
+                        "decode section payload {} for {}: {source}",
+                        reference.payload_uri, reference.parse_id
+                    ))
+                }));
+            }
+        };
+        deserializer.end().map_err(|source| {
+            failure(format!(
+                "section payload {} trailing data: {source}",
+                reference.payload_uri
+            ))
+        })?;
+        Ok(count)
+    })
+}
+
+/// The byte budget is renewed only at a window boundary. It limits allocations
+/// for malformed strings/metadata before serde finishes decoding the value.
+struct SectionRecordReader<'a, R> {
+    reader: R,
+    remaining: &'a Cell<usize>,
+}
+
+impl<R: Read> Read for SectionRecordReader<'_, R> {
+    /// Enforce the current record limit without buffering the entire JSON artifact.
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let allowed = self.remaining.get().min(buffer.len());
+        if allowed == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "section JSON record exceeds its bounded byte budget",
+            ));
+        }
+        let read = self.reader.read(&mut buffer[..allowed])?;
+        self.remaining.set(self.remaining.get() - read);
+        Ok(read)
+    }
+}
+
+/// Carry expected identity and the provisional callback across serde's map/array boundary.
+struct SectionPayloadSeed<'a> {
+    reference: &'a SectionDenseReference,
+    remaining: &'a Cell<usize>,
+    visit: &'a mut dyn FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
+    callback_error: &'a mut Option<ApiError>,
+}
+
+impl<'de> DeserializeSeed<'de> for SectionPayloadSeed<'_> {
+    type Value = usize;
+
+    /// Deserialize the envelope map while delegating its windows to an incremental reader.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SectionPayloadSeed<'_> {
+    type Value = usize;
+
+    /// Preserve useful format context in malformed artifact errors.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a section dense plane with a streamed windows array")
+    }
+
+    /// Validate the complete header even when JSON field order puts it after windows.
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut header = serde_json::Map::new();
+        let mut window_count = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "windows" {
+                if window_count.is_some() {
+                    return Err(M::Error::duplicate_field("windows"));
+                }
+                window_count = Some(map.next_value_seed(SectionWindowsSeed {
+                    reference: self.reference,
+                    remaining: self.remaining,
+                    visit: self.visit,
+                    callback_error: self.callback_error,
+                })?);
+            } else {
+                if header.contains_key(&key) {
+                    return Err(M::Error::custom(format!("duplicate section field {key}")));
+                }
+                if !matches!(
+                    key.as_str(),
+                    "sourceId"
+                        | "parseId"
+                        | "dimension"
+                        | "policyHash"
+                        | "tokenizerHash"
+                        | "modelBackend"
+                        | "modelName"
+                        | "modelPooling"
+                ) {
+                    return Err(M::Error::custom(format!("unknown section field {key}")));
+                }
+                header.insert(key, map.next_value::<Value>()?);
+            }
+        }
+        let count = window_count.ok_or_else(|| M::Error::missing_field("windows"))?;
+        header.insert("windows".to_owned(), Value::Array(Vec::new()));
+        let plane = serde_json::from_value(Value::Object(header)).map_err(M::Error::custom)?;
+        validate_payload(
+            &plane,
+            &self.reference.source_id,
+            &self.reference.parse_id,
+            self.reference.dimension,
+        )
+        .map_err(M::Error::custom)?;
+        Ok(count)
+    }
+}
+
+/// Sequence visits release each window before deserializing its successor.
+struct SectionWindowsSeed<'a> {
+    reference: &'a SectionDenseReference,
+    remaining: &'a Cell<usize>,
+    visit: &'a mut dyn FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
+    callback_error: &'a mut Option<ApiError>,
+}
+
+impl<'de> DeserializeSeed<'de> for SectionWindowsSeed<'_> {
+    type Value = usize;
+
+    /// Enter the array without serde allocating a vector for all windows.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SectionWindowsSeed<'_> {
+    type Value = usize;
+
+    /// Report the expected collection at the array boundary.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of section dense windows")
+    }
+
+    /// Validate shape before the callback, but defer accepting scores until the
+    /// header, trailing bytes, and whole-artifact digest also pass validation.
+    fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<Self::Value, S::Error> {
+        let record_bytes = self
+            .reference
+            .dimension
+            .checked_mul(32)
+            .and_then(|bytes| bytes.checked_add(MAX_ENVELOPE_BYTES))
+            .ok_or_else(|| S::Error::custom("section record byte budget overflow"))?;
+        let mut count = 0;
+        loop {
+            self.remaining.set(record_bytes);
+            let Some(window) = sequence.next_element_seed(SectionWindowSeed {
+                dimension: self.reference.dimension,
+            })?
+            else {
+                break;
+            };
+            validate_window(
+                &window,
+                &self.reference.parse_id,
+                self.reference.dimension,
+                count,
+            )
+            .map_err(S::Error::custom)?;
+            if let Err(error) = (self.visit)(&window) {
+                *self.callback_error = Some(error);
+                return Err(S::Error::custom("section window callback failed"));
+            }
+            count += 1;
+        }
+        // Header data after windows receives the same cap as data before it.
+        self.remaining.set(MAX_ENVELOPE_BYTES);
+        Ok(count)
+    }
+}
+
+/// Bound the vector by the known model dimension before a malformed array grows.
+struct SectionWindowSeed {
+    dimension: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SectionWindowSeed {
+    type Value = SectionDenseWindow;
+
+    /// Decode metadata separately so vector elements bypass serde_json::Value allocations.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SectionWindowSeed {
+    type Value = SectionDenseWindow;
+
+    /// Keep malformed per-window errors tied to the expected representation.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a section window with a dimension-bounded vector")
+    }
+
+    /// Decode typed fields directly so duplicate fields in canonical fragments
+    /// remain errors, rather than disappearing through an intermediate JSON map.
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut fields = BTreeSet::new();
+        let mut window_id = None;
+        let mut section_id = None;
+        let mut section_path = None;
+        let mut input_unit_ids = None;
+        let mut targeting_text = None;
+        let mut token_count = None;
+        let mut norm = None;
+        let mut fragments = None;
+        let mut vector = None;
+        while let Some(key) = map.next_key::<String>()? {
+            // The set owns at most the nine field names while the current key
+            // remains borrowed for dispatch and contextual duplicate errors.
+            if !fields.insert(key.clone()) {
+                return Err(M::Error::custom(format!(
+                    "duplicate section window field {key}"
+                )));
+            }
+            match key.as_str() {
+                "windowId" => window_id = Some(map.next_value()?),
+                "sectionId" => section_id = map.next_value()?,
+                "sectionPath" => section_path = Some(map.next_value()?),
+                "inputUnitIds" => input_unit_ids = Some(map.next_value()?),
+                "targetingText" => targeting_text = Some(map.next_value()?),
+                "tokenCount" => token_count = Some(map.next_value()?),
+                "norm" => norm = Some(map.next_value()?),
+                "fragments" => fragments = Some(map.next_value()?),
+                "vector" => {
+                    vector = Some(map.next_value_seed(SectionVectorSeed {
+                        dimension: self.dimension,
+                    })?)
+                }
+                _ => {
+                    return Err(M::Error::custom(format!(
+                        "unknown section window field {key}"
+                    )));
+                }
+            }
+        }
+        Ok(SectionDenseWindow {
+            window_id: window_id.ok_or_else(|| M::Error::missing_field("windowId"))?,
+            section_id,
+            section_path: section_path.ok_or_else(|| M::Error::missing_field("sectionPath"))?,
+            input_unit_ids: input_unit_ids
+                .ok_or_else(|| M::Error::missing_field("inputUnitIds"))?,
+            targeting_text: targeting_text
+                .ok_or_else(|| M::Error::missing_field("targetingText"))?,
+            token_count: token_count.ok_or_else(|| M::Error::missing_field("tokenCount"))?,
+            norm: norm.ok_or_else(|| M::Error::missing_field("norm"))?,
+            fragments: fragments.ok_or_else(|| M::Error::missing_field("fragments"))?,
+            vector: vector.ok_or_else(|| M::Error::missing_field("vector"))?,
+        })
+    }
+}
+
+/// Only the configured model dimension determines vector allocation, never artifact lengths.
+struct SectionVectorSeed {
+    dimension: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SectionVectorSeed {
+    type Value = Vec<f32>;
+
+    /// Route the vector through a sequence visitor that ignores untrusted size hints.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SectionVectorSeed {
+    type Value = Vec<f32>;
+
+    /// Identify the dimension contract when vector JSON is malformed.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "exactly {} dense vector values", self.dimension)
+    }
+
+    /// Reject the first excess scalar without allocating space for it.
+    fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<Self::Value, S::Error> {
+        let mut vector = Vec::new();
+        while let Some(value) = sequence.next_element::<f32>()? {
+            if vector.len() == self.dimension {
+                return Err(S::Error::custom(
+                    "section vector exceeds expected dimension",
+                ));
+            }
+            vector.push(value);
+        }
+        if vector.len() != self.dimension {
+            return Err(S::Error::custom(
+                "section vector is shorter than expected dimension",
+            ));
+        }
+        Ok(vector)
+    }
 }
 
 /// Verify immutable artifact integrity and shape without requiring model inference.
@@ -474,37 +1065,49 @@ fn validate_payload(
             "section plane identity/policy/model mismatch for {parse_id}"
         )));
     }
-    let mut ids = BTreeSet::new();
     for (index, window) in plane.windows.iter().enumerate() {
-        // The shared validator owns its input; retain the archived vector while
-        // checking its norm with exactly the same arithmetic as fresh embeddings.
-        let checked = validate_vector(window.window_id.clone(), window.vector.clone(), dimension)
-            .map_err(failure)?;
-        if !ids.insert(&window.window_id)
-            || window.window_id != window_id(parse_id, index)
-            || window.token_count == 0
-            || window.token_count > MAX_WINDOW_TOKENS
-            || window.targeting_text.trim().is_empty()
-            || window.input_unit_ids.is_empty()
-            || window.fragments.len() != window.input_unit_ids.len()
-            || window.input_unit_ids.iter().collect::<BTreeSet<_>>().len()
-                != window.input_unit_ids.len()
-            || window
-                .fragments
-                .iter()
-                .zip(&window.input_unit_ids)
-                .any(|(fragment, id)| {
-                    fragment.unit_id != *id || fragment.start_byte >= fragment.end_byte
-                })
-            || !window.norm.is_finite()
-            || (checked.norm - window.norm).abs() > checked.norm * 1e-5
-            || (window.section_id.is_none() && !window.section_path.is_empty())
-        {
-            return Err(failure(format!(
-                "invalid section window {} in {parse_id}",
-                window.window_id
-            )));
-        }
+        validate_window(window, parse_id, dimension, index)?;
+    }
+    Ok(())
+}
+
+/// Validate one streamed window with the same invariants used by archive readers.
+fn validate_window(
+    window: &SectionDenseWindow,
+    parse_id: &str,
+    dimension: usize,
+    index: usize,
+) -> Result<(), ApiError> {
+    // The shared validator owns its input; retain the archived vector while
+    // checking its norm with exactly the same arithmetic as fresh embeddings.
+    let checked = validate_vector(window.window_id.clone(), window.vector.clone(), dimension)
+        .map_err(failure)?;
+    // Exact ordinal identity also rejects duplicate window IDs without a
+    // set that grows with every streamed vector.
+    if window.window_id != window_id(parse_id, index)
+        || window.token_count == 0
+        || window.token_count > MAX_WINDOW_TOKENS
+        || window.targeting_text.trim().is_empty()
+        || window.input_unit_ids.is_empty()
+        || window.fragments.len() != window.input_unit_ids.len()
+        || window.input_unit_ids.iter().collect::<BTreeSet<_>>().len()
+            != window.input_unit_ids.len()
+        || window
+            .fragments
+            .iter()
+            .zip(&window.input_unit_ids)
+            .any(|(fragment, id)| {
+                fragment.unit_id != *id || fragment.start_byte >= fragment.end_byte
+            })
+        || !window.norm.is_finite()
+        || window.norm <= 0.0
+        || (checked.norm - window.norm).abs() > checked.norm * 1e-5
+        || (window.section_id.is_none() && !window.section_path.is_empty())
+    {
+        return Err(failure(format!(
+            "invalid section window {} in {parse_id}",
+            window.window_id
+        )));
     }
     Ok(())
 }
@@ -512,6 +1115,22 @@ fn validate_payload(
 /// Read canonical evidence in the same sequence as passage chunking, retaining
 /// even short nonempty leaves and excluding only explicitly labeled furniture.
 fn read_leaves(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Vec<Leaf>, ApiError> {
+    let mut leaves = Vec::new();
+    visit_leaves(conn, source_id, parse_id, |leaf| {
+        leaves.push(leaf);
+        Ok(())
+    })?;
+    Ok(leaves)
+}
+
+/// Offer canonical leaves one at a time so stream validation retains only IDs
+/// needed to reproduce section grouping, not all of the document's evidence text.
+fn visit_leaves(
+    conn: &Connection,
+    source_id: &str,
+    parse_id: &str,
+    mut visit: impl FnMut(Leaf) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
     let mut statement = conn
         .prepare(UNITS_SQL)
         .map_err(|source| failure(format!("prepare section leaves for {parse_id}: {source}")))?;
@@ -528,7 +1147,6 @@ fn read_leaves(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Vec
             },
         )
         .map_err(|source| failure(format!("read section leaves for {parse_id}: {source}")))?;
-    let mut leaves = Vec::new();
     for (index, row) in rows.enumerate() {
         if index == MAX_PARSE_UNITS {
             return Err(failure(format!(
@@ -555,14 +1173,14 @@ fn read_leaves(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Vec
             continue;
         };
         let (section_id, section_path) = read_section(conn, parse_id, &id)?;
-        leaves.push(Leaf {
+        visit(Leaf {
             id,
             text,
             section_id,
             section_path,
-        });
+        })?;
     }
-    Ok(leaves)
+    Ok(())
 }
 
 /// Keep live and archived furniture exclusion and canonical evidence fields identical.

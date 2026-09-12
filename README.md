@@ -53,17 +53,18 @@ cadence:
        ├──────────► RETRIEVE: POST /query serves the active parse
        ▼
   ┌──────────────┐   a separate worker runs entity, relation, and summary chains;
-  │  ANNOTATE    │   publishes summary/graph projections after required work completes
+  │  ANNOTATE    │   completed outputs commit durably
   └────┬─────────┘
-       └──────────► published graph evidence enriches retrieval
+       └──────────► projection worker publishes graph, summary, dense + ColBERT
 ```
 
 Only one parse is ever active per source: unit reads honor the active-parse gate,
 so a non-active parse's units are never served.
 
-Retrieval does not wait for annotation completion. Lexical and dense candidates
-from active parses combine with available graph candidates, then pass through
-ColBERT scoring, passage construction, and reranking to produce cited evidence.
+Retrieval combines source-dense, lexical, and grouped graph/semantic annotation
+rankings. ColBERT evaluates source and matched annotation representations; final
+reranking receives canonical passages plus separately labeled matched context.
+Publication and retrieval do not wait for all annotation types to finish.
 
 ### Annotation request chains
 
@@ -117,7 +118,7 @@ out the remaining delay. Failed rebuilds keep storage paused. Startup logging
 and admin-token publication remain active.
 
 **Set up storage once.** Run the server with `--setup-storage` to build the
-fabric hot plane (the only durable store). This is one deliberate operator
+fabric hot plane's SQLite schema. This is one deliberate operator
 action. The runtime NEVER creates or migrates schema — all schema arrives through
 this explicit setup step. See **INSTALL.md** for the full procedure and the
 model artifacts required before first start.
@@ -146,6 +147,12 @@ health is diagnostic-only and never makes a running service report unavailable.
 **Annotation work.** The worker runs the [annotation request chains](#annotation-request-chains)
 over bounded excerpts. Each call enables thinking, requests structured JSON
 without streaming, and allows up to 150,000 output tokens including reasoning.
+
+**Projection work.** A separate synchronous worker publishes graph and summary
+inputs independently, and builds dense/ColBERT representations for individual
+annotations, combined annotations per excerpt, and canonical source windows.
+It discovers existing committed annotations without regenerating them. Embedding
+failures retain annotation results and the previous valid publication.
 
 **Operator policies.** The entity-match document controls graph-entry fuzzy
 matching. Inspect vocabulary with `--vocabulary <entity|relation>` before editing
@@ -251,7 +258,7 @@ Components that publish no counters serialize an empty array.
 - Readiness-gating components: `inference`, `sync`. Their combined readiness is
   the top-level `ready`.
 - Diagnostic-only components: `logging`, and the fabric diagnostics `fabric`,
-  `annotation`, and `search_admission`. These are visible for operators but never
+  `annotation`, `projections`, and `search_admission`. These are visible for operators but never
   gate readiness. The `fabric` and `annotation` counters (held, serving-stale,
   stuck-building, access-lost, unparseable-mime, verification-halted, annotation
   freshness, retry exhaustion, and so on) are surfaced for observation only.
@@ -270,6 +277,10 @@ captured work. Unknown totals and no required work are explicit. Completion
 counts committed fresh coverage, including empty results and memo reuse; 100%
 does not assert retrieval projection publication. The worker updates progress
 during processing; newly active or changed sources appear on subsequent discovery.
+
+Projection health separately reports published, pending, and failed graph,
+summary, and embedding cohorts per source/parse, with activity and measurement
+times. CLI and web health displays retain this distinction from annotation completion.
 
 Last-cycle counts remain historical: eligible missing work excludes retry-waiting
 and exhausted items, so zero does not establish completion. Parked workers retain
@@ -312,7 +323,8 @@ These are recorded MVP narrowings, not defects:
   `queryExecutionRecordId`. Any per-query id on the pack is
   a correlation handle, not a QER id.
 - **The `multi_vector` retrieval channel is deferred post-MVP.** The active
-  retrieval channels are **lexical**, **dense**, and **graph**. (ColBERT MaxSim is
+  retrieval channels are **lexical**, **dense**, **graph**, and **semantic**;
+  graph and semantic matches share one outer fusion contribution. (ColBERT MaxSim is
   used internally as a reranking stage, not as a retrieval channel.)
 - **Replay claims at MVP:** evidence replay is `bit_exact`; retrieval and
   generation replay are `not_supported`. The system does not claim a replay
@@ -391,17 +403,23 @@ data-store --config config.toml --query how does activation gating work
 ```
 
 The CLI and web console show each passage's matching search channels and
-annotation contribution, including matched entities and directed relationships.
+annotation contribution, including annotation representations, source ranges,
+matched entities, and directed relationships.
 This attribution is available without `debug`; it describes candidate matches,
 not a measured improvement in retrieval quality. Web retrieval details retain
 unit mappings and supporting references.
 
-Dense retrieval uses both passage vectors and section-heading/content vectors.
-Results identify direct passage and section-guided matches. Existing indexes
-require an explicit `data-store --config config.toml --rebuild-all` from the
-project root: this clears indexed state and artifacts and reingests the corpus.
-Until rebuilt, queries against old parses report that section embeddings are
-missing. Pre-feature snapshots cannot restore the new dense representation.
+Dense retrieval combines passage, section, and canonical source-window matches.
+Individual and combined annotations are searched separately and share a grouped
+annotation ranking with graph matches. Exact source excerpts remain identifiable
+through ColBERT scoring, passage construction, reranking, and citations.
+
+Query scoring streams persisted vectors with bounded buffers; operating-system
+file caching can use spare RAM without requiring resident vector planes. Existing
+annotations are embedded during normal discovery. Parses lacking required section
+embeddings still need `data-store --config config.toml --rebuild-all` from the
+project root, which clears indexed state and reingests the corpus. Snapshots
+lacking the required passage/section representations are rejected before restore.
 
 Fine retrieval chunks are capped at 512 ColBERT tokens, measured from the
 normalized indexed text. Oversized words are split to fit this limit.

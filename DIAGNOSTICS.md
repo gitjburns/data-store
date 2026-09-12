@@ -124,6 +124,16 @@ Every spawned task must have durable visibility for start or acceptance, normal
 completion, normal error, panic when detectable, and cancellation or join
 failure when detectable.
 
+Projection publication uses `projection_worker.*` lifecycle records with source,
+parse, and applicable cohort/input identities. Archived embeddings are not yet
+published; report publication only after commit. Preserve separate failure-audit,
+retirement, cancellation, and join outcomes.
+
+Query stages remain distinct: `query.channels.*` collects source/graph candidates,
+`query.annotation.*` scans annotation representations, `query.fusion.*` records
+grouped fusion, and `query.annotation_maxsim.*` scores annotation/source windows.
+Retain candidate counts, invalid-input exclusions, source errors, and elapsed time.
+
 ### Annotation Cancellation
 
 `maintenance.annotation_cancellation_requested` records rebuild or shutdown
@@ -149,6 +159,10 @@ released; other admitted work may still delay this boundary after annotation
 cancellation. `rebuild_all.completed` means storage clearing finished and
 background ingestion resumed. Neither local HTTP cancellation nor these
 rebuild events confirm that the remote server released inference resources.
+
+The projection worker stops new batches at cancellation checkpoints. Its blocking
+embedding calls finish or reach configured timeout/retry limits before the storage
+lease is released; unpublished results are discarded.
 
 ## Required Context
 
@@ -179,6 +193,10 @@ document's committed coverage of its measured excerpt/type plan. Use
 zero required work displays `0 / 0 (no required work)`. Do not add entries for
 progress. Counts and percentage follow PROTOCOL.md; retries and output-item
 counts are not completion, and 100% does not assert projection publication.
+
+Projection health and DEBUG document observations use their own published,
+pending, and failed counts with source/parse measurement times. Never substitute
+annotation completion percentages for publication coverage.
 
 ## Forbidden Log Data
 

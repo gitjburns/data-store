@@ -1,13 +1,7 @@
-//! Reciprocal rank fusion of dense, BM25, and graph candidate lists with a
-//! deterministic tie-break (score `total_cmp`, then unit id ordering). The
-//! dense, BM25, and fused match records live here with the fusion algorithm
-//! that consumes and produces them.
+//! Ranked-list fusion with one vote per distinct key in each input list.
+//! Callers own channel grouping and attribution; ties use canonical key order.
 
-// Retrieval fusion substrate consumed by the query fusion stage
-// (query::channels). `empty_fused_match` and `reciprocal_rank_score` are
-// internal helpers called by `fuse_matches`.
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One dense-retrieval candidate: cosine similarity plus its 1-based rank in the dense list.
 #[derive(Debug)]
@@ -25,82 +19,33 @@ pub(crate) struct Bm25Match {
     pub(crate) rank: usize,
 }
 
-/// One fused candidate. Per-signal rank/score fields are `None` when that
-/// signal did not return the unit; `score` is the combined RRF rank signal.
-#[derive(Debug)]
-pub(crate) struct FusedMatch {
-    pub(crate) unit_id: String,
-    pub(crate) score: f64,
-    pub(crate) rank: usize,
-    pub(crate) dense_rank: Option<usize>,
-    pub(crate) dense_similarity: Option<f32>,
-    pub(crate) bm25_rank: Option<usize>,
-    pub(crate) bm25_score: Option<f64>,
-    pub(crate) graph_rank: Option<usize>,
-}
-
-/// Fuse unit-deduplicated channel lists; graph scores carry only ordinal meaning.
-///
-/// The output score is only a fused rank signal, not a semantic similarity score.
-pub(crate) fn fuse_matches(
-    dense_matches: &[DenseMatch],
-    bm25_matches: &[Bm25Match],
-    graph_matches: &[(&str, usize)],
+/// Fuse ranked keys with one vote per list, compressing duplicate entries before assigning ranks.
+pub(crate) fn fuse_ranked_lists(
+    lists: &[Vec<String>],
     top_k: usize,
     rrf_k: u32,
-) -> Vec<FusedMatch> {
-    let mut values = BTreeMap::<String, FusedMatch>::new();
-    for matched in dense_matches {
-        let entry = values
-            .entry(matched.unit_id.clone())
-            .or_insert_with(|| empty_fused_match(&matched.unit_id));
-        entry.score += reciprocal_rank_score(rrf_k, matched.rank);
-        entry.dense_rank = Some(matched.rank);
-        entry.dense_similarity = Some(matched.similarity);
+) -> Vec<(String, f64)> {
+    let mut values = BTreeMap::<&str, f64>::new();
+    for list in lists {
+        let mut seen = BTreeSet::<&str>::new();
+        let mut rank = 0;
+        for key in list {
+            if !seen.insert(key.as_str()) {
+                continue;
+            }
+            // A repeated representation must neither add a vote nor displace another key's rank.
+            rank += 1;
+            *values.entry(key.as_str()).or_default() += reciprocal_rank_score(rrf_k, rank);
+        }
     }
-    for matched in bm25_matches {
-        let entry = values
-            .entry(matched.unit_id.clone())
-            .or_insert_with(|| empty_fused_match(&matched.unit_id));
-        entry.score += reciprocal_rank_score(rrf_k, matched.rank);
-        entry.bm25_rank = Some(matched.rank);
-        entry.bm25_score = Some(matched.score);
-    }
-    for &(unit_id, rank) in graph_matches {
-        let entry = values
-            .entry(unit_id.to_owned())
-            .or_insert_with(|| empty_fused_match(unit_id));
-        entry.score += reciprocal_rank_score(rrf_k, rank);
-        entry.graph_rank = Some(rank);
-    }
-
-    let mut fused = values.into_values().collect::<Vec<_>>();
-    fused.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.unit_id.cmp(&right.unit_id))
-    });
+    let mut fused: Vec<_> = values.into_iter().collect();
+    fused.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
     fused.truncate(top_k);
-    for (index, matched) in fused.iter_mut().enumerate() {
-        matched.rank = index + 1;
-    }
-
+    // Only returned keys need owned storage; all fusion accounting borrows the caller's lists.
     fused
-}
-
-/// Return the initial fused-candidate record for one unit id.
-fn empty_fused_match(unit_id: &str) -> FusedMatch {
-    FusedMatch {
-        unit_id: unit_id.to_string(),
-        score: 0.0,
-        rank: 0,
-        dense_rank: None,
-        dense_similarity: None,
-        bm25_rank: None,
-        bm25_score: None,
-        graph_rank: None,
-    }
+        .into_iter()
+        .map(|(key, score)| (key.to_owned(), score))
+        .collect()
 }
 
 /// Return the reciprocal-rank contribution for one candidate rank using the configured RRF K constant.

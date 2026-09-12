@@ -37,7 +37,6 @@
 //! deterministic planes; it never re-embeds, re-parses, or re-scores. A grep for
 //! `embed|InferenceRuntime|score_|docling` over this file must stay empty.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -351,13 +350,26 @@ pub(crate) fn complete_superseded_parse(
         );
         return Err(source);
     }
+    // The gating snapshot can name the successor while deletion targets its
+    // predecessor. Preflight immutable embedding dependencies before taking the
+    // writer, then compare the actual deletion target inside that transaction.
+    let annotation_publications = (|| {
+        let manifest = load_manifest(&store, &snapshot)?;
+        crate::snapshot::verify::verified_annotation_publications(&store, &snapshot.id, &manifest)
+    })()
+    .inspect_err(|source| {
+        error!(event = "restore.cleanup_gate_failed", source_id, superseded_parse_id, flow,
+            snapshot_id = %snapshot.id, stage = "annotation_payload_preflight", error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "annotation snapshot verification failed; superseded state retained, nothing deleted");
+    })?;
     info!(
         event = "restore.cleanup_gate_passed",
         source_id,
         superseded_parse_id,
         flow,
         snapshot_id = %snapshot.id,
-        "deletion gate passed; proceeding to delete superseded hot state"
+        "snapshot verification passed; proceeding to final publication check and deletion"
     );
 
     // Step 3 — one IMMEDIATE transaction: supersede envelopes, delete every hot
@@ -368,7 +380,21 @@ pub(crate) fn complete_superseded_parse(
         TX_LOG_NAMESPACE,
         "complete_superseded",
     )?;
-    let counts = match delete_superseded_body(&tx, source_id, superseded_parse_id, &mode) {
+    let counts = match crate::snapshot::verify::verify_annotation_deletion_state(
+        &tx,
+        &annotation_publications,
+        &snapshot.id,
+        source_id,
+        superseded_parse_id,
+    )
+    .inspect_err(|source| {
+        error!(event = "restore.cleanup_gate_failed", source_id, superseded_parse_id, flow,
+            snapshot_id = %snapshot.id, stage = "annotation_publication_state", error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "annotation state changed since snapshot; superseded state retained, nothing deleted");
+    })
+    .and_then(|()| delete_superseded_body(&tx, source_id, superseded_parse_id, &mode))
+    {
         Ok(counts) => counts,
         Err(source) => {
             return Err(hot_plane::abort_transaction(
@@ -794,6 +820,36 @@ pub(crate) fn restore_source_from_snapshot(
     // Load the manifest once for the re-import; get_json re-hashes it to its
     // address (tamper-evident) — remapped to a RestoreFailed with restore context.
     let manifest = load_manifest(&store, &snapshot)?;
+    // Annotation indexes are optional post-activation state. Existing published
+    // references are restored verbatim; their absence leaves discovery to the
+    // projection worker and never triggers inference during restoration.
+    let annotation_publications =
+        crate::snapshot::verify::verified_annotation_publications(&store, &snapshot.id, &manifest)
+            .inspect_err(|source| {
+                error!(event = "restore.annotation_preflight_failed", source_id, parse_id,
+                snapshot_id = %snapshot.id, error = %source, committed = false,
+                "annotation embedding snapshot inputs failed preflight before restore writes");
+            })?;
+    info!(event = "restore.annotation_preflight_completed", source_id, parse_id,
+        snapshot_id = %snapshot.id, snapshot_manifest_count = annotation_publications.manifest_count,
+        snapshot_embedding_blob_count = annotation_publications.embedding_blob_count,
+        snapshot_representation_count = annotation_publications.representation_count,
+        "snapshot annotation embeddings verified without inference before restore writes");
+    drop(annotation_publications);
+    // Publication may lag annotation completion. Reconstruct only the graph
+    // envelope captured in this manifest while preserving every annotation row.
+    let graph_planes = crate::snapshot::verify::verified_graph_planes(&store, &snapshot, &manifest)
+        .inspect_err(|source| {
+            error!(event = "restore.graph_preflight_failed", source_id, parse_id,
+                snapshot_id = %snapshot.id, error = %source, committed = false,
+                "captured graph inputs failed verification before restore writes");
+        })?;
+    let captured_graph = graph_planes.get(parse_id);
+    info!(event = "restore.graph_preflight_completed", source_id, parse_id,
+        snapshot_id = %snapshot.id,
+        graph_published = captured_graph.is_some(),
+        projection_id = captured_graph.map(|graph| graph.projection_id.as_str()),
+        "captured graph publication state verified before restore writes");
     // Reject legacy/incompatible snapshots before opening a write transaction.
     // Section vectors are immutable artifacts: restoration never calls a model.
     let section_planes =
@@ -844,7 +900,7 @@ pub(crate) fn restore_source_from_snapshot(
     // so they run inside the tx body freely; only the hot-plane writes are txn'd.
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "restore")?;
-    let counts = match restore_body(&tx, &store, &snapshot, &manifest, source_id, parse_id)
+    let counts = match restore_body(&tx, &store, captured_graph, &manifest, source_id, parse_id)
         .and_then(|counts| {
             crate::projections::section_dense::validate_plane(&tx, section_plane)?;
             Ok(counts)
@@ -944,7 +1000,7 @@ struct RestoreCounts {
 fn restore_body(
     tx: &Transaction<'_>,
     store: &ArtifactStore,
-    snapshot: &ForensicSnapshot,
+    captured_graph: Option<&crate::projections::graph::CapturedGraph>,
     manifest: &ForensicSnapshotManifest,
     source_id: &str,
     parse_id: &str,
@@ -991,18 +1047,32 @@ fn restore_body(
         parse_id,
     )?;
 
-    // Deterministically rebuild the non-archived planes from the re-imported
-    // rows (§30.5/§8.3 — these are NOT archived; they are rebuilt in step). FTS5
-    // from the re-imported chunk rows; graph tables from the re-imported fresh
-    // annotations. Both mirror their builders' deterministic producer exactly
-    // and MUST STAY IN STEP with them.
+    // FTS5 uses the restored chunks. Graph payload uses only the verified
+    // published envelope's exact inputs; all completed annotations were restored
+    // above, including inputs the projection worker has not published yet.
     let lexical_index = rebuild_lexical_index(tx, parse_id)?;
-    let (graph_mentions, graph_edges) = rebuild_graph_planes(tx, snapshot, parse_id)?;
-
-    // source_id is carried for symmetry with the cleanup path and future
-    // per-source logging; the per-row source_id is restored verbatim from the
-    // archived columns, so it is not needed to reconstruct rows.
-    let _ = source_id;
+    let (graph_mentions, graph_edges) = match captured_graph {
+        Some(graph) => {
+            if graph.source_id != source_id || graph.parse_id != parse_id {
+                return Err(ApiError::RestoreFailed {
+                    message: format!(
+                        "captured graph {} does not belong to restored source {source_id}, parse {parse_id}",
+                        graph.projection_id
+                    ),
+                });
+            }
+            crate::projections::graph::restore_captured_graph(tx, graph).map_err(|source| {
+                ApiError::RestoreFailed {
+                    message: format!(
+                        "restore of captured graph {}: {source}",
+                        graph.projection_id
+                    ),
+                }
+            })?
+        }
+        // Absence is preserved; reconstruction cannot silently publish a graph.
+        None => (0, 0),
+    };
 
     Ok(RestoreCounts {
         content_units,
@@ -1303,282 +1373,6 @@ INSERT INTO chunk_text_index (chunk_id, targeting_text) VALUES (?1, ?2)";
     Ok(chunks.len())
 }
 
-/// Deterministically rebuild the graph planes (`graph_entity_mentions`,
-/// `graph_entity_edges`) for the parse from its just-re-imported fresh
-/// `semantic_annotations` rows, mirroring `graph.rs`'s pure derivation EXACTLY —
-/// the same one `snapshot::verify::verify_graph_plane` mirrors for the deletion
-/// gate. `normalize_entity_name` is reused from `graph.rs` so node identity —
-/// and the edge's relation_type plus the mention's entityType metadata, which
-/// the builder also stores NORMALIZED through the same scheme — is
-/// byte-identical to the build-time key; the mention accumulation and edge
-/// derivation are mirrored here (the builder's helpers are private) and MUST STAY
-/// IN STEP with `graph.rs`. No model is invoked (§38): the graph channel
-/// materializes annotations, it does not score them.
-///
-/// The rebuilt rows carry a fresh `projection_id`/`id`: the graph payload tables
-/// are NOT envelope-single-sourced on those columns (schema §22 — payload rows
-/// reference an envelope by projection_id but are hot-cleanup targets), and the
-/// re-imported `retrieval_projections` graph envelope's id is not a hot lookup
-/// key for these tables, so a freshly minted marker id is faithful. Node/edge
-/// IDENTITY (normalized names, unit sets, relation types) is fully deterministic
-/// and byte-identical to the archived-derived expectation the gate checks.
-fn rebuild_graph_planes(
-    tx: &Transaction<'_>,
-    snapshot: &ForensicSnapshot,
-    parse_id: &str,
-) -> Result<(usize, usize), ApiError> {
-    use crate::projections::graph::normalize_entity_name;
-
-    const SELECT_FRESH_ANNOTATIONS_SQL: &str = "
-SELECT id, source_id, annotation_type, body_json, target_unit_ids_json
-FROM semantic_annotations
-WHERE parse_id = ?1 AND freshness_status = 'fresh' AND deleted_at IS NULL
-ORDER BY id";
-    const INSERT_MENTION_SQL: &str = "
-INSERT INTO graph_entity_mentions (
-  id, projection_id, source_id, parse_id, normalized_name, entity_type,
-  unit_ids_json, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
-    const INSERT_EDGE_SQL: &str = "
-INSERT INTO graph_entity_edges (
-  id, projection_id, source_id, parse_id, from_normalized_name,
-  to_normalized_name, relation_type, target_unit_ids_json, created_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
-
-    // Read the fresh annotation rows (subject parse, fresh, not deleted — the
-    // SAME filter graph.rs applies through fresh_for_active_parse and the gate
-    // mirrors).
-    let annotations = read_fresh_annotations(tx, SELECT_FRESH_ANNOTATIONS_SQL, parse_id)?;
-
-    // Accumulate mentions and edges with the SAME derivation as graph.rs (and
-    // the gate mirror): entity → mention (name normalized to node identity,
-    // entityType metadata normalized, unit sets deduplicated + deterministically
-    // ordered via BTreeSet); relation → directional edge (subject/object
-    // normalized, NORMALIZED predicate as relation type).
-    let mut mentions: BTreeMap<String, MentionAccumulator> = BTreeMap::new();
-    let mut edges: Vec<GraphEdge> = Vec::new();
-    for annotation in &annotations {
-        let body = parse_body(&annotation.body_json)?;
-        let target_units = decode_json_string_array(
-            &annotation.target_unit_ids_json,
-            true,
-            "target_unit_ids_json",
-        )?;
-        match annotation.annotation_type.as_str() {
-            "entity" => {
-                let raw_name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
-                    ApiError::RestoreFailed {
-                        message: "restore graph rebuild: entity annotation has no string `name`"
-                            .to_owned(),
-                    }
-                })?;
-                let normalized = normalize_entity_name(raw_name);
-                // Mirror of graph.rs::accumulate_mentions: entityType metadata
-                // is stored NORMALIZED (whitespace-only treated as absent, same
-                // as the builder's extractor), so the rebuilt mention row is
-                // byte-identical to the build-time row.
-                let entity_type = body
-                    .get("entityType")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                    .map(normalize_entity_name);
-                let accumulator =
-                    mentions
-                        .entry(normalized)
-                        .or_insert_with(|| MentionAccumulator {
-                            entity_type: entity_type.clone(),
-                            units: std::collections::BTreeSet::new(),
-                        });
-                for unit in target_units {
-                    accumulator.units.insert(unit);
-                }
-            }
-            "relation" => {
-                let field = |name: &str| -> Result<String, ApiError> {
-                    body.get(name)
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .ok_or_else(|| ApiError::RestoreFailed {
-                            message: format!(
-                                "restore graph rebuild: relation annotation has no string `{name}`"
-                            ),
-                        })
-                };
-                // Mirror of graph.rs::derive_edges: relation_type is the
-                // NORMALIZED predicate, and a predicate that normalizes to
-                // empty (whitespace-only raw) is rejected loudly the same way a
-                // missing predicate is — an edge with no predicate is
-                // meaningless, and the deletion gate re-derives the same way.
-                let relation_type = normalize_entity_name(&field("predicate")?);
-                if relation_type.is_empty() {
-                    return Err(ApiError::RestoreFailed {
-                        message: "restore graph rebuild: relation annotation has an empty \
-                                  `predicate` after normalization"
-                            .to_owned(),
-                    });
-                }
-                edges.push(GraphEdge {
-                    from_normalized_name: normalize_entity_name(&field("subject")?),
-                    to_normalized_name: normalize_entity_name(&field("object")?),
-                    relation_type,
-                    target_unit_ids: target_units,
-                    source_id: annotation.source_id.clone(),
-                });
-            }
-            // Every other annotation type is irrelevant to the graph channel.
-            _ => {}
-        }
-    }
-
-    let now = utc_now()?;
-    // Fresh marker projection ids for the rebuilt payload rows (see the fn doc:
-    // these payload tables are not envelope-single-sourced on this id).
-    let mention_projection_id = crate::ids::new_retrieval_projection_id()?;
-    let mut mention_count = 0usize;
-    for (normalized_name, accumulator) in &mentions {
-        // Reuse a per-mention source_id from any contributing annotation is not
-        // needed — mentions are keyed by normalized name across the parse; the
-        // row's source_id is the snapshot's single subject source.
-        let source_id = snapshot
-            .source_object_ids
-            .first()
-            .map(String::as_str)
-            .unwrap_or("");
-        let units_json = encode_json_string_array(
-            &accumulator.units.iter().cloned().collect::<Vec<_>>(),
-            "graph mention unit ids",
-        )?;
-        let row_id = crate::ids::new_retrieval_projection_id()?;
-        tx.execute(
-            INSERT_MENTION_SQL,
-            params![
-                row_id,
-                mention_projection_id,
-                source_id,
-                parse_id,
-                normalized_name,
-                accumulator.entity_type,
-                units_json,
-                now,
-            ],
-        )
-        .map_err(|source| ApiError::RestoreFailed {
-            message: format!("restore failed to insert graph mention row: {source}"),
-        })?;
-        mention_count += 1;
-    }
-
-    let mut edge_count = 0usize;
-    for edge in &edges {
-        let units_json = encode_json_string_array(&edge.target_unit_ids, "graph edge unit ids")?;
-        let row_id = crate::ids::new_retrieval_projection_id()?;
-        tx.execute(
-            INSERT_EDGE_SQL,
-            params![
-                row_id,
-                mention_projection_id,
-                edge.source_id,
-                parse_id,
-                edge.from_normalized_name,
-                edge.to_normalized_name,
-                edge.relation_type,
-                units_json,
-                now,
-            ],
-        )
-        .map_err(|source| ApiError::RestoreFailed {
-            message: format!("restore failed to insert graph edge row: {source}"),
-        })?;
-        edge_count += 1;
-    }
-
-    Ok((mention_count, edge_count))
-}
-
-/// One re-derived entity mention during the graph rebuild: the deduplicated,
-/// deterministically ordered unit set plus the entityType metadata (entityType
-/// is node metadata, not identity — D9 — but the mention row carries it).
-struct MentionAccumulator {
-    entity_type: Option<String>,
-    units: std::collections::BTreeSet<String>,
-}
-
-/// One re-derived directional edge during the graph rebuild.
-struct GraphEdge {
-    from_normalized_name: String,
-    to_normalized_name: String,
-    relation_type: String,
-    target_unit_ids: Vec<String>,
-    source_id: String,
-}
-
-/// One fresh annotation row read for the graph rebuild.
-struct FreshAnnotation {
-    source_id: String,
-    annotation_type: String,
-    body_json: Option<String>,
-    target_unit_ids_json: String,
-}
-
-/// Read the parse's fresh, non-deleted annotation rows for the graph rebuild.
-fn read_fresh_annotations(
-    tx: &Transaction<'_>,
-    sql: &str,
-    parse_id: &str,
-) -> Result<Vec<FreshAnnotation>, ApiError> {
-    let mut statement = tx.prepare(sql).map_err(|source| ApiError::RestoreFailed {
-        message: format!(
-            "restore failed to prepare fresh-annotation read for graph rebuild of parse \
-             {parse_id}: {source}"
-        ),
-    })?;
-    let rows = statement
-        .query_map(params![parse_id], |row| {
-            Ok(FreshAnnotation {
-                source_id: row.get::<_, String>(1)?,
-                annotation_type: row.get::<_, String>(2)?,
-                body_json: row.get::<_, Option<String>>(3)?,
-                target_unit_ids_json: row.get::<_, String>(4)?,
-            })
-        })
-        .map_err(|source| ApiError::RestoreFailed {
-            message: format!(
-                "restore failed to read fresh annotations for graph rebuild of parse \
-                 {parse_id}: {source}"
-            ),
-        })?;
-    let mut annotations = Vec::new();
-    for row in rows {
-        annotations.push(row.map_err(|source| ApiError::RestoreFailed {
-            message: format!(
-                "restore failed to read a fresh-annotation row for graph rebuild of parse \
-                 {parse_id}: {source}"
-            ),
-        })?);
-    }
-    Ok(annotations)
-}
-
-/// Parse an annotation's `body_json` TEXT into a JSON object for graph
-/// derivation. A fresh annotation always carries a body; a NULL/absent or
-/// non-object body is a corrupt restore input.
-fn parse_body(body_json: &Option<String>) -> Result<Map<String, Value>, ApiError> {
-    let text = body_json
-        .as_deref()
-        .ok_or_else(|| ApiError::RestoreFailed {
-            message: "restore graph rebuild: a fresh annotation has a NULL body_json".to_owned(),
-        })?;
-    let value: Value = serde_json::from_str(text).map_err(|source| ApiError::RestoreFailed {
-        message: format!("restore graph rebuild: annotation body_json is not valid JSON: {source}"),
-    })?;
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => Err(ApiError::RestoreFailed {
-            message: "restore graph rebuild: annotation body_json is not a JSON object".to_owned(),
-        }),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shared archived-record helpers.
 // ---------------------------------------------------------------------------
@@ -1689,15 +1483,6 @@ fn decode_json_string_array(
         } else {
             ApiError::StorageOperation { message }
         }
-    })
-}
-
-/// Encode a `Vec<String>` as a canonical JSON string array TEXT value (the repo
-/// list-column convention) for a rebuilt list column.
-fn encode_json_string_array(values: &[String], what: &str) -> Result<String, ApiError> {
-    let bytes = crate::canonical::canonical_json_bytes_of(&values)?;
-    String::from_utf8(bytes).map_err(|source| ApiError::RestoreFailed {
-        message: format!("restore: canonical bytes for {what} are not UTF-8: {source}"),
     })
 }
 

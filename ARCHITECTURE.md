@@ -14,7 +14,8 @@ The service is an **autonomous pipeline** wrapped in a **thin async HTTP
 transport shell**. Nothing routine is operator-driven: a background scheduler
 detects source changes, acquires bytes, parses them into canonical units, builds
 retrieval projections, and activates the result — on its own adaptive cadence. A
-dedicated annotation worker then enriches each newly activated parse. The HTTP
+dedicated annotation worker commits enrichment; a separate projection worker
+publishes it for retrieval. The HTTP
 surface exists to answer queries, expose diagnostics, and accept rare operator
 overrides (re-parse, activate/accept/discard, snapshot, restore, shutdown).
 
@@ -34,6 +35,8 @@ lifecycle machinery is synchronous OS-thread work over `rusqlite`:
   `std::thread`;
 - the annotation worker (`src/annotations/worker.rs`) runs on its own
   `std::thread`;
+- the annotation projection worker (`src/projections/worker.rs`) runs on a
+  separate `std::thread`;
 - the importer, activation, snapshotting, projection builders, and the query
   pipeline are all synchronous functions.
 
@@ -63,7 +66,7 @@ an incidental choice — new lifecycle machinery must keep this shape.
    │  scheduler thread ──▶ detect ▶ acquire ▶ parse ▶ project   │
    │                       ▶ gate/activate                      │
    │  annotation worker thread ──▶ entity/relation/summary      │
-   │                       ▶ graph + summary projections        │
+   │  projection worker ──▶ graph / summary / dense / ColBERT    │
    └────────────────────────────────────────────────────────────┘
 ```
 
@@ -228,6 +231,10 @@ orphan temp file, never a partial blob at a hashed path. Raw sources, canonical
 parse bundles, projection payloads, and (when the audit tier lands) full QERs
 live here, referenced from the hot plane by `ArtifactRef` (`uri` + `hash` +
 `size_bytes`).
+
+Annotation manifests reference separate dense-vector and ColBERT-matrix blobs.
+The paired `retrieval_projections` envelopes publish one immutable manifest URI
+per excerpt cohort and model/input version.
 
 ### 2.3 Event log
 
@@ -474,11 +481,22 @@ The worker flushes a pending duplicate memo key before preparing another request
 for it, so the next lookup can reuse the committed result. Legacy whole-group
 annotations remain intact; their keys cannot satisfy new fragment coverage.
 
-After every required key in the current excerpt plan has fresh output, and the
-parse is still active, the worker builds summary then graph projections in one
-transaction. Legacy failed rows outside that plan do not block publication.
-Derived names, entity types, and predicates use `normalize_entity_name`;
-stored annotation strings retain their producer output.
+**Projection publication.** `src/projections/worker.rs` owns graph, summary, and
+annotation embedding publication. Graph and summary commit independently when
+their fresh input IDs change, without waiting for unrelated annotation types.
+Graph names, types, and predicates use `normalize_entity_name`; source annotations
+retain their producer output.
+
+The worker embeds individual entities, relationships, summaries, combined
+annotations per excerpt, and complete canonical source windows using dense and
+ColBERT backends. It archives bounded batches before opening a publication write
+transaction. Paired dense/multivector envelopes share a cohort partition, manifest
+URI, model/input identity, exact annotation IDs, and canonical target unit.
+Publication rechecks active parse, deactivation, and declared inputs inside the
+transaction. New annotations leave older valid subsets usable until refreshed;
+staling an annotation atomically stales dependent projections. Source/cohort
+cursors bound embedding work per cycle. Cancellation stops new batches, retains
+storage admission through current blocking calls, and discards unpublished output.
 
 **Document progress.** Shared accounting in `src/annotations/progress.rs` counts
 one item per required excerpt/type pair and completed items from fresh coverage,
@@ -617,14 +635,14 @@ Snapshots are minted at every lifecycle transition that requires one:
 `manual` or `incident` snapshots (the lifecycle types are scheduler-triggered,
 never requestable).
 
-Snapshot creation is two-phase, artifact-store-first:
+Snapshot scope and exported rows share one SQLite read transaction; start/failure
+audits and the final metadata write remain outside it. Creation is artifact-store-first:
 
 1. **Archive, then seal.** Every hot-only plane is archived and every
    already-archived artifact referenced into a **§30.4 manifest**; every
    referenced blob is in the write-once store **before** the manifest seals,
    and the **self-hashed manifest is written LAST** — a manifest never
-   references bytes that are not in the store. No SQL is touched in this
-   phase.
+   references bytes that are not in the store.
 2. **Header row.** Only then does one write transaction insert the
    `forensic_snapshots` metadata row carrying `manifest_uri`/`manifest_hash`
    (the `manifestHash` that verification later checks against).
@@ -648,8 +666,8 @@ probe/tolerance machinery is post-MVP — see Section 9).
 - `verify_deletion_gate` — mechanical verification **plus** deterministic
   index-rebuild verification over the subject parse: the chunk plane is
   compared on its deterministic columns, dense and multivector blobs are
-  **decoded and compared**, and the graph plane is **re-derived from the
-  archived annotations** and compared; the lexical index is verified
+  **decoded and compared**, and the graph plane is **re-derived from each
+  archived graph envelope's ordered annotation inputs** and compared; the lexical index is verified
   transitively through the chunk plane. The rebuild check re-imports archived
   bytes and re-derives from archived rows — it **never re-embeds**.
 
@@ -692,15 +710,17 @@ byte-reproduced from the archived blobs. The non-archived planes — the FTS5
 lexical index and the graph tables — are **deterministically rebuilt** from
 the restored rows. The dense-cache publish happens **under the held per-source
 barrier**, exactly as at activation (Section 4). A hard module invariant: no
-model call anywhere in the restore/verify path — a grep for
-`embed|InferenceRuntime|score_|docling` over `restore.rs` must match no code
-symbols (its only hits are the comments stating this invariant).
+model call anywhere in the restore/verify path.
 
 Section payloads are explicitly pinned in snapshot manifests. Verification checks
 their exact canonical fragment coverage and complete live/archive envelope sets.
 Restore requires the target's passage and section representations before writing;
 pre-feature snapshots are incompatible. Valid section vectors are read from the
 archived artifact and published with the passage plane without inference.
+Annotation manifests and every referenced dense/ColBERT blob are pinned and
+verified with their paired envelopes, canonical ranges, and declared input
+lineage. Restore preserves published subsets rather than incorporating newer
+annotations that were not inputs to those publications.
 
 ### 5.5 Deletion lifecycle (`src/deletion.rs`)
 
@@ -739,17 +759,21 @@ capture and every subsequent read share a single pinned WAL snapshot. The
 passed `ResolvedScope` / `&[CapturedParse]` **is** the scope mechanism (§6, §38):
 there is no separate scope enforcement pass. Each captured parse carries its
 dense plane as an `Arc<DensePlane>` clone taken under the same snapshot.
-The plane contains passage and section vectors together. Startup reloads active
-planes before starting workers; a scoped parse missing either representation
-causes an explicit rebuild-required query error.
+The plane retains identities and counts, while passage vectors are streamed from
+SQLite and section vectors from verified artifacts. Annotation publication IDs
+and immutable payload references are captured in the query transaction, including
+versions published without an active-parse change. Bounded scoring buffers let
+the operating system retain or reclaim file pages; vector residency is not required.
+Missing persisted passage/section representations still require an explicit rebuild.
 
 ```
 open read-only transaction → capture scoped active parses → cutover-barrier probe
        ↓
-dense passages + section nominations + lexical chunks → canonical units ┐
-graph entity matches + one semantic hop ─┴→ rank fusion (100 units)
+source dense: passages + sections + source windows ┐
+lexical chunks ───────────────────────────────────┼→ grouped RRF (100 targets)
+graph + semantic annotation matches ──────────────┘
        ↓
-ColBERT MaxSim (persisted unit matrices)
+ColBERT MaxSim (persisted unit, annotation, and source-window matrices)
        ↓
 bounded same-section passages → final passage reranker → requested result count
        ↓
@@ -764,10 +788,16 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   entity-name matching of query text against stored entity-annotation names and
   one semantic relational hop over
   `graph_entity_mentions`/`graph_entity_edges`, tiered deterministically (multi-entity units,
-  then direct mentions, then one-hop related). No LLM call is made in the query
-  path. Each channel supplies up to 100 candidates independently of the requested
-  result count. **RRF across all three channels** deduplicates canonical units
-  into a 100-unit pool before ColBERT scoring.
+  then direct mentions, then one-hop related). No annotation-generation call is
+  made during retrieval.
+
+  `src/query/annotation.rs` searches individual entities, relationships, summaries,
+  combined annotations, and canonical source windows. Semantic entity matches can
+  seed the graph; relation and summary matches nominate supporting excerpts directly.
+  Outer RRF has three contributions: source dense, lexical, and grouped graph plus
+  semantic annotations. Each is capped at 100; the final pool contains at most
+  100 source targets. Whole-unit and exact full-unit candidates consolidate, while
+  distinct partial excerpts retain separate identities.
 
   Dense retrieval uses the same query vector to shortlist 20 section windows.
   Each nominates up to five eligible units by their best fine-chunk cosine,
@@ -786,24 +816,25 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   `min_token_len` chars is a leading prefix of the correspondingly positioned
   stored-name token) classes, capped at `max_fuzzy_candidates`. Candidate order
   is rank-only and deterministic: tier, then match class (`Exact` < `Acronym` <
-  `TokenPrefix`), then matched-name character length descending, then name
-  ascending, then unitId then parseId ascending. **When both fuzzy classes are disabled (the shipped default) the
-  path is byte-identical to the prior exact-only behavior:**
-  `entity_names_for_parse` (`src/projections/graph.rs`, the per-parse name
-  enumeration) is **never called**, so the class order component is constant.
+  `TokenPrefix` < `Semantic`), then matched-name character length descending, then
+  name, unitId, and parseId ascending. Disabling fuzzy classes skips stored-name
+  enumeration; semantic entry remains available. Traversal stays within one parse.
   These knobs live in the entity-match policy document, deliberately **not** the
   `RetrievalProfile`.
-- **MaxSim** (`src/query/rerank.rs`). ColBERT MaxSim **re-scores the already-fused
-  pool** from persisted C6e matrices; the loader decodes stored blobs and never
-  re-embeds. This is a rerank/scoring stage, not candidate generation — see the
-  deferred `multi_vector` channel in Section 9.
-- **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked units,
+- **MaxSim** (`src/query/rerank.rs`, `src/query/annotation.rs`). Score admitted
+  whole units and exact excerpts using persisted matrices. Each excerpt takes
+  the best source or matched-annotation MaxSim score, never their sum. Queries
+  embed the query only; document matrices are loaded in bounded buffers.
+- **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked units and excerpts,
   construct same-section passages in canonical reading order, bounded to 512
   ColBERT tokens and 64 contributing units. Merge overlapping passages when they
-  fit; preserve structured-content boundaries. Oversized single-unit prefixes
-  carry `truncated: true`, while raw evidence retains the full canonical body.
+  fit; preserve structured-content boundaries and retrieved source ranges.
+  Candidate IDs describe source ranges separately from canonical anchor IDs.
+  Legacy oversized whole-unit prefixes carry `truncated: true`; exact retrieved
+  windows remain complete and raw evidence retains full canonical bodies.
 - **Reranker** (`src/query/rerank.rs`). Scores up to 30 passages, or the requested
-  count if larger (maximum 100), with their section headings via the
+  count if larger (maximum 100), with source text, headings, and separately labeled
+  matched annotation/graph context via the
   config-selected backend. Model-call gating is **caller-side and
   backend-aware**: the shared model-call gate is acquired only when a local
   accelerator-backed model is invoked; a remote HTTP reranker is not gated behind
@@ -822,7 +853,8 @@ and annotation requirements. Each has a stable version and self-hash over its
 canonical serialization, excluding the hash field, and an `active_*()` accessor.
 
 - The **`RetrievalProfile`** (`src/query/profile.rs`, `active_profile` /
-  `seal_mvp_profile`, version 3) supplies the RRF
+  `seal_mvp_profile`, version 4) seals `grouped_rrf`, semantic annotation retrieval,
+  best source/annotation MaxSim scoring, and the RRF
   fusion constant (`rrf_k = 60`), per-channel and MaxSim candidate pool sizes
   (`100`), section shortlist (`20`) and nominations per window (`5`), the reranker
   passage pool size (`30`, raised to the requested count up to `100`), and the D9 graph hop budget (`1`). These are
@@ -843,8 +875,8 @@ only when requested with `debug: true` (`POST /query`).
 `queryExecutionRecordId` is **omitted** — a recorded narrowing pending the QER
 audit tier (Section 9), addable additively. `QueryStageLatencies` records
 per-stage timings, including passage construction and the duration the WAL read
-snapshot was held. Diagnostics also retain `channelHits`, `fusedPool`, `maxsim`,
-`passageCandidates`, and `reranked` stage outputs.
+snapshot was held. Diagnostics retain `channelHits`, `fusedPool`, whole-unit
+`maxsim`, exact-window `annotationMaxsim`, `passageCandidates`, and `reranked`.
 
 ## 7. Health and admission internals
 
@@ -865,8 +897,11 @@ database connections. Slots are poison-recovered on read.
   worker accounting (Section 3.1); health never queries SQLite or infers progress
   from cycle counts. PROTOCOL.md defines the wire shape. `GET /sync/status` reads
   only the scheduler's slot.
+- The **projection worker** publishes `ProjectionHealth` independently: source/parse
+  identity, graph/summary/cohort publication counts, activity, failures, and
+  measurement times. Rebuild clears its observations; dry runs report unavailable.
 - **Readiness = {inference, sync}** —
-  `inference_component.ready && sync_component.ready`. The fabric and annotation
+  `inference_component.ready && sync_component.ready`. The fabric, annotation, and projection
   counts are **diagnostic-only** and NEVER gate readiness; a degraded diagnostic
   must not make a running service look down.
 - `AdmissionGate` (`search_admission`) enforces a **single in-flight search**

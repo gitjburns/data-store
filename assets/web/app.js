@@ -691,7 +691,12 @@ function queryPassageMarkup(result, rank) {
 /** Translate channel identifiers for readers while preserving unknown values. */
 function retrievalChannelsMarkup(channels) {
   if (!Array.isArray(channels) || channels.length === 0) return escOr(null);
-  const labels = { dense: 'Semantic search', lexical: 'Keyword search', graph: 'Annotations' };
+  const labels = {
+    dense: 'Source semantic search',
+    lexical: 'Keyword search',
+    graph: 'Annotation graph',
+    semantic: 'Annotation semantic search',
+  };
   return channels.map((channel) => badge(labels[channel] || channel)).join(' ');
 }
 
@@ -701,7 +706,7 @@ function retrievalChannelsMarkup(channels) {
  * walking an incoming edge does not reverse the annotation's meaning.
  */
 function graphMatchMarkup(match) {
-  const matchLabels = { acronym: 'acronym match', token_prefix: 'token-prefix match' };
+  const matchLabels = { acronym: 'acronym match', token_prefix: 'token-prefix match', semantic: 'semantic match' };
   const matchClass = match.matchClass && match.matchClass !== 'exact'
     ? ` (${esc(matchLabels[match.matchClass] || match.matchClass)})` : '';
   const entity = `“${esc(match.matchedEntity)}”${matchClass}`;
@@ -726,6 +731,33 @@ function denseMatchDescription(match) {
   return `Section-guided match: ${path || match.sectionId}`;
 }
 
+/** Describe half-open canonical character coordinates without exposing source or annotation bodies. */
+function sourceExcerptDescription(excerpt) {
+  if (!excerpt || excerpt.startChar == null || excerpt.endChar == null) return 'Source range unavailable';
+  return `source characters [${excerpt.startChar}, ${excerpt.endChar})`;
+}
+
+/** Keep raw source embeddings distinct from annotation evidence, including historical whole-unit scope. */
+function annotationMatchDescription(match) {
+  const labels = { entity: 'entity', relation: 'relationship', summary: 'summary', combined: 'combined annotations', source: 'source excerpt' };
+  const origin = match.representation === 'source' ? 'Source dense retrieval' : 'Annotation retrieval';
+  const scope = match.exactAnnotationRange === false ? ' · legacy scope: whole unit'
+    : match.exactAnnotationRange === true ? '' : ' · annotation scope unavailable';
+  return `${origin}: ${labels[match.representation] || match.representation} · ${sourceExcerptDescription(match.excerpt)}${scope}`;
+}
+
+/** Share safe representation/range attribution across result and diagnostic tables. */
+function annotationMatchesMarkup(matches) {
+  if (!Array.isArray(matches) || matches.length === 0) return '';
+  return `<ul class="retrieval-matches">${matches.map((match) => `<li>${esc(annotationMatchDescription(match))}</li>`).join('')}</ul>`;
+}
+
+/** Keep source-unit navigation separate from the plain-text coordinates of an exact candidate. */
+function sourceExcerptMarkup(excerpt) {
+  if (!excerpt || typeof excerpt !== 'object') return escOr(null);
+  return `${unitLink(excerpt.unitId)} · ${esc(sourceExcerptDescription(excerpt))}`;
+}
+
 /**
  * Present server-owned candidate attribution without deriving contribution from
  * merged passage channels. Preview deduplication affects display only: the unit
@@ -737,8 +769,8 @@ function retrievalProvenanceMarkup(provenance) {
   }
   const contributionLabels = {
     none: 'No annotation-based candidate matches.',
-    overlap: 'All annotation-matched units also matched keyword or semantic search.',
-    additional_matches: 'Annotations matched units absent from keyword and semantic candidate lists.',
+    overlap: 'All annotation-matched units also matched keyword or source semantic search.',
+    additional_matches: 'Annotations matched units absent from keyword and source semantic candidate lists.',
   };
   const contribution = contributionLabels[provenance.annotationContribution]
     || 'Annotation contribution unavailable.';
@@ -748,7 +780,7 @@ function retrievalProvenanceMarkup(provenance) {
   const denseExplanations = new Set();
   const unitRows = matchedUnits.map((unit) => {
     const denseMatches = Array.isArray(unit.denseMatches) ? unit.denseMatches : [];
-    const denseMarkup = denseMatches.map((match) => {
+    let denseMarkup = denseMatches.map((match) => {
       const description = denseMatchDescription(match);
       denseExplanations.add(description);
       // Window/chunk identifiers have no detail endpoint. Preserve them as text;
@@ -760,7 +792,7 @@ function retrievalProvenanceMarkup(provenance) {
       return `<li>${esc(description)}${section}${window}${chunk}</li>`;
     }).join('');
     const matches = Array.isArray(unit.graphMatches) ? unit.graphMatches : [];
-    const matchMarkup = matches.map((match) => {
+    let matchMarkup = matches.map((match) => {
       const explanation = graphMatchMarkup(match);
       explanations.add(explanation);
       const support = match.relationship && Array.isArray(match.relationship.supportingUnitIds)
@@ -768,6 +800,19 @@ function retrievalProvenanceMarkup(provenance) {
         : '';
       return `<li>${explanation}${support}</li>`;
     }).join('');
+    const annotationMatches = Array.isArray(unit.annotationMatches) ? unit.annotationMatches : [];
+    for (const match of annotationMatches) {
+      const description = annotationMatchDescription(match);
+      const markup = `<li>${esc(description)}</li>`;
+      // Source windows share persisted annotation storage, but remain source-dense attribution.
+      if (match.representation === 'source') {
+        denseExplanations.add(description);
+        denseMarkup += markup;
+      } else {
+        explanations.add(esc(description));
+        matchMarkup += markup;
+      }
+    }
     return [
       unitLink(unit.unitId),
       retrievalChannelsMarkup(unit.channels),
@@ -1056,6 +1101,7 @@ function debugPanelMarkup(diagnostics) {
       retrievalHitsMarkup(diagnostics.channelHits, 'channelHits', 'channel') +
       retrievalHitsMarkup(diagnostics.fusedPool, 'fusedPool', 'representative channel') +
       maxsimMarkup(diagnostics.maxsim) +
+      annotationMaxsimMarkup(diagnostics.annotationMaxsim) +
       rerankedMarkup(diagnostics.reranked)
   );
 }
@@ -1087,16 +1133,18 @@ function retrievalHitsMarkup(pool, title, channelHeading) {
       ? jsonTree(hit.graphMatches, 'Graph matches', 0) : '';
     const denseMatches = Array.isArray(hit.denseMatches) && hit.denseMatches.length > 0
       ? jsonTree(hit.denseMatches, 'Dense matches', 0) : '';
+    const annotations = annotationMatchesMarkup(hit.annotationMatches);
+    const excerpt = hit.sourceExcerpt ? `<div>Source range: ${sourceExcerptMarkup(hit.sourceExcerpt)}</div>` : '';
     return [
       escOr(hit.rank),
-      badge(hit.channel || 'unknown'),
+      retrievalChannelsMarkup([hit.channel || 'unknown']),
       escOr(hit.hitType),
       `<code>${escOr(hit.hitId)}</code>`,
       formatScore(hit.score),
       sourceLink(hit.sourceId),
       idListMarkup(hit.unitIds, unitLink),
-      notes === '' && matches === '' && denseMatches === ''
-        ? escOr(null) : notes + matches + denseMatches,
+      notes === '' && matches === '' && denseMatches === '' && annotations === '' && excerpt === ''
+        ? escOr(null) : notes + matches + denseMatches + excerpt + annotations,
     ];
   });
   return `<h3 class="subhead">${esc(title)}</h3>${dataTable(
@@ -1112,17 +1160,34 @@ function maxsimMarkup(entries) {
   return `<h3 class="subhead">maxsim</h3>${dataTable(['rank', 'unitId', 'score'], rows)}`;
 }
 
-/** Final reranker scores; `logit` and `tokenCount` are omitted when absent. */
+/** Exact-window diagnostics expose measured scores and attribution, never source or annotation body copies. */
+function annotationMaxsimMarkup(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '';
+  const rows = entries.map((entry) => [
+    `<code>${escOr(entry.candidateId)}</code>`,
+    sourceLink(entry.sourceId),
+    `<code>${escOr(entry.parseId)}</code>`,
+    sourceExcerptMarkup(entry.excerpt),
+    formatScore(entry.score),
+    formatScore(entry.sourceScore),
+    annotationMatchesMarkup(entry.annotationMatches) || escOr(null),
+  ]);
+  return `<h3 class="subhead">annotationMaxsim</h3>${dataTable(
+    ['candidateId', 'sourceId', 'parseId', 'source range', 'score', 'sourceScore', 'matches'], rows
+  )}`;
+}
+
+/** Final scores join by opaque passage candidate, while optional provider diagnostics remain explicitly absent. */
 function rerankedMarkup(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return '';
   const rows = entries.map((entry) => [
     escOr(entry.rank),
-    unitLink(entry.unitId),
+    `<code>${escOr(entry.candidateId)}</code>`,
     formatScore(entry.score),
     entry.logit === null || entry.logit === undefined ? escOr(null) : formatScore(entry.logit),
     escOr(entry.tokenCount),
   ]);
-  return `<h3 class="subhead">reranked</h3>${dataTable(['rank', 'unitId', 'score', 'logit', 'tokenCount'], rows)}`;
+  return `<h3 class="subhead">reranked</h3>${dataTable(['rank', 'candidateId', 'score', 'logit', 'tokenCount'], rows)}`;
 }
 
 /**

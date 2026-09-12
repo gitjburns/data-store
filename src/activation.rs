@@ -863,7 +863,7 @@ fn verify_section_payload(
     parse_id: &str,
     dimension: usize,
 ) -> Result<(), ApiError> {
-    let result = crate::projections::section_dense::load_section_dense(
+    let result = crate::projections::section_dense::load_section_dense_reference(
         connection, store, parse_id, dimension,
     )
     .and_then(|plane| {

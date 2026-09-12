@@ -7,8 +7,9 @@
 //!
 //! Handle contract (pinned by the C9s skeleton, mirrors
 //! `activation::gate_and_activate`): a trigger receives `index_root` plus the
-//! lifecycle subject id, opens its own write connection via
-//! `hot_plane::open_write` and its own `ArtifactStore::open(index_root)`, and is
+//! lifecycle subject id and opens its own artifact store and database handles.
+//! One read-only transaction captures scope and every archived database record;
+//! a separate write connection owns audit and metadata commits. Triggers are
 //! never handed a live `Connection`/`Transaction`. Lifecycle snapshots are
 //! per-subject; the parameterized `manual`/`incident` entry leaves the subject
 //! columns NULL. `scheduled` and `pre_deployment` are inert (no trigger
@@ -17,7 +18,7 @@
 //! Two-phase minting mirrors the parse importer's caller-side bundle write
 //! (`parse::importer::write_canonical_parse_bundle`): every heavy artifact is
 //! written to the write-once artifact store FIRST (idempotent, outside any SQL
-//! transaction), the self-hashed manifest is written LAST, and only then does
+//! write transaction), the self-hashed manifest is written LAST, and only then does
 //! the `forensic_snapshots` row plus its `snapshot.completed` event commit in
 //! one IMMEDIATE hot-plane transaction. A crash between the artifact writes and
 //! the row commit leaves orphaned-but-valid content-addressed blobs and no
@@ -117,16 +118,18 @@ pub(crate) fn pre_activation_snapshot(
 ) -> Result<ForensicSnapshot, ApiError> {
     // Barrier boundary (§31.1): the scheduler calls this BEFORE
     // gate_and_activate acquires the source barrier, so no barrier is held here.
-    let mut connection = hot_plane::open_write(index_root)?;
-    let store = ArtifactStore::open(index_root)?;
-    let source_id = lookup_source_of_parse(&connection, parse_run_id)?;
-    mint_lifecycle_snapshot(
-        &mut connection,
-        &store,
+    mint(
+        index_root,
         identity,
         SnapshotType::PreActivation,
-        &source_id,
-        parse_run_id,
+        |connection| {
+            let source_id = lookup_source_of_parse(connection, parse_run_id)?;
+            Ok(lifecycle_scope(
+                SnapshotType::PreActivation,
+                &source_id,
+                parse_run_id,
+            ))
+        },
     )
 }
 
@@ -143,16 +146,18 @@ pub(crate) fn post_activation_snapshot(
 ) -> Result<ForensicSnapshot, ApiError> {
     // Barrier boundary (§31.1): the scheduler calls this AFTER
     // gate_and_activate returns and its internal barrier has released.
-    let mut connection = hot_plane::open_write(index_root)?;
-    let store = ArtifactStore::open(index_root)?;
-    let source_id = lookup_source_of_parse(&connection, parse_run_id)?;
-    mint_lifecycle_snapshot(
-        &mut connection,
-        &store,
+    mint(
+        index_root,
         identity,
         SnapshotType::PostActivation,
-        &source_id,
-        parse_run_id,
+        |connection| {
+            let source_id = lookup_source_of_parse(connection, parse_run_id)?;
+            Ok(lifecycle_scope(
+                SnapshotType::PostActivation,
+                &source_id,
+                parse_run_id,
+            ))
+        },
     )
 }
 
@@ -169,22 +174,25 @@ pub(crate) fn pre_deactivation_snapshot(
 ) -> Result<ForensicSnapshot, ApiError> {
     // Barrier boundary (§31.1): C9c calls this BEFORE it acquires the source
     // barrier for the deactivation cutover.
-    let mut connection = hot_plane::open_write(index_root)?;
-    let store = ArtifactStore::open(index_root)?;
-    let active_parse_id =
-        lookup_active_parse(&connection, source_id)?.ok_or_else(|| ApiError::BadRequest {
-            message: format!(
-                "cannot mint pre_deactivation snapshot for source {source_id}: \
-                 the source has no active parse to capture"
-            ),
-        })?;
-    mint_lifecycle_snapshot(
-        &mut connection,
-        &store,
+    mint(
+        index_root,
         identity,
         SnapshotType::PreDeactivation,
-        source_id,
-        &active_parse_id,
+        |connection| {
+            let active_parse_id = lookup_active_parse(connection, source_id)?.ok_or_else(|| {
+                ApiError::BadRequest {
+                    message: format!(
+                        "cannot mint pre_deactivation snapshot for source {source_id}: \
+                 the source has no active parse to capture"
+                    ),
+                }
+            })?;
+            Ok(lifecycle_scope(
+                SnapshotType::PreDeactivation,
+                source_id,
+                &active_parse_id,
+            ))
+        },
     )
 }
 
@@ -213,38 +221,29 @@ pub(crate) fn request_snapshot(
         });
     }
 
-    let mut connection = hot_plane::open_write(index_root)?;
-    let store = ArtifactStore::open(index_root)?;
-
-    // Corpus-wide scope: every source and its active parse.
-    let sources = load_all_source_ids(&connection)?;
-    let active_parses = load_all_active_parse_ids(&connection)?;
-    let scope = SnapshotScope {
-        snapshot_type,
-        subject_source_id: None,
-        subject_parse_id: None,
-        source_object_ids: sources,
-        active_parse_ids: active_parses,
-        created_by: created_by.map(str::to_owned),
-        notes: notes.map(str::to_owned),
-    };
-    mint(&mut connection, &store, identity, &scope)
+    mint(index_root, identity, snapshot_type, |connection| {
+        // These scope reads and manifest archival share the transaction owned by mint.
+        let sources = load_all_source_ids(connection)?;
+        let active_parses = load_all_active_parse_ids(connection)?;
+        Ok(SnapshotScope {
+            snapshot_type,
+            subject_source_id: None,
+            subject_parse_id: None,
+            source_object_ids: sources,
+            active_parse_ids: active_parses,
+            created_by: created_by.map(str::to_owned),
+            notes: notes.map(str::to_owned),
+        })
+    })
 }
 
-/// Mint one per-source lifecycle snapshot. The subject source and subject parse
-/// are set (schema partial index invariant: lifecycle snapshots ALWAYS set both
+/// Describe one per-source lifecycle snapshot from its captured read view. The
+/// subject source and parse are set (lifecycle snapshots always set both
 /// subject columns); the captured scope is exactly that source and that parse,
 /// which is the artifact set the deletion gate and restore resolve by
 /// `(subject_source_id, subject_parse_id, snapshot_type)`.
-fn mint_lifecycle_snapshot(
-    connection: &mut Connection,
-    store: &ArtifactStore,
-    identity: &ApplicationIdentity,
-    snapshot_type: SnapshotType,
-    source_id: &str,
-    parse_id: &str,
-) -> Result<ForensicSnapshot, ApiError> {
-    let scope = SnapshotScope {
+fn lifecycle_scope(snapshot_type: SnapshotType, source_id: &str, parse_id: &str) -> SnapshotScope {
+    SnapshotScope {
         snapshot_type,
         subject_source_id: Some(source_id.to_owned()),
         subject_parse_id: Some(parse_id.to_owned()),
@@ -252,13 +251,12 @@ fn mint_lifecycle_snapshot(
         active_parse_ids: vec![parse_id.to_owned()],
         created_by: None,
         notes: None,
-    };
-    mint(connection, store, identity, &scope)
+    }
 }
 
 /// The resolved scope of one snapshot: which sources/parses it covers and its
-/// subject/attribution metadata. Built by the trigger entry points and consumed
-/// by `mint`, so the two-phase minting body is independent of trigger kind.
+/// subject/attribution metadata. Trigger callbacks resolve it within mint's read
+/// transaction, so scope and exported database records describe the same state.
 struct SnapshotScope {
     snapshot_type: SnapshotType,
     subject_source_id: Option<String>,
@@ -269,51 +267,47 @@ struct SnapshotScope {
     notes: Option<String>,
 }
 
-/// The shared two-phase minting body (§30.1–30.4). Phase 1 archives every heavy
-/// artifact and writes the self-hashed manifest to the write-once store (no SQL
-/// transaction — the store is idempotent). Phase 2 verifies every referenced
-/// blob still `exists()` and commits the metadata row plus its
-/// `snapshot.completed` event in one IMMEDIATE hot-plane transaction. The
-/// `snapshot.started` boundary is emitted on its own tiny transaction first, so
-/// a crash during the (potentially long) artifact-archival phase still leaves
-/// durable evidence that this snapshot began — matching the diagnostics
-/// standard's start-boundary rule.
+/// Archive one consistent SQLite view before publishing its metadata. Scope
+/// resolution and every manifest read share a read-only transaction; independent
+/// write transactions retain started/failed audit events and atomically publish
+/// the final metadata row with its completed event after all artifacts exist.
 fn mint(
-    connection: &mut Connection,
-    store: &ArtifactStore,
+    index_root: &Path,
     identity: &ApplicationIdentity,
-    scope: &SnapshotScope,
+    snapshot_type: SnapshotType,
+    resolve_scope: impl FnOnce(&Connection) -> Result<SnapshotScope, ApiError>,
 ) -> Result<ForensicSnapshot, ApiError> {
     let started = Instant::now();
     let snapshot_id = crate::ids::new_forensic_snapshot_id()?;
     let snapshot_log = crate::util::LogContext::new("snapshot", &snapshot_id);
-    if let Some(source_id) = &scope.subject_source_id {
-        snapshot_log.record("source_id", source_id.as_str());
-    }
-    if let Some(parse_id) = &scope.subject_parse_id {
-        snapshot_log.record("parse_id", parse_id.as_str());
-    }
-    snapshot_log.record("trigger", snapshot_type_wire_name(scope.snapshot_type));
+    snapshot_log.record("trigger", snapshot_type_wire_name(snapshot_type));
     let _snapshot_log = snapshot_log.enter();
     let created_at = utc_now()?;
-    let type_name = snapshot_type_wire_name(scope.snapshot_type);
+    let type_name = snapshot_type_wire_name(snapshot_type);
 
     info!(
         event = "snapshot.started",
         snapshot_id,
         snapshot_type = type_name,
-        subject_source_id = scope.subject_source_id.as_deref().unwrap_or("none"),
-        subject_parse_id = scope.subject_parse_id.as_deref().unwrap_or("none"),
-        source_count = scope.source_object_ids.len() as u64,
-        active_parse_count = scope.active_parse_ids.len() as u64,
         "forensic snapshot minting started"
     );
+    let mut connection = hot_plane::open_write(index_root).inspect_err(|source| {
+        error!(
+            event = "snapshot.failed",
+            snapshot_id,
+            snapshot_type = type_name,
+            stage = "open_write",
+            error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "forensic snapshot failed opening its audit connection"
+        );
+    })?;
     // Durable started-boundary event on its own small transaction: the audit
     // trail records that a snapshot began even if archival later crashes. It is
     // NOT part of the completion transaction — a started event with no
     // completed event is exactly the recoverable "began but did not finish"
     // signal an operator needs.
-    if let Err(source) = emit_started_event(connection, &snapshot_id, &created_at, type_name) {
+    if let Err(source) = emit_started_event(&mut connection, &snapshot_id, &created_at, type_name) {
         error!(
             event = "snapshot.failed",
             snapshot_id,
@@ -326,21 +320,70 @@ fn mint(
         return Err(source);
     }
 
-    // Phase 1: archive every heavy artifact and build the self-hashed manifest.
-    let (manifest_ref, counts) =
-        match build_and_archive_manifest(connection, store, identity, &snapshot_id, &created_at) {
-            Ok(result) => result,
-            Err(source) => {
-                return Err(fail_snapshot(
-                    connection,
-                    &snapshot_id,
-                    type_name,
-                    "archive",
-                    started,
-                    source,
-                ));
+    // The first scope SELECT pins the WAL view for every later plane and artifact
+    // reference. A separate read-only connection cannot accidentally publish
+    // metadata or audit writes into that captured view. Writers remain available;
+    // checkpoints retain WAL history until this export releases its connection.
+    let mut archive_stage = "open_artifact_store";
+    let captured = (|| {
+        let store = ArtifactStore::open(index_root)?;
+        archive_stage = "open_read";
+        let mut read_connection = hot_plane::open_read(index_root)?;
+        archive_stage = "begin_read_transaction";
+        let tx = hot_plane::begin_read_transaction(
+            &mut read_connection,
+            TX_LOG_NAMESPACE,
+            "archive_snapshot",
+        )?;
+        let read_started = Instant::now();
+        archive_stage = "capture_scope";
+        let result = resolve_scope(&tx).and_then(|scope| {
+            if let Some(source_id) = &scope.subject_source_id {
+                snapshot_log.record("source_id", source_id.as_str());
             }
-        };
+            if let Some(parse_id) = &scope.subject_parse_id {
+                snapshot_log.record("parse_id", parse_id.as_str());
+            }
+            info!(
+                event = "snapshot.scope_captured",
+                subject_source_id = scope.subject_source_id.as_deref().unwrap_or("none"),
+                subject_parse_id = scope.subject_parse_id.as_deref().unwrap_or("none"),
+                source_count = scope.source_object_ids.len() as u64,
+                active_parse_count = scope.active_parse_ids.len() as u64,
+                snapshot_id,
+                "snapshot scope captured; archiving its consistent database view"
+            );
+            archive_stage = "archive";
+            build_and_archive_manifest(&tx, &store, identity, &snapshot_id, &created_at)
+                .map(|(manifest_ref, counts)| (scope, manifest_ref, counts))
+        });
+        // No database writes occur on this connection. Drop both handles on
+        // success and failure before any final audit/metadata write, releasing
+        // this export's WAL pin even when archival returned an error.
+        drop(tx);
+        drop(read_connection);
+        info!(
+            event = "snapshot.read_snapshot_released",
+            snapshot_id,
+            archive_succeeded = result.is_ok(),
+            snapshot_held_ms = read_started.elapsed().as_millis() as u64,
+            "snapshot read transaction and connection dropped"
+        );
+        result
+    })();
+    let (scope, manifest_ref, counts) = match captured {
+        Ok(result) => result,
+        Err(source) => {
+            return Err(fail_snapshot(
+                &mut connection,
+                &snapshot_id,
+                type_name,
+                archive_stage,
+                started,
+                source,
+            ));
+        }
+    };
 
     let header = ForensicSnapshot {
         id: snapshot_id.clone(),
@@ -362,13 +405,13 @@ fn mint(
     // manual/incident leave both NULL) — they are a table concern, not carried
     // on the returned header.
     if let Err(source) = commit_snapshot_row(
-        connection,
+        &mut connection,
         &header,
         scope.subject_source_id.as_deref(),
         scope.subject_parse_id.as_deref(),
     ) {
         return Err(fail_snapshot(
-            connection,
+            &mut connection,
             &snapshot_id,
             type_name,
             "commit",
@@ -394,6 +437,8 @@ fn mint(
         chunk_projections = counts.chunk_projections as u64,
         dense_blobs = counts.dense_blobs as u64,
         section_dense_payloads = counts.section_dense_payloads as u64,
+        annotation_manifests = counts.annotation_manifests as u64,
+        annotation_embedding_blobs = counts.annotation_embedding_blobs as u64,
         multivector_blobs = counts.multivector_blobs as u64,
         deletion_evidence_rows = counts.deletion_evidence_rows as u64,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -452,6 +497,8 @@ struct ArchivedCounts {
     chunk_projections: usize,
     dense_blobs: usize,
     section_dense_payloads: usize,
+    annotation_manifests: usize,
+    annotation_embedding_blobs: usize,
     multivector_blobs: usize,
     deletion_evidence_rows: usize,
 }
@@ -475,9 +522,10 @@ fn jsonl_record_count(artifact: &SnapshotArtifactRef) -> usize {
 /// artifact store. Every referenced blob is proven present via `exists()`
 /// before the manifest seals (acceptance §3): a manifest never references bytes
 /// that are not in the store. Returns the sealed manifest ref plus the per-plane
-/// archived counts for the `snapshot.completed` log.
+/// archived counts for the `snapshot.completed` log. The caller-owned read
+/// transaction also resolved scope, preventing mixed annotation/projection states.
 fn build_and_archive_manifest(
-    connection: &Connection,
+    connection: &rusqlite::Transaction<'_>,
     store: &ArtifactStore,
     identity: &ApplicationIdentity,
     snapshot_id: &str,
@@ -543,6 +591,7 @@ fn build_and_archive_manifest(
     let section_payloads = reference_section_dense_payloads(connection, store)?;
     let section_dense_payloads = section_payloads.len();
     retrieval_indexes.extend(section_payloads);
+    retrieval_indexes.extend(reference_annotation_payloads(connection, store)?);
 
     // --- Sealed policies/profiles serialized at snapshot time (§30.4
     // assemblyPolicies/retrievalProfiles/capabilityProfiles). These are
@@ -629,6 +678,10 @@ fn build_and_archive_manifest(
     // fail mechanical verification. Prove presence now, at the write boundary,
     // where the failure is attributable to the missing artifact.
     verify_all_refs_present(store, &manifest)?;
+    // Exact input and nested-payload validation runs against the just-archived
+    // database view before the manifest can be sealed as a completed snapshot.
+    let annotation_publications =
+        verify::verified_annotation_publications(store, snapshot_id, &manifest)?;
 
     // manifestHash covers the manifest body WITHOUT its own hash field — a
     // record cannot contain its own hash (§30.4, §16.2). The shared self-hash
@@ -663,6 +716,8 @@ fn build_and_archive_manifest(
         chunk_projections: retrieval_projection_count(&manifest, "chunk_projections"),
         dense_blobs: dense_blob_count,
         section_dense_payloads,
+        annotation_manifests: annotation_publications.manifest_count,
+        annotation_embedding_blobs: annotation_publications.embedding_blob_count,
         multivector_blobs: multivector_blob_count,
         deletion_evidence_rows: manifest
             .deletion_records
@@ -744,6 +799,83 @@ fn reference_section_dense_payloads(
         });
     }
     Ok(refs)
+}
+
+/// Pin every completed annotation manifest and its nested immutable embedding
+/// blobs. Paired envelopes share one manifest; repeated model payloads are
+/// referenced once by content hash without losing their per-manifest shapes.
+fn reference_annotation_payloads(
+    connection: &Connection,
+    store: &ArtifactStore,
+) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
+    use crate::projections::annotation::{
+        INDEX_NAME, PAYLOAD_TYPE, VECTOR_PAYLOAD_TYPE, read_manifest,
+    };
+    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
+    let mut refs = BTreeMap::new();
+    for record in records {
+        if record.get("index_name").and_then(Value::as_str) != Some(INDEX_NAME) {
+            continue;
+        }
+        let Some(uri) = record.get("payload_uri").and_then(Value::as_str) else {
+            if matches!(
+                record.get("freshness_status").and_then(Value::as_str),
+                Some("building" | "failed")
+            ) {
+                continue;
+            }
+            return Err(ApiError::StorageOperation {
+                message: "completed annotation projection has no payload URI".to_owned(),
+            });
+        };
+        let stored = store.reference_for_uri(uri)?;
+        if refs.contains_key(&(PAYLOAD_TYPE, stored.hash.clone())) {
+            continue;
+        }
+        let publication = read_manifest(store, uri)?;
+        for representation in &publication.representations {
+            for embedding in [&representation.dense, &representation.colbert] {
+                let key = (VECTOR_PAYLOAD_TYPE, embedding.artifact.hash.clone());
+                if refs.contains_key(&key) {
+                    continue;
+                }
+                let actual = store.reference_for_uri(&embedding.artifact.uri)?;
+                if actual.hash != embedding.artifact.hash
+                    || actual.size_bytes != embedding.artifact.size_bytes
+                {
+                    return Err(ApiError::StorageOperation {
+                        message: format!(
+                            "annotation embedding {} differs from its manifest reference",
+                            embedding.artifact.hash
+                        ),
+                    });
+                }
+                refs.insert(
+                    key,
+                    SnapshotArtifactRef {
+                        artifact_type: VECTOR_PAYLOAD_TYPE.to_owned(),
+                        uri: actual.uri,
+                        hash: actual.hash,
+                        format: Some("f32_le".to_owned()),
+                        created_at: None,
+                        metadata: None,
+                    },
+                );
+            }
+        }
+        refs.insert(
+            (PAYLOAD_TYPE, stored.hash.clone()),
+            SnapshotArtifactRef {
+                artifact_type: PAYLOAD_TYPE.to_owned(),
+                uri: stored.uri,
+                hash: stored.hash,
+                format: Some("json".to_owned()),
+                created_at: None,
+                metadata: None,
+            },
+        );
+    }
+    Ok(refs.into_values().collect())
 }
 
 /// The archived record count of the `retrieval_projections` section's JSONL ref

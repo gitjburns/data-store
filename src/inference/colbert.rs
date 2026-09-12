@@ -95,6 +95,85 @@ pub struct ColbertDocumentEmbedding {
     pub vector: Vec<f32>,
 }
 
+/// One query matrix retained on its inference backend's scoring device for a retrieval stage.
+/// The caller owns a local model permit during preparation and scoring calls;
+/// retaining the tensor between those calls performs no model work and needs no permit.
+#[derive(Debug)]
+pub struct PreparedColbertQuery {
+    matrix: Tensor,
+    token_count: usize,
+    dimension: usize,
+}
+
+impl PreparedColbertQuery {
+    /// Preserve actual query token accounting without exposing the device tensor to retrieval code.
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    /// Validate the small query once, before it can be reused across persisted document matrices.
+    pub(super) fn from_matrix(matrix: Tensor, expected_dimension: usize) -> Result<Self, ApiError> {
+        let (token_count, dimension) = matrix.dims2().map_err(|source| {
+            inference_error(format!("ColBERT prepared query shape error: {source}"))
+        })?;
+        if token_count == 0 || dimension == 0 || dimension != expected_dimension {
+            return Err(inference_error(format!(
+                "ColBERT prepared query has shape [{token_count}, {dimension}], expected nonempty rows of dimension {expected_dimension}"
+            )));
+        }
+        // A single query-sized CPU validation prevents NaNs from being hidden by MaxSim's maximum.
+        let values = matrix
+            .flatten_all()
+            .and_then(|tensor| tensor.to_device(&Device::Cpu))
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|source| {
+                inference_error(format!(
+                    "ColBERT prepared query validation failed: {source}"
+                ))
+            })?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(inference_error(
+                "ColBERT prepared query contains nonfinite values".to_string(),
+            ));
+        }
+        Ok(Self {
+            matrix,
+            token_count,
+            dimension,
+        })
+    }
+
+    /// Score one borrowed matrix with temporary device storage; the caller owns stage diagnostics.
+    pub(super) fn score_matrix(
+        &self,
+        values: &[f32],
+        rows: usize,
+        dimension: usize,
+        expected_dimension: usize,
+        device: &Device,
+    ) -> Result<f32, ApiError> {
+        if rows == 0
+            || dimension == 0
+            || dimension != expected_dimension
+            || dimension != self.dimension
+            || rows.checked_mul(dimension) != Some(values.len())
+            || values.iter().any(|value| !value.is_finite())
+        {
+            return Err(inference_error(format!(
+                "persisted ColBERT matrix has invalid shape [{rows}, {dimension}] or nonfinite values; backend dimension {expected_dimension}, query dimension {}",
+                self.dimension
+            )));
+        }
+        // Candle owns one document allocation at a time; the persisted payload remains borrowed.
+        let document = Tensor::from_slice(values, (rows, dimension), device).map_err(|source| {
+            inference_error(format!(
+                "failed to load persisted ColBERT matrix onto scoring device: {source}"
+            ))
+        })?;
+        maxsim_score(&self.matrix, &document)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ColbertInputPath {
     embeddings: Embedding,
@@ -562,6 +641,11 @@ impl ColbertRuntime {
         &self.tokenizer
     }
 
+    /// Share the actual formatted-document capacity with source-window construction.
+    pub(super) fn document_max_tokens(&self) -> usize {
+        self.document_max_tokens
+    }
+
     /// Encode and flatten one unit's ColBERT document token matrix. Production
     /// path for LONG units under the CPd length-threshold hybrid (2026-07-18):
     /// the C6e builder routes units above `COLBERT_BATCH_ROUTE_MAX_TOKENS`
@@ -768,6 +852,69 @@ impl ColbertRuntime {
                 })
             })
             .collect()
+    }
+
+    /// Embed one query on the existing device while the caller holds the local model permit.
+    /// The permit may be released afterward and reacquired for each subsequent scoring scope.
+    pub(super) fn prepare_query(&self, query: &str) -> Result<PreparedColbertQuery, ApiError> {
+        let context = crate::util::model_call_context("colbert", "query_embedding");
+        let _entered = context.enter();
+        let started_at = Instant::now();
+        let query_chars = query.chars().count();
+        info!(
+            event = "model_call.started",
+            model_role = "colbert",
+            call_purpose = "query_embedding",
+            input_kind = "query",
+            text_count = 1usize,
+            query_chars,
+            configured_max_tokens = self.query_max_tokens,
+            expected_dimension = self.projection_dimension,
+            "ColBERT query embedding started"
+        );
+        let result = self.encode_projected_query(query).and_then(|matrix| {
+            PreparedColbertQuery::from_matrix(matrix, self.projection_dimension)
+        });
+        match &result {
+            Ok(prepared) => info!(
+                event = "model_call.completed",
+                model_role = "colbert",
+                call_purpose = "query_embedding",
+                input_kind = "query",
+                text_count = 1usize,
+                query_chars,
+                token_count = prepared.token_count(),
+                configured_max_tokens = self.query_max_tokens,
+                vector_dimension = self.projection_dimension,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "ColBERT query embedding completed"
+            ),
+            Err(source) => error!(
+                event = "model_call.failed", model_role = "colbert", call_purpose = "query_embedding",
+                input_kind = "query", text_count = 1usize, query_chars,
+                configured_max_tokens = self.query_max_tokens, expected_dimension = self.projection_dimension,
+                elapsed_ms = started_at.elapsed().as_millis() as u64, error = %source,
+                "ColBERT query embedding failed"
+            ),
+        }
+        result
+    }
+
+    /// Reuse a prepared query while loading only the current document onto the existing device.
+    pub(super) fn score_matrix(
+        &self,
+        prepared: &PreparedColbertQuery,
+        values: &[f32],
+        rows: usize,
+        dimension: usize,
+    ) -> Result<f32, ApiError> {
+        prepared.score_matrix(
+            values,
+            rows,
+            dimension,
+            self.projection_dimension,
+            &self.device,
+        )
     }
 
     /// Score persisted ColBERT document token vectors without per-candidate progress reporting.

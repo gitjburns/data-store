@@ -121,6 +121,20 @@ const DELETE_FOR_PARSE_SQL: &str = "
 DELETE FROM retrieval_projections
 WHERE parse_id = ?1 AND projection_type = ?2";
 
+/// A cohort refresh must not delete passage vectors, other annotation excerpts,
+/// or another model representation that shares the same projection type.
+const DELETE_FOR_INDEX_PARTITION_SQL: &str = "
+DELETE FROM retrieval_projections
+WHERE parse_id = ?1 AND projection_type = ?2
+  AND index_name IS ?3 AND index_partition IS ?4";
+
+const MAX_ANNOTATION_DEPENDENTS: usize = 1_000_000;
+const ANNOTATION_DEPENDENTS_SQL: &str = "
+SELECT p.id FROM retrieval_projections AS p
+WHERE p.freshness_status = 'fresh' AND p.deleted_at IS NULL
+  AND EXISTS(SELECT 1 FROM json_each(p.input_annotation_ids_json) WHERE value = ?1)
+ORDER BY p.id LIMIT ?2";
+
 /// SystemEvent object_type for retrieval_projections rows.
 const OBJECT_TYPE_RETRIEVAL_PROJECTION: &str = "retrieval_projection";
 
@@ -357,6 +371,52 @@ pub(crate) fn mark_stale(tx: &Transaction<'_>, projection_id: &str) -> Result<()
     append_event(tx, &event)
 }
 
+/// Invalidate every fresh projection consuming an annotation in the same source
+/// transaction that stales it. Paired dense/ColBERT and graph/summary envelopes
+/// therefore never remain fresh across a deliberately invalidated input boundary.
+pub(crate) fn mark_annotation_dependents_stale(
+    tx: &Transaction<'_>,
+    annotation_id: &str,
+) -> Result<usize, ApiError> {
+    let mut statement =
+        tx.prepare(ANNOTATION_DEPENDENTS_SQL)
+            .map_err(|source| ApiError::StorageOperation {
+                message: format!(
+                    "prepare dependent projections for annotation {annotation_id}: {source}"
+                ),
+            })?;
+    let rows = statement
+        .query_map(
+            params![annotation_id, MAX_ANNOTATION_DEPENDENTS + 1],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("read dependent projections for annotation {annotation_id}: {source}"),
+        })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        if ids.len() == MAX_ANNOTATION_DEPENDENTS {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "annotation {annotation_id} exceeds the dependent projection limit"
+                ),
+            });
+        }
+        ids.push(row.map_err(|source| ApiError::StorageOperation {
+            message: format!(
+                "decode dependent projection for annotation {annotation_id}: {source}"
+            ),
+        })?);
+    }
+    // Finish the read cursor before mutating its table; each transition keeps
+    // the existing projection.stale audit event in the same commit.
+    drop(statement);
+    for id in &ids {
+        mark_stale(tx, id)?;
+    }
+    Ok(ids.len())
+}
+
 /// Transition `fresh → superseded` (parse superseded at cutover, §31.2),
 /// stamping valid_to with the supersession time, then append
 /// `projection.superseded`. The UPDATE is status-guarded and asserted to hit
@@ -417,6 +477,23 @@ pub(crate) fn delete_for_parse(
             message: format!(
                 "failed to delete {type_name} projections for parse {parse_id}: {source}"
             ),
+        })
+}
+
+/// Replace only one index partition inside the caller's publication transaction.
+/// NULL identifies the existing graph/summary index; lifecycle events survive
+/// envelope cleanup, and a failed replacement rolls the deletion back.
+pub(crate) fn delete_for_index_partition(
+    tx: &Transaction<'_>,
+    parse_id: &str,
+    projection_type: ProjectionType,
+    index_name: Option<&str>,
+    index_partition: Option<&str>,
+) -> Result<usize, ApiError> {
+    let kind = enum_wire_name(&projection_type, "projection type")?;
+    tx.execute(DELETE_FOR_INDEX_PARTITION_SQL, params![parse_id, kind, index_name, index_partition])
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("failed to replace {kind} index {index_name:?} partition {index_partition:?} for parse {parse_id}: {source}"),
         })
 }
 

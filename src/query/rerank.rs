@@ -1,18 +1,17 @@
-//! Rerank stage (§24, §38): ColBERT MaxSim over the fused candidate pool via
-//! persisted matrices, then the final reranker. Content lands with package
-//! C7c; consumed at C7d/C8d.
+//! Persisted whole-unit MaxSim and final passage reranking on the query snapshot.
+//! Exact source-window matrices are scored separately by query::annotation.
 //!
 //! Two scoring stages live here, in pipeline order:
 //!
-//! 1. **ColBERT MaxSim** re-scores the fused candidate pool (dense+lexical+graph,
-//!    already fused by RRF) using the ColBERT document matrices PERSISTED at
+//! 1. **ColBERT MaxSim** re-scores the fused pool's legacy whole-unit subset
+//!    using the ColBERT document matrices PERSISTED at
 //!    build time. §38 forbids recomputing those document vectors at search
 //!    time, so the loader decodes stored blobs and MaxSim never re-embeds a
-//!    document. The query is embedded live by the selected ColBERT backend.
-//!    Local inference/scoring holds the model-call gate; remote query embedding
-//!    and CPU MaxSim run without that accelerator permit.
+//!    document. The caller embeds the query once for source and annotation scoring.
+//!    Local scoring acquires the model-call gate after matrix loading; HTTP CPU
+//!    MaxSim runs without that accelerator permit.
 //!
-//! 2. **Final reranker** scores passages built from MaxSim-ranked units via the config-selected
+//! 2. **Final reranker** scores passages built from ranked units and exact windows via the config-selected
 //!    reranker backend. The gate discipline is CALLER-SIDE and backend-aware:
 //!    the Local backend is a live accelerator call and MUST run under the
 //!    model-call gate; the Http backend is network I/O and MUST NOT hold the
@@ -20,7 +19,7 @@
 //!    decides which path a given backend takes (it acquires nothing itself).
 //!
 //! NOTE on the deferred `multi_vector` CHANNEL: ColBERT MaxSim here is a
-//! rerank/scoring stage over the ALREADY-fused pool, not a candidate-generation
+//! rerank/scoring stage over an ALREADY-fused subset, not a candidate-generation
 //! channel. The `multi_vector` retrieval channel is deferred post-MVP
 //! (2026-07-15 rescope); this stage is retained.
 //!
@@ -33,12 +32,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::Connection;
+use serde::Serialize;
 use tracing::{error, info};
 
 use crate::error::ApiError;
 use crate::inference::{
-    ColbertBackend, ColbertCandidateScore, RerankerBackend, RerankerCandidateInput,
-    RerankerCandidateScore,
+    ColbertBackend, ColbertCandidateScore, PreparedColbertQuery, RerankerBackend,
+    RerankerCandidateInput,
 };
 use crate::projections::multivector;
 use crate::query::model::RetrievalHit;
@@ -74,26 +74,39 @@ pub(crate) struct RerankStageContext<'a> {
     pub(crate) query_id: &'a str,
 }
 
-/// ColBERT MaxSim over the fused candidate pool.
+/// A final passage score uses the complete candidate identity, independent of its canonical anchor.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PassageScore {
+    pub(crate) candidate_id: String,
+    pub(crate) score: f32,
+    pub(crate) rank: usize,
+    /// Backend diagnostics remain absent when the provider did not report them.
+    pub(crate) logit: Option<f32>,
+    pub(crate) token_count: Option<usize>,
+}
+
+/// ColBERT MaxSim over legacy whole-unit candidates remaining in the fused pool.
 ///
-/// Loads the persisted ColBERT matrices for the fused pool (capped at
+/// Loads the persisted ColBERT matrices for the whole-unit subset (capped at
 /// `colbert_candidate_pool_size`) via the query-time loader — NO document
-/// recomputation (§38) — then scores them against a LIVE query embedding.
-/// The local backend holds the model-call gate while embedding and scoring;
-/// the HTTP backend embeds remotely and performs CPU MaxSim without that gate.
+/// recomputation (§38) — then scores them against the caller's prepared query.
+/// Matrix loading precedes the local scoring permit; the caller must release
+/// its query-embedding permit before entering this stage. HTTP CPU MaxSim needs no gate.
 ///
-/// `pool` is the RRF-fused, unit-grained hit list. Candidates are grouped by
+/// Exact `source_excerpt` hits are handled by annotation::score_excerpts and skipped here.
+/// Remaining candidates are grouped by
 /// their originating `parse_id` because both the matrix load and the store are
 /// parse-scoped; a query in scope over several sources fuses hits from several
 /// active parses. `expected_dimension` is the runtime ColBERT projection
 /// dimension the decoder validates against.
 ///
-/// Returns the MaxSim scores (already ranked, best first, by
-/// `score_persisted_candidates`). Units in the pool with no stored matrix are
-/// omitted by the loader and therefore carry no MaxSim score.
+/// Returns MaxSim scores ranked best first, with unit IDs breaking ties. Units
+/// with no stored matrix are omitted by the loader and carry no MaxSim score.
 pub(crate) fn run_maxsim_stage(
     ctx: &RerankStageContext<'_>,
     colbert: &ColbertBackend,
+    prepared: &PreparedColbertQuery,
     pool: &[RetrievalHit],
     expected_dimension: usize,
     colbert_candidate_pool_size: usize,
@@ -114,6 +127,7 @@ pub(crate) fn run_maxsim_stage(
         parse_count = capped.len(),
         candidate_count,
         colbert_candidate_pool_size,
+        query_tokens = prepared.token_count(),
         expected_dimension,
         "ColBERT MaxSim stage started"
     );
@@ -139,8 +153,7 @@ pub(crate) fn run_maxsim_stage(
         candidates.append(&mut loaded);
     }
 
-    // Only the local backend embeds and scores on the accelerator. HTTP query
-    // embedding and its CPU MaxSim comparison must not hold that exclusive gate.
+    // The prepared query is reused; only local scoring needs admission, after persisted I/O finishes.
     let gate_started = Instant::now();
     let (scores, gate_wait_ms, scoring_ms) = {
         let permit = if colbert.uses_local_model_gate() {
@@ -168,20 +181,46 @@ pub(crate) fn run_maxsim_stage(
             0
         };
         let scoring_started = Instant::now();
-        let scores = colbert
-            .score_persisted_candidates(ctx.query, &candidates)
-            .inspect_err(|source| {
-                error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
-                    backend = ?colbert.backend_kind(),
-                    stage = "scoring", candidate_count = candidates.len(),
-                    error = %source, error_chain = %crate::util::error_chain(source),
-                    gate_wait_ms, scoring_ms = scoring_started.elapsed().as_millis() as u64,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "ColBERT MaxSim scoring failed");
-            })?;
+        let mut scores = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            let score = colbert
+                .score_matrix(
+                    prepared,
+                    &candidate.vector,
+                    candidate.token_count,
+                    candidate.dimension,
+                )
+                .inspect_err(|source| {
+                    error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
+                        backend = ?colbert.backend_kind(),
+                        stage = "scoring", candidate_count = candidates.len(),
+                        unit_id = %candidate.unit_id,
+                        error = %source, error_chain = %crate::util::error_chain(source),
+                        gate_wait_ms, scoring_ms = scoring_started.elapsed().as_millis() as u64,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "ColBERT MaxSim scoring failed");
+                })?;
+            scores.push(ColbertCandidateScore {
+                unit_id: candidate.unit_id.clone(),
+                score,
+                rank: 0,
+                query_tokens: prepared.token_count(),
+                document_tokens: candidate.token_count,
+            });
+        }
         let scoring_ms = scoring_started.elapsed().as_millis() as u64;
         // Release local admission immediately after its accelerator work.
         drop(permit);
+        // Matrix load order spans parses; stable global score ranks must not depend on that order.
+        scores.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.unit_id.cmp(&right.unit_id))
+        });
+        for (index, score) in scores.iter_mut().enumerate() {
+            score.rank = index + 1;
+        }
         (scores, gate_wait_ms, scoring_ms)
     };
 
@@ -197,6 +236,8 @@ pub(crate) fn run_maxsim_stage(
         scoring_ms,
         scored = scores.len(),
         colbert_candidate_pool_size,
+        query_tokens = prepared.token_count(),
+        document_tokens = scores.iter().map(|score| score.document_tokens).sum::<usize>(),
         expected_dimension,
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "ColBERT MaxSim stage completed"
@@ -206,8 +247,8 @@ pub(crate) fn run_maxsim_stage(
 }
 
 /// Score the caller-bounded passages, including their section headings, using
-/// the configured backend. Scores belong to complete passages; the representative
-/// anchor id is only the stable join key used to attach each returned score.
+/// the configured backend. Candidate IDs keep disjoint passages from the same
+/// canonical anchor distinct across the backend's opaque scoring-key contract.
 ///
 /// Gate discipline (CALLER-SIDE, §1.5 pinned; mirrors the scheduler's local
 /// acquire). `uses_local_model_gate()` is a PREDICATE that returns `true` for
@@ -221,7 +262,7 @@ pub(crate) fn run_reranker_stage(
     ctx: &RerankStageContext<'_>,
     reranker: &RerankerBackend,
     passages: &[PassageCandidate],
-) -> Result<Vec<RerankerCandidateScore>, ApiError> {
+) -> Result<Vec<PassageScore>, ApiError> {
     let started_at = Instant::now();
 
     // Passage construction already resolved canonical content on the query snapshot.
@@ -229,7 +270,8 @@ pub(crate) fn run_reranker_stage(
     let inputs: Vec<RerankerCandidateInput> = passages
         .iter()
         .map(|passage| RerankerCandidateInput {
-            unit_id: passage.anchor_unit_id.clone(),
+            // The inference API calls this field unit_id, but returns the caller's opaque key.
+            unit_id: passage.candidate_id.clone(),
             content: passage.ranking_text(),
         })
         .collect();
@@ -321,13 +363,22 @@ pub(crate) fn run_reranker_stage(
         "final reranker stage completed"
     );
 
-    Ok(scores)
+    Ok(scores
+        .into_iter()
+        .map(|score| PassageScore {
+            candidate_id: score.unit_id,
+            score: score.score,
+            rank: score.rank,
+            logit: score.logit,
+            token_count: score.token_count,
+        })
+        .collect())
 }
 
-/// Group the fused pool's unit ids by originating `parse_id`, capping the TOTAL
+/// Group legacy whole-unit candidates by originating `parse_id`, capping the TOTAL
 /// candidate count at `colbert_candidate_pool_size` while preserving fused
-/// order. The pool is unit-grained (chunk→unit resolution happened before
-/// fusion), so each hit's `unit_ids` are the candidate units it contributes; a
+/// order. Exact-window hits belong to the annotation scorer; each remaining
+/// hit's `unit_ids` are the candidate units it contributes. A
 /// unit already collected (a later hit resolving to the same unit) is not
 /// re-added, so the cap counts distinct candidates.
 fn capped_pool_units(
@@ -338,6 +389,10 @@ fn capped_pool_units(
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
     let mut total = 0usize;
     'pool: for hit in pool {
+        // Exact windows have separate persisted matrices and are scored by annotation::score_excerpts.
+        if hit.source_excerpt.is_some() {
+            continue;
+        }
         for unit_id in &hit.unit_ids {
             if total >= colbert_candidate_pool_size {
                 break 'pool;

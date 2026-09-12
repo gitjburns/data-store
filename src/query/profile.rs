@@ -20,7 +20,7 @@
 //! abstract shape does not name (`rrf_k`,
 //! `colbert_candidate_pool_size`, `reranker_candidate_pool_size`,
 //! `graph_hop_budget`) are added as additional profile fields and covered by
-//! the same self-hash. Candidate budgets and passage ranking use the sealed v3
+//! the same self-hash. Candidate budgets and passage ranking use the sealed v4
 //! values; the graph hop budget remains one.
 
 use std::sync::OnceLock;
@@ -50,9 +50,8 @@ pub(crate) struct RetrievalProfile {
     /// Profile version; part of the profile's audited identity (§24.2 `version`).
     pub(crate) version: String,
 
-    /// Channels retrieved by default (§24.2 `defaultChannels`). MVP set is
-    /// exactly dense, lexical, graph (`multi_vector` channel deferred post-MVP,
-    /// 2026-07-15 rescope).
+    /// Discovery mechanisms retained in attribution. Graph and semantic share
+    /// one annotation contribution in final fusion; ColBERT scores the fused pool.
     pub(crate) default_channels: Vec<RetrievalChannel>,
     /// Per-channel candidate cap before fusion (§24.2
     /// `defaultMaxCandidatesPerChannel`). MVP maps this to the dense/lexical
@@ -64,7 +63,7 @@ pub(crate) struct RetrievalProfile {
     pub(crate) default_max_final_evidence_units: u32,
     /// Whether the final reranker runs by default (§24.2 `defaultRerank`).
     pub(crate) default_rerank: bool,
-    /// Fusion strategy tag (§24.2 `defaultFusionStrategy?`). MVP fuses with RRF.
+    /// Fusion strategy tag (§24.2 `defaultFusionStrategy?`), including grouping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) default_fusion_strategy: Option<String>,
 
@@ -119,8 +118,9 @@ pub(crate) fn active_profile() -> Result<&'static RetrievalProfile, ApiError> {
     }
 }
 
-/// Seal retrieval v3: passage and section lists fuse inside the dense channel,
-/// which retains one vote alongside lexical and graph in outer RRF.
+/// Seal retrieval v4: source dense, lexical, and grouped graph/semantic each
+/// contribute once to final RRF. Exact excerpts use their best source or matched
+/// annotation MaxSim, preventing extra representations from adding score votes.
 ///
 /// `created_at` is a FIXED authoring timestamp, not runtime state: this is a
 /// versioned document whose identity (id + version + hash) must be stable
@@ -131,21 +131,21 @@ fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
     let candidate_pool = 100;
     let mut profile = RetrievalProfile {
         id: "retrieval-profile".to_string(),
-        version: "3".to_string(),
+        version: "4".to_string(),
 
-        // MVP channel set: dense, lexical, graph (multi_vector channel deferred
-        // post-MVP, 2026-07-15 rescope).
+        // Attribution distinguishes discovery mechanisms from final fusion groups.
         default_channels: vec![
             RetrievalChannel::Dense,
             RetrievalChannel::Lexical,
             RetrievalChannel::Graph,
+            RetrievalChannel::Semantic,
         ],
         // Per-channel candidate cap = the ColBERT-fed pool size (100).
         default_max_candidates_per_channel: candidate_pool,
         // The public legacy field now caps final passages, not seed units.
         default_max_final_evidence_units: default_results,
         default_rerank: true,
-        default_fusion_strategy: Some("rrf".to_string()),
+        default_fusion_strategy: Some("grouped_rrf".to_string()),
 
         default_top_k: default_results,
         max_top_k: MAX_QUERY_RESULTS as u32,
@@ -157,7 +157,7 @@ fn seal_mvp_profile() -> Result<RetrievalProfile, ApiError> {
         graph_hop_budget: 1,
 
         // Fixed authoring timestamp of this versioned document; see fn comment.
-        created_at: "2026-09-08T00:00:00.000Z".to_string(),
+        created_at: "2026-09-12T00:00:00.000Z".to_string(),
         profile_hash: String::new(),
     };
     // Self-hash over the document minus its own hash field (spec §16.2 rules);

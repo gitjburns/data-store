@@ -67,6 +67,12 @@ pub enum HealthObservations {
         #[serde(default)]
         inventory_measured_at: Option<String>,
     },
+    Projections {
+        activity: ProjectionActivity,
+        measured_at: Option<String>,
+        /// None before inventory; an empty list is a measured empty active corpus.
+        documents: Option<Vec<ProjectionDocumentProgress>>,
+    },
     Corpus {
         source_systems: Vec<String>,
         measured_at: Option<String>,
@@ -85,6 +91,62 @@ pub enum HealthObservations {
         level: String,
         file_path: String,
     },
+}
+
+/// Mutually exclusive counts for the current measured input version. An older
+/// publication does not satisfy a newer cohort; it remains available to queries
+/// while its replacement is pending or failed.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct ProjectionPublicationCounts {
+    pub published: u64,
+    pub pending: u64,
+    pub failed: u64,
+}
+
+/// Projection coverage belongs to one captured source/parse and remains separate
+/// from annotation generation progress. Embeddings are unmeasured without inference.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProjectionDocumentProgress {
+    pub source_id: String,
+    pub parse_id: String,
+    pub source_paths: Vec<String>,
+    pub measured_at: Option<String>,
+    pub graph: ProjectionPublicationCounts,
+    pub summary: ProjectionPublicationCounts,
+    pub embeddings: Option<ProjectionPublicationCounts>,
+    pub activity: ProjectionActivity,
+    pub detail: Option<String>,
+}
+
+/// Classification is supplied by the publication owner, never inferred by clients.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionActivity {
+    #[default]
+    Discovering,
+    Pending,
+    Building,
+    AwaitingCommit,
+    Complete,
+    RetryWait,
+    Stopped,
+    Unavailable,
+}
+
+impl std::fmt::Display for ProjectionActivity {
+    /// Keep CLI and operational activity labels aligned with server classifications.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Discovering => "discovering",
+            Self::Pending => "pending",
+            Self::Building => "building",
+            Self::AwaitingCommit => "awaiting commit",
+            Self::Complete => "projections published",
+            Self::RetryWait => "waiting to retry",
+            Self::Stopped => "stopped",
+            Self::Unavailable => "unavailable",
+        })
+    }
 }
 
 /// Counts describe work examined in a completed cycle. Eligible missing work

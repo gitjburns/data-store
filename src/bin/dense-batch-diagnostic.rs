@@ -36,12 +36,17 @@
 
 use std::{env, path::PathBuf, time::Instant};
 
+// Included inference computes the same canonical embedding identity as the service.
+#[path = "../canonical.rs"]
+mod canonical;
 #[path = "../config.rs"]
 mod config;
 #[path = "../error.rs"]
 mod error;
 #[path = "../inference/mod.rs"]
 mod inference;
+#[path = "../primitives/mod.rs"]
+mod primitives;
 // Required by the included inference sources: device.rs renders panic
 // payloads through crate::util, which this bin crate must therefore declare.
 #[path = "../util.rs"]

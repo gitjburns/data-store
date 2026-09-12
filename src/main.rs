@@ -594,6 +594,7 @@ async fn run_http_service(
     // neither slot gates readiness (the set stays {inference, sync}).
     let fabric_health = Arc::new(Mutex::new(FabricHealth::default()));
     let annotation_health = Arc::new(Mutex::new(AnnotationHealth::startup_pending()));
+    let projection_health = Arc::new(Mutex::new(state::ProjectionHealth::default()));
     let shutdown_signal = Arc::new(ShutdownSignal::default());
     // One cutover-barrier registry per process (§31.1): activation via the
     // scheduler and the future C10a accept disposition must serialize on the
@@ -621,6 +622,7 @@ async fn run_http_service(
         Arc::clone(&sync_health),
         Arc::clone(&fabric_health),
         Arc::clone(&annotation_health),
+        Arc::clone(&projection_health),
         Arc::clone(&dense_cache),
         Arc::clone(&cutover_registry),
         // Cloned onto AppState so HTTP snapshot/restore handlers stamp the same
@@ -727,6 +729,7 @@ async fn run_http_service(
     // even if a later startup stage fails or panics.
     let mut scheduler_handle = None;
     let mut annotation_worker_handle = None;
+    let mut projection_worker_handle = None;
     let startup_result: Result<(), ApiError> = async {
         http_waiting.await.map_err(|source| ApiError::InternalIo {
             message: format!("HTTP startup handoff failed: {source}"),
@@ -800,6 +803,26 @@ async fn run_http_service(
                 ),
             })?,
         );
+        // This owner publishes committed annotations independently of producer
+        // waves. A spawn fault is visible in its diagnostic-only health slot.
+        projection_worker_handle =
+            match projections::worker::start(projections::worker::WorkerInputs {
+                index_root: state.config.storage.index_root.clone(),
+                runtime: Some(Arc::new(state.inference()?.clone())),
+                dense_dimension: state.config.models.dense.dimension as usize,
+                colbert_dimension: state.config.models.colbert.dimension as usize,
+                model_gate: state.model_call_gate_handle(),
+                shutdown: Arc::clone(&shutdown_signal),
+                maintenance: Arc::clone(&maintenance),
+                health: projection_health,
+            }) {
+                Ok(handle) => Some(handle),
+                Err(source) => {
+                    error!(event = "startup.projection_worker_unavailable", error = %source,
+                    "service continues with projection publication unavailable");
+                    None
+                }
+            };
         maintenance.complete_startup()?;
         drop(permit);
         info!(
@@ -852,6 +875,12 @@ async fn run_http_service(
         error!(
             event = "annotation_worker.join_panicked",
             "annotation worker thread panicked before shutdown"
+        );
+    }
+    if projection_worker_handle.is_some_and(|handle| handle.join().is_err()) {
+        error!(
+            event = "projection_worker.join_panicked",
+            "annotation projection worker panicked before shutdown join"
         );
     }
     // An accepted rebuild owns filesystem deletion independently of its HTTP
@@ -1248,6 +1277,13 @@ async fn run_annotation_dry_run_mode(
         Arc::new(Mutex::new(SyncHealth::startup_pending())),
         Arc::new(Mutex::new(FabricHealth::default())),
         Arc::new(Mutex::new(AnnotationHealth::startup_pending())),
+        Arc::new(Mutex::new(state::ProjectionHealth {
+            activity: types::ProjectionActivity::Unavailable,
+            detail: Some(
+                "Projection publication is disabled in annotation dry-run mode.".to_owned(),
+            ),
+            ..Default::default()
+        })),
         Arc::new(projections::dense_cache::DenseCache::new()),
         Arc::new(state::CutoverRegistry::new()),
         application_identity,

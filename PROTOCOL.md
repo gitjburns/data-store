@@ -246,6 +246,7 @@ Service readiness and startup diagnostics. Public.
 | --- | --- |
 | `ingestion` | `pending`, `in_flight`, `failed` (integer queue observations); `last_success_at` (nullable timestamp of the last successful cycle, not a queue-measurement timestamp). |
 | `annotations` | `parked` (bool), `measured_at` (nullable cycle timestamp), `last_cycle` (nullable object: integer `sources_examined`, `planned`, `eligible_missing`, `new_failures`, `exhausted`); `documents` (nullable array below), `inventory_measured_at` (nullable discovery timestamp). |
+| `projections` | `activity`, `measured_at` (nullable timestamp), `documents` (nullable array of projection observations below). |
 | `corpus` | `source_systems` (sorted string array), `measured_at` (nullable timestamp); exception values remain in the component's typed `counts`. |
 | `queries` | `in_flight`, `max_in_flight` (integer live admission observations). |
 | `models` | `initialized` (bool); `dense`, `colbert`, `reranker` (each `local` or `http`). Initialization does not assert current remote availability. |
@@ -287,8 +288,19 @@ from coverage after restart; rebuild resets the snapshots. Retry counters and
 timers remain process-local. Annotation completion at 100% does not assert
 retrieval projection publication.
 
+Projection documents contain `source_id`, `parse_id`, `source_paths`, nullable
+`measured_at`, `activity`, nullable `detail`, and `graph`, `summary`, `embeddings`
+coverage. Each coverage object has integer `published`, `pending`, and `failed`
+counts for the measured input version; `embeddings: null` means unavailable or
+not yet measured. Graph and summary each require one publication; embedding
+counts cover excerpt cohorts and outstanding retirements. An older valid cohort
+can remain searchable while its replacement is pending. Activities are
+`discovering`, `pending`, `building`, `awaiting_commit`, `complete`, `retry_wait`,
+`stopped`, and `unavailable`. Missing/null documents mean unmeasured; `[]` is a
+measured empty inventory. Projection publication is disabled in annotation dry runs.
+
 Readiness (`ready`) is determined by the `inference` and `sync` components. The
-other components (`logging`, `fabric`, `annotation`, `search_admission`) are
+other components (`logging`, `fabric`, `annotation`, `projections`, `search_admission`) are
 diagnostic-only and do not gate top-level readiness. `GET /v1/health` is the single aggregation
 surface for corpus/fabric counts.
 
@@ -385,6 +397,7 @@ when the request set `debug: true`:
       "sourceId": "...",
       "parseId": "...",
       "unitIds": ["..."],
+      "sourceExcerpts": [{"unitId": "...", "startChar": 0, "endChar": 23, "textHash": "..."}],
       "sourceLocations": [{"nativeUri": "...", "status": "current"}],
       "sectionPath": ["Section heading"],
       "pageNumbers": [12],
@@ -395,7 +408,8 @@ when the request set `debug: true`:
         "annotationContribution": "none",
         "matchedUnits": [{
           "unitId": "...", "channels": ["dense"], "graphMatches": [],
-          "denseMatches": [{"representation": "passage", "chunkId": "...", "sectionWindowId": null, "sectionId": null, "sectionPath": []}]
+          "denseMatches": [{"representation": "passage", "chunkId": "...", "sectionWindowId": null, "sectionId": null, "sectionPath": []}],
+          "annotationMatches": []
         }],
         "contextUnitIds": []
       }
@@ -432,11 +446,12 @@ when the request set `debug: true`:
 | `text` | string | Passage text in canonical reading order, bounded to 512 ColBERT tokens. |
 | `sourceId`, `parseId` | string | Captured source and active parse. |
 | `unitIds` | array of string | Canonical units contributing to the passage, in reading order. |
+| `sourceExcerpts` | array | Displayed canonical ranges, in passage order: `unitId`, `startChar`, `endChar`, `textHash`. Offsets are Unicode-scalar positions; `endChar` is exclusive and the hash covers the excerpt's UTF-8 bytes. |
 | `sourceLocations` | array of object | Recorded locations, each with `nativeUri` and availability `status`. |
 | `sectionPath` | array of string | Section headings, or an empty array when unavailable. |
 | `pageNumbers` | array of integer | Physical PDF page positions, not printed page labels; empty when unavailable. |
 | `score` | number | Final passage reranker score. |
-| `truncated` | bool | A single oversized canonical unit was excerpted to fit the passage limit. Its full body remains in `evidencePack`. |
+| `truncated` | bool | A legacy whole-unit candidate was clipped to fit the passage limit. Retrieved exact windows remain complete; full canonical bodies remain in `evidencePack`. |
 | `retrievalProvenance` | object | Server-computed candidate attribution, present independently of `debug` and evidence toggles. |
 
 `results` is rank-ordered. `evidencePack` retains exactly their canonical
@@ -448,9 +463,9 @@ passage citations remain present.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `channels` | array of `dense`, `lexical`, `graph` | Union of the retained matches' channel memberships. |
-| `annotationContribution` | `none`, `overlap`, `additional_matches` | No retained graph match; every retained graph match also occurs in another channel; or at least one retained unit occurs only in graph. |
-| `matchedUnits` | array | Final-passage units admitted to the fused pool, each with `unitId`, `channels`, `graphMatches`, and `denseMatches`. |
+| `channels` | array of `dense`, `lexical`, `graph`, `semantic` | Union of retained channel memberships. Canonical source-window matches count as dense evidence. |
+| `annotationContribution` | `none`, `overlap`, `additional_matches` | No graph/semantic annotation match; all annotation-matched units also have dense/lexical matches; or at least one retained unit has only annotation-derived matches. |
+| `matchedUnits` | array | Final-passage units admitted to the fused pool, each with `unitId`, `channels`, `graphMatches`, `denseMatches`, and `annotationMatches`. |
 | `contextUnitIds` | array of string | Remaining passage units, added as surrounding context. |
 
 Membership is checked against this query's eligible, capped channel lists and
@@ -463,13 +478,22 @@ Each `denseMatches` entry has `representation` (`passage` or `section`),
 unit; `chunkId` identifies its best fine-grained match. A null `sectionId` on
 a section match denotes document-scoped content without a section heading.
 
-Dense retrieval combines direct passage and section-guided ranks before outer
-channel fusion. Its diagnostic `score` is the inner RRF score, not raw cosine.
+Each `annotationMatches` entry contains `projectionId`, `representationId`,
+`representation` (`entity`, `relation`, `summary`, `combined`, `source`),
+`annotationIds`, `excerpt` (the `sourceExcerpts` range shape), and
+`exactAnnotationRange`. The latter is false for historical whole-unit annotation
+targets. Attribution contains identities and ranges; annotation bodies remain
+controlled by evidence inclusion options.
+
+Retrieval profile v4 uses three outer RRF contributions: source dense, lexical,
+and grouped graph plus semantic annotation retrieval. Passage/section/source-window
+ranks merge within source dense; individual and combined annotations share the
+annotation contribution. Diagnostic fused scores are RRF scores, not raw cosine.
 Queries return `503 service_unavailable` with rebuild instructions when any
-scoped active parse lacks the required passage/section cache data.
+scoped active parse lacks the required persisted passage/section representation.
 
 Each `graphMatches` entry has `matchedEntity` (normalized name), `matchClass`
-(`exact`, `acronym`, `token_prefix`), and `kind` (`direct_mention`,
+(`exact`, `acronym`, `token_prefix`, `semantic`), and `kind` (`direct_mention`,
 `relation_support`, `related_entity_mention`). The latter two include
 `relationship`: `subject`, `predicate`, `object` (normalized stored triple),
 and `supportingUnitIds`. The triple always retains subject-to-object direction,
@@ -548,21 +572,23 @@ serializable projection of the pipeline's in-memory stage outputs.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `channelHits` | array of `RetrievalHit` | Dense, lexical, and graph stage outputs before cross-channel fusion. |
-| `fusedPool` | array of `RetrievalHit` | The fused dense+lexical+graph candidate pool the rerankers scored over. |
-| `maxsim` | array | ColBERT MaxSim scores over the fused pool, best-first. Entries: `unitId` (string), `score` (number), `rank` (integer). |
-| `passageCandidates` | array | Passages submitted to final reranking: `anchorUnitId`, `sourceId`, `parseId`, `unitIds`, `text`, `sectionPath`, `truncated`. |
-| `reranked` | array | Final passage reranker scores, best-first. Entries: `unitId` (representative anchor), `score` (number), `rank` (integer), `logit` (number, omitted when absent), `tokenCount` (integer, omitted when absent). |
-| `latencies` | object | Per-stage wall-clock latencies in milliseconds (all `u64`, always): `openTransactionMs`, `captureMs`, `queryEmbedMs`, `denseLexicalFusionMs`, `graphMs`, `maxsimMs`, `passageBuildMs`, `rerankMs`, `assemblyMs`, `snapshotHeldMs`. |
+| `channelHits` | array of `RetrievalHit` | Dense, lexical, graph, and semantic attribution before outer fusion. |
+| `fusedPool` | array of `RetrievalHit` | Candidates admitted by the three grouped contributions, retaining exact excerpts where available. |
+| `maxsim` | array | ColBERT scores for whole-unit candidates, best-first: `unitId`, `score`, `rank`. |
+| `annotationMaxsim` | array | Exact-window scores: `candidateId`, `sourceId`, `parseId`, `excerpt`, canonical `text`, `score`, `sourceScore`, `annotationMatches`. `score` is the best source or matched-annotation MaxSim, not their sum. Derived annotation text is omitted. |
+| `passageCandidates` | array | Passages offered to final reranking: `candidateId`, `anchorUnitId`, `sourceId`, `parseId`, `unitIds`, `text`, `sectionPath`, `truncated`. Candidate IDs distinguish different ranges within one canonical anchor. |
+| `reranked` | array | Final passage scores, best-first: `candidateId`, `score`, `rank`, optional `logit`, optional `tokenCount`. |
+| `latencies` | object | Milliseconds (`u64`): `openTransactionMs`, `captureMs`, `queryEmbedMs`, `denseLexicalFusionMs`, `graphMs`, `annotationRetrievalMs`, `fusionMs`, `annotationMaxsimMs`, `maxsimMs`, `passageBuildMs`, `rerankMs`, `assemblyMs`, `snapshotHeldMs`. `annotationMaxsimMs` is included within `maxsimMs`. |
 
 `RetrievalHit` entries (`camelCase`): `hitType` (`chunk` \| `content_unit` \|
 `semantic_annotation` \| `retrieval_projection`, always), `hitId` (string,
 always), `sourceId` (string, always), `parseId` (string, always), `unitIds`
-(array of string, always), `channel` (`dense` \| `lexical` \| `graph`, always),
+(array of string, always), `channel` (`dense` \| `lexical` \| `graph` \| `semantic`, always),
 `score` (number, always), `rank` (integer, omitted when absent),
 `matchedProjectionId` (string, omitted when absent), `matchedAnnotationId`
 (string, omitted when absent), `explanation` (string, omitted when absent),
-`graphMatches` and `denseMatches` (arrays, always; the same path records used in result provenance).
+`graphMatches`, `denseMatches`, and `annotationMatches` (arrays, always; the same
+records used in result provenance), and optional `sourceExcerpt`.
 A fused record's `channel` is representative; `channelHits` preserves every
 eligible channel membership.
 
@@ -922,6 +948,9 @@ Mint a corpus-wide snapshot (detached async task). Writes a `pending` Operation
 (`operationType: snapshot_creation`, target `corpus`, `targetObjectId` =
 `corpus`) and returns `202`.
 
+Scope and exported rows share one SQLite read snapshot. Published annotation
+manifests and their dense/ColBERT payloads are included with their recorded lineage.
+
 **Request body** — `SnapshotRequest` (`camelCase`, `deny_unknown_fields`); all
 fields optional:
 
@@ -962,9 +991,10 @@ both required:
 A failure on the restore path surfaces on the polled Operation as `failed` with
 error kind `restore_failed` (`500`).
 
-Snapshots without the required passage and section dense projections are
-rejected before restore writes. Valid section payloads are restored from
-verified artifacts, never regenerated through model calls.
+Snapshots without required passage/section dense projections are rejected before
+restore writes. Section and archived annotation embedding payloads are verified
+and restored without model calls. Graph reconstruction uses each archived
+projection's declared annotation inputs, preserving its publication state.
 
 **Response `202`** — `{ operationId }`.
 
@@ -988,8 +1018,10 @@ The service rejects new storage-dependent requests with `503`
 further annotation dispatch. The annotation worker joins its producer threads,
 discards cancelled results without retry or failure accounting, and rolls back
 uncommitted writes before releasing its storage lease. Actual failures remain
-diagnosable. Other admitted storage work still drains, and the scheduler parks
-between cycles; storage is cleared only after all leases are released. Local
+diagnosable. The projection worker stops new embedding batches and retains its
+lease until blocking calls finish or reach their configured timeout/retry limits;
+unpublished results are discarded. Other admitted storage work still drains, and
+the scheduler parks between cycles; storage is cleared only after all leases are released. Local
 HTTP cancellation does not establish that remote inference has stopped.
 Health, Operation polling, and shutdown remain available. An overlapping
 rebuild returns `503`.
@@ -1028,8 +1060,9 @@ is a recorded extra-spec additive; the §34.6 operation-type set has no shutdown
 value, consistent with it not being tracked async work.)
 
 Shutdown cancels annotation HTTP requests and stops further annotation dispatch.
-The worker joins producers, discards cancelled results, and rolls back
-uncommitted writes before releasing storage. Confirmation acknowledges the
+The annotation worker joins producers and the projection worker waits for current
+blocking embedding calls; both discard cancelled results before releasing storage.
+Uncommitted writes are rolled back. Confirmation acknowledges the
 shutdown signal, not completed local cleanup or termination of remote inference.
 
 **Request body** — none.

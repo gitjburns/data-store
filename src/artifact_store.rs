@@ -19,7 +19,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
@@ -27,6 +27,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::error::ApiError;
@@ -59,6 +60,33 @@ pub(crate) struct ArtifactRef {
     pub(crate) size_bytes: u64,
 }
 
+/// Hash bytes as they are consumed without retaining a second payload-sized copy.
+struct HashingReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes_read: u64,
+    max_bytes: Option<u64>,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    /// Enforce the declared byte ceiling even if a file grows after metadata inspection.
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("artifact byte count overflow"))?;
+        if self.max_bytes.is_some_and(|limit| self.bytes_read > limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact exceeds its byte ceiling",
+            ));
+        }
+        self.digest.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
 /// Write-once content-addressed blob store on the local filesystem (D1).
 /// One instance per store root; all methods take `&self` and are safe under
 /// concurrent use because publication is an atomic rename of immutable
@@ -70,6 +98,27 @@ pub(crate) struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    /// Query readers require an existing store and never create filesystem state.
+    pub(crate) fn open_existing(index_root: &Path) -> Result<Self, ApiError> {
+        let root = index_root.join("fabric").join("artifacts");
+        let directory = root.join(HASH_ALGORITHM_DIR);
+        let metadata = fs::metadata(&directory).map_err(|source| ApiError::StorageOperation {
+            message: format!(
+                "inspect artifact store directory {}: {source}",
+                directory.display()
+            ),
+        })?;
+        if !metadata.is_dir() {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "artifact store path is not a directory: {}",
+                    directory.display()
+                ),
+            });
+        }
+        Ok(Self { root })
+    }
+
     /// Open (creating if absent) the artifact store under
     /// `{index_root}/fabric/artifacts`. Callers pass `config.storage.index_root`;
     /// this constructor owns root creation and logs that boundary. It does not
@@ -242,11 +291,84 @@ impl ArtifactStore {
         self.get_bytes(hash)
     }
 
-    /// Pin an existing envelope payload to a verified manifest reference.
+    /// Consume a payload with bounded buffers, releasing the result only after
+    /// all consumed bytes reproduce its content address. Callback side effects
+    /// must remain provisional until this method succeeds; early parser returns
+    /// still drain and verify the rest of the file.
+    pub(crate) fn with_verified_reader<T>(
+        &self,
+        uri: &str,
+        max_bytes: Option<u64>,
+        read: impl FnOnce(&mut dyn Read) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let hash = self.hash_from_uri(uri)?;
+        let path = self.blob_path(hash);
+        let started = Instant::now();
+        tracing::debug!(event = "artifact_store.blob_read_started", hash,
+            path = %path.display(), max_bytes, "streaming blob read starting");
+        let result = (|| {
+            let file = fs::File::open(&path).map_err(|source| ApiError::StorageOperation {
+                message: format!("open artifact {hash}: {source}"),
+            })?;
+            let size = file
+                .metadata()
+                .map_err(|source| ApiError::StorageOperation {
+                    message: format!("inspect artifact {hash}: {source}"),
+                })?
+                .len();
+            if max_bytes.is_some_and(|limit| size > limit) {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "artifact {hash} has {size} bytes, exceeding ceiling {max_bytes:?}"
+                    ),
+                });
+            }
+            let mut reader = HashingReader {
+                inner: file,
+                digest: Sha256::new(),
+                bytes_read: 0,
+                max_bytes,
+            };
+            // Buffer above the digest so parsers requesting one byte at a time
+            // still hash/read in blocks. Read-ahead bytes already enter the hash.
+            let value = read(&mut BufReader::new(&mut reader))?;
+            io::copy(&mut reader, &mut io::sink()).map_err(|source| {
+                ApiError::StorageOperation {
+                    message: format!("finish reading artifact {hash}: {source}"),
+                }
+            })?;
+            let bytes_read = reader.bytes_read;
+            let actual = format!("{:x}", reader.digest.finalize());
+            if actual != hash {
+                return Err(ApiError::StorageOperation {
+                    message: format!("artifact store corruption: {hash} hashes to {actual}"),
+                });
+            }
+            tracing::debug!(
+                event = "artifact_store.blob_read",
+                hash,
+                size_bytes = bytes_read,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "streamed blob read and verified"
+            );
+            Ok(value)
+        })();
+        result.inspect_err(|source| {
+            error!(event = "artifact_store.read_failed", hash,
+            path = %path.display(), error = %source,
+            elapsed_ms = started.elapsed().as_millis() as u64, "streamed artifact read failed")
+        })
+    }
+
+    /// Pin a payload by streaming its integrity check instead of retaining its bytes.
     pub(crate) fn reference_for_uri(&self, uri: &str) -> Result<ArtifactRef, ApiError> {
         let hash = self.hash_from_uri(uri)?;
-        let bytes = self.get_bytes(hash)?;
-        Ok(self.artifact_ref(hash.to_owned(), &self.blob_path(hash), bytes.len() as u64))
+        let size = self.with_verified_reader(uri, None, |reader| {
+            io::copy(reader, &mut io::sink()).map_err(|source| ApiError::StorageOperation {
+                message: format!("read artifact reference {hash}: {source}"),
+            })
+        })?;
+        Ok(self.artifact_ref(hash.to_owned(), &self.blob_path(hash), size))
     }
 
     /// Accept only the store's canonical sha256/shard/hash URI suffix. The

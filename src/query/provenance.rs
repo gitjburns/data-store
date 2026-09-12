@@ -4,16 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Spec §24.3 `RetrievalChannel`. The candidate-generation channel a hit came
-/// from. The spec's full string set is
-/// `"lexical" | "learned_sparse" | "dense" | "multi_vector" | "graph" |
-/// "semantic" | "temporal"`; the C7 MVP retrieves over exactly three channels
-/// — dense, lexical, graph — so only those variants are defined here. This
-/// keeps every match on the channel exhaustive with no phantom arms for
-/// channels the MVP never emits (`multi_vector` channel deferred post-MVP,
-/// 2026-07-15 rescope; the remaining spec channels are unimplemented). The
-/// wire form is the spec's snake_case string literals, so a future channel is
-/// added by name without a serde rename.
+/// Discovery mechanism recorded for a hit. Graph and semantic share the final
+/// annotation fusion contribution, while their attribution remains distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalChannel {
@@ -23,12 +15,14 @@ pub(crate) enum RetrievalChannel {
     Lexical,
     /// Semantic-graph traversal from entity-name matches (D9).
     Graph,
+    /// Dense matching of stored annotation meaning, grouped with graph for fusion.
+    Semantic,
 }
 
 /// How a query matched a stored NORMALIZED entity name (D9 amendment, CA2-P2
 /// 2026-07-19). Strength order is RULED: `Exact` is strongest, then `Acronym`,
-/// then `TokenPrefix`. `#[derive(Ord)]` makes `Exact < Acronym < TokenPrefix`
-/// (declaration order), i.e. "stronger first" — a plain ascending sort places
+/// then `TokenPrefix`, then embedding-derived `Semantic`. Declaration order
+/// means "stronger first" — a plain ascending sort places
 /// exact-derived matches before fuzzy ones, and acronym before token-prefix,
 /// exactly as the ruled ordering key requires. This ordinal ranks WITHIN a D9
 /// tier, strictly BELOW the tier discriminator and strictly ABOVE matched-name
@@ -47,6 +41,8 @@ pub(crate) enum MatchClass {
     /// Each normalized query token is a prefix of the corresponding stored-name
     /// token, in order (a leading-subsequence prefix match).
     TokenPrefix,
+    /// An entity annotation was selected by its embedding, not by query spelling.
+    Semantic,
 }
 
 /// Attribution for the retrieved units retained in one final passage.
@@ -77,6 +73,9 @@ pub(crate) struct UnitRetrievalMatch {
     pub(crate) channels: Vec<RetrievalChannel>,
     pub(crate) graph_matches: Vec<GraphMatch>,
     pub(crate) dense_matches: Vec<DenseRetrievalMatch>,
+    /// Exact annotation-derived candidates retained in this unit's final passages.
+    #[serde(default)]
+    pub(crate) annotation_matches: Vec<AnnotationMatch>,
 }
 
 /// Distinguish fine passage discovery from section-guided nomination.
@@ -127,4 +126,51 @@ pub(crate) struct GraphRelationship {
     pub(crate) predicate: String,
     pub(crate) object: String,
     pub(crate) supporting_unit_ids: Vec<String>,
+}
+
+/// Canonical Unicode-scalar slice, independent of model tokenization or projection version.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceExcerpt {
+    pub(crate) unit_id: String,
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+    pub(crate) text_hash: String,
+}
+
+/// Search representations retain their distinct roles while sharing one annotation vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnnotationRepresentation {
+    Entity,
+    Relation,
+    Summary,
+    Combined,
+    Source,
+}
+
+impl AnnotationRepresentation {
+    /// A shared human-readable type label for model input framing and client attribution.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Relation => "relationship",
+            Self::Summary => "summary",
+            Self::Combined => "combined annotations",
+            Self::Source => "source excerpt",
+        }
+    }
+}
+
+/// Recorded model-input match; annotation bodies remain controlled by evidence options.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AnnotationMatch {
+    pub(crate) projection_id: String,
+    pub(crate) representation_id: String,
+    pub(crate) representation: AnnotationRepresentation,
+    pub(crate) annotation_ids: Vec<String>,
+    pub(crate) excerpt: SourceExcerpt,
+    /// False for historical annotations that identify whole units without extraction offsets.
+    pub(crate) exact_annotation_range: bool,
 }

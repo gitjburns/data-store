@@ -47,17 +47,23 @@ use std::time::Instant;
 
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
 use crate::hot_plane;
-use crate::model::{ForensicSnapshot, ForensicSnapshotManifest, SnapshotArtifactRef};
+use crate::model::{
+    AnnotationFreshnessStatus, ContentType, ForensicSnapshot, ForensicSnapshotManifest, Provenance,
+    SemanticAnnotation, SemanticAnnotationType, SnapshotArtifactRef,
+};
 use crate::projections::ChunkerConfig;
-use crate::projections::graph::normalize_entity_name;
+use crate::projections::graph::{CapturedGraph, DerivedEdge};
 use crate::projections::section_dense::{
     SECTION_DENSE_INDEX_NAME, SectionDensePlane, read_section_payload,
 };
+use crate::projections::{annotation, annotation_io};
+use crate::query::provenance::{AnnotationRepresentation, SourceExcerpt};
 
 /// Log-event namespace for this module's verification boundary logs, so every
 /// verify line is attributable to snapshot verification.
@@ -104,6 +110,10 @@ pub(crate) fn verify_mechanical(
     };
     let section_planes = verified_section_planes(&store, snapshot, &manifest)
         .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
+    let graph_planes = verified_graph_planes(&store, snapshot, &manifest)
+        .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
+    let annotation_publications = verified_annotation_publications(&store, &snapshot.id, &manifest)
+        .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
 
     info!(
         event = "snapshot.verify.mechanical_succeeded",
@@ -113,10 +123,1430 @@ pub(crate) fn verify_mechanical(
         blob_refs_hashed = counts.blob_refs_hashed as u64,
         marker_refs_skipped = counts.marker_refs_skipped as u64,
         section_dense_payloads = section_planes.len(),
+        graph_projections = graph_planes.len(),
+        annotation_manifests = annotation_publications.manifest_count,
+        annotation_embedding_blobs = annotation_publications.embedding_blob_count,
+        annotation_representations = annotation_publications.representation_count,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "mechanical snapshot verification succeeded"
     );
     Ok(())
+}
+
+/// Verified immutable publications retain compact row identities for the final
+/// deletion transaction; neither manifest texts nor embedding matrices survive.
+pub(crate) struct VerifiedAnnotationPublications {
+    pub(crate) manifest_count: usize,
+    pub(crate) embedding_blob_count: usize,
+    pub(crate) representation_count: usize,
+    envelopes: BTreeMap<String, VerifiedAnnotationEnvelope>,
+}
+
+/// Full archived-row hashing detects a replacement even when its cohort is unchanged.
+struct VerifiedAnnotationEnvelope {
+    source_id: String,
+    parse_id: String,
+    record_hash: String,
+}
+
+/// Only publication columns participate in pairing; other columns remain pinned
+/// by each record's full hash and are restored through the existing row importer.
+#[derive(serde::Deserialize)]
+struct ArchivedAnnotationEnvelope {
+    id: String,
+    source_id: String,
+    parse_id: String,
+    projection_type: String,
+    input_unit_ids_json: Option<String>,
+    input_annotation_ids_json: Option<String>,
+    producer_json: String,
+    index_partition: Option<String>,
+    payload_uri: Option<String>,
+    freshness_status: String,
+    deleted_at: Option<String>,
+}
+
+/// A provenance target remains exact even when a later cohort uses a finer range.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ExpectedAnnotationTarget {
+    unit_id: String,
+    range: Option<SourceExcerpt>,
+}
+
+/// Compact expectations are merged across historical and current publications.
+struct ExpectedAnnotationInput {
+    source_id: String,
+    parse_id: String,
+    fingerprint: String,
+    representation: AnnotationRepresentation,
+    require_fresh: bool,
+    targets: BTreeSet<ExpectedAnnotationTarget>,
+    nonempty: bool,
+    windows: BTreeSet<ExpectedTextWindow>,
+    full_text_lengths: BTreeSet<usize>,
+    combined_inputs: Vec<usize>,
+}
+
+/// Source verification retains hashes and scalar offsets instead of source bodies.
+struct ExpectedSourceInput {
+    source_id: String,
+    parse_id: String,
+    ranges: BTreeSet<SourceExcerpt>,
+    whole_unit_lengths: BTreeSet<usize>,
+}
+
+/// Model-input windows are verified by scalar offsets and exact-byte hashes.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ExpectedTextWindow {
+    start_char: usize,
+    end_char: usize,
+    text_hash: String,
+}
+
+/// A combined input is hashed incrementally while its ordered annotations stream
+/// past; no corpus-wide collection of rendered annotation strings is retained.
+struct ExpectedCombinedInput {
+    annotation_ids: Vec<String>,
+    next_annotation: usize,
+    next_char: usize,
+    next_window: usize,
+    windows: Vec<(ExpectedTextWindow, Sha256)>,
+    full_text_length: usize,
+}
+
+/// Verify optional annotation indexes without model calls. Each bounded manifest
+/// is decoded once, each matrix is released after validation, and archived inputs
+/// are streamed once per plane after collecting only their hashes and ranges.
+pub(crate) fn verified_annotation_publications(
+    store: &ArtifactStore,
+    snapshot_id: &str,
+    manifest: &ForensicSnapshotManifest,
+) -> Result<VerifiedAnnotationPublications, ApiError> {
+    let mut result = VerifiedAnnotationPublications {
+        manifest_count: 0,
+        embedding_blob_count: 0,
+        representation_count: 0,
+        envelopes: BTreeMap::new(),
+    };
+    let mut by_payload: BTreeMap<String, Vec<ArchivedAnnotationEnvelope>> = BTreeMap::new();
+    visit_annotation_archive::<Value>(
+        store,
+        snapshot_id,
+        manifest,
+        "retrieval_projections",
+        |record| {
+            if record.get("index_name").and_then(Value::as_str) != Some(annotation::INDEX_NAME) {
+                return Ok(());
+            }
+            let record_hash = crate::canonical::canonical_sha256_hex_of(&record)?;
+            let row: ArchivedAnnotationEnvelope =
+                serde_json::from_value(record).map_err(|source| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("decode annotation envelope: {source}"),
+                    )
+                })?;
+            if row.payload_uri.is_none()
+                && matches!(row.freshness_status.as_str(), "building" | "failed")
+            {
+                return Ok(());
+            }
+            if !matches!(
+                row.freshness_status.as_str(),
+                "fresh" | "stale" | "superseded"
+            ) {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "annotation envelope {} has a payload in unfinished state {}",
+                        row.id, row.freshness_status
+                    ),
+                ));
+            }
+            let uri = row.payload_uri.as_deref().ok_or_else(|| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("completed annotation envelope {} has no payload", row.id),
+                )
+            })?;
+            let hash = annotation_uri_hash(uri, snapshot_id)?.to_owned();
+            let identity = VerifiedAnnotationEnvelope {
+                source_id: row.source_id.clone(),
+                parse_id: row.parse_id.clone(),
+                record_hash,
+            };
+            if result.envelopes.insert(row.id.clone(), identity).is_some() {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("duplicate annotation envelope {}", row.id),
+                ));
+            }
+            by_payload.entry(hash).or_default().push(row);
+            Ok(())
+        },
+    )?;
+    let manifest_refs = annotation_snapshot_refs(manifest, annotation::PAYLOAD_TYPE, snapshot_id)?;
+    let blob_refs =
+        annotation_snapshot_refs(manifest, annotation::VECTOR_PAYLOAD_TYPE, snapshot_id)?;
+    if by_payload.keys().collect::<BTreeSet<_>>() != manifest_refs.keys().collect::<BTreeSet<_>>() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation manifest refs and completed envelopes differ",
+        ));
+    }
+    if by_payload.is_empty() {
+        if !blob_refs.is_empty() {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "annotation blobs have no published manifest",
+            ));
+        }
+        return Ok(result);
+    }
+    let mut expected_annotations = BTreeMap::new();
+    let mut expected_sources = BTreeMap::new();
+    let mut expected_combined = Vec::new();
+    let mut fresh_cohorts = BTreeSet::new();
+    let mut used_blobs = BTreeSet::new();
+    let mut checked_shapes = BTreeSet::new();
+    for (hash, rows) in by_payload {
+        let reference = manifest_refs.get(&hash).ok_or_else(|| {
+            annotation_snapshot_failure(snapshot_id, "missing annotation manifest reference")
+        })?;
+        let publication = annotation::read_manifest(store, &reference.uri).map_err(|source| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                format!("read annotation manifest {hash}: {source}"),
+            )
+        })?;
+        let require_fresh =
+            verify_annotation_envelope_pair(snapshot_id, &rows, &publication, &mut fresh_cohorts)?;
+        collect_annotation_expectations(
+            snapshot_id,
+            &publication,
+            require_fresh,
+            &mut expected_annotations,
+            &mut expected_sources,
+            &mut expected_combined,
+        )?;
+        for representation in &publication.representations {
+            for embedding in [&representation.dense, &representation.colbert] {
+                let blob = blob_refs.get(&embedding.artifact.hash).ok_or_else(|| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!(
+                            "annotation manifest {hash} references unpinned embedding {}",
+                            embedding.artifact.hash
+                        ),
+                    )
+                })?;
+                if annotation_uri_hash(&embedding.artifact.uri, snapshot_id)? != blob.hash {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        "embedding URI differs from its explicit snapshot ref",
+                    ));
+                }
+                used_blobs.insert(embedding.artifact.hash.clone());
+                let shape = (
+                    embedding.artifact.hash.clone(),
+                    embedding.rows,
+                    embedding.dimension,
+                    embedding.norm.to_bits(),
+                );
+                if checked_shapes.insert(shape) {
+                    // The decoder validates shape, finite nonzero rows, norm, size,
+                    // and the full digest. Only this one bounded matrix is resident.
+                    drop(
+                        annotation_io::load_embedding(store, embedding).map_err(|source| {
+                            annotation_snapshot_failure(
+                                snapshot_id,
+                                format!("verify embedding {}: {source}", embedding.artifact.hash),
+                            )
+                        })?,
+                    );
+                }
+            }
+        }
+        result.manifest_count += 1;
+        result.representation_count += publication.representations.len();
+    }
+    if used_blobs.iter().collect::<BTreeSet<_>>() != blob_refs.keys().collect::<BTreeSet<_>>() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation snapshot contains embedding refs with no owning manifest",
+        ));
+    }
+    result.embedding_blob_count = used_blobs.len();
+    verify_archived_annotation_inputs(
+        store,
+        snapshot_id,
+        manifest,
+        expected_annotations,
+        expected_combined,
+    )?;
+    verify_archived_annotation_sources(store, snapshot_id, manifest, expected_sources)?;
+    Ok(result)
+}
+
+/// Reduce one bounded manifest to fingerprint and window-hash expectations. Its
+/// annotation-ID order is also the stream order used to hash combined inputs.
+fn collect_annotation_expectations(
+    snapshot_id: &str,
+    publication: &annotation::AnnotationProjection,
+    require_fresh: bool,
+    annotations: &mut BTreeMap<String, ExpectedAnnotationInput>,
+    sources: &mut BTreeMap<String, ExpectedSourceInput>,
+    combined_inputs: &mut Vec<ExpectedCombinedInput>,
+) -> Result<(), ApiError> {
+    let plan = &publication.plan;
+    if plan
+        .inputs
+        .windows(2)
+        .any(|pair| pair[0].annotation_id >= pair[1].annotation_id)
+    {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation manifest inputs are not in producer order",
+        ));
+    }
+    let source = sources
+        .entry(plan.target.unit_id.clone())
+        .or_insert_with(|| ExpectedSourceInput {
+            source_id: plan.source_id.clone(),
+            parse_id: plan.parse_id.clone(),
+            ranges: BTreeSet::new(),
+            whole_unit_lengths: BTreeSet::new(),
+        });
+    if source.source_id != plan.source_id || source.parse_id != plan.parse_id {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation manifests disagree on canonical unit ownership",
+        ));
+    }
+    let target_range = plan.target.range.as_ref().map(|range| SourceExcerpt {
+        unit_id: plan.target.unit_id.clone(),
+        start_char: range.start_char,
+        end_char: range.end_char,
+        text_hash: range.text_hash.clone(),
+    });
+    if let Some(range) = &target_range {
+        source.ranges.insert(range.clone());
+    }
+    let mut groups: BTreeMap<
+        (AnnotationRepresentation, Vec<String>),
+        Vec<&annotation::RepresentationText>,
+    > = BTreeMap::new();
+    let mut dimensions = None;
+    for representation in &publication.representations {
+        let shape = (
+            representation.dense.dimension,
+            representation.colbert.dimension,
+        );
+        if dimensions.is_some_and(|expected| expected != shape) {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "annotation manifest mixes dimensions within one model identity",
+            ));
+        }
+        dimensions = Some(shape);
+        let input = &representation.input;
+        if let Some(excerpt) = &input.source_excerpt {
+            let base = plan
+                .target
+                .range
+                .as_ref()
+                .map_or(0, |range| range.start_char);
+            if base.checked_add(input.input_start_char) != Some(excerpt.start_char)
+                || base.checked_add(input.input_end_char) != Some(excerpt.end_char)
+            {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "source window model-input and canonical offsets disagree",
+                ));
+            }
+            source.ranges.insert(excerpt.clone());
+        }
+        groups
+            .entry((input.representation, input.annotation_ids.clone()))
+            .or_default()
+            .push(input);
+    }
+    let mut individual = BTreeMap::new();
+    let mut combined = None;
+    for ((kind, ids), mut windows) in groups {
+        windows.sort_by_key(|window| window.input_start_char);
+        let mut next = 0;
+        let mut expected_windows = Vec::new();
+        for window in windows {
+            if window.input_start_char != next {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "annotation model-input windows have a gap or overlap",
+                ));
+            }
+            next = window.input_end_char;
+            expected_windows.push(ExpectedTextWindow {
+                start_char: window.input_start_char,
+                end_char: window.input_end_char,
+                text_hash: crate::canonical::sha256_hex_bytes(window.text.as_bytes()),
+            });
+        }
+        match kind {
+            AnnotationRepresentation::Source => {
+                if plan.target.range.is_none() {
+                    source.whole_unit_lengths.insert(next);
+                }
+            }
+            AnnotationRepresentation::Combined => {
+                if combined.replace((ids, expected_windows, next)).is_some() {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        "annotation manifest has inconsistent combined-input lineage",
+                    ));
+                }
+            }
+            _ => {
+                let [id] = ids.as_slice() else {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        "individual annotation representation must name exactly one input",
+                    ));
+                };
+                if individual
+                    .insert(id.clone(), (kind, expected_windows, next))
+                    .is_some()
+                {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        "annotation input has conflicting individual representation types",
+                    ));
+                }
+            }
+        }
+    }
+    let mut nonempty_ids = Vec::new();
+    for signature in &plan.inputs {
+        let detail = individual.remove(&signature.annotation_id);
+        let nonempty = detail.is_some();
+        let expected = annotations
+            .entry(signature.annotation_id.clone())
+            .or_insert_with(|| ExpectedAnnotationInput {
+                source_id: plan.source_id.clone(),
+                parse_id: plan.parse_id.clone(),
+                fingerprint: signature.fingerprint.clone(),
+                representation: signature.representation,
+                require_fresh,
+                targets: BTreeSet::new(),
+                nonempty,
+                windows: BTreeSet::new(),
+                full_text_lengths: BTreeSet::new(),
+                combined_inputs: Vec::new(),
+            });
+        if expected.source_id != plan.source_id
+            || expected.parse_id != plan.parse_id
+            || expected.fingerprint != signature.fingerprint
+            || expected.representation != signature.representation
+            || expected.nonempty != nonempty
+        {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!(
+                    "publications disagree on annotation {}",
+                    signature.annotation_id
+                ),
+            ));
+        }
+        expected.require_fresh |= require_fresh;
+        expected.targets.insert(ExpectedAnnotationTarget {
+            unit_id: plan.target.unit_id.clone(),
+            range: target_range.clone(),
+        });
+        if let Some((kind, windows, length)) = detail {
+            if kind != signature.representation {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "individual annotation representation disagrees with input signature",
+                ));
+            }
+            expected.windows.extend(windows);
+            expected.full_text_lengths.insert(length);
+            nonempty_ids.push(signature.annotation_id.clone());
+        }
+    }
+    if !individual.is_empty() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "individual representation references an undeclared annotation",
+        ));
+    }
+    match combined {
+        Some((ids, windows, length)) if !ids.is_empty() && ids == nonempty_ids => {
+            let index = combined_inputs.len();
+            for id in &ids {
+                let expected = annotations.get_mut(id).ok_or_else(|| {
+                    annotation_snapshot_failure(snapshot_id, "combined input is undeclared")
+                })?;
+                expected.combined_inputs.push(index);
+            }
+            combined_inputs.push(ExpectedCombinedInput {
+                annotation_ids: ids,
+                next_annotation: 0,
+                next_char: 0,
+                next_window: 0,
+                windows: windows
+                    .into_iter()
+                    .map(|window| (window, Sha256::new()))
+                    .collect(),
+                full_text_length: length,
+            });
+        }
+        None if nonempty_ids.is_empty() => {}
+        _ => {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "combined representation must cover every nonempty annotation in producer order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Streamed SQLite annotation columns are decoded into the shared semantic model
+/// only when a published manifest references the row; unrelated rows are dropped.
+#[derive(serde::Deserialize)]
+struct ArchivedAnnotationInput {
+    id: String,
+    source_id: String,
+    parse_id: String,
+    target_unit_ids_json: String,
+    annotation_type: SemanticAnnotationType,
+    body_json: Option<String>,
+    provenance_json: String,
+    confidence: Option<f64>,
+    freshness_status: AnnotationFreshnessStatus,
+    created_at: String,
+    deleted_at: Option<String>,
+}
+
+impl ArchivedAnnotationInput {
+    /// Reconstruct exactly the fields used by the authoritative input fingerprint.
+    fn into_annotation(self, snapshot_id: &str) -> Result<SemanticAnnotation, ApiError> {
+        let body = self.body_json.ok_or_else(|| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                format!("published annotation {} has no body", self.id),
+            )
+        })?;
+        Ok(SemanticAnnotation {
+            target_unit_ids: serde_json::from_str(&self.target_unit_ids_json).map_err(
+                |source| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("annotation {} target IDs: {source}", self.id),
+                    )
+                },
+            )?,
+            body: serde_json::from_str(&body).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("annotation {} body: {source}", self.id),
+                )
+            })?,
+            provenance: serde_json::from_str(&self.provenance_json).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("annotation {} provenance: {source}", self.id),
+                )
+            })?,
+            id: self.id,
+            source_id: self.source_id,
+            parse_id: self.parse_id,
+            annotation_type: self.annotation_type,
+            confidence: self.confidence,
+            freshness_status: self.freshness_status,
+            created_at: self.created_at,
+            deleted_at: self.deleted_at,
+        })
+    }
+}
+
+/// Verify fingerprints, provenance targets, and framed model inputs in one
+/// annotation pass. Combined windows receive only streaming digest updates.
+fn verify_archived_annotation_inputs(
+    store: &ArtifactStore,
+    snapshot_id: &str,
+    manifest: &ForensicSnapshotManifest,
+    mut expected: BTreeMap<String, ExpectedAnnotationInput>,
+    mut combined: Vec<ExpectedCombinedInput>,
+) -> Result<(), ApiError> {
+    let mut seen = BTreeSet::new();
+    visit_annotation_archive::<ArchivedAnnotationInput>(
+        store,
+        snapshot_id,
+        manifest,
+        "semantic_annotations",
+        |row| {
+            if seen.contains(&row.id) {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("duplicate referenced annotation {}", row.id),
+                ));
+            }
+            let Some(input) = expected.remove(&row.id) else {
+                return Ok(());
+            };
+            seen.insert(row.id.clone());
+            let annotation = row.into_annotation(snapshot_id)?;
+            if annotation.source_id != input.source_id
+                || annotation.parse_id != input.parse_id
+                || !matches!(
+                    annotation.freshness_status,
+                    AnnotationFreshnessStatus::Fresh | AnnotationFreshnessStatus::Stale
+                )
+                || (input.require_fresh
+                    && (annotation.freshness_status != AnnotationFreshnessStatus::Fresh
+                        || annotation.deleted_at.is_some()))
+                || annotation::representation_kind(annotation.annotation_type)
+                    != Some(input.representation)
+                || annotation::input_fingerprint(&annotation)? != input.fingerprint
+            {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "published input {} differs from archived annotation ownership, freshness, type, or fingerprint",
+                        annotation.id
+                    ),
+                ));
+            }
+            for target in &input.targets {
+                verify_annotation_target(snapshot_id, &annotation, target)?;
+            }
+            let rendered = annotation::render_annotation(&annotation).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("render archived annotation {}: {source}", annotation.id),
+                )
+            })?;
+            if rendered.is_some() != input.nonempty {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "annotation {} representation coverage disagrees with its empty-marker state",
+                        annotation.id
+                    ),
+                ));
+            }
+            if let Some(text) = rendered {
+                let length = text.chars().count();
+                if input
+                    .full_text_lengths
+                    .iter()
+                    .any(|expected_length| *expected_length != length)
+                {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        format!(
+                            "annotation {} model-input windows omit or extend rendered text",
+                            annotation.id
+                        ),
+                    ));
+                }
+                for window in &input.windows {
+                    let slice = annotation::slice_chars(&text, window.start_char, window.end_char)?;
+                    if crate::canonical::sha256_hex_bytes(slice.as_bytes()) != window.text_hash {
+                        return Err(annotation_snapshot_failure(
+                            snapshot_id,
+                            format!(
+                                "annotation {} model-input text differs from its archived body",
+                                annotation.id
+                            ),
+                        ));
+                    }
+                }
+                for index in input.combined_inputs {
+                    let state = combined.get_mut(index).ok_or_else(|| {
+                        annotation_snapshot_failure(
+                            snapshot_id,
+                            "combined verification identity is missing",
+                        )
+                    })?;
+                    if state.annotation_ids.get(state.next_annotation) != Some(&annotation.id) {
+                        return Err(annotation_snapshot_failure(
+                            snapshot_id,
+                            "archived annotations do not follow the recorded combined-input order",
+                        ));
+                    }
+                    if state.next_annotation > 0 {
+                        feed_combined_window_hashes(snapshot_id, state, "\n\n")?;
+                    }
+                    feed_combined_window_hashes(snapshot_id, state, &text)?;
+                    state.next_annotation += 1;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if let Some((id, _)) = expected.first_key_value() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!("published annotation {id} is missing from the archive"),
+        ));
+    }
+    for state in combined {
+        if state.next_annotation != state.annotation_ids.len()
+            || state.next_char != state.full_text_length
+        {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "combined annotation text does not cover its complete declared input",
+            ));
+        }
+        for (window, digest) in state.windows {
+            if format!("{:x}", digest.finalize()) != window.text_hash {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "combined annotation window differs from the archived annotation bodies",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Match the producer's range-discovery rule, including old whole-unit inputs
+/// whose provenance contained no reference for the target unit.
+fn verify_annotation_target(
+    snapshot_id: &str,
+    annotation: &SemanticAnnotation,
+    expected: &ExpectedAnnotationTarget,
+) -> Result<(), ApiError> {
+    let refs: Vec<_> = annotation
+        .provenance
+        .input_refs
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|input| input.id == expected.unit_id)
+        .collect();
+    let matches_range = refs
+        .iter()
+        .any(|input| match (&input.text_range, &expected.range) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => {
+                actual.start_char == expected.start_char
+                    && actual.end_char == expected.end_char
+                    && actual.text_hash == expected.text_hash
+            }
+            _ => false,
+        })
+        || (refs.is_empty() && expected.range.is_none());
+    if !annotation.target_unit_ids.contains(&expected.unit_id) || !matches_range {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!(
+                "annotation {} does not declare the manifest target/range on {}",
+                annotation.id, expected.unit_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Hash only window intersections with the next rendered fragment. Completed
+/// windows are skipped thereafter, so verification does not rescan prior text.
+fn feed_combined_window_hashes(
+    snapshot_id: &str,
+    state: &mut ExpectedCombinedInput,
+    text: &str,
+) -> Result<(), ApiError> {
+    let end = state
+        .next_char
+        .checked_add(text.chars().count())
+        .filter(|end| *end <= state.full_text_length)
+        .ok_or_else(|| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                "combined annotation text exceeds its recorded windows",
+            )
+        })?;
+    for (index, (window, digest)) in state.windows.iter_mut().enumerate().skip(state.next_window) {
+        if window.start_char >= end {
+            break;
+        }
+        let start = window.start_char.max(state.next_char);
+        let stop = window.end_char.min(end);
+        if start < stop {
+            digest.update(
+                annotation::slice_chars(text, start - state.next_char, stop - state.next_char)?
+                    .as_bytes(),
+            );
+        }
+        if window.end_char <= end {
+            state.next_window = index + 1;
+        }
+    }
+    state.next_char = end;
+    Ok(())
+}
+
+/// Canonical bodies are held for one streamed record, never for the corpus.
+#[derive(serde::Deserialize)]
+struct ArchivedAnnotationSource {
+    id: String,
+    source_id: String,
+    parse_id: String,
+    content_type: ContentType,
+    body_json: Option<String>,
+}
+
+/// A parse's immutable owner is checked independently of its current active state.
+#[derive(serde::Deserialize)]
+struct ArchivedParseOwner {
+    id: String,
+    source_id: String,
+}
+
+/// Source existence needs only identity; other source metadata is skipped on read.
+#[derive(serde::Deserialize)]
+struct ArchivedSourceIdentity {
+    id: String,
+}
+
+/// Check exact canonical text hashes and complete whole-unit coverage, then
+/// confirm parse/source bindings without retaining source contents between rows.
+fn verify_archived_annotation_sources(
+    store: &ArtifactStore,
+    snapshot_id: &str,
+    manifest: &ForensicSnapshotManifest,
+    mut expected: BTreeMap<String, ExpectedSourceInput>,
+) -> Result<(), ApiError> {
+    let mut parse_owners = BTreeMap::new();
+    let mut source_ids = BTreeSet::new();
+    for input in expected.values() {
+        if parse_owners
+            .insert(input.parse_id.clone(), input.source_id.clone())
+            .is_some_and(|owner| owner != input.source_id)
+        {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "annotation source expectations disagree on parse ownership",
+            ));
+        }
+        source_ids.insert(input.source_id.clone());
+    }
+    let mut seen = BTreeSet::new();
+    visit_annotation_archive::<ArchivedAnnotationSource>(
+        store,
+        snapshot_id,
+        manifest,
+        "content_units",
+        |row| {
+            if seen.contains(&row.id) {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("duplicate referenced source unit {}", row.id),
+                ));
+            }
+            let Some(input) = expected.remove(&row.id) else {
+                return Ok(());
+            };
+            seen.insert(row.id.clone());
+            if row.source_id != input.source_id || row.parse_id != input.parse_id {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("annotation source unit {} has mismatched ownership", row.id),
+                ));
+            }
+            let body_json = row.body_json.ok_or_else(|| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("annotation source unit {} has no body", row.id),
+                )
+            })?;
+            let body: Value = serde_json::from_str(&body_json).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("decode annotation source unit {}: {source}", row.id),
+                )
+            })?;
+            let text = crate::assembly::evidence::evidence_text(row.content_type, &body)
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!(
+                            "annotation source unit {} has no canonical evidence text",
+                            row.id
+                        ),
+                    )
+                })?;
+            let length = text.chars().count();
+            if input
+                .whole_unit_lengths
+                .iter()
+                .any(|expected_length| *expected_length != length)
+            {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "whole-unit annotation source {} is not completely covered by its windows",
+                        row.id
+                    ),
+                ));
+            }
+            for range in input.ranges {
+                let slice = annotation::slice_chars(&text, range.start_char, range.end_char)
+                    .map_err(|source| {
+                        annotation_snapshot_failure(
+                            snapshot_id,
+                            format!("annotation source range on {}: {source}", row.id),
+                        )
+                    })?;
+                if crate::canonical::sha256_hex_bytes(slice.as_bytes()) != range.text_hash {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        format!(
+                            "annotation source window hash differs from canonical unit {}",
+                            row.id
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if let Some((id, _)) = expected.first_key_value() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!("annotation source unit {id} is missing from the archive"),
+        ));
+    }
+    let mut seen_parses = BTreeSet::new();
+    visit_annotation_archive::<ArchivedParseOwner>(
+        store,
+        snapshot_id,
+        manifest,
+        "parse_runs",
+        |row| {
+            if seen_parses.contains(&row.id) {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "duplicate referenced parse",
+                ));
+            }
+            if let Some(owner) = parse_owners.remove(&row.id) {
+                if owner != row.source_id {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("annotation parse {} source mismatch", row.id),
+                    ));
+                }
+                seen_parses.insert(row.id);
+            }
+            Ok(())
+        },
+    )?;
+    if !parse_owners.is_empty() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation publication references a missing parse",
+        ));
+    }
+    let mut seen_sources = BTreeSet::new();
+    visit_annotation_archive::<ArchivedSourceIdentity>(
+        store,
+        snapshot_id,
+        manifest,
+        "source_objects",
+        |row| {
+            if seen_sources.contains(&row.id) {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    "duplicate referenced source",
+                ));
+            }
+            if source_ids.remove(&row.id) {
+                seen_sources.insert(row.id);
+            }
+            Ok(())
+        },
+    )?;
+    if !source_ids.is_empty() {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            "annotation publication references a missing source",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse deletion of annotation embedding state absent from the gating snapshot.
+/// The caller runs this on its deletion transaction after immutable preflight, so
+/// publication cannot replace an envelope between this comparison and deletion.
+pub(crate) fn verify_annotation_deletion_state(
+    connection: &Connection,
+    verified: &VerifiedAnnotationPublications,
+    snapshot_id: &str,
+    source_id: &str,
+    parse_id: &str,
+) -> Result<(), ApiError> {
+    const SQL: &str = "SELECT * FROM retrieval_projections WHERE source_id = ?1 AND parse_id = ?2 AND index_name = ?3 ORDER BY id";
+    let mut statement = connection.prepare(SQL).map_err(|source| {
+        annotation_snapshot_failure(
+            snapshot_id,
+            format!("prepare annotation deletion-state check: {source}"),
+        )
+    })?;
+    let columns: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut rows = statement
+        .query(params![source_id, parse_id, annotation::INDEX_NAME])
+        .map_err(|source| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                format!("read annotation deletion state: {source}"),
+            )
+        })?;
+    let mut seen = BTreeSet::new();
+    while let Some(row) = rows.next().map_err(|source| {
+        annotation_snapshot_failure(
+            snapshot_id,
+            format!("read annotation deletion-state row: {source}"),
+        )
+    })? {
+        let mut record = Map::new();
+        for (index, column) in columns.iter().enumerate() {
+            record.insert(
+                column.clone(),
+                super::column_value_to_json(row, index, "retrieval_projections", column)?,
+            );
+        }
+        if record.get("payload_uri").is_none_or(Value::is_null)
+            && matches!(
+                record.get("freshness_status").and_then(Value::as_str),
+                Some("building" | "failed")
+            )
+        {
+            continue;
+        }
+        let id = record.get("id").and_then(Value::as_str).ok_or_else(|| {
+            annotation_snapshot_failure(snapshot_id, "live annotation envelope has no ID")
+        })?;
+        let expected = verified.envelopes.get(id).ok_or_else(|| annotation_snapshot_failure(snapshot_id,
+            format!("refusing to delete annotation projection {id} for parse {parse_id}: it is absent from the gating snapshot")))?;
+        if expected.source_id != source_id
+            || expected.parse_id != parse_id
+            || crate::canonical::canonical_sha256_hex_of(&record)? != expected.record_hash
+        {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!(
+                    "refusing to delete annotation projection {id}: its live state differs from the gating snapshot"
+                ),
+            ));
+        }
+        seen.insert(id.to_owned());
+    }
+    if verified.envelopes.iter().any(|(id, expected)| {
+        expected.source_id == source_id && expected.parse_id == parse_id && !seen.contains(id)
+    }) {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!(
+                "annotation projections for parse {parse_id} disappeared since the gating snapshot"
+            ),
+        ));
+    }
+    tracing::debug!(
+        event = "snapshot.verify.annotation_deletion_state_checked",
+        snapshot_id,
+        source_id,
+        parse_id,
+        annotation_envelopes_compared = seen.len(),
+        "annotation publication state matches the deletion snapshot"
+    );
+    Ok(())
+}
+
+/// Validate both model roles against the producer's current immutable contract.
+/// Historical versions may coexist; each completed version has coherent paired
+/// lifecycle state, while only one non-deleted fresh version may own a cohort.
+fn verify_annotation_envelope_pair(
+    snapshot_id: &str,
+    rows: &[ArchivedAnnotationEnvelope],
+    publication: &annotation::AnnotationProjection,
+    fresh_cohorts: &mut BTreeSet<(String, String, String)>,
+) -> Result<bool, ApiError> {
+    let plan = &publication.plan;
+    let expected_producer = crate::canonical::canonical_json_bytes_of(&annotation::producer(plan))?;
+    let mut roles: BTreeMap<(&str, Option<&str>, &str), (usize, usize)> = BTreeMap::new();
+    for row in rows {
+        let decode = |field: Option<&str>, label: &str| -> Result<Vec<String>, ApiError> {
+            let text = field.ok_or_else(|| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("annotation envelope {} lacks {label}", row.id),
+                )
+            })?;
+            serde_json::from_str(text).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "annotation envelope {} has invalid {label}: {source}",
+                        row.id
+                    ),
+                )
+            })
+        };
+        let ids = decode(
+            row.input_annotation_ids_json.as_deref(),
+            "input_annotation_ids",
+        )?;
+        let units = decode(row.input_unit_ids_json.as_deref(), "input_unit_ids")?;
+        let producer: Provenance = serde_json::from_str(&row.producer_json).map_err(|source| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                format!("annotation envelope {} producer: {source}", row.id),
+            )
+        })?;
+        if row.source_id != plan.source_id
+            || row.parse_id != plan.parse_id
+            || row.index_partition.as_deref() != Some(plan.cohort_id.as_str())
+            || !ids
+                .iter()
+                .map(String::as_str)
+                .eq(plan.inputs.iter().map(|input| input.annotation_id.as_str()))
+            || units.as_slice() != std::slice::from_ref(&plan.target.unit_id)
+            || crate::canonical::canonical_json_bytes_of(&producer)? != expected_producer
+        {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!(
+                    "annotation envelope {} differs from its manifest ownership, producer, or declared inputs",
+                    row.id
+                ),
+            ));
+        }
+        let uri = row.payload_uri.as_deref().ok_or_else(|| {
+            annotation_snapshot_failure(snapshot_id, "paired envelope lacks payload")
+        })?;
+        let counts = roles
+            .entry((&row.freshness_status, row.deleted_at.as_deref(), uri))
+            .or_default();
+        match row.projection_type.as_str() {
+            "dense_vector" => counts.0 += 1,
+            "multi_vector" => counts.1 += 1,
+            other => {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "annotation envelope {} has unsupported projection type {other}",
+                        row.id
+                    ),
+                ));
+            }
+        }
+    }
+    let mut require_fresh = false;
+    for ((status, deleted_at, _), (dense, colbert)) in roles {
+        if dense == 0 || dense != colbert {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!(
+                    "annotation cohort {} has incoherent {status} dense/ColBERT publication pair",
+                    plan.cohort_id
+                ),
+            ));
+        }
+        if status == "fresh" && deleted_at.is_none() {
+            if dense != 1
+                || !fresh_cohorts.insert((
+                    plan.source_id.clone(),
+                    plan.parse_id.clone(),
+                    plan.cohort_id.clone(),
+                ))
+            {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "annotation cohort {} has multiple fresh publications",
+                        plan.cohort_id
+                    ),
+                ));
+            }
+            require_fresh = true;
+        }
+    }
+    Ok(require_fresh)
+}
+
+/// Require one explicit manifest reference per immutable dependency identity.
+fn annotation_snapshot_refs<'a>(
+    manifest: &'a ForensicSnapshotManifest,
+    artifact_type: &str,
+    snapshot_id: &str,
+) -> Result<BTreeMap<String, &'a SnapshotArtifactRef>, ApiError> {
+    let mut output = BTreeMap::new();
+    for (_, refs) in manifest_ref_sections(manifest) {
+        for reference in refs {
+            if reference.artifact_type != artifact_type {
+                continue;
+            }
+            if annotation_uri_hash(&reference.uri, snapshot_id)? != reference.hash {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("{artifact_type} URI and hash disagree"),
+                ));
+            }
+            if output.insert(reference.hash.clone(), reference).is_some() {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("duplicate {artifact_type} ref {}", reference.hash),
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Stream a canonical archived plane once. A callback retains only requested
+/// verification metadata; partial conclusions are discarded if the hash fails.
+fn visit_annotation_archive<T: serde::de::DeserializeOwned>(
+    store: &ArtifactStore,
+    snapshot_id: &str,
+    manifest: &ForensicSnapshotManifest,
+    artifact_type: &str,
+    mut visit: impl FnMut(T) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    let reference = find_ref_by_type(manifest, artifact_type).ok_or_else(|| {
+        annotation_snapshot_failure(snapshot_id, format!("missing archived {artifact_type}"))
+    })?;
+    if annotation_uri_hash(&reference.uri, snapshot_id)? != reference.hash {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!("archived {artifact_type} URI differs from its hash"),
+        ));
+    }
+    store
+        .with_verified_reader(&reference.uri, None, |reader| {
+            // Buffer outside the hashing reader so serde's byte-oriented parser
+            // updates the integrity digest in blocks instead of one byte at a time.
+            let buffered = std::io::BufReader::new(reader);
+            for record in serde_json::Deserializer::from_reader(buffered).into_iter::<T>() {
+                visit(record.map_err(|source| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("decode archived {artifact_type}: {source}"),
+                    )
+                })?)?;
+            }
+            Ok(())
+        })
+        .map_err(|source| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                format!("verify archived {artifact_type}: {source}"),
+            )
+        })
+}
+
+/// The artifact store validates the full URI suffix and reads local bytes; this
+/// extracts only the content identity for matching explicit snapshot references.
+fn annotation_uri_hash<'a>(uri: &'a str, snapshot_id: &str) -> Result<&'a str, ApiError> {
+    Path::new(uri)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            annotation_snapshot_failure(
+                snapshot_id,
+                "annotation artifact URI has no canonical SHA-256 identity",
+            )
+        })
+}
+
+/// Attach snapshot identity while preserving the specific failed input boundary.
+fn annotation_snapshot_failure(snapshot_id: &str, message: impl std::fmt::Display) -> ApiError {
+    verification_failure(format!("snapshot {snapshot_id}: {message}"))
+}
+
+/// Validate and derive exactly the graphs published in the archived database
+/// view. Missing graph envelopes are valid publication lag; extra fresh
+/// annotations remain available for later publication after restoration.
+pub(crate) fn verified_graph_planes(
+    store: &ArtifactStore,
+    snapshot: &ForensicSnapshot,
+    manifest: &ForensicSnapshotManifest,
+) -> Result<BTreeMap<String, crate::projections::graph::CapturedGraph>, ApiError> {
+    let projections = load_archived_jsonl(store, snapshot, manifest, "retrieval_projections")?;
+    let annotations = load_archived_jsonl(store, snapshot, manifest, "semantic_annotations")?;
+    let parses = load_archived_jsonl(store, snapshot, manifest, "parse_runs")?;
+    let sources = load_archived_jsonl(store, snapshot, manifest, "source_objects")?;
+    let unit_rows = archived_unit_owners(store, snapshot, manifest)?;
+    let annotation_rows = archived_rows_by_id(&annotations, snapshot, "semantic_annotations")?;
+    let parse_rows = archived_rows_by_id(&parses, snapshot, "parse_runs")?;
+    let source_rows = archived_rows_by_id(&sources, snapshot, "source_objects")?;
+    let mut graphs = BTreeMap::new();
+    for projection in &projections {
+        let object = as_object(projection, snapshot, "retrieval_projections")?;
+        if json_str(object, "projection_type") != Some("graph_projection")
+            || json_str(object, "freshness_status") != Some("fresh")
+            || !json_is_null_or_absent(object, "deleted_at")
+        {
+            continue;
+        }
+        let graph = crate::projections::graph::derive_captured_graph(projection, &annotation_rows)
+            .map_err(|source| {
+                verification_failure(format!(
+                    "snapshot {}: captured graph input validation failed: {source}",
+                    snapshot.id
+                ))
+            })?;
+        let parse = parse_rows.get(graph.parse_id.as_str());
+        let source = source_rows.get(graph.source_id.as_str());
+        // A post-activation snapshot still contains the predecessor's fresh
+        // envelopes until archive/verify/delete supersedes them. Their source
+        // binding must agree; the source's current active pointer need not.
+        if parse
+            .and_then(|row| row.get("source_id"))
+            .and_then(Value::as_str)
+            != Some(graph.source_id.as_str())
+            || source.is_none()
+        {
+            return Err(verification_failure(format!(
+                "snapshot {}: graph {} source/parse ownership differs from archived canonical records",
+                snapshot.id, graph.projection_id
+            )));
+        }
+        // Validate every consumed annotation's canonical targets, including []
+        // markers that intentionally produce neither a mention nor an edge.
+        for annotation_id in &graph.payload.input_annotation_ids {
+            let record = annotation_rows.get(annotation_id.as_str()).ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: graph {} lost referenced annotation {annotation_id}",
+                    snapshot.id, graph.projection_id
+                ))
+            })?;
+            let object = as_object(record, snapshot, "semantic_annotations")?;
+            let target_ids = decode_json_string_array(
+                &required_str(
+                    object,
+                    "target_unit_ids_json",
+                    snapshot,
+                    "semantic_annotations",
+                )?,
+                snapshot,
+                "semantic_annotations.target_unit_ids_json",
+            )?;
+            for unit_id in target_ids {
+                let unit = unit_rows.get(unit_id.as_str());
+                if !unit.is_some_and(|unit| {
+                    unit.source_id == graph.source_id && unit.parse_id == graph.parse_id
+                }) {
+                    return Err(verification_failure(format!(
+                        "snapshot {}: graph {} annotation {annotation_id} targets missing or mismatched content unit {unit_id}",
+                        snapshot.id, graph.projection_id
+                    )));
+                }
+            }
+        }
+        let parse_id = graph.parse_id.clone();
+        if graphs.insert(parse_id.clone(), graph).is_some() {
+            return Err(verification_failure(format!(
+                "snapshot {}: parse {parse_id} has multiple fresh graph projections",
+                snapshot.id
+            )));
+        }
+    }
+    Ok(graphs)
+}
+
+/// Index immutable archived rows without copying payloads, rejecting duplicate
+/// identities rather than silently choosing one version of a referenced record.
+fn archived_rows_by_id<'a>(
+    records: &'a [Value],
+    snapshot: &ForensicSnapshot,
+    plane: &str,
+) -> Result<BTreeMap<&'a str, &'a Value>, ApiError> {
+    let mut by_id = BTreeMap::new();
+    for record in records {
+        let object = as_object(record, snapshot, plane)?;
+        let id = json_str(object, "id").ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: archived {plane} row has no string id",
+                snapshot.id
+            ))
+        })?;
+        if by_id.insert(id, record).is_some() {
+            return Err(verification_failure(format!(
+                "snapshot {}: archived {plane} repeats id {id}",
+                snapshot.id
+            )));
+        }
+    }
+    Ok(by_id)
+}
+
+/// Only the canonical ownership columns needed to validate graph targets.
+/// Other archived columns, including document bodies, are skipped by serde.
+#[derive(serde::Deserialize)]
+struct ArchivedUnitOwner {
+    id: String,
+    source_id: String,
+    parse_id: String,
+}
+
+/// Stream canonical ownership without retaining archived content bodies. The
+/// compact map is released to the caller only after the artifact hash verifies.
+fn archived_unit_owners(
+    store: &ArtifactStore,
+    snapshot: &ForensicSnapshot,
+    manifest: &ForensicSnapshotManifest,
+) -> Result<BTreeMap<String, ArchivedUnitOwner>, ApiError> {
+    let artifact = find_ref_by_type(manifest, "content_units").ok_or_else(|| {
+        verification_failure(format!(
+            "snapshot {} has no content_units artifact for graph ownership validation",
+            snapshot.id
+        ))
+    })?;
+    // The streaming API validates the URI's content address; require that address
+    // to be the manifest's recorded hash before deriving any ownership claims.
+    if Path::new(&artifact.uri)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(artifact.hash.as_str())
+    {
+        return Err(verification_failure(format!(
+            "snapshot {}: content_units URI disagrees with its recorded hash",
+            snapshot.id
+        )));
+    }
+    store.with_verified_reader(&artifact.uri, None, |reader| {
+        let mut owners = BTreeMap::new();
+        let buffered = std::io::BufReader::new(reader);
+        for record in serde_json::Deserializer::from_reader(buffered).into_iter::<ArchivedUnitOwner>() {
+            let owner = record.map_err(|source| verification_failure(format!(
+                "snapshot {}: archived content-unit ownership could not be decoded: {source}", snapshot.id
+            )))?;
+            let id = owner.id.clone();
+            if owners.insert(id.clone(), owner).is_some() {
+                return Err(verification_failure(format!(
+                    "snapshot {}: archived content_units repeats id {id}", snapshot.id
+                )));
+            }
+        }
+        Ok(owners)
+    }).map_err(|source| verification_failure(format!(
+        "snapshot {}: archived content-unit ownership validation failed: {source}", snapshot.id
+    )))
 }
 
 /// Cross-check immutable section payloads against their archived envelopes and
@@ -302,7 +1732,7 @@ pub(crate) fn verify_deletion_gate(
 
     // The subject parse the rebuild check is scoped to. Lifecycle snapshots set
     // `active_parse_ids = [subject_parse_id]` (see
-    // `snapshot::mint_lifecycle_snapshot`); the deletion gate only ever runs
+    // `snapshot::lifecycle_scope`); the deletion gate only ever runs
     // over a lifecycle snapshot, so exactly one active parse is expected. A
     // corpus-wide or empty scope reaching the gate is a caller-contract error.
     let subject_parse_id = subject_parse_of(snapshot)?;
@@ -621,10 +2051,10 @@ fn verify_all_refs_hash(
                     snapshot.id, section_name, artifact.artifact_type
                 )));
             }
-            // Blob-backed ref: get_bytes re-hashes the stored bytes to their
-            // address, so corruption or absence surfaces here. Remap into a
-            // verification failure naming the section and artifactType.
-            store.get_bytes(&artifact.hash).map_err(|source| {
+            // Integrity checks stream payloads before any format-specific decoder
+            // allocates memory. A malformed matrix cannot bypass its decoder's
+            // allocation ceiling through this generic completeness pass.
+            let actual = store.reference_for_uri(&artifact.uri).map_err(|source| {
                 verification_failure(format!(
                     "snapshot {}: section {} artifact {} ({}) failed hash verification: {source}",
                     snapshot.id,
@@ -633,6 +2063,12 @@ fn verify_all_refs_hash(
                     artifact.artifact_type
                 ))
             })?;
+            if actual.hash != artifact.hash {
+                return Err(verification_failure(format!(
+                    "snapshot {}: section {} artifact {} URI disagrees with its recorded hash",
+                    snapshot.id, section_name, artifact.artifact_type
+                )));
+            }
             blob_refs_hashed += 1;
         }
     }
@@ -964,25 +2400,9 @@ fn verify_multivector_plane(
     Ok(compared)
 }
 
-/// GRAPH PLANE (§30.5). RE-DERIVES entity mentions and directional edges from
-/// the ARCHIVED `semantic_annotations` rows using the SAME pure derivation
-/// `graph.rs` uses, and compares against the live `graph_entity_mentions` /
-/// `graph_entity_edges` tables for the subject parse. `normalize_entity_name`
-/// is imported from `graph.rs` so the node identity — and the edge's
-/// relation_type, which the builder also stores as the NORMALIZED predicate —
-/// is byte-identical to the build-time key; the mention accumulation and edge
-/// derivation are MIRRORED
-/// here (the builder's `accumulate_mentions` / `derive_edges` are private) and
-/// MUST STAY IN STEP with `graph.rs` — a change to that derivation must be
-/// reflected here or this gate will spuriously fail. No model is invoked.
-///
-/// The archived rows are the RAW column projection C9a wrote via
-/// `read_table_as_json` (columns `annotation_type`, `body_json`,
-/// `target_unit_ids_json`, `freshness_status`, `deleted_at`), NOT the
-/// `SemanticAnnotation` model serialization, so this reads those columns
-/// directly. The build reads annotations via `fresh_for_active_parse`, so the
-/// re-derivation applies the SAME filter: subject parse, `annotation_type` in
-/// {entity, relation}, `freshness_status == 'fresh'`, `deleted_at` absent.
+/// Compare the live payload with the graph projection actually published in the
+/// captured snapshot, using the builder's shared derivation. Completed annotations
+/// outside its input sequence cannot alter the expected graph during this check.
 fn verify_graph_plane(
     store: &ArtifactStore,
     connection: &Connection,
@@ -990,46 +2410,26 @@ fn verify_graph_plane(
     manifest: &ForensicSnapshotManifest,
     subject_parse_id: &str,
 ) -> Result<(usize, usize), ApiError> {
-    let archived = load_archived_jsonl(store, snapshot, manifest, "semantic_annotations")?;
-
-    let mut expected_mentions: BTreeMap<String, MentionExpectation> = BTreeMap::new();
-    let mut expected_edges: BTreeSet<EdgeKey> = BTreeSet::new();
-
-    for record in &archived {
-        let object = as_object(record, snapshot, "semantic_annotations")?;
-        // Mirror fresh_for_active_parse: subject parse, fresh, not deleted.
-        if json_str(object, "parse_id") != Some(subject_parse_id) {
-            continue;
-        }
-        if json_str(object, "freshness_status") != Some("fresh") {
-            continue;
-        }
-        if !json_is_null_or_absent(object, "deleted_at") {
-            continue;
-        }
-        let annotation_type = json_str(object, "annotation_type").unwrap_or("");
-        match annotation_type {
-            "entity" => accumulate_expected_mention(object, snapshot, &mut expected_mentions)?,
-            "relation" => {
-                expected_edges.insert(derive_expected_edge(object, snapshot)?);
-            }
-            // Every other annotation type is irrelevant to the graph channel
-            // (mirror of graph.rs's entity/relation partition).
-            _ => {}
-        }
-    }
+    let graphs = verified_graph_planes(store, snapshot, manifest)?;
+    let captured = graphs.get(subject_parse_id);
+    let empty = crate::projections::graph::GraphPayload::default();
+    let payload = captured.map(|graph| &graph.payload).unwrap_or(&empty);
+    let expected_mentions = &payload.mentions;
 
     // Compare against the live mention rows: one row per (parse, normalized
-    // name), unit_ids the deduplicated deterministic set. On success both sides
-    // share every key, so the expected count is the mentions compared.
+    // name), unit_ids the deduplicated deterministic set. Entity type remains
+    // metadata outside this comparison: old envelopes did not record the order
+    // needed to prove their first-seen type when annotations disagreed.
     let mentions_compared = expected_mentions.len();
-    let hot_mentions = load_hot_mentions(connection, subject_parse_id)?;
+    let hot_mentions = load_hot_mentions(connection, subject_parse_id, captured)?;
     compare_keyed_sets(
         snapshot,
         "graph_entity_mentions",
         &expected_mentions
             .iter()
-            .map(|(name, expectation)| (name.clone(), expectation.units.clone()))
+            .map(|(name, expectation)| {
+                (name.clone(), expectation.unit_ids.iter().cloned().collect())
+            })
             .collect(),
         &hot_mentions,
         |name, expected_units, hot_units| {
@@ -1045,11 +2445,14 @@ fn verify_graph_plane(
         },
     )?;
 
-    // Compare against the live edge rows as a set of edge keys. The builder
-    // stores one row per relation annotation in its natural subject→object
-    // direction, so the comparison is over the multiset-as-set of edge keys.
-    let hot_edges = load_hot_edges(connection, subject_parse_id)?;
-    if expected_edges != hot_edges {
+    // Compare multiplicities as well as direction and supporting units: two
+    // consumed relation annotations may intentionally emit identical edge rows.
+    let hot_edges = load_hot_edges(connection, subject_parse_id, captured)?;
+    let mut expected_edges: Vec<_> = payload.edges.iter().collect();
+    let mut observed_edges: Vec<_> = hot_edges.iter().collect();
+    expected_edges.sort();
+    observed_edges.sort();
+    if expected_edges != observed_edges {
         return Err(verification_failure(format!(
             "snapshot {}: graph edge set re-derived from archived relation annotations differs \
              from the hot graph_entity_edges for parse {subject_parse_id} (archived-derived {} \
@@ -1059,7 +2462,7 @@ fn verify_graph_plane(
             hot_edges.len()
         )));
     }
-    // Equal sets, so either cardinality is the edges compared.
+    // Equal multisets, so either cardinality is the number of rows compared.
     Ok((mentions_compared, expected_edges.len()))
 }
 
@@ -1225,173 +2628,16 @@ fn load_hot_multivector_row(
 // Graph comparison shapes and readers.
 // ---------------------------------------------------------------------------
 
-/// One re-derived entity mention: the accumulated, deduplicated, deterministically
-/// ordered target unit set for a normalized name. Mirrors
-/// `graph.rs::MentionAccumulator` but keeps ONLY the unit set — the hot
-/// comparison is over unit sets, and entityType is metadata, never identity (D9),
-/// so it is intentionally excluded from the comparison.
-struct MentionExpectation {
-    units: Vec<String>,
-}
-
-/// One re-derived directional edge key. Mirrors `graph.rs::DerivedEdge`'s
-/// comparison-relevant fields; the target unit list is included so an edge whose
-/// endpoints match but whose supporting units differ is still caught.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct EdgeKey {
-    from_normalized_name: String,
-    to_normalized_name: String,
-    relation_type: String,
-    target_unit_ids: Vec<String>,
-}
-
-/// Accumulate one archived entity annotation into the expected mention set,
-/// mirroring `graph.rs::accumulate_mentions`: read the body's `name`, normalize
-/// it to node identity, and fold the annotation's target units into that name's
-/// deduplicated set. entityType is metadata and is NOT accumulated. A corrupt
-/// body (missing string `name`) is a verification failure, matching the
-/// builder's honest-reflection policy.
-fn accumulate_expected_mention(
-    object: &Map<String, Value>,
-    snapshot: &ForensicSnapshot,
-    mentions: &mut BTreeMap<String, MentionExpectation>,
-) -> Result<(), ApiError> {
-    let body = annotation_body(object, snapshot)?;
-    let raw_name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
-        verification_failure(format!(
-            "snapshot {}: archived entity annotation has no string `name` body field",
-            snapshot.id
-        ))
-    })?;
-    let normalized = normalize_entity_name(raw_name);
-    let target_unit_ids = archived_target_unit_ids(object, snapshot)?;
-
-    // BTreeSet gives dedup + deterministic order in one step, exactly as the
-    // builder does, so the flushed unit list is byte-identical.
-    let entry = mentions
-        .entry(normalized)
-        .or_insert_with(|| MentionExpectation { units: Vec::new() });
-    let mut set: BTreeSet<String> = entry.units.iter().cloned().collect();
-    for unit_id in target_unit_ids {
-        set.insert(unit_id);
-    }
-    entry.units = set.into_iter().collect();
-    Ok(())
-}
-
-/// Re-derive one directional edge from an archived relation annotation,
-/// mirroring `graph.rs::derive_edges`: read the `{subject, predicate, object}`
-/// body, normalize subject/object to node identities, and take the NORMALIZED
-/// predicate (same `normalize_entity_name` scheme the builder applies) as
-/// relation_type with the annotation's target units as supporting units. A
-/// corrupt body is a verification failure.
-fn derive_expected_edge(
-    object: &Map<String, Value>,
-    snapshot: &ForensicSnapshot,
-) -> Result<EdgeKey, ApiError> {
-    let body = annotation_body(object, snapshot)?;
-    let field = |name: &str| -> Result<String, ApiError> {
-        body.get(name)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                verification_failure(format!(
-                    "snapshot {}: archived relation annotation has no string `{name}` body field",
-                    snapshot.id
-                ))
-            })
-    };
-    let subject = field("subject")?;
-    let predicate = field("predicate")?;
-    let object_name = field("object")?;
-    Ok(EdgeKey {
-        from_normalized_name: normalize_entity_name(&subject),
-        to_normalized_name: normalize_entity_name(&object_name),
-        // Mirror of the builder: the live plane stores the NORMALIZED predicate
-        // as relation_type (`graph.rs::derive_edges`), so the re-derivation must
-        // normalize identically or the deletion gate would spuriously fail.
-        relation_type: normalize_entity_name(&predicate),
-        target_unit_ids: archived_target_unit_ids(object, snapshot)?,
-    })
-}
-
-/// Decode the `body_json` TEXT column of an archived annotation row into a JSON
-/// object. The archived value is the raw hot column (a JSON string), so it is
-/// parsed here; a NULL/absent or non-object body is a verification failure (the
-/// graph builder only runs over fresh rows, whose body is present).
-fn annotation_body(
-    object: &Map<String, Value>,
-    snapshot: &ForensicSnapshot,
-) -> Result<Map<String, Value>, ApiError> {
-    let body_text = json_str(object, "body_json").ok_or_else(|| {
-        verification_failure(format!(
-            "snapshot {}: archived fresh annotation has a NULL/absent body_json",
-            snapshot.id
-        ))
-    })?;
-    let parsed: Value = serde_json::from_str(body_text).map_err(|source| {
-        verification_failure(format!(
-            "snapshot {}: archived annotation body_json is not valid JSON: {source}",
-            snapshot.id
-        ))
-    })?;
-    match parsed {
-        Value::Object(map) => Ok(map),
-        _ => Err(verification_failure(format!(
-            "snapshot {}: archived annotation body_json is not a JSON object",
-            snapshot.id
-        ))),
-    }
-}
-
-/// Decode the `target_unit_ids_json` TEXT column of an archived annotation row.
-fn archived_target_unit_ids(
-    object: &Map<String, Value>,
-    snapshot: &ForensicSnapshot,
-) -> Result<Vec<String>, ApiError> {
-    let json = required_str(
-        object,
-        "target_unit_ids_json",
-        snapshot,
-        "semantic_annotations",
-    )?;
-    decode_json_string_array(&json, snapshot, "semantic_annotations.target_unit_ids_json")
-}
-
 /// Load the subject parse's live entity-mention rows as (normalized_name →
 /// deterministically ordered unit ids), matching the archived-derived shape.
 fn load_hot_mentions(
     connection: &Connection,
     parse_id: &str,
+    captured: Option<&CapturedGraph>,
 ) -> Result<BTreeMap<String, Vec<String>>, ApiError> {
-    const SQL: &str = "SELECT normalized_name, unit_ids_json FROM graph_entity_mentions \
+    const SQL: &str = "SELECT normalized_name, unit_ids_json, projection_id, source_id FROM graph_entity_mentions \
                        WHERE parse_id = ?1 ORDER BY normalized_name";
     let mut statement = prepare(connection, SQL, "hot graph_entity_mentions")?;
-    let rows = statement
-        .query_map(params![parse_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|source| query_failure("hot graph_entity_mentions", source))?;
-
-    let mut mentions = BTreeMap::new();
-    for row in rows {
-        let (normalized_name, unit_ids_json) =
-            row.map_err(|source| query_failure("hot graph_entity_mentions row", source))?;
-        let unit_ids = decode_json_string_array_untied(
-            &unit_ids_json,
-            "hot graph_entity_mentions.unit_ids_json",
-        )?;
-        mentions.insert(normalized_name, unit_ids);
-    }
-    Ok(mentions)
-}
-
-/// Load the subject parse's live edge rows as a set of edge keys, matching the
-/// archived-derived shape.
-fn load_hot_edges(connection: &Connection, parse_id: &str) -> Result<BTreeSet<EdgeKey>, ApiError> {
-    const SQL: &str = "SELECT from_normalized_name, to_normalized_name, relation_type, \
-                       target_unit_ids_json FROM graph_entity_edges WHERE parse_id = ?1";
-    let mut statement = prepare(connection, SQL, "hot graph_entity_edges")?;
     let rows = statement
         .query_map(params![parse_id], |row| {
             Ok((
@@ -1401,17 +2647,65 @@ fn load_hot_edges(connection: &Connection, parse_id: &str) -> Result<BTreeSet<Ed
                 row.get::<_, String>(3)?,
             ))
         })
+        .map_err(|source| query_failure("hot graph_entity_mentions", source))?;
+
+    let mut mentions = BTreeMap::new();
+    for row in rows {
+        let (normalized_name, unit_ids_json, projection_id, source_id) =
+            row.map_err(|source| query_failure("hot graph_entity_mentions row", source))?;
+        verify_graph_row_owner(captured, &projection_id, &source_id, parse_id)?;
+        let unit_ids = decode_json_string_array_untied(
+            &unit_ids_json,
+            "hot graph_entity_mentions.unit_ids_json",
+        )?;
+        if mentions.insert(normalized_name, unit_ids).is_some() {
+            return Err(verification_failure(format!(
+                "hot graph_entity_mentions repeats an entity name for parse {parse_id}"
+            )));
+        }
+    }
+    Ok(mentions)
+}
+
+/// Load every live edge in the shared derived shape without dropping duplicate
+/// rows, checking that each belongs to the captured published projection.
+fn load_hot_edges(
+    connection: &Connection,
+    parse_id: &str,
+    captured: Option<&CapturedGraph>,
+) -> Result<Vec<DerivedEdge>, ApiError> {
+    const SQL: &str = "SELECT from_normalized_name, to_normalized_name, relation_type, \
+                       target_unit_ids_json, projection_id, source_id FROM graph_entity_edges WHERE parse_id = ?1";
+    let mut statement = prepare(connection, SQL, "hot graph_entity_edges")?;
+    let rows = statement
+        .query_map(params![parse_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
         .map_err(|source| query_failure("hot graph_entity_edges", source))?;
 
-    let mut edges = BTreeSet::new();
+    let mut edges = Vec::new();
     for row in rows {
-        let (from_normalized_name, to_normalized_name, relation_type, target_unit_ids_json) =
-            row.map_err(|source| query_failure("hot graph_entity_edges row", source))?;
+        let (
+            from_normalized_name,
+            to_normalized_name,
+            relation_type,
+            target_unit_ids_json,
+            projection_id,
+            source_id,
+        ) = row.map_err(|source| query_failure("hot graph_entity_edges row", source))?;
+        verify_graph_row_owner(captured, &projection_id, &source_id, parse_id)?;
         let target_unit_ids = decode_json_string_array_untied(
             &target_unit_ids_json,
             "hot graph_entity_edges.target_unit_ids_json",
         )?;
-        edges.insert(EdgeKey {
+        edges.push(DerivedEdge {
             from_normalized_name,
             to_normalized_name,
             relation_type,
@@ -1419,6 +2713,27 @@ fn load_hot_edges(connection: &Connection, parse_id: &str) -> Result<BTreeSet<Ed
         });
     }
     Ok(edges)
+}
+
+/// A payload row requires the captured envelope identity. An absent publication
+/// cannot own rows, even if enough annotations now exist to build a newer graph.
+fn verify_graph_row_owner(
+    captured: Option<&CapturedGraph>,
+    projection_id: &str,
+    source_id: &str,
+    parse_id: &str,
+) -> Result<(), ApiError> {
+    if captured.is_some_and(|graph| {
+        graph.projection_id == projection_id
+            && graph.source_id == source_id
+            && graph.parse_id == parse_id
+    }) {
+        Ok(())
+    } else {
+        Err(verification_failure(format!(
+            "live graph row for source {source_id}, parse {parse_id}, projection {projection_id} does not belong to the snapshot's published graph"
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------

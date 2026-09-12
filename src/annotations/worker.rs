@@ -87,7 +87,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use tracing::{debug, error, info, warn};
 
 use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
@@ -102,9 +102,8 @@ use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
-use crate::model::{ProducerType, Provenance, SemanticAnnotationType};
+use crate::model::{Provenance, SemanticAnnotationType};
 use crate::primitives::utc_now;
-use crate::projections::{envelope, graph, view};
 use crate::state::{AnnotationCycleCounts, AnnotationHealth, ShutdownSignal};
 use crate::types::{AnnotationActivity, AnnotationProgressCount};
 use crate::util::{panic_payload_message, truncate_persisted_detail};
@@ -267,22 +266,6 @@ SELECT id, active_parse_id,
         WHERE source_id = source_objects.id AND status = 'current')
 FROM source_objects
 WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL";
-
-/// The source's CURRENT active-parse pointer (§14), re-read at projection-build
-/// time. The cycle read the pointer once at discovery; a supersession can land
-/// between then and the post-cycle projection build, so the annotation-derived
-/// projection hook re-reads the pointer and builds ONLY when it still names the
-/// parse the annotations were built for — otherwise it would materialize
-/// summary/graph envelopes for a parse that is no longer active.
-const SELECT_ACTIVE_PARSE_ID_SQL: &str = "
-SELECT active_parse_id FROM source_objects WHERE id = ?1";
-
-/// Producer identity stamped on the durable annotation-derived projection-build
-/// failure-audit envelope (see `record_projection_build_failure`, mirroring the
-/// scheduler's content-derived equivalent). Bumped only if the audit semantics
-/// change, so a version change is a visible signal.
-const PROJECTION_BUILD_PRODUCER_NAME: &str = "fabric-projection-build";
-const PROJECTION_BUILD_PRODUCER_VERSION: &str = "1";
 
 /// Spawn the annotation worker thread: one std::thread that loads the shared
 /// producer client, then runs the discovery/build loop until shutdown. The
@@ -650,8 +633,7 @@ fn run_cycle(
                     // stateless next cycle re-discovers everything. The deferral
                     // was already counted and logged (`cycle_deferred`) in
                     // `prepare_work_item`, and any paid wave was flushed before the
-                    // Deferred return; the projection hook is skipped for this
-                    // source since its annotation build did not finish.
+                    // Deferred return.
                     break;
                 }
                 if flow == BuildFlow::ShutdownAbort {
@@ -663,58 +645,8 @@ fn run_cycle(
                     // Not a deferral: no count, no cycle_deferred log.
                     break;
                 }
-                // Post-activation completion hook: the annotation build for this
-                // source's active parse finished this cycle. The two
-                // annotation-derived projections (summary, then graph) are built
-                // ONLY once the annotations they read are all fresh — they
-                // materialize FRESH annotations that exist only after the worker
-                // completes and the parse is active, so they cannot build in the
-                // scheduler's pre-activation content-derived pass. A projection
-                // build fault is isolated here (logged, not propagated) exactly
-                // like a per-source annotation fault: a broken projection build
-                // for one source must not stall the rest of the cycle, and the
-                // stateless next cycle re-attempts it.
-                match build_annotation_derived_projections(index_root, source, config, cancellation)
-                {
-                    Ok(BuildFlow::Cancelled(reason)) => return cancelled_cycle(reason),
-                    Ok(BuildFlow::Deferred) => {
-                        // The projection build (a pre-paid boundary) hit writer
-                        // contention: count the deferral, log it once, and end
-                        // the cycle early for the same reason as above.
-                        totals.deferred += 1;
-                        debug!(
-                            event = "annotation_worker.cycle_deferred",
-                            source_id = %source.source_id,
-                            parse_id = %source.active_parse_id,
-                            stage = "projection_build",
-                            built = totals.built,
-                            memoized = totals.memoized,
-                            failed = totals.failed,
-                            deferred = totals.deferred,
-                            "projection build deferred; hot-plane writer lock held \
-                             (re-attempt next cycle)"
-                        );
-                        break;
-                    }
-                    // Structurally unreachable: the projection build contains
-                    // only the pre-paid `projection_build` boundary, and
-                    // `ShutdownAbort` and `CallFailed` originate in producer
-                    // waves, not this projection boundary. Treated as Continue (a no-op)
-                    // rather than a fault so a future refactor cannot turn this
-                    // arm into silent work loss without touching this match.
-                    Ok(BuildFlow::Continue | BuildFlow::ShutdownAbort | BuildFlow::CallFailed) => {}
-                    Err(projection_error) => {
-                        totals.projection_failures += 1;
-                        error!(
-                            event = "annotation_worker.projection_build_failed",
-                            source_id = %source.source_id,
-                            parse_id = %source.active_parse_id,
-                            error = %projection_error,
-                            "annotation-derived projection build failed for one source; \
-                             continuing with remaining sources"
-                        );
-                    }
-                }
+                // Committed annotations are discovered independently by the
+                // projection worker; publication never delays producer dispatch.
             }
             Err(source_error) => {
                 // A per-source fault (e.g. its parse units became unreadable)
@@ -744,7 +676,6 @@ fn run_cycle(
         || totals.memoized > 0
         || totals.failed > 0
         || totals.source_failures > 0
-        || totals.projection_failures > 0
         || totals.orphans_adopted > 0;
     if report_activity {
         info!(
@@ -761,7 +692,6 @@ fn run_cycle(
             memoized = totals.memoized,
             failed = totals.failed,
             source_failures = totals.source_failures,
-            projection_failures = totals.projection_failures,
             orphans_adopted = totals.orphans_adopted,
             deferred = totals.deferred,
             exhausted = totals.exhausted,
@@ -783,7 +713,6 @@ fn run_cycle(
             memoized = totals.memoized,
             failed = totals.failed,
             source_failures = totals.source_failures,
-            projection_failures = totals.projection_failures,
             orphans_adopted = totals.orphans_adopted,
             deferred = totals.deferred,
             exhausted = totals.exhausted,
@@ -866,11 +795,6 @@ struct CycleTotals {
     memoized: u64,
     failed: u64,
     source_failures: u64,
-    /// Sources whose annotation build succeeded but whose annotation-derived
-    /// projection build (summary/graph) failed this cycle. Counted separately
-    /// from `source_failures` so the completion-hook failure domain is visible
-    /// in the cycle log distinct from the annotation-build failure domain.
-    projection_failures: u64,
     /// Crash-orphaned `building` rows adopted for completion this cycle (§21
     /// crash-recovery evidence). Folded from each source's `SourceCounts` so the
     /// per-cycle health count and the completion log agree.
@@ -2537,342 +2461,6 @@ fn read_active_sources(conn: &Connection) -> Result<Vec<ActiveSource>, ApiError>
     Ok(sources)
 }
 
-/// Post-activation completion hook: build the two annotation-derived
-/// projections (summary, then graph) for one source's active parse, once the
-/// annotations that feed them are all fresh.
-///
-/// WHY POST-ACTIVATION (and why here, not in the scheduler's content-derived
-/// pass): both builders read FRESH annotations via
-/// `annotations::store::fresh_for_active_parse`, whose active-parse subselect
-/// yields rows only after the parse is the source's active parse AND the worker
-/// has completed the entity/relation/summary annotations. That state exists
-/// only after an annotation build cycle for the active parse — this hook — so
-/// pre-activation there would be nothing to materialize.
-///
-/// GUARDS (only build when the parse is still active AND its annotations are
-/// fresh):
-///   1. Active-parse re-check: the pointer is re-read here (not trusted from
-///      the cycle-start read) because a supersession can land mid-cycle; a
-///      pointer that no longer names `active_parse_id` skips the build so no
-///      summary/graph envelope is ever materialized for a non-active parse.
-///   2. Every required key in the current excerpt plan must have fresh output.
-///      Legacy failed/building rows outside that plan remain historical records
-///      and cannot block publication of a fully completed new plan.
-///
-/// IDEMPOTENCE: each projection type is `envelope::delete_for_parse`-swept
-/// immediately before its builder (rebuild replaces rather than accumulates),
-/// and the graph builder clears its own payload rows; so a re-run on a later
-/// cycle over the same fresh annotations produces identical rows. Both builds
-/// ride ONE hot-plane write transaction, so the parse's annotation-derived
-/// projection set commits or rolls back together (mirror of the scheduler's
-/// content-derived single-transaction discipline).
-///
-/// CUTOVER STANCE: like the annotation build, this takes NO cutover barrier —
-/// it swaps no active pointer and writes only parse-scoped projection rows for
-/// the parse the guards confirmed active.
-///
-/// FAILURE ISOLATION / AUDIT: on any builder Err the transaction is rolled
-/// back (discarding partial writes AND the builders' own on-tx `failed`
-/// markers), then the failure is recorded durably in a SEPARATE committed
-/// transaction (FAILURE-AUDIT invariant, mirroring
-/// `scheduler::record_projection_build_failure`) so `projection.failed`
-/// survives for the operator even though the build tx vanished.
-fn build_annotation_derived_projections(
-    index_root: &Path,
-    source: &ActiveSource,
-    config: &AnnotatorModelConfig,
-    cancellation: &AnnotationCancellation,
-) -> Result<BuildFlow, ApiError> {
-    if let Some(reason) = cancellation.reason() {
-        return Ok(BuildFlow::Cancelled(reason));
-    }
-    // Guard 1 + 2 on a read connection dropped before the write transaction.
-    let should_build = {
-        let connection = hot_plane::open_read(index_root)?;
-        let active_parse_id = read_active_parse_id(&connection, &source.source_id)?;
-        if active_parse_id.as_deref() != Some(source.active_parse_id.as_str()) {
-            // The parse was superseded (or the source deactivated) between the
-            // cycle-start read and now: skip so no projection is built for a
-            // non-active parse.
-            debug!(
-                event = "annotation_worker.projection_build_skipped",
-                source_id = %source.source_id,
-                parse_id = %source.active_parse_id,
-                reason = "parse_no_longer_active",
-                "skipping annotation-derived projection build; parse is no longer active"
-            );
-            false
-        } else if !parse_annotations_complete(&connection, &source.active_parse_id, config)? {
-            // Some required annotation is still failed/building: the annotation
-            // build is incomplete, so building projections now would materialize
-            // a partial summary/graph. Skip; the next cycle re-attempts.
-            debug!(
-                event = "annotation_worker.projection_build_skipped",
-                source_id = %source.source_id,
-                parse_id = %source.active_parse_id,
-                reason = "annotations_incomplete",
-                "skipping annotation-derived projection build; annotations not yet all fresh"
-            );
-            false
-        } else {
-            true
-        }
-    };
-    if !should_build {
-        return Ok(BuildFlow::Continue);
-    }
-
-    let started = Instant::now();
-    if let Some(reason) = cancellation.reason() {
-        return Ok(BuildFlow::Cancelled(reason));
-    }
-
-    let mut connection = hot_plane::open_write(index_root)?;
-    // PRE-PAID boundary: the projection build produces nothing external, so on
-    // writer contention it defers quietly (caller counts it and ends the cycle)
-    // — the stateless next cycle re-attempts the whole build.
-    let tx = match hot_plane::begin_write_transaction_if_free(
-        &mut connection,
-        TX_LOG_NAMESPACE,
-        "projection_build",
-    )? {
-        WriteTransactionAttempt::Begun(tx) => tx,
-        WriteTransactionAttempt::Busy => return Ok(BuildFlow::Deferred),
-    };
-    if let Some(reason) = cancellation.reason() {
-        rollback_cancelled(tx, "projection_build", reason)?;
-        return Ok(BuildFlow::Cancelled(reason));
-    }
-    // An expected busy writer is a deferral, not a build start at INFO.
-    info!(
-        event = "annotation_worker.projection_build_started",
-        source_id = %source.source_id,
-        parse_id = %source.active_parse_id,
-        "annotation-derived projection build starting"
-    );
-
-    // The whole build rides `tx`; the first builder Err aborts it below, so no
-    // partial annotation-derived projection set ever commits.
-    let build =
-        build_annotation_projection_transaction(&tx, &source.source_id, &source.active_parse_id);
-    match build {
-        Ok(()) => {
-            if let Some(reason) = cancellation.reason() {
-                rollback_cancelled(tx, "projection_build", reason)?;
-                return Ok(BuildFlow::Cancelled(reason));
-            }
-            hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build")?;
-            info!(
-                event = "annotation_worker.projection_build_succeeded",
-                source_id = %source.source_id,
-                parse_id = %source.active_parse_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "annotation-derived projection build committed (summary + graph)"
-            );
-            Ok(BuildFlow::Continue)
-        }
-        Err(error) => {
-            // Roll back the build tx: this discards partial inserts AND the
-            // builders' own on-tx `failed` markers. To keep `projection.failed`
-            // durable for the operator, the failure is re-recorded on a fresh
-            // committed transaction below (FAILURE-AUDIT invariant).
-            let error =
-                hot_plane::abort_transaction(tx, TX_LOG_NAMESPACE, "projection_build", error);
-            error!(
-                event = "annotation_worker.projection_build_failure",
-                source_id = %source.source_id,
-                parse_id = %source.active_parse_id,
-                error = %error,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "annotation-derived projection build failed; rollback attempted, recording failure audit"
-            );
-            record_projection_build_failure(
-                &mut connection,
-                &source.source_id,
-                &source.active_parse_id,
-                &error,
-                cancellation,
-            );
-            Err(error)
-        }
-    }
-}
-
-/// The fallible body of the annotation-derived projection build: summary then
-/// graph, each preceded by its type's `envelope::delete_for_parse` sweep for
-/// rebuild idempotence, on the shared `tx`. Summary is built before graph for a
-/// deterministic build order; both are annotation-derived and independent, so
-/// the order is a convention, not a dependency. Split out so its single caller
-/// owns the commit / rollback-and-audit decision.
-fn build_annotation_projection_transaction(
-    tx: &rusqlite::Transaction<'_>,
-    source_id: &str,
-    parse_id: &str,
-) -> Result<(), ApiError> {
-    // Summary: materializes the parse's fresh summary annotations.
-    envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::Summary)?;
-    view::build_summary(tx, tx, source_id, parse_id)?;
-
-    // Graph: materializes the parse's fresh entity + relation annotations into
-    // the mention/edge lookup surface.
-    envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::GraphProjection)?;
-    graph::build_graph_projection(tx, tx, source_id, parse_id)?;
-
-    Ok(())
-}
-
-/// Read the source's CURRENT active-parse pointer for the build-time re-check
-/// (see guard 1 in `build_annotation_derived_projections`). `None` means the
-/// source has no active parse now (deactivated or never activated), which the
-/// caller treats as "parse no longer active" and skips.
-fn read_active_parse_id(conn: &Connection, source_id: &str) -> Result<Option<String>, ApiError> {
-    conn.query_row(SELECT_ACTIVE_PARSE_ID_SQL, params![source_id], |row| {
-        row.get::<_, Option<String>>(0)
-    })
-    .optional()
-    .map_err(|source| ApiError::StorageOperation {
-        message: format!("failed to read active parse for source {source_id}: {source}"),
-    })
-    .map(Option::flatten)
-}
-
-/// Admit projections only after every current excerpt/type has fresh coverage.
-/// Old grouping keys may retain failed rows, but they no longer describe owed work.
-fn parse_annotations_complete(
-    conn: &Connection,
-    parse_id: &str,
-    config: &AnnotatorModelConfig,
-) -> Result<bool, ApiError> {
-    let fresh = store::fresh_content_key_hashes_for_parse(conn, parse_id)?;
-    let plan = producer::build_invocation_plan(conn, parse_id, config.max_input_chars)?;
-    let policy = policy::active_policy()?;
-    for annotation_type in &policy.post_activation_types {
-        let kind = producer_kind_for(*annotation_type)?;
-        for invocation in &plan {
-            if producer::invocation_matches_kind(kind, invocation)
-                && !fresh.contains(&memo::content_key_hash(conn, kind, invocation)?)
-            {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// Record a durable `projection.failed` audit marker after the annotation-derived
-/// projection build tx rolled back (FAILURE-AUDIT invariant, mirror of
-/// `scheduler::record_projection_build_failure`). The build's own on-tx `failed`
-/// markers vanished with the rollback, so this opens a FRESH committed
-/// transaction and writes one `building`→`failed` envelope carrying the bounded
-/// failure detail, so `projection.failed` survives for the operator. Best-effort:
-/// a failure to record the audit is logged but never masks the original build
-/// error the caller returns (the build already failed; the projections simply do
-/// not materialize this cycle). The generic `Summary` type is used purely as the
-/// audit marker's carrier — the failure is per-parse, not per-channel.
-fn record_projection_build_failure(
-    connection: &mut Connection,
-    source_id: &str,
-    parse_id: &str,
-    build_error: &ApiError,
-    cancellation: &AnnotationCancellation,
-) {
-    // A real build error remains logged even if maintenance cancels its separate
-    // audit write. Never label a cancelled or rolled-back audit as committed.
-    let outcome = (|| -> Result<Option<AnnotationCancelReason>, ApiError> {
-        if let Some(reason) = cancellation.reason() {
-            return Ok(Some(reason));
-        }
-        let tx = hot_plane::begin_write_transaction(
-            connection,
-            TX_LOG_NAMESPACE,
-            "projection_build_failure",
-        )?;
-        if let Some(reason) = cancellation.reason() {
-            rollback_cancelled(tx, "projection_build_failure", reason)?;
-            return Ok(Some(reason));
-        }
-        let body = (|| -> Result<(), ApiError> {
-            let projection_id = envelope::insert_building(
-                &tx,
-                &envelope::NewProjection {
-                    source_id: source_id.to_string(),
-                    parse_id: parse_id.to_string(),
-                    projection_type: envelope::ProjectionType::Summary,
-                    input_unit_ids: None,
-                    input_annotation_ids: None,
-                    producer: projection_failure_producer(),
-                    index_name: None,
-                    index_partition: None,
-                },
-            )?;
-            envelope::mark_failed(&tx, &projection_id, &build_error.to_string())
-        })();
-        match body {
-            Ok(()) => {
-                if let Some(reason) = cancellation.reason() {
-                    rollback_cancelled(tx, "projection_build_failure", reason)?;
-                    return Ok(Some(reason));
-                }
-                hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build_failure")?;
-                Ok(None)
-            }
-            Err(source) => Err(hot_plane::abort_transaction(
-                tx,
-                TX_LOG_NAMESPACE,
-                "projection_build_failure",
-                source,
-            )),
-        }
-    })();
-    match outcome {
-        Err(audit_error) => {
-            error!(
-                event = "annotation_worker.projection_build.failure_audit_failed",
-                source_id,
-                parse_id,
-                error = %audit_error,
-                "durable projection.failed audit could not be recorded; original build error stands"
-            );
-        }
-        Ok(Some(reason)) => info!(
-            event = "annotation_worker.projection_build.failure_audit_cancelled",
-            source_id,
-            parse_id,
-            reason = reason.label(),
-            "projection failure audit cancelled; original build failure remains in the log"
-        ),
-        Ok(None) => {
-            // The original build failed, but its failure marker committed separately.
-            info!(
-                event = "annotation_worker.projection_build.failure_audit_committed",
-                source_id, parse_id, "projection failure audit committed"
-            );
-        }
-    }
-}
-
-/// The producer provenance stamped on the durable failure-audit envelope. Names
-/// the annotation worker's projection-build hook as a `System` producer so the
-/// `projection.failed` event is attributable to the integration wiring, not a
-/// specific channel builder (the failure is per-parse, not per-channel).
-fn projection_failure_producer() -> Provenance {
-    Provenance {
-        producer_type: ProducerType::System,
-        producer_name: PROJECTION_BUILD_PRODUCER_NAME.to_string(),
-        producer_version: Some(PROJECTION_BUILD_PRODUCER_VERSION.to_string()),
-        config_hash: None,
-        model_name: None,
-        model_version: None,
-        prompt_hash: None,
-        temperature: None,
-        confidence: None,
-        memoized: None,
-        memoized_from: None,
-        memoization_key_hash: None,
-        input_refs: None,
-    }
-}
-
 /// Mutate one observation under the existing poison-recovered health boundary.
 /// Cycle publication must not replace newer per-document commit observations.
 pub(super) fn update_annotation_health(
@@ -2933,7 +2521,6 @@ fn publish_cycle_annotation_health(slot: &Mutex<AnnotationHealth>, report: &Cycl
             memoized: totals.memoized,
             failed: totals.failed,
             source_failures: totals.source_failures,
-            projection_failures: totals.projection_failures,
             orphans_adopted: totals.orphans_adopted,
             deferred: totals.deferred,
             exhausted: totals.exhausted,

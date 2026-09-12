@@ -27,6 +27,8 @@
 // package wires the shared contract.
 #![allow(dead_code)]
 
+pub(crate) mod annotation;
+pub(crate) mod annotation_io;
 pub(crate) mod chunk;
 pub(crate) mod dense;
 pub(crate) mod dense_cache;
@@ -36,6 +38,7 @@ pub(crate) mod lexical;
 pub(crate) mod multivector;
 pub(crate) mod section_dense;
 pub(crate) mod view;
+pub(crate) mod worker;
 
 use serde::Serialize;
 

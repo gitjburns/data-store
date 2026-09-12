@@ -18,9 +18,9 @@ use crate::{
     inference::{
         InferenceProgress,
         colbert::{
-            ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime, SMOKE_BATCH_SHORT,
-            SMOKE_DOCUMENT, SMOKE_QUERY, format_document, format_query, maxsim_score,
-            tokenize_formatted, validate_colbert_config,
+            ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime, PreparedColbertQuery,
+            SMOKE_BATCH_SHORT, SMOKE_DOCUMENT, SMOKE_QUERY, format_document, format_query,
+            maxsim_score, tokenize_formatted, validate_colbert_config,
         },
     },
     util::{error_chain, model_call_context},
@@ -35,6 +35,16 @@ const FAILURE_EXCERPT_CHARS: usize = 2048;
 pub enum ColbertBackend {
     Local(Box<ColbertRuntime>),
     Http(Box<HttpColbertClient>),
+}
+
+/// Complete source text fitting one formatted ColBERT document, with Unicode scalar offsets.
+#[derive(Debug)]
+pub struct ColbertTextWindow {
+    pub text: String,
+    /// Inclusive offset into the input supplied to `document_windows`.
+    pub start_char: usize,
+    /// Exclusive offset; adjacent windows preserve every scalar, including whitespace.
+    pub end_char: usize,
 }
 
 impl ColbertBackend {
@@ -74,6 +84,58 @@ impl ColbertBackend {
         }
     }
 
+    /// Partition source text to fit both raw passage and formatted model limits, including special tokens.
+    pub fn document_windows(
+        &self,
+        text: &str,
+        max_content_tokens: usize,
+    ) -> Result<Vec<ColbertTextWindow>, ApiError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max_tokens = match self {
+            Self::Local(runtime) => runtime.document_max_tokens(),
+            Self::Http(client) => client.document_max_tokens,
+        };
+        // Counting must see the whole formatted input; provider truncation or padding would hide tails.
+        let mut counter = self.tokenizer().clone();
+        counter.with_truncation(None).map_err(|source| {
+            inference_error(format!(
+                "failed to disable ColBERT document-window tokenizer truncation: {source}"
+            ))
+        })?;
+        counter.with_padding(None);
+        if !document_window_fits(&counter, "", max_tokens, max_content_tokens)? {
+            return Err(inference_error(format!(
+                "ColBERT document limit {max_tokens} or raw content limit {max_content_tokens} cannot fit formatting and special tokens"
+            )));
+        }
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        let mut start_char = 0;
+        let mut windows = Vec::new();
+        while start_char < boundaries.len() - 1 {
+            let end_char = document_window_end(
+                &counter,
+                text,
+                &boundaries,
+                start_char,
+                max_tokens,
+                max_content_tokens,
+            )?;
+            windows.push(ColbertTextWindow {
+                text: text[boundaries[start_char]..boundaries[end_char]].to_owned(),
+                start_char,
+                end_char,
+            });
+            start_char = end_char;
+        }
+        Ok(windows)
+    }
+
     /// Expose readiness facts without revealing authentication material.
     pub fn health_details(&self) -> Vec<String> {
         let mut details = vec![format!("ColBERT backend: {}", self.backend_kind())];
@@ -110,17 +172,110 @@ impl ColbertBackend {
         }
     }
 
-    /// Embed only the query remotely; persisted document matrices stay on the application CPU.
-    pub fn score_persisted_candidates(
-        &self,
-        query: &str,
-        candidates: &[ColbertDocumentEmbedding],
-    ) -> Result<Vec<ColbertCandidateScore>, ApiError> {
+    /// Embed a query once for streamed scoring; local callers hold a model permit during this call.
+    /// Retaining the prepared tensor between calls needs no permit; local scoring acquires one again.
+    pub fn prepare_query(&self, query: &str) -> Result<PreparedColbertQuery, ApiError> {
         match self {
-            Self::Local(runtime) => runtime.score_persisted_candidates(query, candidates),
-            Self::Http(client) => client.score_persisted_candidates(query, candidates),
+            Self::Local(runtime) => runtime.prepare_query(query),
+            Self::Http(client) => client.prepare_query(query),
         }
     }
+
+    /// Score one persisted matrix on the configured device without allocating an entire shortlist.
+    /// The owning query stage records scoring diagnostics and supplies any required local model permit.
+    pub fn score_matrix(
+        &self,
+        prepared: &PreparedColbertQuery,
+        values: &[f32],
+        rows: usize,
+        dimension: usize,
+    ) -> Result<f32, ApiError> {
+        match self {
+            Self::Local(runtime) => runtime.score_matrix(prepared, values, rows, dimension),
+            Self::Http(client) => {
+                prepared.score_matrix(values, rows, dimension, client.dimension, &Device::Cpu)
+            }
+        }
+    }
+}
+
+/// Verify both passage-rendering and model-input bounds with the untruncated, unpadded tokenizer.
+fn document_window_fits(
+    counter: &Tokenizer,
+    text: &str,
+    max_tokens: usize,
+    max_content_tokens: usize,
+) -> Result<bool, ApiError> {
+    // Raw passage accounting also includes special tokens, but omits the model's document prompt.
+    let content_tokens = counter
+        .encode(text, true)
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT source-window tokenization failed: {source}"
+            ))
+        })?
+        .len();
+    if content_tokens > max_content_tokens {
+        return Ok(false);
+    }
+    counter
+        .encode(format_document(text), true)
+        .map(|encoding| encoding.len() <= max_tokens)
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT document-window tokenization failed: {source}"
+            ))
+        })
+}
+
+/// Find a verified fitting endpoint without tokenizing an entire long source for every window.
+fn document_window_end(
+    counter: &Tokenizer,
+    text: &str,
+    boundaries: &[usize],
+    start_char: usize,
+    max_tokens: usize,
+    max_content_tokens: usize,
+) -> Result<usize, ApiError> {
+    let total_chars = boundaries.len() - 1;
+    let start_byte = boundaries[start_char];
+    let mut fitting_end = start_char;
+    let mut probe_end = start_char
+        .saturating_add(max_tokens.max(1))
+        .min(total_chars);
+    loop {
+        let candidate = &text[start_byte..boundaries[probe_end]];
+        if !document_window_fits(counter, candidate, max_tokens, max_content_tokens)? {
+            break;
+        }
+        fitting_end = probe_end;
+        if fitting_end == total_chars {
+            return Ok(fitting_end);
+        }
+        let next_length = (fitting_end - start_char).saturating_mul(2);
+        probe_end = start_char.saturating_add(next_length).min(total_chars);
+    }
+    // Token merges need not be monotonic. Keep only actually measured fitting endpoints;
+    // a conservative window is acceptable, but an inferred fit could silently lose its tail.
+    while probe_end - fitting_end > 1 {
+        let middle = fitting_end + (probe_end - fitting_end) / 2;
+        if document_window_fits(
+            counter,
+            &text[start_byte..boundaries[middle]],
+            max_tokens,
+            max_content_tokens,
+        )? {
+            fitting_end = middle;
+        } else {
+            probe_end = middle;
+        }
+    }
+    if fitting_end == start_char {
+        return Err(inference_error(format!(
+            "ColBERT document limit {max_tokens} or raw content limit {max_content_tokens} cannot fit the source scalar at character {start_char}"
+        )));
+    }
+    Ok(fitting_end)
 }
 
 /// Synchronous vLLM pooling client; it loads a tokenizer but no model weights or accelerator.
@@ -301,6 +456,23 @@ impl HttpColbertClient {
                 vector,
             })
             .collect())
+    }
+
+    /// Retain one remotely embedded query on CPU; the HTTP helper owns actual request diagnostics.
+    fn prepare_query(&self, query: &str) -> Result<PreparedColbertQuery, ApiError> {
+        let ids = tokenize_formatted(
+            &self.tokenizer,
+            &format_query(query),
+            self.query_max_tokens,
+            "HTTP query",
+        )?;
+        let query_tokens = ids.len();
+        let vector = self
+            .embed_token_batch(&[ids], "query_embedding")?
+            .pop()
+            .ok_or_else(|| inference_error("HTTP ColBERT returned no query matrix"))?;
+        let matrix = cpu_matrix(&vector, query_tokens, self.dimension, "query")?;
+        PreparedColbertQuery::from_matrix(matrix, self.dimension)
     }
 
     /// Keep scoring local and deterministic while remote inference supplies only the query matrix.

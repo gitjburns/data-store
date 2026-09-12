@@ -1,7 +1,6 @@
-//! C6c active dense cache: the in-memory successor to the retired legacy dense
-//! cache (§1.6 "ingest publish invariant"; §2 state.rs/units.rs rows). It holds
-//! one loaded dense plane per ACTIVE parse and hands the C7 dense retrieval
-//! channel a captured snapshot to score against.
+//! Active dense handles retain publication identity, never resident vector planes.
+//! Passage rows remain in SQLite and section vectors remain in immutable artifacts;
+//! each query scans them through its captured read snapshot with bounded buffers.
 //!
 //! Successor identity: the legacy `ingest_document` path held a dense-cache
 //! Mutex across the SQLite commit so the durable active-row write and the
@@ -19,23 +18,8 @@
 //! `chunk_dense_vectors` table and immutable section artifacts. The cache is
 //! derived from both and reconstructed without inference at startup and restore.
 //!
-//! Parallel-array layout (approved design fact): a plane stores its vectors as
-//! PARALLEL ARRAYS — one contiguous row-major `Vec<f32>` of length n*dim, a
-//! parallel `Vec<String>` of chunk ids, and a parallel `Vec<f32>` of L2 norms —
-//! not a `Vec` of per-row structs. This is the layout the C7 dense channel
-//! scans: cosine scoring walks the contiguous `vectors` buffer dim-strided
-//! while indexing `chunk_ids`/`norms` by the same row index, which keeps the
-//! scan cache-friendly and avoids per-row indirection. The three arrays are
-//! always the same length in rows (`chunk_ids.len() == norms.len() ==
-//! vectors.len() / dimension`); that invariant is established once at plane
-//! construction and never mutated afterwards (planes are immutable behind an
-//! `Arc` — see the swap invariant below).
-
-// The cache is consumed by the C7 dense retrieval channel (`snapshot_for_parse`
-// scoring) and by the C5/C6 integration activation wiring (`load_parse`,
-// `evict_parse`). None are wired yet, so this module-level allow names those
-// pending consumers; remove it as each seam attaches.
-#![allow(dead_code)]
+//! File pages can stay warm in operating-system caches and be reclaimed under
+//! memory pressure without evicting a required service-owned vector buffer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,104 +30,71 @@ use tracing::{debug, error, info};
 
 use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
-use crate::projections::dense::load_dense_vectors_for_parse;
-use crate::projections::section_dense::{SectionDensePlane, load_section_dense};
+use crate::projections::dense::{StoredDenseVectorRow, visit_dense_vectors_for_parse};
+use crate::projections::section_dense::{
+    SectionDenseReference, SectionDenseWindow, load_section_dense_reference, visit_section_dense,
+};
 
-/// One immutable loaded dense plane for a single active parse, stored as
-/// parallel arrays (see the module-level layout note). Once built the plane is
-/// never mutated; a "swap" installs a brand-new `Arc<DensePlane>` in the cache
-/// map and drops the old one, so any reader holding a captured `Arc` keeps a
-/// consistent plane for the whole scan.
-///
-/// Layout invariant (established in `from_rows`, never broken afterwards):
-/// `chunk_ids.len() == norms.len()` and `vectors.len() == chunk_ids.len() *
-/// dimension`. The C7 dense channel relies on this to index the three arrays by
-/// a shared row index and to stride `vectors` by `dimension`.
+/// An immutable handle to one parse's persisted vectors. Captured handles survive
+/// cutover; callers supply their captured SQLite connection for every scan.
 #[derive(Debug)]
 pub(crate) struct DensePlane {
-    /// Row-major contiguous embeddings: row `i` occupies
-    /// `vectors[i*dimension .. (i+1)*dimension]`. Contiguous (not a Vec of
-    /// vectors) so the C7 cosine scan walks one buffer.
-    vectors: Vec<f32>,
-    /// Chunk id of row `i`, parallel to `vectors`' row `i`. Carried so a scan
-    /// can report which chunk each score belongs to without a second lookup.
-    chunk_ids: Vec<String>,
-    /// Precomputed L2 norm of row `i`, parallel to `vectors`' row `i`. Reused by
-    /// the query-time cosine scorer; every norm is finite and strictly positive
-    /// (guaranteed by C6c-1's loader — the cache does not re-validate).
-    norms: Vec<f32>,
-    /// Embedding dimension: the stride into `vectors` and the length of every
-    /// row. Uniform across the plane (a mismatch fails in C6c-1's loader).
+    parse_id: String,
+    row_count: usize,
     dimension: usize,
     // Both representations share one immutable publication. None identifies a
     // legacy parse explicitly; query execution must require an operator rebuild.
-    sections: Option<SectionDensePlane>,
+    sections: Option<SectionDenseReference>,
 }
 
 impl DensePlane {
-    /// Build a plane from C6c-1's already-validated loader rows. The rows arrive
-    /// in `chunk_id` order (C6c-1's handoff guarantee) and each satisfies
-    /// `vector.len() == dimension`, finite values, and finite strictly-positive
-    /// `norm`, so this constructor does NOT re-validate — it only flattens the
-    /// row-of-structs shape into the parallel-array layout the C7 channel scans.
-    /// It appends each row's `vector` into one contiguous buffer, establishing
-    /// the layout invariant (`vectors.len() == chunk_ids.len() * dimension`) by
-    /// construction.
-    fn from_rows(
-        rows: Vec<crate::projections::dense::StoredDenseVectorRow>,
-        dimension: usize,
-        sections: Option<SectionDensePlane>,
-    ) -> Self {
-        let mut vectors = Vec::with_capacity(rows.len() * dimension);
-        let mut chunk_ids = Vec::with_capacity(rows.len());
-        let mut norms = Vec::with_capacity(rows.len());
-        for row in rows {
-            // Each row's vector is length `dimension` (loader guarantee), so
-            // extending the flat buffer preserves the row-major stride.
-            vectors.extend_from_slice(&row.vector);
-            chunk_ids.push(row.chunk_id);
-            norms.push(row.norm);
-        }
-        Self {
-            vectors,
-            chunk_ids,
-            norms,
-            dimension,
-            sections,
-        }
-    }
-
-    /// Number of vector rows in the plane (chunks, not f32s). Bounded by the
-    /// parse's chunk count.
-    pub(crate) fn row_count(&self) -> usize {
-        self.chunk_ids.len()
-    }
-
-    /// The embedding dimension (stride into `vectors`, length of each row).
+    /// Expected model dimension is checked before any row is offered for scoring.
     pub(crate) fn dimension(&self) -> usize {
         self.dimension
     }
 
-    /// The contiguous row-major embedding buffer the C7 dense channel scans.
-    /// Row `i` is `&self.vectors()[i*dimension .. (i+1)*dimension]`.
-    pub(crate) fn vectors(&self) -> &[f32] {
-        &self.vectors
-    }
-
-    /// Chunk ids parallel to the vector rows: `chunk_ids()[i]` names row `i`.
-    pub(crate) fn chunk_ids(&self) -> &[String] {
-        &self.chunk_ids
-    }
-
-    /// Precomputed L2 norms parallel to the vector rows: `norms()[i]` is the
-    /// norm of row `i`, reused by the cosine scorer.
-    pub(crate) fn norms(&self) -> &[f32] {
-        &self.norms
+    /// Visit one validated passage row at a time in the query's read snapshot.
+    /// A disappeared persisted row is corruption, not an ordinary cache miss.
+    pub(crate) fn visit_vectors(
+        &self,
+        conn: &Connection,
+        visit: impl FnMut(&StoredDenseVectorRow) -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        let count = visit_dense_vectors_for_parse(conn, &self.parse_id, self.dimension, visit)?;
+        if count != self.row_count {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "dense row count changed for parse {}: expected {}, found {count}",
+                    self.parse_id, self.row_count
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Return the section representation captured in the same cache publication.
-    pub(crate) fn sections(&self) -> Option<&SectionDensePlane> {
+    pub(crate) fn sections(&self) -> Option<&SectionDenseReference> {
         self.sections.as_ref()
+    }
+
+    /// Stream captured section vectors without retaining the full artifact. Any
+    /// provisional scores must be discarded if final integrity validation fails.
+    pub(crate) fn visit_sections(
+        &self,
+        conn: &Connection,
+        store: &ArtifactStore,
+        visit: impl FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        let reference = self
+            .sections
+            .as_ref()
+            .ok_or_else(|| ApiError::ServiceUnavailable {
+                message: format!(
+                    "section dense projection missing for parse {}",
+                    self.parse_id
+                ),
+            })?;
+        visit_section_dense(conn, store, reference, visit)
     }
 }
 
@@ -194,7 +145,7 @@ impl DenseCache {
     }
 
     /// Load (or reload) the active dense plane for `parse_id` from the durable
-    /// `chunk_dense_vectors` rows through C6c-1's `load_dense_vectors_for_parse`
+    /// `chunk_dense_vectors` rows through `visit_dense_vectors_for_parse`
     /// reader, then atomically swap it into the cache map.
     ///
     /// Publish invariant (successor to the §1.6 ingest publish invariant): the
@@ -230,31 +181,36 @@ impl DenseCache {
 
         // Durable read + plane construction happen OUTSIDE the map lock, so the
         // lock is never held across the SQLite work — only across the swap.
-        let rows = match load_dense_vectors_for_parse(conn, parse_id, expected_dimension) {
-            Ok(rows) => rows,
-            Err(error) => {
-                error!(
-                    event = "dense_cache.load.failed",
-                    parse_id,
-                    expected_dimension,
-                    error = %error,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "active dense plane load failed"
-                );
-                return Err(error);
-            }
-        };
-        let row_count = rows.len();
-        let sections =
-            load_section_dense(conn, store, parse_id, expected_dimension).map_err(|error| {
+        let row_count =
+            match visit_dense_vectors_for_parse(conn, parse_id, expected_dimension, |_| Ok(())) {
+                Ok(count) => count,
+                Err(error) => {
+                    error!(
+                        event = "dense_cache.load.failed",
+                        parse_id,
+                        expected_dimension,
+                        error = %error,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "active dense plane load failed"
+                    );
+                    return Err(error);
+                }
+            };
+        let sections = load_section_dense_reference(conn, store, parse_id, expected_dimension)
+            .map_err(|error| {
                 error!(event = "dense_cache.load.failed", parse_id, expected_dimension,
                 error = %error, elapsed_ms = started.elapsed().as_millis() as u64,
                 "active section dense plane load failed; cache not published");
                 error
             })?;
-        let section_window_count = sections.as_ref().map_or(0, |plane| plane.windows.len());
+        let section_window_count = sections.as_ref().map_or(0, |plane| plane.window_count);
         let section_projection_present = sections.is_some();
-        let plane = Arc::new(DensePlane::from_rows(rows, expected_dimension, sections));
+        let plane = Arc::new(DensePlane {
+            parse_id: parse_id.to_owned(),
+            row_count,
+            dimension: expected_dimension,
+            sections,
+        });
 
         // Swap under the lock: a single map insert replacing any prior plane.
         // Held only for this pointer move, never across the load above.

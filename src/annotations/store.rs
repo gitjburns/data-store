@@ -106,15 +106,24 @@ WHERE id = ?1 AND freshness_status = 'failed'";
 /// unless its parse is active — so a superseded parse's annotations simply do
 /// not appear even though their rows still exist pending hot cleanup.
 const SELECT_FRESH_FOR_ACTIVE_PARSE_SQL: &str = "
-SELECT
-  id, source_id, parse_id, target_unit_ids_json, annotation_type,
-  body_json, provenance_json, confidence, freshness_status,
-  created_at, deleted_at
+WITH inputs AS (
+SELECT *, coalesce(length(CAST(body_json AS BLOB)), 0)
+  + length(CAST(target_unit_ids_json AS BLOB)) + length(CAST(provenance_json AS BLOB))
+  + length(CAST(id AS BLOB)) + length(CAST(source_id AS BLOB)) + length(CAST(parse_id AS BLOB))
+  + length(CAST(annotation_type AS BLOB)) + length(CAST(freshness_status AS BLOB))
+  + length(CAST(created_at AS BLOB)) AS input_bytes
 FROM semantic_annotations
 WHERE source_id = ?1
   AND parse_id = (SELECT active_parse_id FROM source_objects WHERE id = ?1)
   AND freshness_status = 'fresh'
-  AND deleted_at IS NULL";
+  AND deleted_at IS NULL)
+SELECT id, source_id, parse_id,
+  CASE WHEN ?2 IS NULL OR input_bytes <= ?2 THEN target_unit_ids_json END,
+  annotation_type,
+  CASE WHEN ?2 IS NULL OR input_bytes <= ?2 THEN body_json END,
+  CASE WHEN ?2 IS NULL OR input_bytes <= ?2 THEN provenance_json END,
+  confidence, freshness_status, created_at, deleted_at, input_bytes
+FROM inputs";
 
 /// Only fresh records satisfy coverage; stale, failed, and building rows do not.
 const SELECT_CONTENT_KEYS_FOR_PARSE_SQL: &str = "
@@ -461,7 +470,11 @@ pub(crate) fn mark_stale(tx: &Transaction<'_>, annotation_id: &str) -> Result<()
         annotation_id,
         Some(payload),
     )?;
-    append_event(tx, &event)
+    append_event(tx, &event)?;
+    // Publication freshness shares the annotation's transaction: no query may
+    // capture a fresh graph, summary, or embedding envelope with this stale input.
+    crate::projections::envelope::mark_annotation_dependents_stale(tx, annotation_id)?;
+    Ok(())
 }
 
 /// Read every fresh, non-deleted annotation of a source's CURRENT active
@@ -475,6 +488,23 @@ pub(crate) fn fresh_for_active_parse(
     conn: &Connection,
     source_id: &str,
 ) -> Result<Vec<SemanticAnnotation>, ApiError> {
+    let mut annotations = Vec::new();
+    visit_fresh_for_active_parse(conn, source_id, None, |annotation| {
+        annotations.push(annotation);
+        Ok(())
+    })?;
+    Ok(annotations)
+}
+
+/// Discover projection inputs one record at a time. A supplied ceiling rejects
+/// oversized raw rows before Rust copies or decodes their JSON fields; None
+/// preserves the existing unbounded reader policy for legacy consumers.
+pub(crate) fn visit_fresh_for_active_parse(
+    conn: &Connection,
+    source_id: &str,
+    max_row_bytes: Option<u64>,
+    mut visit: impl FnMut(SemanticAnnotation) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
     let mut statement = conn
         .prepare(SELECT_FRESH_FOR_ACTIVE_PARSE_SQL)
         .map_err(|source| ApiError::StorageOperation {
@@ -483,33 +513,55 @@ pub(crate) fn fresh_for_active_parse(
             ),
         })?;
     let rows = statement
-        .query_map(params![source_id], |row| {
-            Ok(AnnotationRow {
-                id: row.get(0)?,
-                source_id: row.get(1)?,
-                parse_id: row.get(2)?,
-                target_unit_ids_json: row.get(3)?,
-                annotation_type: row.get(4)?,
-                body_json: row.get(5)?,
-                provenance_json: row.get(6)?,
-                confidence: row.get(7)?,
-                freshness_status: row.get(8)?,
-                created_at: row.get(9)?,
-                deleted_at: row.get(10)?,
-            })
+        .query_map(params![source_id, max_row_bytes], |row| {
+            let bytes: u64 = row.get(11)?;
+            if max_row_bytes.is_some_and(|limit| bytes > limit) {
+                return Ok((bytes, None));
+            }
+            Ok((
+                bytes,
+                Some(AnnotationRow {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    parse_id: row.get(2)?,
+                    target_unit_ids_json: row.get(3)?,
+                    annotation_type: row.get(4)?,
+                    body_json: row.get(5)?,
+                    provenance_json: row.get(6)?,
+                    confidence: row.get(7)?,
+                    freshness_status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    deleted_at: row.get(10)?,
+                }),
+            ))
         })
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query fresh annotations for source {source_id}: {source}"),
         })?;
 
-    let mut annotations = Vec::new();
     for row in rows {
-        let row = row.map_err(|source| ApiError::StorageOperation {
+        let (bytes, row) = row.map_err(|source| ApiError::StorageOperation {
             message: format!("failed to read annotation row for source {source_id}: {source}"),
         })?;
-        annotations.push(annotation_from_row(row)?);
+        match (row, max_row_bytes) {
+            (Some(row), _) => visit(annotation_from_row(row)?)?,
+            (None, Some(limit)) => {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "fresh annotation row for source {source_id} has {bytes} raw bytes, exceeding its {limit}-byte ceiling"
+                    ),
+                });
+            }
+            (None, None) => {
+                return Err(ApiError::StorageOperation {
+                    message: format!(
+                        "fresh annotation row for source {source_id} was guarded without a byte ceiling"
+                    ),
+                });
+            }
+        }
     }
-    Ok(annotations)
+    Ok(())
 }
 
 /// Read completed coverage for discovery and projection admission. Completion

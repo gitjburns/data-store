@@ -3,9 +3,9 @@
 //!
 //! `execute_query` opens ONE read-only WAL snapshot as its first act (DP1),
 //! captures the scope-filtered active `(source_id → parse_id)` set INSIDE that
-//! transaction, then drives the fabric stages in order — dense+lexical fusion
-//! (C7b-1), graph traversal (C7b-2), ColBERT MaxSim over the fused pool and the
-//! final reranker (C7c) — and returns the ranked candidates plus per-stage
+//! transaction, then drives annotation discovery, graph traversal, grouped
+//! source/lexical/annotation fusion, ColBERT MaxSim and the final passage
+//! reranker — and returns the ranked candidates plus per-stage
 //! latencies. Every hot-plane read for one query rides the single connection
 //! this function owns; nothing here opens a second connection or begins a second
 //! transaction.
@@ -16,9 +16,9 @@
 //! capture is read INSIDE that transaction so capture and reads share one WAL
 //! snapshot (§31.1)." The SQLite reads (active-set capture, lexical, chunk→unit,
 //! multivector, unit content) share that ONE WAL snapshot via the single read
-//! transaction; the dense planes are IN-MEMORY `Arc` clones whose isolation
-//! comes from the `DenseCache` Arc-clone immutability discipline
-//! (`dense_cache.rs::snapshot_for_parse`), not from WAL. Recorded tradeoff: a
+//! transaction. Dense handles pin immutable metadata and artifact identities;
+//! vector rows use that transaction and artifact reads verify their hashes.
+//! No corpus-sized vector array must remain resident. Recorded tradeoff: a
 //! pinned WAL read snapshot blocks checkpointing past it for the query's
 //! duration (bounded by C8d's single-search admission window); the
 //! snapshot-held duration is logged at completion.
@@ -44,19 +44,23 @@ use std::time::Instant;
 use rusqlite::{Connection, params, params_from_iter};
 use tracing::{error, info, warn};
 
+use crate::artifact_store::ArtifactStore;
 use crate::assembly::evidence::{EvidenceOptions, PassageEvidence, build_evidence_pack};
 use crate::assembly::model::EvidencePack;
 use crate::assembly::policy::{CapturedParseRef, active_policy};
 use crate::error::ApiError;
-use crate::inference::{ColbertCandidateScore, InferenceRuntime, RerankerCandidateScore};
+use crate::inference::{ColbertCandidateScore, InferenceRuntime};
 use crate::policy::EntityMatchPolicy;
 use crate::projections::dense_cache::DenseCache;
-use crate::query::channels::{CapturedParse, fused_channels, graph_channel};
+use crate::query::annotation::{self as annotation_query, ScoredExcerpt};
+use crate::query::channels::{CapturedParse, collect_channels, graph_channel};
 use crate::query::model::{ResolvedScope, ResolvedScopeKind, RetrievalHit};
 use crate::query::passages::{PassageCandidate, SearchResult, build_passages};
 use crate::query::profile::RetrievalProfile;
 use crate::query::request::EvidenceOptions as RequestEvidenceOptions;
-use crate::query::rerank::{RerankStageContext, run_maxsim_stage, run_reranker_stage};
+use crate::query::rerank::{
+    PassageScore, RerankStageContext, run_maxsim_stage, run_reranker_stage,
+};
 use crate::state::{CutoverRegistry, ExclusiveGate, acquire_model_call_gate_on};
 
 /// Log-event namespace passed to the shared hot-plane transaction helpers so the
@@ -84,15 +88,22 @@ const DENSE_CALL_PURPOSE: &str = "query_embedding";
 pub(crate) struct QueryStageLatencies {
     /// Opening the read connection and beginning the DEFERRED read transaction.
     pub(crate) open_transaction_ms: u64,
-    /// Capturing the scope-filtered active set and cloning the dense planes,
+    /// Capturing the scope-filtered active set and pinning dense metadata,
     /// inside the transaction (DP1).
     pub(crate) capture_ms: u64,
     /// The live dense query embedding (`embed_query_vector`, gated dense role).
     pub(crate) query_embed_ms: u64,
-    /// Dense+lexical candidate generation, chunk→unit resolution, and RRF fusion.
+    /// Source candidate collection, chunk→unit resolution, and inner dense RRF.
+    /// The legacy field name is retained; final grouped fusion has its own timing.
     pub(crate) dense_lexical_fusion_ms: u64,
     /// Graph channel D9 traversal + tiering.
     pub(crate) graph_ms: u64,
+    /// Dense scanning of published annotation and source-window representations.
+    pub(crate) annotation_retrieval_ms: u64,
+    /// Grouped source-dense, lexical, and annotation rank fusion.
+    pub(crate) fusion_ms: u64,
+    /// Annotation/source window scoring, included within maxsim_ms.
+    pub(crate) annotation_maxsim_ms: u64,
     /// ColBERT MaxSim over the fused pool (persisted matrices; gated colbert role).
     pub(crate) maxsim_ms: u64,
     /// Canonical passage construction and overlap merging, before final scoring.
@@ -120,7 +131,7 @@ pub(crate) struct QueryPipelineOutcome {
     pub(crate) results: Vec<SearchResult>,
     /// Canonical constituent records and their selection trace for raw inspection.
     pub(crate) evidence_pack: EvidencePack,
-    /// The deduplicated three-channel RRF pool that ColBERT scored.
+    /// The deduplicated pool from source dense, lexical, and grouped annotation RRF.
     pub(crate) fused_pool: Vec<RetrievalHit>,
     /// Eligible channel records before fusion, preserving their individual scores.
     pub(crate) channel_hits: Vec<RetrievalHit>,
@@ -131,7 +142,9 @@ pub(crate) struct QueryPipelineOutcome {
     /// had no unit with a persisted ColBERT matrix). `debug`-only.
     pub(crate) maxsim: Vec<ColbertCandidateScore>,
     /// Final passage scores, best-first, including candidates beyond the result cap.
-    pub(crate) reranked: Vec<RerankerCandidateScore>,
+    pub(crate) reranked: Vec<PassageScore>,
+    /// Exact source-window scores and the retained model-input context.
+    pub(crate) annotation_maxsim: Vec<ScoredExcerpt>,
     /// Per-stage timings, including the DP1 snapshot-held duration.
     pub(crate) latencies: QueryStageLatencies,
 }
@@ -284,6 +297,7 @@ pub(crate) fn execute_query(
     let mut stage = "capture_active_set";
     let result = run_pipeline_body(
         &tx,
+        index_root,
         registry,
         dense_cache,
         inference,
@@ -350,6 +364,7 @@ pub(crate) fn execute_query(
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_body(
     conn: &Connection,
+    index_root: &Path,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     inference: &InferenceRuntime,
@@ -365,10 +380,9 @@ fn run_pipeline_body(
     stage: &mut &'static str,
 ) -> Result<QueryPipelineOutcome, ApiError> {
     // === Capture the scope-filtered active set INSIDE the transaction (DP1),
-    // then clone the dense planes for those parses. The SQLite active-set read
-    // shares the query's one WAL snapshot; the dense planes are in-memory `Arc`
-    // clones whose isolation comes from the DenseCache Arc-clone immutability
-    // discipline (dense_cache.rs::snapshot_for_parse), not from WAL. ===
+    // then pin immutable dense metadata for those parses. Vector rows share the
+    // query's WAL snapshot; section and annotation artifact identities select
+    // immutable, hash-verified files independently of cache residency. ===
     let capture_started_at = Instant::now();
     let active = capture_active_set(conn, scope)?;
 
@@ -400,6 +414,9 @@ fn run_pipeline_body(
         "scope-filtered active set captured inside the read snapshot"
     );
 
+    *stage = "open_artifact_store";
+    let store = ArtifactStore::open_existing(index_root)?;
+
     // === Dense query embedding, backend-aware gate discipline (§1.5, mirrors the
     // reranker stage in `query::rerank` and the scheduler's dense build). For the
     // LOCAL backend, `uses_local_model_gate()` is true: acquire the dense-role
@@ -422,8 +439,20 @@ fn run_pipeline_body(
     };
     latencies.query_embed_ms = embed_started_at.elapsed().as_millis() as u64;
 
-    // Generate graph hits before fusion so they compete in the same bounded
-    // three-channel pool instead of being appended after its cutoff.
+    // Semantic entity nominations feed the same bounded graph traversal; all
+    // annotation types also retain direct, precisely located source candidates.
+    let annotation_started = Instant::now();
+    *stage = "annotation_retrieval";
+    let annotation_scan = annotation_query::scan(
+        conn,
+        &store,
+        &captured,
+        inference,
+        &query_vector,
+        profile,
+        query_id,
+    )?;
+    latencies.annotation_retrieval_ms = annotation_started.elapsed().as_millis() as u64;
     let graph_started_at = Instant::now();
     *stage = "graph_retrieval";
     let graph_hits = graph_channel(
@@ -433,14 +462,16 @@ fn run_pipeline_body(
         query_text,
         profile.graph_hop_budget as usize,
         entity_match_policy,
+        &annotation_scan.semantic_names,
     )?;
     latencies.graph_ms = graph_started_at.elapsed().as_millis() as u64;
     // Candidate depth is independent of the requested final passage count.
     let fusion_started_at = Instant::now();
     *stage = "dense_lexical_fusion";
     let top_k = request_ctx.max_final_evidence_units as usize;
-    let fusion = fused_channels(
+    let source_channels = collect_channels(
         conn,
+        &store,
         query_id,
         &captured,
         &query_vector,
@@ -450,19 +481,20 @@ fn run_pipeline_body(
     )?;
     latencies.dense_lexical_fusion_ms = fusion_started_at.elapsed().as_millis() as u64;
 
-    let pool = fusion.pool;
+    *stage = "retrieval_fusion";
+    let grouped_started = Instant::now();
+    let fusion = annotation_query::fuse(conn, annotation_scan, source_channels, profile, query_id)?;
+    latencies.fusion_ms = grouped_started.elapsed().as_millis() as u64;
 
     // === Build the parse-of-unit index passage construction needs to resolve unit
     // content parse-scoped. A pool can span several active parses (a query in
     // scope over several sources), so each hit's units map to that hit's parse.
     // First writer wins per unit (a unit belongs to one active parse). ===
-    let parse_of_unit = build_parse_of_unit(&pool);
+    let parse_of_unit = build_parse_of_unit(&fusion.pool);
 
-    // === Rerank context: constructed from the handles this function holds (DP2).
-    // `conn` is the shared read transaction; `gate` is the model-call gate; the
-    // two rerank stages acquire the gate caller-side for THEIR local model calls
-    // (ColBERT query embed inside MaxSim; local reranker) — already handled inside
-    // the C7c stages, so C7d does NOT double-gate them. ===
+    // Scoring stages borrow this transaction and acquire their own local-model
+    // permits after storage reads. Query embedding below has a separate permit
+    // that is released before either scoring stage begins.
     let ctx = RerankStageContext {
         conn,
         gate,
@@ -470,19 +502,43 @@ fn run_pipeline_body(
         query_id,
     };
 
-    // === ColBERT MaxSim over the fused pool (C7c): re-scores the pool via
-    // persisted matrices (loaded on `conn`); the ColBERT query embed inside is
-    // gated by the stage itself (not double-gated here). ===
+    // Prepare once for both source and annotation scoring. The small immutable
+    // query tensor survives between gate scopes; no permit spans storage reads.
     let maxsim_started_at = Instant::now();
     *stage = "colbert_maxsim";
+    let query_permit = if inference.colbert.uses_local_model_gate() {
+        Some(acquire_model_call_gate_on(
+            gate,
+            query_id,
+            "colbert",
+            "query_embedding",
+        )?)
+    } else {
+        None
+    };
+    let prepared_query = inference.colbert.prepare_query(query_text)?;
+    drop(query_permit);
     let maxsim = run_maxsim_stage(
         &ctx,
         &inference.colbert,
-        &pool,
+        &prepared_query,
+        &fusion.pool,
         colbert_expected_dimension,
         profile.colbert_candidate_pool_size as usize,
     )?;
+    let annotation_scoring_started = Instant::now();
+    let annotation_maxsim = annotation_query::score_excerpts(
+        conn,
+        &store,
+        &fusion,
+        inference,
+        &prepared_query,
+        gate,
+        query_id,
+    )?;
+    latencies.annotation_maxsim_ms = annotation_scoring_started.elapsed().as_millis() as u64;
     latencies.maxsim_ms = maxsim_started_at.elapsed().as_millis() as u64;
+    let pool = fusion.pool;
 
     // Form distinct passages before final scoring. Larger requested result sets
     // raise passage candidate depth without exceeding the already-bounded seeds.
@@ -491,14 +547,18 @@ fn run_pipeline_body(
     let passage_limit = (profile.reranker_candidate_pool_size as usize)
         .max(top_k)
         .min(profile.colbert_candidate_pool_size as usize);
-    let passage_candidates = build_passages(
+    let mut passage_candidates = build_passages(
         conn,
         &maxsim,
+        &annotation_maxsim,
         &parse_of_unit,
         inference.colbert.tokenizer(),
         passage_limit,
         query_id,
     )?;
+    for passage in &mut passage_candidates {
+        passage.attach_graph_context(&fusion.channel_hits, inference.colbert.tokenizer())?;
+    }
     latencies.passage_build_ms = passage_started_at.elapsed().as_millis() as u64;
 
     // The final model evaluates the same passage and section context that will
@@ -517,9 +577,9 @@ fn run_pipeline_body(
         .map(|score| {
             let candidate = passage_candidates
                 .iter()
-                .find(|candidate| candidate.anchor_unit_id == score.unit_id)
+                .find(|candidate| candidate.candidate_id == score.candidate_id)
                 .ok_or_else(|| ApiError::StorageOperation {
-                    message: format!("reranker returned unknown passage {}", score.unit_id),
+                    message: format!("reranker returned unknown passage {}", score.candidate_id),
                 })?;
             Ok((candidate, f64::from(score.score)))
         })
@@ -558,6 +618,7 @@ fn run_pipeline_body(
         channel_hits: fusion.channel_hits,
         passage_candidates,
         maxsim,
+        annotation_maxsim,
         reranked,
         // Filled by `execute_query` once the snapshot-held time is known.
         latencies: QueryStageLatencies::default(),
@@ -859,12 +920,10 @@ fn collect_active_parses(
     Ok(parses)
 }
 
-/// Clone the `Arc<DensePlane>` snapshot for each captured active parse. The clone
-/// is the in-memory isolation boundary (DenseCache Arc-clone immutability
-/// discipline, `dense_cache.rs::snapshot_for_parse`); once captured, a concurrent
-/// cutover that evicts the plane does not affect this query.
+/// Pin each captured parse's immutable dense metadata. Removing the cache entry
+/// during cutover cannot change the query's file identities or WAL vector rows.
 ///
-/// Both dense representations are required by retrieval v3. A known cutover
+/// Both source dense representations remain required. A known cutover
 /// remains retryable; otherwise missing planes reject the whole query with an
 /// actionable rebuild requirement rather than silently dropping a channel.
 fn clone_dense_planes(

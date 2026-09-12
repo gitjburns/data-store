@@ -10,7 +10,8 @@
 //! so the pipeline, its DTOs, and the profile are reachable from the request
 //! path — the former module-level `dead_code` allow was removed at C8d-2.
 
-pub(crate) mod channels; // C7b: dense/lexical/graph candidate generation + RRF fusion.
+pub(crate) mod annotation; // Semantic annotation discovery and grouped source-window fusion.
+pub(crate) mod channels; // Dense/lexical/graph candidate generation.
 pub(crate) mod execute; // C7d: the synchronous execute_query pipeline.
 pub(crate) mod model; // C7s: shared §24 contract types (this package).
 pub(crate) mod passages; // Canonical passage construction before final reranking.

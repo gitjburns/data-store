@@ -19,17 +19,19 @@ use crate::maintenance::MaintenancePermit;
 use crate::util::LogContext;
 
 use crate::assembly::model::EvidencePack;
-use crate::inference::{ColbertCandidateScore, RerankerCandidateScore};
+use crate::inference::ColbertCandidateScore;
 use crate::model::SnapshotType;
 use crate::model::{
     ContentUnit, DeletionEvidence, Operation, ParseRun, SourceLocation, SourceLocationStatus,
     SourceObject, UnitRelationship,
 };
+use crate::query::annotation::ScoredExcerpt;
 use crate::query::execute::{QueryPipelineOutcome, QueryRequestContext, execute_query};
 use crate::query::model::RetrievalHit;
 use crate::query::passages::{PassageCandidate, SearchResult};
 use crate::query::profile::{ScopeInput, active_profile, resolve_scope};
 use crate::query::request::{QueryRequest, ValidatedQuery};
+use crate::query::rerank::PassageScore;
 
 // Axum is confined to this transport module: it owns routing, bearer auth,
 // request-body limits, and the spawn_blocking seams that keep synchronous
@@ -524,10 +526,8 @@ struct QueryResponse {
 }
 
 /// Raw per-stage retrieval diagnostics, attached only under `debug`. Projects the
-/// pipeline's in-memory stage outputs into a serializable shape: the inference
-/// candidate-score types (`ColbertCandidateScore`/`RerankerCandidateScore`) are
-/// not `Serialize` and are owned by another module, so their decision-relevant
-/// fields are projected into local DTOs here rather than serialized directly.
+/// pipeline's stage outputs into the client contract. Score views distinguish
+/// whole-unit MaxSim from exact-window scoring and final passage candidate IDs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryDiagnostics {
@@ -535,11 +535,13 @@ struct QueryDiagnostics {
     channel_hits: Vec<RetrievalHit>,
     /// Passage text and membership offered to the final reranker.
     passage_candidates: Vec<PassageCandidate>,
-    /// The fused dense+lexical+graph candidate pool the rerankers scored over.
+    /// The pool selected by source dense, lexical, and grouped annotation fusion.
     fused_pool: Vec<RetrievalHit>,
     /// ColBERT MaxSim scores over the fused pool, best-first.
     maxsim: Vec<MaxsimScoreView>,
-    /// Final passage reranker scores, keyed by representative anchor, best-first.
+    /// Exact-window MaxSim and annotation attribution; annotation bodies are not serialized here.
+    annotation_maxsim: Vec<ScoredExcerpt>,
+    /// Final passage reranker scores, keyed by unique passage candidate, best-first.
     reranked: Vec<RerankerScoreView>,
     /// Per-stage wall-clock latencies (milliseconds).
     latencies: StageLatencyView,
@@ -560,7 +562,7 @@ struct MaxsimScoreView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RerankerScoreView {
-    unit_id: String,
+    candidate_id: String,
     score: f32,
     rank: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -578,6 +580,9 @@ struct StageLatencyView {
     query_embed_ms: u64,
     dense_lexical_fusion_ms: u64,
     graph_ms: u64,
+    annotation_retrieval_ms: u64,
+    fusion_ms: u64,
+    annotation_maxsim_ms: u64,
     maxsim_ms: u64,
     passage_build_ms: u64,
     rerank_ms: u64,
@@ -601,8 +606,8 @@ impl QueryDiagnostics {
         let reranked = outcome
             .reranked
             .iter()
-            .map(|score: &RerankerCandidateScore| RerankerScoreView {
-                unit_id: score.unit_id.clone(),
+            .map(|score: &PassageScore| RerankerScoreView {
+                candidate_id: score.candidate_id.clone(),
                 score: score.score,
                 rank: score.rank,
                 logit: score.logit,
@@ -615,6 +620,9 @@ impl QueryDiagnostics {
             query_embed_ms: outcome.latencies.query_embed_ms,
             dense_lexical_fusion_ms: outcome.latencies.dense_lexical_fusion_ms,
             graph_ms: outcome.latencies.graph_ms,
+            annotation_retrieval_ms: outcome.latencies.annotation_retrieval_ms,
+            fusion_ms: outcome.latencies.fusion_ms,
+            annotation_maxsim_ms: outcome.latencies.annotation_maxsim_ms,
             maxsim_ms: outcome.latencies.maxsim_ms,
             passage_build_ms: outcome.latencies.passage_build_ms,
             rerank_ms: outcome.latencies.rerank_ms,
@@ -626,6 +634,7 @@ impl QueryDiagnostics {
             passage_candidates: outcome.passage_candidates.clone(),
             fused_pool: outcome.fused_pool.clone(),
             maxsim,
+            annotation_maxsim: outcome.annotation_maxsim.clone(),
             reranked,
             latencies,
         }

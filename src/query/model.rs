@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) use super::provenance::RetrievalChannel;
-use super::provenance::{DenseRetrievalMatch, GraphMatch};
+use super::provenance::{AnnotationMatch, DenseRetrievalMatch, GraphMatch, SourceExcerpt};
 
 /// Spec §24.4 `hitType`. What kind of artifact a hit targets. Closed set; the
 /// C7 channels emit `chunk`/`content_unit`-grained hits, and annotation- and
@@ -79,6 +79,10 @@ pub(crate) struct RetrievalHit {
     pub(crate) graph_matches: Vec<GraphMatch>,
     /// Passage and section paths retained independently of internal dense fusion.
     pub(crate) dense_matches: Vec<DenseRetrievalMatch>,
+    /// Source coordinates survive candidate fusion instead of collapsing to a unit prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_excerpt: Option<SourceExcerpt>,
+    pub(crate) annotation_matches: Vec<AnnotationMatch>,
 }
 
 /// Spec §24.2 `ResolvedScope.kind`. Whether a query targets all sources, an

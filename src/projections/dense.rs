@@ -46,7 +46,7 @@
 
 // Implemented by the C6c dense package. The build/read paths and the load-path
 // row type are consumed by C6c-2 (the active dense cache, which loads through
-// `load_dense_vectors_for_parse`), the C6 integration agent (which wires
+// `visit_dense_vectors_for_parse`), the C6 integration agent (which wires
 // `build_dense_vectors` into the projection worker and holds the model gate for
 // the batch), and the C7 retrieval pipeline. None are wired yet, so the
 // module-level allow names those pending consumers.
@@ -133,12 +133,11 @@ INSERT INTO chunk_dense_vectors (
   chunk_id, source_id, parse_id, dimension, norm, vector_blob, created_at
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
-/// Read every dense vector row of a parse in a stable order. This is the
-/// rebuild-from-hot-plane / load-the-dense-plane path (spec §C6c) and the exact
-/// reader C6c-2's cache calls; `chunk_id` order matches the build order so the
-/// cache sees the same sequence the builder wrote.
+/// Stable row order permits reproducible scans. Reject oversized blobs in SQL
+/// before SQLite copies them into Rust; the visitor reports the offending row.
 const SELECT_PARSE_DENSE_SQL: &str = "
-SELECT chunk_id, parse_id, dimension, norm, vector_blob
+SELECT chunk_id, parse_id, dimension, norm,
+       CASE WHEN length(vector_blob) = ?2 THEN vector_blob END
 FROM chunk_dense_vectors
 WHERE parse_id = ?1
 ORDER BY chunk_id";
@@ -148,7 +147,7 @@ ORDER BY chunk_id";
 /// f32 passage embedding of length `dimension`; `norm` is the precomputed L2
 /// norm the query-time cosine scorer reuses. Every field is
 /// codec+validator-checked before this struct is constructed (see
-/// `load_dense_vectors_for_parse`), so a consumer may rely on: `vector.len() ==
+/// `visit_dense_vectors_for_parse`), so a consumer may rely on: `vector.len() ==
 /// dimension`, all values finite, and `norm` finite and strictly positive —
 /// the cache need NOT re-validate.
 #[derive(Debug, Clone)]
@@ -577,7 +576,7 @@ fn persist_chunk_vector(
         })?;
 
     // Encode/decode boundary: persist through the shared little-endian f32 codec
-    // so the blob layout matches what `load_dense_vectors_for_parse` decodes;
+    // so the blob layout matches what `visit_dense_vectors_for_parse` decodes;
     // blob encoding is never hand-rolled here.
     let blob = encode_vector_blob(&validated.vector);
 
@@ -603,26 +602,22 @@ fn persist_chunk_vector(
     Ok(())
 }
 
-/// Load and validate every dense vector of a parse from the hot plane — the
-/// rebuild-from-canonical / dense-plane load path (spec §C6c) and the exact
-/// reader C6c-2's cache calls.
-///
-/// Each row's blob is decoded AND validated through the shared codec
-/// (`decode_vector_blob` re-checks length, finiteness, and nonzero norm), so
-/// every returned `StoredDenseVectorRow` satisfies the guarantees documented on
-/// that type: `vector.len() == dimension`, all values finite, `norm` finite and
-/// strictly positive. The cache may therefore consume these rows WITHOUT
-/// re-validating. A corrupt or dimension-mismatched blob fails loudly here,
-/// naming the offending chunk, rather than surfacing a wrong vector downstream.
-///
-/// Unbounded per parse: the number of dense rows is bounded by the parse's
-/// chunk count, which the chunker caps per document; no pagination is applied
-/// and the whole parse's plane is returned in one `chunk_id`-ordered pass.
-pub(crate) fn load_dense_vectors_for_parse(
+/// Scan persisted passage vectors in the caller's database snapshot, retaining
+/// only one decoded row. SQLite and the operating system may cache file pages;
+/// query correctness never depends on keeping the vector plane in heap memory.
+/// Callers must discard accumulated scores if any later row fails validation.
+pub(crate) fn visit_dense_vectors_for_parse(
     conn: &Connection,
     parse_id: &str,
     expected_dimension: usize,
-) -> Result<Vec<StoredDenseVectorRow>, ApiError> {
+    mut visit: impl FnMut(&StoredDenseVectorRow) -> Result<(), ApiError>,
+) -> Result<usize, ApiError> {
+    let expected_bytes = expected_dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| i64::try_from(bytes).ok())
+        .ok_or_else(|| ApiError::StorageOperation {
+            message: format!("dense dimension byte length overflow for parse {parse_id}"),
+        })?;
     let mut statement =
         conn.prepare(SELECT_PARSE_DENSE_SQL)
             .map_err(|source| ApiError::StorageOperation {
@@ -631,7 +626,7 @@ pub(crate) fn load_dense_vectors_for_parse(
                 ),
             })?;
     let rows = statement
-        .query_map(params![parse_id], |row| {
+        .query_map(params![parse_id, expected_bytes], |row| {
             Ok(DenseVectorRawRow {
                 chunk_id: row.get(0)?,
                 parse_id: row.get(1)?,
@@ -644,14 +639,16 @@ pub(crate) fn load_dense_vectors_for_parse(
             message: format!("failed to query dense vectors for parse {parse_id}: {source}"),
         })?;
 
-    let mut vectors = Vec::new();
+    let mut row_count = 0;
     for row in rows {
         let row = row.map_err(|source| ApiError::StorageOperation {
             message: format!("failed to read dense-vector row for parse {parse_id}: {source}"),
         })?;
-        vectors.push(dense_row_from_raw(row, expected_dimension)?);
+        let vector = dense_row_from_raw(row, expected_dimension)?;
+        visit(&vector)?;
+        row_count += 1;
     }
-    Ok(vectors)
+    Ok(row_count)
 }
 
 /// One `chunk_dense_vectors` row as read from SQLite, before its blob is
@@ -661,7 +658,7 @@ struct DenseVectorRawRow {
     parse_id: String,
     dimension: i64,
     norm: f32,
-    vector_blob: Vec<u8>,
+    vector_blob: Option<Vec<u8>>,
 }
 
 /// Decode+validate one raw dense row into a `StoredDenseVectorRow`. The stored
@@ -684,16 +681,31 @@ fn dense_row_from_raw(
     // decode_vector_blob checks stored-vs-expected dimension, byte length, and
     // re-runs validate_vector (finite + nonzero norm) on the decoded values, so
     // the returned vector already satisfies the StoredDenseVectorRow guarantees.
-    let vector = decode_vector_blob(
-        &row.chunk_id,
-        &row.vector_blob,
-        stored_dimension,
-        expected_dimension,
-    )
-    .map_err(|message| ApiError::StorageOperation {
-        message: format!("failed to decode stored dense vector: {message}"),
+    let blob = row.vector_blob.ok_or_else(|| ApiError::StorageOperation {
+        message: format!(
+            "dense vector {} blob length differs from expected dimension {expected_dimension}",
+            row.chunk_id
+        ),
     })?;
+    let vector = decode_vector_blob(&row.chunk_id, &blob, stored_dimension, expected_dimension)
+        .map_err(|message| ApiError::StorageOperation {
+            message: format!("failed to decode stored dense vector: {message}"),
+        })?;
 
+    // A valid vector with a corrupt stored norm would still change cosine
+    // ordering. Keep the persisted denominator consistent with its payload.
+    let computed_norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if !row.norm.is_finite()
+        || row.norm <= 0.0
+        || (computed_norm - row.norm).abs() > computed_norm * 1e-5
+    {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "dense vector {} has an inconsistent stored norm",
+                row.chunk_id
+            ),
+        });
+    }
     Ok(StoredDenseVectorRow {
         chunk_id: row.chunk_id,
         parse_id: row.parse_id,
