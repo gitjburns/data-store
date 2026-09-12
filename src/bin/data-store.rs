@@ -35,7 +35,8 @@ use provenance::{
 #[path = "../types.rs"]
 mod health_types;
 use health_types::{
-    HealthBackend, HealthComponent, HealthObservations, HealthResponse, HealthStatus,
+    AnnotationDocumentProgress, AnnotationWorkCounts, HealthBackend, HealthComponent,
+    HealthObservations, HealthResponse, HealthStatus,
 };
 
 const PROMPT: &str = "data-store> ";
@@ -1986,10 +1987,20 @@ fn render_health_observations(component: &HealthComponent, observations: &Health
             parked,
             last_cycle,
             measured_at,
+            documents,
+            inventory_measured_at,
         } => {
+            println!("Worker parked: {}", yes_no(*parked));
+            render_annotation_documents(
+                documents.as_deref(),
+                inventory_measured_at.as_deref(),
+                "             ",
+            );
+            // Completed-cycle counters are historical diagnostics, not a denominator
+            // or a substitute for the worker's current document observations.
             if let Some(cycle) = last_cycle {
                 println!(
-                    "Last cycle: {} sources · {} planned items",
+                    "             Last completed cycle: {} sources · {} planned items",
                     cycle.sources_examined, cycle.planned
                 );
                 println!(
@@ -1997,16 +2008,11 @@ fn render_health_observations(component: &HealthComponent, observations: &Health
                     cycle.eligible_missing, cycle.new_failures, cycle.exhausted
                 );
                 println!(
-                    "             Measured: {}",
+                    "             Cycle measured: {}",
                     measured_at.as_deref().unwrap_or("not reported")
                 );
             } else {
-                println!("No completed cycle reported");
-            }
-            if *parked {
-                println!("             Completion: not reported");
-            } else {
-                println!("             Completion and current activity: not reported");
+                println!("             No completed cycle reported");
             }
         }
         HealthObservations::Corpus {
@@ -2069,6 +2075,76 @@ fn render_health_observations(component: &HealthComponent, observations: &Health
     }
 }
 
+/// Present the same measured document snapshot in both health views without
+/// deriving completion, activity, or percentages from historical cycle counters.
+fn render_annotation_documents(
+    documents: Option<&[AnnotationDocumentProgress]>,
+    inventory_measured_at: Option<&str>,
+    indent: &str,
+) {
+    println!(
+        "{indent}Document inventory measured: {}",
+        inventory_measured_at.unwrap_or("not reported")
+    );
+    let Some(documents) = documents else {
+        println!("{indent}Document progress: unavailable (inventory not measured)");
+        return;
+    };
+    if documents.is_empty() {
+        println!("{indent}Document progress: no documents in the measured inventory");
+        return;
+    }
+    for document in documents {
+        println!(
+            "{indent}Document {}: {} — {}",
+            document.source_id, document.progress, document.activity
+        );
+        if document.progress.total.is_none() {
+            println!("{indent}  Required total: unknown");
+        }
+        if document.source_paths.is_empty() {
+            println!("{indent}  Paths: not reported");
+        } else {
+            for path in &document.source_paths {
+                println!("{indent}  Path: {path}");
+            }
+        }
+        println!("{indent}  Work: {}", format_annotation_work(&document.work));
+        for annotation_type in &document.by_type {
+            println!(
+                "{indent}  {}: {} · {}",
+                annotation_type.annotation_type,
+                annotation_type.progress,
+                format_annotation_work(&annotation_type.work)
+            );
+            if annotation_type.progress.total.is_none() {
+                println!("{indent}    Required total: unknown");
+            }
+        }
+        if let Some(detail) = &document.detail {
+            println!("{indent}  {detail}");
+        }
+        println!(
+            "{indent}  Parse: {} · Plan: {}",
+            document.parse_id,
+            document.plan_id.as_deref().unwrap_or("not measured")
+        );
+        println!(
+            "{indent}  Measured: {}",
+            document.measured_at.as_deref().unwrap_or("not reported")
+        );
+    }
+}
+
+/// Keep every unfinished state visible, including zero counts; running items
+/// include chains awaiting persistence and are not a count of remote requests.
+fn format_annotation_work(work: &AnnotationWorkCounts) -> String {
+    format!(
+        "{} pending · {} running · {} failed · {} retry waiting · {} exhausted",
+        work.pending, work.running, work.failed, work.retry_waiting, work.exhausted
+    )
+}
+
 /// Keep backend labels concise while preserving the selected execution location.
 fn health_backend_label(backend: &HealthBackend) -> &'static str {
     match backend {
@@ -2104,6 +2180,21 @@ fn render_health_details(response: HealthResponse) {
             println!(
                 "    count {}{}: {} (as of {})",
                 count.label, scope, count.value, count.as_of
+            );
+        }
+        if let Some(HealthObservations::Annotations {
+            documents,
+            inventory_measured_at,
+            ..
+        }) = component
+            .summary
+            .as_ref()
+            .map(|summary| &summary.observations)
+        {
+            render_annotation_documents(
+                documents.as_deref(),
+                inventory_measured_at.as_deref(),
+                "    ",
             );
         }
     }

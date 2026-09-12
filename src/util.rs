@@ -51,6 +51,7 @@ impl LogContext {
                 parse_id = Empty,
                 source_paths = Empty,
                 annotation_id = Empty,
+                annotation_progress = Empty,
                 section_id = Empty,
                 split_index = Empty,
                 target_units = Empty,

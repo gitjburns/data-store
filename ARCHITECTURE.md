@@ -480,6 +480,22 @@ transaction. Legacy failed rows outside that plan do not block publication.
 Derived names, entity types, and predicates use `normalize_entity_name`;
 stored annotation strings retain their producer output.
 
+**Document progress.** Shared accounting in `src/annotations/progress.rs` counts
+one item per required excerpt/type pair and completed items from fresh coverage,
+including successful empty results and committed memo reuse. Before model
+dispatch, the worker inventories all discovered documents; commits and work-state
+transitions refresh their health snapshots without waiting for cycle completion.
+The inventory is as of discovery; subsequent discovery captures newly active or
+changed sources. Completion is reconstructed after restart and reset on rebuild.
+
+Pending, running, failed, retry-waiting, and exhausted counts partition unfinished
+work. Running extends through persistence; document activity distinguishes model
+work, awaiting commit, and storage waits. Unknown totals and zero required work
+remain explicit. The server calculates percentages to one decimal place without
+rounding incomplete work to 100%; 100% covers annotation commits, not retrieval
+projection publication. Existing service-log entries and transcript progress lines
+use the same progress formatting, with timing defined by DIAGNOSTICS.md.
+
 **Retries.** Two counters in `AnnotationRetryState` track failed chain attempts
 per annotation and process run. Malformed outputs use
 `annotation_max_retries` and the fixed `annotation_retry_interval_seconds`.
@@ -834,7 +850,7 @@ snapshot was held. Diagnostics also retain `channelHits`, `fusedPool`, `maxsim`,
 
 Health is assembled entirely **in memory** via a publish-into-slot pattern
 (`src/state.rs`, `AppState::health()`): each owning thread writes its own
-`Arc<Mutex<…>>` slot every cycle, and `health()` only reads slots — it opens no
+`Arc<Mutex<…>>` slot, and `health()` only reads slots — it opens no
 database connections. Slots are poison-recovered on read.
 
 - The **scheduler** publishes `SyncHealth` (queue depths, cycle stats, cadence,
@@ -842,10 +858,13 @@ database connections. Slots are poison-recovered on read.
   fabric counts (held, serving-stale, stuck-`building`, access-lost,
   unparseable-mime, verification-halted). Each count carries an **as-of** label
   so an operator never reads a count without knowing when it was taken.
-- The **annotation worker** publishes `AnnotationHealth`: parked state and counts
-  from the last completed cycle, including exhausted work. This slot is not
-  live per-call progress; call starts and outcomes are recorded in the service log.
-  `GET /sync/status` reads only the scheduler's slot.
+- The **annotation worker** publishes `AnnotationHealth`: parked state, historical
+  last-cycle counts, and per-document progress updated during processing. Discovery
+  captures active source/parse identity and paths; each document observation carries
+  its plan identity and measurement time. Completion and unfinished states come from
+  worker accounting (Section 3.1); health never queries SQLite or infers progress
+  from cycle counts. PROTOCOL.md defines the wire shape. `GET /sync/status` reads
+  only the scheduler's slot.
 - **Readiness = {inference, sync}** —
   `inference_component.ready && sync_component.ready`. The fabric and annotation
   counts are **diagnostic-only** and NEVER gate readiness; a degraded diagnostic

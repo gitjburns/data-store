@@ -262,15 +262,24 @@ zero-valued categories collapse into one line. `--health-details` retains every
 component detail, startup smoke result, and diagnostic counter. Both commands
 read the same endpoint; summaries come from the server's component snapshots.
 
-Annotation counts describe the last completed cycle, with its measurement time.
-Eligible missing work excludes items waiting for retry and exhausted work, so
-zero does not establish completion. Completion and current activity remain
-explicitly unreported; parked workers retain their reason. `--sync-status`
-reports ingestion. Model initialization does not establish live endpoint health.
+Both health commands show each document in the worker's measured inventory:
+`completed / total (percentage)`, entity/relation/summary breakdowns, pending,
+running, failed, retry-waiting, and exhausted work, and activity including commit
+and storage waits. Source/parse/plan identity and measurement times identify the
+captured work. Unknown totals and no required work are explicit. Completion
+counts committed fresh coverage, including empty results and memo reuse; 100%
+does not assert retrieval projection publication. The worker updates progress
+during processing; newly active or changed sources appear on subsequent discovery.
+
+Last-cycle counts remain historical: eligible missing work excludes retry-waiting
+and exhausted items, so zero does not establish completion. Parked workers retain
+their reason. `--sync-status` reports ingestion. Model initialization does not
+establish live endpoint health.
 For current model activity, read the file configured by `logging.file_path`
 (`logs/data-store.log` as shipped): stage starts, completions, measured
 usage, failures, retry delays, and exhaustion are recorded there. Missing token
-usage remains unknown; character counts are not token estimates.
+usage remains unknown; character counts are not token estimates. Existing
+annotation log entries include `annotation_progress="completed / total (percentage)"`.
 
 Annotator requests omit `response_format` and `stream` from the transcript while
 retaining temperature. Responses show only content, reasoning, completion tokens,
@@ -287,6 +296,12 @@ progress records are written. A timeout or cancellation before body receipt is
 reported without a partial response. Database commits remain
 separate service-log events. Transcript open/write failures appear in the service
 log; authentication credentials are excluded from the transcript.
+
+The transcript shows document progress immediately before `END CALL`. Its
+pre-persistence timing is preserved: calls in a wave may repeat the count, and
+the final transcript entry may remain below 100%. Health and service-log commit
+entries show subsequent completion. Unmeasured progress, including dry runs,
+is `unavailable`; neither log adds entries for progress.
 
 ## Known deviations (stated where an operator meets them)
 

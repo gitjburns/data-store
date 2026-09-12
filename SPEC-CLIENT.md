@@ -345,20 +345,30 @@ corpus, query-admission, model-initialization, and logging observations. Server
 statuses put attention items first, then unreported measurements, then normal
 observations. Specific problem reasons remain visible. Zero-valued corpus
 exceptions collapse into one line per source system; nonzero counts remain
-explicit. Annotation and corpus measurement times appear once per group.
+explicit. Cycle and corpus measurement times appear once per group.
 
 The shared wire types in `src/types.rs` carry server-owned summaries; the client
 does not parse diagnostic strings or calculate operational status. A missing
 summary is explicitly unavailable, with a pointer to `health-details`.
 
-Annotation observations describe the last completed cycle. `eligible_missing`
-excludes work waiting for retry and exhausted work; `new_failures` counts only
-that cycle's failures. Completion and current activity remain explicitly
-unreported; a parked worker retains its reason. Model initialization is not a
-live endpoint probe. Current model activity and retry details remain in the
-configured service log.
+Both health views show each document in the worker's measured inventory with
+`completed / total (percentage)`, entity/relation/summary breakdowns, and pending,
+running, failed, retry-waiting, and exhausted counts, including zeros. They show
+server-owned activity, including awaiting commit and storage waits, along with
+source paths, source/parse/plan identity, inventory time, and document measurement
+time. Missing progress is unavailable; unknown totals and no required work are
+explicit. The client formats the server's percentage without recalculating it.
+Committed coverage defines completion, including empty results and memo reuse;
+100% does not assert retrieval projection publication. See PROTOCOL.md for the
+snapshot and accounting contract.
 
-`health-details` makes the same public request and preserves the original display:
+Last-cycle annotation observations remain historical. `eligible_missing` excludes
+work waiting for retry and exhausted work; `new_failures` counts only that cycle's
+failures. These counters do not determine document completion. A parked worker
+retains its reason. Model initialization is not a live endpoint probe; detailed
+model-call diagnostics remain in the configured service log.
+
+`health-details` makes the same public request and also retains
 service/component readiness, every detail line, and every counter as
 `count <label> [<sourceSystem>]: <value> (as of <timestamp>)`.
 

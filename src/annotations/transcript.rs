@@ -13,6 +13,7 @@ use serde_json::Value;
 use tracing::{error, info};
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
+use crate::types::AnnotationProgressCount;
 use crate::util::{LogContext, diagnostic_id};
 
 /// One append-only sink shared by all clones of an annotator client. Holding the
@@ -29,6 +30,9 @@ pub(crate) struct TranscriptCall<'sink> {
     sink: &'sink Transcript,
     id: String,
     pub(crate) stage: &'static str,
+    // Calls finish before the worker commits this wave; validation alone must
+    // never advance the document's durable completion count.
+    progress: AnnotationProgressCount,
     started_at: Instant,
     request: Option<String>,
     response: Option<String>,
@@ -61,16 +65,25 @@ impl Transcript {
 
     /// Return independent owners for mutable transcript data and immutable tracing
     /// context, both carrying the same identity through HTTP and validation.
-    pub(crate) fn call(&self, stage: &'static str) -> (TranscriptCall<'_>, LogContext) {
+    pub(crate) fn call(
+        &self,
+        stage: &'static str,
+        progress: Option<AnnotationProgressCount>,
+    ) -> (TranscriptCall<'_>, LogContext) {
+        // Dry runs have no measured document plan; the default explicitly
+        // formats this missing coverage as unavailable in both log destinations.
+        let progress = progress.unwrap_or_default();
         let id = diagnostic_id("call");
         let context = LogContext::new("model_call", &id);
         context.record("model_role", "annotator");
         context.record("call_purpose", stage);
         context.record("stage", stage);
+        context.record("annotation_progress", tracing::field::display(progress));
         let call = TranscriptCall {
             sink: self,
             id,
             stage,
+            progress,
             started_at: Instant::now(),
             request: None,
             response: None,
@@ -106,12 +119,13 @@ impl TranscriptCall<'_> {
                 call_id = %self.id, "failed to format annotator transcript time");
         }
         let block = format!(
-            "\n===== ANNOTATOR CALL — {} =====\nTime: {timestamp}\nStage: {}\nElapsed: {} ms\n\nREQUEST\n{}\n\nRESPONSE\n{}\n\nRESULT\n{outcome}\n{reason}\n===== END CALL — {} =====\n",
+            "\n===== ANNOTATOR CALL — {} =====\nTime: {timestamp}\nStage: {}\nElapsed: {} ms\n\nREQUEST\n{}\n\nRESPONSE\n{}\n\nRESULT\n{outcome}\n{reason}\nProgress: {}\n===== END CALL — {} =====\n",
             self.id,
             self.stage,
             self.started_at.elapsed().as_millis(),
             self.request.as_deref().unwrap_or("No request prepared."),
             self.response.as_deref().unwrap_or("No response received."),
+            self.progress,
             self.id,
         );
         if let Err(source) = self.sink.append(&block) {

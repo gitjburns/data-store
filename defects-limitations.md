@@ -12,7 +12,7 @@ not been established.
 | D06 | Annotation selection is exhaustive rather than selective | Open |
 | D07 | Graph traversal cannot follow connections across documents | Open |
 | D08 | Derived-data rebuilding is too coarse | Open |
-| D09 | Semantic entity retrieval, independent annotation publication, and document progress | Open |
+| D09 | Semantic entity retrieval, independent annotation publication, and document progress | Open; document progress implemented, live verification pending |
 
 ## Implemented annotation behavior
 
@@ -59,7 +59,7 @@ rates and production matching performance remain unmeasured. Fuzzy acceptance
 can omit qualifications or admit changed names, numbers, or negation; it does not
 establish semantic correctness or persistence. Source-text corruption, long
 reasoning, and request timeouts remain observed issues.
-Independent publication and document progress remain pending under D09.
+Independent publication remains pending under D09.
 
 ## D04 — Character-based annotation budgets
 
@@ -230,23 +230,29 @@ to distinguish completed annotation work from pending retrieval publication.
 
 ### Per-document annotation progress
 
-**Current behavior.** Operators have no per-document annotation percentage.
-The worker already enumerates planned work and checks fresh content keys, but
-those completion facts are not exposed as live document progress.
+**Status.** Implemented; live verification pending.
 
-**Required behavior.** Expose each document's annotation percentage, completed
-and total required work, and a breakdown by annotation type. Base completion on
-the current parse's authoritative work plan and durably satisfied coverage,
-including successful empty results, explicit rejection of all candidates, and
-completed memo reuse. Model-call counts, output-item counts, and retries must
-not inflate progress; different chains can require different numbers of calls.
+**Current behavior.** `--health` and `--health-details` show each discovered
+document's `completed / total (percentage)`, annotation-type breakdowns, and
+pending, running, failed, retry-waiting, and exhausted counts. Worker snapshots
+update at work and commit boundaries, with source/parse/plan identity and
+measurement times. Newly active or changed sources appear on subsequent discovery.
 
-Update progress as work completes, without waiting for the document or worker
-cycle to finish. Show pending, running, failed, and retry-exhausted work distinctly,
-with an as-of time. Unknown totals and documents with no required work must be
-explicit. Recompute from durable coverage after restart; identify parse or plan
-changes that alter the denominator. The percentage measures work completion,
-not estimated time remaining, and must not imply retrieval publication is ready.
+Completion counts committed fresh excerpt/type coverage, including empty results,
+rejection of all candidates, and memo reuse. Retries, model calls, and output-item
+counts do not inflate it. Coverage is reconstructed after restart; rebuild clears
+the snapshots. Unknown totals and no required work are explicit. The percentage
+measures annotation completion, not time remaining or retrieval publication.
+
+Existing annotation service-log entries and `logs/annotator.log` include the
+metric. The transcript places `Progress: completed / total (percentage)` directly
+before `END CALL`, preserving its pre-persistence timing. Calls in a wave may
+repeat the count, and the final transcript entry may remain below 100%; health
+and service-log commit entries reflect subsequent commits. Progress adds no log entries.
+
+**Verification and limits.** `cargo fmt`, `cargo check --offline`, and
+`cargo clippy --offline` passed without warnings; second-pass review completed.
+Live CLI/log output and runtime lifecycle behavior remain unverified.
 
 **Relationship to D07.** Semantic graph entry does not establish that similarly
 named entities in different documents are identical. Cross-document entity

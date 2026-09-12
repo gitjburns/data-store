@@ -61,6 +61,11 @@ pub enum HealthObservations {
         parked: bool,
         last_cycle: Option<AnnotationSummary>,
         measured_at: Option<String>,
+        /// None before inventory or on an older server; an empty list is a measured empty scope.
+        #[serde(default)]
+        documents: Option<Vec<AnnotationDocumentProgress>>,
+        #[serde(default)]
+        inventory_measured_at: Option<String>,
     },
     Corpus {
         source_systems: Vec<String>,
@@ -91,6 +96,99 @@ pub struct AnnotationSummary {
     pub eligible_missing: u64,
     pub new_failures: u64,
     pub exhausted: u64,
+}
+
+/// Committed coverage of a measured plan. The server supplies the percentage;
+/// clients only format it, and an unknown denominator is never treated as zero.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct AnnotationProgressCount {
+    pub completed: u64,
+    pub total: Option<u64>,
+    pub percentage: Option<f64>,
+}
+
+impl std::fmt::Display for AnnotationProgressCount {
+    /// Keep CLI and log rendering identical without rounding incomplete work to 100%.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.total, self.percentage) {
+            (Some(0), _) => write!(formatter, "{} / 0 (no required work)", self.completed),
+            (Some(total), Some(percentage)) => {
+                write!(formatter, "{} / {total} ({percentage:.1}%)", self.completed)
+            }
+            _ => formatter.write_str("unavailable"),
+        }
+    }
+}
+
+/// Mutually exclusive states of unfinished plan items. Running covers a chain
+/// from preparation through persistence; document activity identifies storage waits.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AnnotationWorkCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub failed: u64,
+    pub retry_waiting: u64,
+    pub exhausted: u64,
+}
+
+/// Per-type coverage uses the same required work and state accounting as the document.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnnotationTypeProgress {
+    pub annotation_type: String,
+    pub progress: AnnotationProgressCount,
+    pub work: AnnotationWorkCounts,
+}
+
+/// A worker observation tied to one captured active parse and required plan.
+/// Activity and completion describe annotation work, not retrieval publication.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnnotationDocumentProgress {
+    pub source_id: String,
+    pub parse_id: String,
+    pub source_paths: Vec<String>,
+    pub plan_id: Option<String>,
+    pub measured_at: Option<String>,
+    pub progress: AnnotationProgressCount,
+    pub work: AnnotationWorkCounts,
+    pub by_type: Vec<AnnotationTypeProgress>,
+    pub activity: AnnotationActivity,
+    pub detail: Option<String>,
+}
+
+/// The worker owns activity classification; health clients must not infer it from counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationActivity {
+    Discovering,
+    Pending,
+    Running,
+    AwaitingCommit,
+    WaitingForStorage,
+    RetryWait,
+    Exhausted,
+    Complete,
+    NoWork,
+    Stopped,
+    Unavailable,
+}
+
+impl std::fmt::Display for AnnotationActivity {
+    /// Render the server's classification as readable operator text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Discovering => "discovering",
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::AwaitingCommit => "awaiting commit",
+            Self::WaitingForStorage => "waiting for storage",
+            Self::RetryWait => "waiting to retry",
+            Self::Exhausted => "retries exhausted",
+            Self::Complete => "annotations complete",
+            Self::NoWork => "no required annotation work",
+            Self::Stopped => "stopped",
+            Self::Unavailable => "unavailable",
+        })
+    }
 }
 
 /// Config-selected retrieval execution location, not a live endpoint probe.

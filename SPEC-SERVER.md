@@ -159,11 +159,19 @@ token usage and finish metadata are optional reported facts, never estimates.
 Counters label their scope; elapsed, gate-wait, dispatch-wait, and persistence
 times describe separate boundaries. `DIAGNOSTICS.md` defines the log contract.
 
-Annotator calls log stage identity, periodic streaming progress, and terminal
-measurements, including partial work on timeout or cancellation. Answer and
-reasoning characters are counted separately; token counts come from provider
-usage when supplied. Retry logs identify both failure counters, their limits,
-eligibility delay, and next action. Model payloads are not retained in these logs.
+Annotator calls log stage identity and terminal measurements; calls use complete
+responses and emit no generation-progress entries. Answer and reasoning characters
+are counted separately; token counts come from provider usage when supplied. Retry
+logs identify both failure counters, their limits, eligibility delay, and next
+action. Model payloads are not retained in these logs.
+
+Existing annotation-related entries include
+`annotation_progress="completed / total (percentage)"` for committed document
+coverage. The separate `logs/annotator.log` transcript appends the same progress
+immediately before `END CALL`, before persistence, so a wave may repeat counts and
+its last entry may remain below 100%. Health and service-log commit entries
+reflect subsequent commits. Unmeasured progress, including dry runs, is
+`unavailable`; progress adds no log entries. DIAGNOSTICS.md defines both formats.
 
 **Forbidden log data.** API keys, bearer/admin tokens, prompt text, model
 outputs, document contents, and vector values never enter the service log.
@@ -689,13 +697,28 @@ Components:
 - **`annotation`** (diagnostic-only) — the annotation worker's own slot:
   `parked` (+ detail) and counts from the last completed cycle, including
   exhausted work, with an `as_of`. Counts are corpus-aggregate, not
-  source-system keyed. Current model-call progress is in the service log (§2.2);
+  source-system keyed. Typed summary observations additionally expose each
+  discovered document's committed/required progress, entity/relation/summary
+  breakdown, mutually exclusive pending/running/failed/retry-waiting/exhausted
+  counts, and worker activity including commit and storage waits. Source paths,
+  source/parse/plan identity, inventory time, and document measurement time scope
+  the observation; PROTOCOL.md defines the wire contract. Historical cycle
+  counters retain their existing meaning and do not determine completion.
   `GET /sync/status` reports only the scheduler snapshot.
 - **`search_admission`** (diagnostic-only) — the search admission gate window
   (`max_in_flight` / `in_flight`) via `AdmissionGate::snapshot`.
 
 **Only `inference` and `sync` gate the top-level `ready` flag.** The other
 components are diagnostic-only by construction.
+
+The annotation worker measures discovered documents before model dispatch and
+updates their snapshots after commits and work-state transitions. Subsequent
+discovery captures newly active or changed sources. Completion is fresh coverage
+of required excerpt/type pairs, including successful empty results and committed
+memo reuse; retry attempts and output-item counts do not increase it. Completion
+is reconstructed after restart and snapshots reset on rebuild. Unknown totals
+and zero required work remain explicit. Percentages are floored to one decimal
+place; 100% annotation completion does not assert retrieval projection publication.
 
 Admission itself: the `/query` handler acquires a permit from a fail-fast
 in-flight search gate before running the pipeline. Saturation surfaces the

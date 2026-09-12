@@ -18,6 +18,7 @@ use crate::annotations::{
     summary,
 };
 use crate::error::ApiError;
+use crate::types::AnnotationProgressCount;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,20 +73,23 @@ struct EvidenceItem {
 
 /// Run dependencies sequentially inside the worker's existing bounded invocation
 /// concurrency. A later failure discards all local results, never partial writes.
+/// Every stage retains the wave's committed coverage snapshot until persistence.
 pub(crate) fn run(
     kind: ProducerKind,
     client: &AnnotatorClient,
     passage: &str,
     temperature: f64,
+    progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     match kind {
-        ProducerKind::Entity => entities(client, passage, temperature),
-        ProducerKind::Relation => relations(client, passage, temperature),
+        ProducerKind::Entity => entities(client, passage, temperature, progress),
+        ProducerKind::Relation => relations(client, passage, temperature, progress),
         ProducerKind::Summary => run_stage(
             Stage::Summary,
             client,
             passage,
             temperature,
+            progress,
             summary::parse_output,
             Vec::len,
         ),
@@ -98,12 +102,14 @@ fn entities(
     client: &AnnotatorClient,
     passage: &str,
     temperature: f64,
+    progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     let names = run_stage(
         Stage::EntityNames,
         client,
         passage,
         temperature,
+        progress,
         |raw| {
             let response: NamesResponse = strict_from_str(raw, Stage::EntityNames.name(), raw)?;
             for name in &response.names {
@@ -124,6 +130,7 @@ fn entities(
             client,
             &input,
             temperature,
+            progress,
             |raw| {
                 let typed = entity::parse_output(raw)?;
                 let mut remaining = BTreeMap::<&str, usize>::new();
@@ -179,12 +186,14 @@ fn relations(
     client: &AnnotatorClient,
     passage: &str,
     temperature: f64,
+    progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     let statements = run_stage(
         Stage::Statements,
         client,
         passage,
         temperature,
+        progress,
         |raw| {
             let response: StatementsResponse = strict_from_str(raw, Stage::Statements.name(), raw)?;
             // Validate source support without undoing the model's text repairs;
@@ -213,10 +222,11 @@ fn relations(
             client,
             &input,
             temperature,
+            progress,
             relation::parse_output,
             Vec::len,
         )?;
-        attach_evidence(client, passage, temperature, &mut formed)?;
+        attach_evidence(client, passage, temperature, &mut formed, progress)?;
         annotations.append(&mut formed);
     }
     Ok(annotations)
@@ -229,6 +239,7 @@ fn attach_evidence(
     passage: &str,
     temperature: f64,
     annotations: &mut [ProducedAnnotation],
+    progress: Option<AnnotationProgressCount>,
 ) -> Result<(), InvocationFailure> {
     let relationships = annotations
         .iter()
@@ -254,6 +265,7 @@ fn attach_evidence(
             client,
             &input,
             temperature,
+            progress,
             |raw| {
                 let response: EvidenceResponse = strict_from_str(raw, Stage::Evidence.name(), raw)?;
                 let mut expected = batch
@@ -333,10 +345,11 @@ fn run_stage<T>(
     client: &AnnotatorClient,
     input: &str,
     temperature: f64,
+    progress: Option<AnnotationProgressCount>,
     parse: impl FnOnce(&str) -> Result<T, ApiError>,
     item_count: impl FnOnce(&T) -> usize,
 ) -> Result<T, InvocationFailure> {
-    let (mut call, context) = client.start_call(stage.name());
+    let (mut call, context) = client.start_call(stage.name(), progress);
     // The synchronous stage owns this context through HTTP and validation. The
     // HTTP future is polled on this same producer thread, never on a Tokio worker.
     // Context and payload buffer have distinct owners: HTTP can fill the buffer

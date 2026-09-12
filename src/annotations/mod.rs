@@ -20,6 +20,7 @@ pub(crate) mod llm_client;
 pub(crate) mod memo;
 pub(crate) mod policy;
 pub(crate) mod producer;
+pub(crate) mod progress;
 pub(crate) mod relation;
 pub(crate) mod stages;
 pub(crate) mod store;

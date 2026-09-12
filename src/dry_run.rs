@@ -418,7 +418,15 @@ fn sample_item(
         return Ok(());
     }
     counts.producer_calls += 1;
-    let result = producer::invoke(kind, client, invocation, llm_client::PRODUCER_TEMPERATURE);
+    // Sampling does not measure the normal document plan; its progress remains
+    // explicitly unavailable rather than treating this sample as the whole plan.
+    let result = producer::invoke(
+        kind,
+        client,
+        invocation,
+        llm_client::PRODUCER_TEMPERATURE,
+        None,
+    );
     // Cancellation can arrive after the response or during validation. Its output
     // and provider errors must not be persisted as fresh annotations or failures,
     // but an already-observed error remains part of the diagnostic record.

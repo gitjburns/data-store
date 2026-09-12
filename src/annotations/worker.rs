@@ -72,8 +72,8 @@
 //! archive-verify-delete sweep so superseded-parse annotations do not linger.)
 //!
 //! HEALTH (C10b): the worker publishes an `AnnotationHealth` snapshot into a
-//! shared slot each cycle (and on the client-load parked path), mirroring the
-//! scheduler's whole-snapshot poison-recovered publish discipline. The snapshot
+//! shared slot at document work/commit boundaries and at cycle completion.
+//! Updates preserve the other observations under the existing health lock. The snapshot
 //! is diagnostic-only — a parked worker never gates service readiness
 //! (annotations are non-critical, CAd ruling). Assembly reads only the slot;
 //! this owning thread does all the measuring.
@@ -96,6 +96,7 @@ use crate::annotations::policy;
 use crate::annotations::producer::{
     self, Invocation, InvocationFailure, ProducedAnnotation, ProducerKind,
 };
+use crate::annotations::progress::{self, DocumentProgress, WorkState};
 use crate::annotations::store::{self, NewAnnotation};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
@@ -105,6 +106,7 @@ use crate::model::{ProducerType, Provenance, SemanticAnnotationType};
 use crate::primitives::utc_now;
 use crate::projections::{envelope, graph, view};
 use crate::state::{AnnotationCycleCounts, AnnotationHealth, ShutdownSignal};
+use crate::types::{AnnotationActivity, AnnotationProgressCount};
 use crate::util::{panic_payload_message, truncate_persisted_detail};
 
 /// Idle interval between discovery cycles. A code constant, never config
@@ -147,6 +149,22 @@ struct AnnotationRetryState {
 }
 
 impl AnnotationRetryState {
+    /// Report retry eligibility without spending or resetting either retry budget.
+    fn work_state(&self, config: &AnnotatorModelConfig) -> WorkState {
+        if self.exhausted_category(config).is_some() {
+            WorkState::Exhausted
+        } else if let Some(delay) = self.delay
+            && !delay.remaining().is_zero()
+        {
+            WorkState::RetryWaiting {
+                started_at: delay.started_at,
+                duration: delay.duration,
+            }
+        } else {
+            WorkState::Failed
+        }
+    }
+
     /// The initial attempt plus N retries permits N+1 failures in either category.
     fn exhausted_category(&self, config: &AnnotatorModelConfig) -> Option<&'static str> {
         if self.invalid_outputs > u64::from(config.annotation_max_retries) {
@@ -382,6 +400,8 @@ fn run_worker(
                     parked_detail: Some(truncate_persisted_detail(&source.to_string())),
                     last_cycle: None,
                     measured_at: None,
+                    documents: None,
+                    inventory_measured_at: None,
                 },
             );
             // Park until shutdown: the process keeps running without
@@ -423,6 +443,8 @@ fn run_worker(
                         ))),
                         last_cycle: None,
                         measured_at: None,
+                        documents: None,
+                        inventory_measured_at: None,
                     },
                 );
                 info!(
@@ -456,12 +478,17 @@ fn run_worker(
             &client,
             &shutdown,
             &mut output_retries,
+            &health_slot,
         ) {
             Ok(Some(report)) if client.cancellation().reason().is_none() => {
                 publish_cycle_annotation_health(&health_slot, &report);
             }
             // Cancellation is control flow, not a completed freshness measurement.
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(reason) = client.cancellation().reason() {
+                    stop_document_activity(&health_slot, reason.label());
+                }
+            }
             Err(source) => error!(
                 event = "annotation_worker.cycle_failed",
                 error = %source,
@@ -477,11 +504,33 @@ fn run_worker(
         delay = output_retries.next_cycle_delay();
     }
 
+    stop_document_activity(&health_slot, "shutdown");
     info!(
         event = "annotation_worker.thread_stopped",
         reason = "shutdown_requested",
         "annotation worker thread stopped cleanly"
     );
+}
+
+/// A stopped worker cannot leave a document looking active or still discovering.
+/// Durable completion is retained; the next admitted cycle reconstructs work states.
+fn stop_document_activity(slot: &Mutex<AnnotationHealth>, reason: &str) {
+    update_annotation_health(slot, |health| {
+        if let Some(documents) = &mut health.documents {
+            for document in documents {
+                if !matches!(
+                    document.activity,
+                    AnnotationActivity::Complete
+                        | AnnotationActivity::NoWork
+                        | AnnotationActivity::Unavailable
+                ) {
+                    document.activity = AnnotationActivity::Stopped;
+                    document.detail = Some(format!("Annotation worker stopped: {reason}."));
+                    // This control outcome does not remeasure coverage or retry timers.
+                }
+            }
+        }
+    });
 }
 
 /// One discovery/build cycle: for every active source, enumerate the missing
@@ -499,6 +548,7 @@ fn run_cycle(
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
     output_retries: &mut RetryState,
+    health_slot: &Mutex<AnnotationHealth>,
 ) -> Result<Option<CycleReport>, ApiError> {
     let cancellation = client.cancellation();
     if let Some(reason) = cancellation.reason() {
@@ -517,6 +567,38 @@ fn run_cycle(
         read_active_sources(&connection)?
     };
 
+    // Measure the entire discovered scope before a slow source begins model work.
+    // Only compact observations survive this pass; source text is released per plan.
+    let documents = sources
+        .iter()
+        .map(|source| {
+            progress::unmeasured(
+                &source.source_id,
+                &source.active_parse_id,
+                &source.source_paths,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    update_annotation_health(health_slot, |health| {
+        health.documents = Some(documents);
+        health.inventory_measured_at = annotation_measured_at();
+    });
+    let mut unavailable = std::collections::HashSet::new();
+    for source in &sources {
+        if let Some(reason) = cancellation.reason() {
+            return cancelled_cycle(reason);
+        }
+        if let Err(source_error) =
+            read_source_plan(index_root, config, source, true).and_then(|plan| {
+                plan.progress(source, config, output_retries, health_slot)
+                    .map(drop)
+            })
+        {
+            record_source_failure(source, &source_error, false, health_slot);
+            unavailable.insert(source.source_id.clone());
+        }
+    }
+
     let mut totals = CycleTotals::default();
     let mut sources_examined = 0usize;
     for source in &sources {
@@ -526,17 +608,35 @@ fn run_cycle(
         // Source discovery is a snapshot; an early-ended cycle has not examined
         // the remaining sources. Keep logs and published health honest about that.
         sources_examined += 1;
+        if unavailable.contains(&source.source_id) {
+            totals.source_failures += 1;
+            continue;
+        }
         let context = crate::util::LogContext::new("annotation_source", &source.source_id);
         context.record("source_id", source.source_id.as_str());
         context.record("parse_id", source.active_parse_id.as_str());
         context.record("source_paths", source.source_paths.as_str());
         let _entered = context.enter();
-        match build_source(index_root, config, client, source, shutdown, output_retries) {
+        match build_source(
+            index_root,
+            config,
+            client,
+            source,
+            shutdown,
+            output_retries,
+            health_slot,
+        ) {
             Ok((source_counts, flow)) => {
                 if let BuildFlow::Cancelled(reason) = flow {
                     return cancelled_cycle(reason);
                 }
                 totals.add(&source_counts);
+                // This context is stamped once after source work; projection
+                // boundary records inherit the final annotation coverage.
+                context.record(
+                    "annotation_progress",
+                    source_counts.progress_count().to_string(),
+                );
                 if flow == BuildFlow::CallFailed {
                     // The wave has recorded all successes/failures. Stop here
                     // rather than multiplying an endpoint outage across sources.
@@ -621,13 +721,11 @@ fn run_cycle(
                 // is recorded and skipped unless a joined wave also observed a
                 // call failure: persistence errors must not erase cycle-stop intent.
                 totals.source_failures += 1;
-                error!(
-                    event = "annotation_worker.source_failed",
-                    source_id = %source.source_id,
-                    parse_id = %source.active_parse_id,
-                    error = %source_error,
-                    call_failure_cycle_ended = output_retries.call_failed_in_cycle,
-                    "annotation build failed for one source"
+                record_source_failure(
+                    source,
+                    &source_error,
+                    output_retries.call_failed_in_cycle,
+                    health_slot,
                 );
                 if output_retries.call_failed_in_cycle {
                     break;
@@ -697,6 +795,39 @@ fn run_cycle(
         sources_examined: sources_examined as u64,
         totals,
     }))
+}
+
+/// Share the existing source-failure record between inventory and dispatch.
+/// A failed measurement is explicit; it does not replace coverage with zero.
+fn record_source_failure(
+    source: &ActiveSource,
+    source_error: &ApiError,
+    call_failure_cycle_ended: bool,
+    health_slot: &Mutex<AnnotationHealth>,
+) {
+    let mut annotation_progress = AnnotationProgressCount::default();
+    update_annotation_health(health_slot, |health| {
+        if let Some(document) = health.documents.as_mut().and_then(|documents| {
+            documents.iter_mut().find(|document| {
+                document.source_id == source.source_id
+                    && document.parse_id == source.active_parse_id
+            })
+        }) {
+            annotation_progress = document.progress;
+            document.activity = AnnotationActivity::Unavailable;
+            document.detail = Some(truncate_persisted_detail(&source_error.to_string()));
+            // Keep the last actual accounting timestamp when measurement fails.
+        }
+    });
+    error!(
+        event = "annotation_worker.source_failed",
+        source_id = %source.source_id,
+        parse_id = %source.active_parse_id,
+        error = %source_error,
+        call_failure_cycle_ended,
+        annotation_progress = %annotation_progress,
+        "annotation build failed for one source"
+    );
 }
 
 /// End a cancelled cycle without publishing partial freshness as completed work.
@@ -770,7 +901,9 @@ impl CycleTotals {
 
 /// One source's work-item accounting for a cycle.
 #[derive(Default)]
-struct SourceCounts {
+struct SourceCounts<'slot> {
+    /// Per-item accounting is retained through the source's commits and early exits.
+    progress: Option<DocumentProgress<'slot>>,
     expected: u64,
     missing: u64,
     built: u64,
@@ -785,6 +918,31 @@ struct SourceCounts {
     deferred: u64,
     /// Failed rows skipped for this source because either retry allowance is spent.
     exhausted: u64,
+}
+
+impl SourceCounts<'_> {
+    /// Missing observations remain unavailable in diagnostic records.
+    fn progress_count(&self) -> AnnotationProgressCount {
+        self.progress
+            .as_ref()
+            .map(DocumentProgress::count)
+            .unwrap_or_default()
+    }
+
+    /// Publish a measured work transition without changing historical cycle totals.
+    fn transition(&mut self, key: &str, state: WorkState) -> Result<(), ApiError> {
+        if let Some(progress) = &mut self.progress {
+            progress.transition(key, state)?;
+        }
+        Ok(())
+    }
+
+    /// Preserve the owning boundary's reason while work waits or stops.
+    fn activity(&mut self, activity: AnnotationActivity, detail: Option<String>) {
+        if let Some(progress) = &mut self.progress {
+            progress.activity(activity, detail);
+        }
+    }
 }
 
 /// One unit of work: a single (invocation × matching producer) pair. Entity
@@ -889,6 +1047,7 @@ fn run_post_paid_transaction<T>(
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
     cancellation: &AnnotationCancellation,
+    counts: &mut SourceCounts,
     mut body: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, ApiError>,
 ) -> Result<PostPaidOutcome<T>, ApiError> {
     // ~60 busy attempts × ~5 s busy_timeout ≈ 5 min between stall logs.
@@ -908,6 +1067,7 @@ fn run_post_paid_transaction<T>(
         if shutdown.wait_timeout(Duration::ZERO) {
             warn!(
                 event = "annotation_worker.completion_abandoned_shutdown",
+                annotation_progress = %counts.progress_count(),
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
                 operation,
@@ -923,6 +1083,7 @@ fn run_post_paid_transaction<T>(
             operation,
         )? {
             WriteTransactionAttempt::Begun(tx) => {
+                counts.activity(AnnotationActivity::AwaitingCommit, None);
                 if let Some(reason) = cancellation.reason() {
                     rollback_cancelled(tx, operation, reason)?;
                     return Ok(PostPaidOutcome::Cancelled(reason));
@@ -948,9 +1109,16 @@ fn run_post_paid_transaction<T>(
             }
             WriteTransactionAttempt::Busy => {
                 busy_attempts += 1;
+                if busy_attempts == 1 {
+                    counts.activity(
+                        AnnotationActivity::WaitingForStorage,
+                        Some("Waiting for SQLite to persist annotation results.".to_string()),
+                    );
+                }
                 if busy_attempts.is_multiple_of(WAIT_LOG_EVERY) {
                     info!(
                         event = "annotation_worker.completion_waiting",
+                        annotation_progress = %counts.progress_count(),
                         source_id = %source.source_id,
                         parse_id = %source.active_parse_id,
                         operation,
@@ -1012,6 +1180,105 @@ struct PendingBuild {
     prepared_at: Instant,
 }
 
+/// One read snapshot supplies both dispatch and progress with the same coverage facts.
+struct SourcePlan {
+    work_items: Vec<WorkItem>,
+    present_keys: std::collections::HashSet<String>,
+    reopenable: HashMap<String, store::ReopenableRow>,
+}
+
+/// Read a plan without holding SQLite across model work or health publication.
+fn read_source_plan(
+    index_root: &Path,
+    config: &AnnotatorModelConfig,
+    source: &ActiveSource,
+    inventory_only: bool,
+) -> Result<SourcePlan, ApiError> {
+    let (work_items, present_keys, reopenable) = {
+        let mut connection = hot_plane::open_read(index_root)?;
+        // Pin plan and coverage together; activation may run on the scheduler.
+        let connection = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| ApiError::StorageOperation {
+                message: format!(
+                    "failed to read annotation plan for {} in one snapshot: {error}",
+                    source.active_parse_id
+                ),
+            })?;
+        // Measuring progress must not duplicate the existing dispatch plan log.
+        let plan_builder = if inventory_only {
+            producer::measure_invocation_plan
+        } else {
+            producer::build_invocation_plan
+        };
+        let plan = plan_builder(&connection, &source.active_parse_id, config.max_input_chars)?;
+        let work_items = enumerate_work_items(&connection, config, &plan)?;
+        // Only fresh CONTENT keys satisfy coverage. The reopenable map holds
+        // one reusable row per unsatisfied CONTENT key
+        // (failed rows and crash-orphaned building rows alike). CA2 (user-ruled
+        // 2026-07-19): satisfaction/reopen are content-scoped, so a model switch
+        // re-annotates only the frontier; the memo CACHE lookup in
+        // `prepare_work_item` still keys on the identity-scoped memo key.
+        let present_keys =
+            store::fresh_content_key_hashes_for_parse(&connection, &source.active_parse_id)?;
+        let reopenable = store::reopenable_rows_for_parse(&connection, &source.active_parse_id)?;
+        (work_items, present_keys, reopenable)
+    };
+
+    Ok(SourcePlan {
+        work_items,
+        present_keys,
+        reopenable,
+    })
+}
+
+impl SourcePlan {
+    /// Reconstruct committed work and classify unfinished keys from current retry
+    /// state. A persisted building row at discovery is an orphan, never live work.
+    fn progress<'slot>(
+        &self,
+        source: &ActiveSource,
+        config: &AnnotatorModelConfig,
+        retries: &RetryState,
+        slot: &'slot Mutex<AnnotationHealth>,
+    ) -> Result<DocumentProgress<'slot>, ApiError> {
+        let planned = self
+            .work_items
+            .iter()
+            .map(|item| {
+                let state = if self.present_keys.contains(&item.content_key) {
+                    WorkState::Completed
+                } else if let Some(row) = self.reopenable.get(&item.content_key) {
+                    match retries.outputs.get(&row.annotation_id) {
+                        Some(retry)
+                            if retry.invalid_outputs > 0 || retry.execution_failures > 0 =>
+                        {
+                            retry.work_state(config)
+                        }
+                        // Merely adopting an orphan creates an empty retry entry;
+                        // it does not prove any failed producer attempt occurred.
+                        _ if row.status == store::ReopenableStatus::Failed => WorkState::Failed,
+                        _ => WorkState::Pending,
+                    }
+                } else {
+                    WorkState::Pending
+                };
+                (item.content_key.clone(), item.kind.annotation_type(), state)
+            })
+            .collect();
+        DocumentProgress::new(
+            slot,
+            progress::unmeasured(
+                &source.source_id,
+                &source.active_parse_id,
+                &source.source_paths,
+            )?,
+            &policy::active_policy()?.post_activation_types,
+            planned,
+        )
+    }
+}
+
 /// Discover and build every missing annotation for one source. Reads the
 /// active parse's invocation plan once, enumerates the policy's post-activation
 /// work items, computes each item's memo key, then classifies each against the
@@ -1040,14 +1307,15 @@ struct PendingBuild {
 ///
 /// Each failure category has its own configured retry allowance. Reopening a
 /// row, waiting for eligibility, or deferring on contention spends neither budget.
-fn build_source(
+fn build_source<'slot>(
     index_root: &Path,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
     output_retries: &mut RetryState,
-) -> Result<(SourceCounts, BuildFlow), ApiError> {
+    health_slot: &'slot Mutex<AnnotationHealth>,
+) -> Result<(SourceCounts<'slot>, BuildFlow), ApiError> {
     let mut counts = SourceCounts::default();
     let cancellation = client.cancellation();
     if let Some(reason) = cancellation.reason() {
@@ -1056,26 +1324,13 @@ fn build_source(
 
     // Build the shared invocation plan and per-item keys on a read connection,
     // dropped before any long-running producer call or write transaction.
-    let (work_items, present_keys, reopenable) = {
-        let connection = hot_plane::open_read(index_root)?;
-        let plan = producer::build_invocation_plan(
-            &connection,
-            &source.active_parse_id,
-            config.max_input_chars,
-        )?;
-        let work_items = enumerate_work_items(&connection, config, &plan)?;
-        // Only fresh CONTENT keys satisfy coverage. The reopenable map holds
-        // one reusable row per unsatisfied CONTENT key
-        // (failed rows and crash-orphaned building rows alike). CA2 (user-ruled
-        // 2026-07-19): satisfaction/reopen are content-scoped, so a model switch
-        // re-annotates only the frontier; the memo CACHE lookup in
-        // `prepare_work_item` still keys on the identity-scoped memo key.
-        let present_keys =
-            store::fresh_content_key_hashes_for_parse(&connection, &source.active_parse_id)?;
-        let reopenable = store::reopenable_rows_for_parse(&connection, &source.active_parse_id)?;
-        (work_items, present_keys, reopenable)
-    };
-
+    let plan = read_source_plan(index_root, config, source, false)?;
+    counts.progress = Some(plan.progress(source, config, output_retries, health_slot)?);
+    let SourcePlan {
+        work_items,
+        present_keys,
+        reopenable,
+    } = plan;
     counts.expected = work_items.len() as u64;
 
     // The current dispatch wave: producer builds past `build_open`, awaiting a
@@ -1153,6 +1408,7 @@ fn build_source(
                     .entry(row.annotation_id.clone())
                     .or_default();
                 if let Some(category) = retry.exhausted_category(config) {
+                    counts.transition(&item.content_key, WorkState::Exhausted)?;
                     if !retry.exhaustion_reported {
                         error!(
                             event = "annotation_worker.retry_exhausted",
@@ -1161,6 +1417,7 @@ fn build_source(
                             annotation_id = %row.annotation_id,
                             producer = producer_label(item.kind),
                             attempts = retry.invalid_outputs + retry.execution_failures,
+                            annotation_progress = %counts.progress_count(),
                             attempts_scope = "failed_chain_attempts_in_this_process",
                             annotation_max_retries = config.annotation_max_retries,
                             execution_max_retries = config.execution_max_retries,
@@ -1178,7 +1435,9 @@ fn build_source(
                 if let Some(delay) = retry.delay
                     && !delay.remaining().is_zero()
                 {
+                    counts.transition(&item.content_key, retry.work_state(config))?;
                     debug!(event = "annotation_worker.retry_wait", annotation_id = %row.annotation_id,
+                        annotation_progress = %counts.progress_count(),
                         retry_in_seconds = delay.remaining().as_secs_f64(),
                         "annotation retry is not yet eligible");
                     output_retries.consider_retry(delay);
@@ -1193,6 +1452,7 @@ fn build_source(
                 counts.orphans_adopted += 1;
                 info!(
                     event = "annotation_worker.orphan_adopted",
+                    annotation_progress = %counts.progress_count(),
                     source_id = %source.source_id,
                     parse_id = %source.active_parse_id,
                     annotation_id = %row.annotation_id,
@@ -1202,6 +1462,8 @@ fn build_source(
             }
         }
         counts.missing += 1;
+        // Preparation owns this chain until its commit or an explicit deferral.
+        counts.transition(&item.content_key, WorkState::Running)?;
 
         // PRE-PAID phase, worker-thread serial. A memo HIT re-mints inline (no
         // producer call); a memo MISS passes `build_open` and is buffered for the
@@ -1239,6 +1501,13 @@ fn build_source(
                 }
             }
             PreparedItem::Deferred => {
+                let state =
+                    if reopened.is_some_and(|row| row.status == store::ReopenableStatus::Failed) {
+                        WorkState::Failed
+                    } else {
+                        WorkState::Pending
+                    };
+                counts.transition(&item.content_key, state)?;
                 // PRE-PAID deferral: the already-buffered wave's producers are
                 // paid for, so flush them before ending the source's work. The
                 // deferral was already counted/logged in `prepare_work_item`.
@@ -1257,6 +1526,10 @@ fn build_source(
                     // rather than relabeling it as the earlier SQLite deferral.
                     return Ok((counts, flow));
                 }
+                counts.activity(
+                    AnnotationActivity::WaitingForStorage,
+                    Some("Annotation writes deferred by SQLite contention.".to_string()),
+                );
                 return Ok((counts, BuildFlow::Deferred));
             }
         }
@@ -1364,6 +1637,7 @@ fn prepare_work_item(
             reopened,
             &entry,
             cancellation,
+            counts,
         )?;
         if let BuildFlow::Cancelled(reason) = flow {
             return Ok(PreparedItem::Cancelled(reason));
@@ -1375,6 +1649,7 @@ fn prepare_work_item(
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
                 stage = "memo_remint",
+                annotation_progress = %counts.progress_count(),
                 built = counts.built,
                 memoized = counts.memoized,
                 failed = counts.failed,
@@ -1417,6 +1692,7 @@ fn prepare_work_item(
                 source_id = %source.source_id,
                 parse_id = %source.active_parse_id,
                 stage = "build_open",
+                annotation_progress = %counts.progress_count(),
                 built = counts.built,
                 memoized = counts.memoized,
                 failed = counts.failed,
@@ -1501,6 +1777,7 @@ fn remint_from_memo(
     reopened: Option<&store::ReopenableRow>,
     entry: &memo::MemoEntry,
     cancellation: &AnnotationCancellation,
+    counts: &mut SourceCounts,
 ) -> Result<BuildFlow, ApiError> {
     if let Some(reason) = cancellation.reason() {
         return Ok(BuildFlow::Cancelled(reason));
@@ -1575,9 +1852,11 @@ fn remint_from_memo(
         return Ok(BuildFlow::Cancelled(reason));
     }
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "memo_remint")?;
+    counts.transition(&item.content_key, WorkState::Completed)?;
 
     info!(
         event = "annotation_worker.memo_hit",
+        annotation_progress = %counts.progress_count(),
         source_id = %source.source_id,
         parse_id = %source.active_parse_id,
         producer = producer_label(item.kind),
@@ -1695,6 +1974,7 @@ fn dispatch_and_commit_wave(
     if shutdown.wait_timeout(Duration::ZERO) {
         warn!(
             event = "annotation_worker.wave_abandoned_shutdown",
+            annotation_progress = %counts.progress_count(),
             source_id = %source.source_id,
             parse_id = %source.active_parse_id,
             wave_size = pending.len(),
@@ -1706,6 +1986,10 @@ fn dispatch_and_commit_wave(
     }
 
     let wave = std::mem::take(pending);
+    // No result commits during fan-out, so one immutable committed-count snapshot
+    // is authoritative for every existing call/stage/transcript entry in this wave.
+    let annotation_progress = counts.progress_count();
+    counts.activity(AnnotationActivity::Running, None);
 
     // Phase 2a fan-out: ONLY the pure producer HTTP call runs off-thread. Results
     // are collected in dispatch order so each maps back to its `PendingBuild`.
@@ -1728,6 +2012,7 @@ fn dispatch_and_commit_wave(
                             client,
                             &build.item.invocation,
                             build.effective_temperature,
+                            Some(annotation_progress),
                         )
                     })
                 })
@@ -1770,6 +2055,7 @@ fn dispatch_and_commit_wave(
                 let _entered = build.log_context.enter();
                 warn!(
                     event = "annotation_worker.discarded_failure",
+                    annotation_progress = %counts.progress_count(),
                     source_id = %source.source_id,
                     parse_id = %source.active_parse_id,
                     producer = producer_label(build.item.kind),
@@ -1786,6 +2072,7 @@ fn dispatch_and_commit_wave(
         }
         info!(
             event = "annotation_worker.wave_cancelled",
+            annotation_progress = %counts.progress_count(),
             source_id = %source.source_id,
             parse_id = %source.active_parse_id,
             reason = reason.label(),
@@ -1819,6 +2106,7 @@ fn dispatch_and_commit_wave(
                 }
                 warn!(
                     event = "annotation_worker.producer_failed",
+                    annotation_progress = %counts.progress_count(),
                     source_id = %source.source_id,
                     parse_id = %source.active_parse_id,
                     producer = producer_label(build.item.kind),
@@ -1843,6 +2131,7 @@ fn dispatch_and_commit_wave(
         })
         .collect();
 
+    counts.activity(AnnotationActivity::AwaitingCommit, None);
     // A call failure stops FUTURE waves only; record this wave's results using
     // the existing storage-failure and shutdown boundaries.
     for (build, (outcome, retry_snapshot)) in wave.into_iter().zip(produced) {
@@ -1867,6 +2156,7 @@ fn dispatch_and_commit_wave(
                     build.effective_temperature,
                     shutdown,
                     cancellation,
+                    counts,
                 )? {
                     CompletionOutcome::Committed => {}
                     CompletionOutcome::AbandonedShutdown => return Ok(BuildFlow::ShutdownAbort),
@@ -1892,6 +2182,7 @@ fn dispatch_and_commit_wave(
                     config,
                     shutdown,
                     cancellation,
+                    counts,
                 )? {
                     CompletionOutcome::Committed => {}
                     CompletionOutcome::AbandonedShutdown => return Ok(BuildFlow::ShutdownAbort),
@@ -1906,6 +2197,7 @@ fn dispatch_and_commit_wave(
     if call_failures > 0 {
         warn!(
             event = "annotation_worker.call_failure_cycle_ended",
+            annotation_progress = %counts.progress_count(),
             source_id = %source.source_id,
             parse_id = %source.active_parse_id,
             call_failures,
@@ -1938,6 +2230,7 @@ fn complete_build(
     effective_temperature: f64,
     shutdown: &ShutdownSignal,
     cancellation: &AnnotationCancellation,
+    counts: &mut SourceCounts,
 ) -> Result<CompletionOutcome, ApiError> {
     let persistence_started = Instant::now();
     // POST-PAID: wait out writer contention for the paid producer output (bounded
@@ -1949,6 +2242,7 @@ fn complete_build(
         source,
         shutdown,
         cancellation,
+        counts,
         |tx| -> Result<usize, ApiError> {
             let Some((first, rest)) = produced_items.split_first() else {
                 // An empty producer result (e.g. no entities found) still
@@ -2044,8 +2338,10 @@ fn complete_build(
         PostPaidOutcome::Cancelled(reason) => return Ok(CompletionOutcome::Cancelled(reason)),
     };
 
+    counts.transition(&item.content_key, WorkState::Completed)?;
     info!(
         event = "annotation_worker.build_completed",
+        annotation_progress = %counts.progress_count(),
         source_id = %source.source_id,
         parse_id = %source.active_parse_id,
         producer = producer_label(item.kind),
@@ -2076,6 +2372,7 @@ fn fail_build(
     config: &AnnotatorModelConfig,
     shutdown: &ShutdownSignal,
     cancellation: &AnnotationCancellation,
+    counts: &mut SourceCounts,
 ) -> Result<CompletionOutcome, ApiError> {
     if let InvocationFailure::Cancelled(reason) = producer_error {
         return Ok(CompletionOutcome::Cancelled(*reason));
@@ -2092,6 +2389,7 @@ fn fail_build(
         source,
         shutdown,
         cancellation,
+        counts,
         |tx| store::mark_failed(tx, building_id, &detail),
     )? {
         PostPaidOutcome::Committed(()) => {}
@@ -2099,8 +2397,10 @@ fn fail_build(
         PostPaidOutcome::Cancelled(reason) => return Ok(CompletionOutcome::Cancelled(reason)),
     }
 
+    counts.transition(&item.content_key, retry.work_state(config))?;
     warn!(
         event = "annotation_worker.build_failed",
+        annotation_progress = %counts.progress_count(),
         source_id = %source.source_id,
         parse_id = %source.active_parse_id,
         producer = producer_label(item.kind),
@@ -2573,12 +2873,12 @@ fn projection_failure_producer() -> Provenance {
     }
 }
 
-/// Publish one whole `AnnotationHealth` snapshot into the shared slot (C10b),
-/// mirroring the scheduler's whole-snapshot poison-recovered publish. A poisoned
-/// lock still guards a valid (stale) snapshot, so poison is recovered — a
-/// panicked reader must not silence the annotation health surface forever — and
-/// the write replaces the value wholly.
-fn publish_annotation_health(slot: &Mutex<AnnotationHealth>, snapshot: &AnnotationHealth) {
+/// Mutate one observation under the existing poison-recovered health boundary.
+/// Cycle publication must not replace newer per-document commit observations.
+pub(super) fn update_annotation_health(
+    slot: &Mutex<AnnotationHealth>,
+    update: impl FnOnce(&mut AnnotationHealth),
+) {
     let mut guard = match slot.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -2589,7 +2889,27 @@ fn publish_annotation_health(slot: &Mutex<AnnotationHealth>, snapshot: &Annotati
             poisoned.into_inner()
         }
     };
-    *guard = snapshot.clone();
+    update(&mut guard);
+}
+
+/// Replace the full slot only when the worker becomes unavailable.
+fn publish_annotation_health(slot: &Mutex<AnnotationHealth>, snapshot: &AnnotationHealth) {
+    update_annotation_health(slot, |health| *health = snapshot.clone());
+}
+
+/// Reuse the timestamp failure boundary for cycle and live document observations.
+pub(super) fn annotation_measured_at() -> Option<String> {
+    match utc_now() {
+        Ok(now) => Some(now),
+        Err(source) => {
+            error!(
+                event = "annotation_worker.health_timestamp_failed",
+                error = %source,
+                "failed to format annotation observation time; measurement time unavailable"
+            );
+            None
+        }
+    }
 }
 
 /// Map one completed cycle's `CycleReport` into an `AnnotationHealth` snapshot
@@ -2598,22 +2918,14 @@ fn publish_annotation_health(slot: &Mutex<AnnotationHealth>, snapshot: &Annotati
 /// 2), and a clock failure loses this publish visibly — the last good cycle's
 /// counts stay with their own older as-of — rather than stamping a guessed time.
 fn publish_cycle_annotation_health(slot: &Mutex<AnnotationHealth>, report: &CycleReport) {
-    let measured_at = match utc_now() {
-        Ok(now) => now,
-        Err(source) => {
-            error!(
-                event = "annotation_worker.health_timestamp_failed",
-                error = %source,
-                "failed to format annotation-cycle as-of timestamp; health not republished"
-            );
-            return;
-        }
+    let Some(measured_at) = annotation_measured_at() else {
+        return;
     };
     let totals = &report.totals;
-    let snapshot = AnnotationHealth {
-        parked: false,
-        parked_detail: None,
-        last_cycle: Some(AnnotationCycleCounts {
+    update_annotation_health(slot, |snapshot| {
+        snapshot.parked = false;
+        snapshot.parked_detail = None;
+        snapshot.last_cycle = Some(AnnotationCycleCounts {
             sources_examined: report.sources_examined,
             expected: totals.expected,
             missing: totals.missing,
@@ -2625,8 +2937,7 @@ fn publish_cycle_annotation_health(slot: &Mutex<AnnotationHealth>, report: &Cycl
             orphans_adopted: totals.orphans_adopted,
             deferred: totals.deferred,
             exhausted: totals.exhausted,
-        }),
-        measured_at: Some(measured_at),
-    };
-    publish_annotation_health(slot, &snapshot);
+        });
+        snapshot.measured_at = Some(measured_at);
+    });
 }

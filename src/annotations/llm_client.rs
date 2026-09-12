@@ -27,6 +27,7 @@ use super::transcript::{Transcript, TranscriptCall};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
+use crate::types::AnnotationProgressCount;
 use crate::util::{LogContext, truncate_diagnostic_text};
 
 /// Stable adapter-mode label carried in this client's boundary logs, mirroring
@@ -391,8 +392,12 @@ impl AnnotatorClient {
 
     /// Give the chain ownership of its transcript buffer and tracing context
     /// until output validation supplies the terminal result.
-    pub(crate) fn start_call(&self, stage: &'static str) -> (TranscriptCall<'_>, LogContext) {
-        self.transcript.call(stage)
+    pub(crate) fn start_call(
+        &self,
+        stage: &'static str,
+        progress: Option<AnnotationProgressCount>,
+    ) -> (TranscriptCall<'_>, LogContext) {
+        self.transcript.call(stage, progress)
     }
 
     /// Expose the same maintenance signal used by HTTP calls to stop worker dispatch.

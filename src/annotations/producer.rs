@@ -24,6 +24,7 @@ use crate::model::{
     self, ContentType, ContentUnit, ProducerType, ProvenanceInputRef, ProvenanceObjectType,
     SemanticAnnotationType,
 };
+use crate::types::AnnotationProgressCount;
 
 /// Ordered SELECT of a parse's content units in reading order. Producer input
 /// purity depends on this exact ordering: the sequence the units come back in
@@ -263,6 +264,27 @@ pub(crate) fn build_invocation_plan(
     parse_id: &str,
     max_input_chars: usize,
 ) -> Result<Vec<Invocation>, ApiError> {
+    invocation_plan(conn, parse_id, max_input_chars, true)
+}
+
+/// Measure the dispatch plan without adding a second preparation log during
+/// the worker's inventory pass. Errors still reach the owning source boundary.
+pub(super) fn measure_invocation_plan(
+    conn: &Connection,
+    parse_id: &str,
+    max_input_chars: usize,
+) -> Result<Vec<Invocation>, ApiError> {
+    invocation_plan(conn, parse_id, max_input_chars, false)
+}
+
+/// Keep measurement and dispatch on identical excerpt boundaries. Only dispatch
+/// emits the existing preparation record; health measurement adds no log entry.
+fn invocation_plan(
+    conn: &Connection,
+    parse_id: &str,
+    max_input_chars: usize,
+    log_preparation: bool,
+) -> Result<Vec<Invocation>, ApiError> {
     let units = read_parse_units(conn, parse_id)?;
 
     // Resolve each evidence-bearing unit to its owning section id via the
@@ -343,13 +365,15 @@ pub(crate) fn build_invocation_plan(
     // Summary remains excerpt-scoped; no request reconstructs the large document.
     push_document_splits(&mut invocations, document)?;
 
-    debug!(
-        event = "annotator_plan.completed",
-        parse_id,
-        invocations = invocations.len(),
-        max_input_chars,
-        "bounded annotation excerpt plan prepared"
-    );
+    if log_preparation {
+        debug!(
+            event = "annotator_plan.completed",
+            parse_id,
+            invocations = invocations.len(),
+            max_input_chars,
+            "bounded annotation excerpt plan prepared"
+        );
+    }
 
     Ok(invocations)
 }
@@ -402,11 +426,14 @@ pub(crate) fn planned_provenance(
 /// retry-escalated value from the worker's ladder. It is deliberately NOT part
 /// of producer identity (the prompt is unchanged); the effective value is
 /// recorded in the completed row's provenance and the call logs instead.
+/// `progress` is committed document coverage at wave dispatch; model stages
+/// cannot advance it because the worker persists results only after the wave.
 pub(crate) fn invoke(
     kind: ProducerKind,
     client: &AnnotatorClient,
     invocation: &Invocation,
     temperature: f64,
+    progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     if let Some(reason) = client.cancellation().reason() {
         return Err(InvocationFailure::Cancelled(reason));
@@ -436,7 +463,7 @@ pub(crate) fn invoke(
         // coverage through the normal empty-result path without spending inference.
         return Ok(Vec::new());
     }
-    chains::run(kind, client, &target.text, temperature)
+    chains::run(kind, client, &target.text, temperature, progress)
 }
 
 /// Choose which invocations a producer consumes. Exposed so the stage-3 worker

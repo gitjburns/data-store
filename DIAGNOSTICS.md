@@ -172,6 +172,14 @@ Do not invent facts. If an outcome is unknown because the process or transport
 failed, log the last known authoritative boundary and make the unknown portion
 explicit.
 
+Enrich existing annotation-related service-log entries with
+`annotation_progress="completed / total (percentage)"` for the associated
+document's committed coverage of its measured excerpt/type plan. Use
+`unavailable` without a measured document context, including startup and dry runs;
+zero required work displays `0 / 0 (no required work)`. Do not add entries for
+progress. Counts and percentage follow PROTOCOL.md; retries and output-item
+counts are not completion, and 100% does not assert projection publication.
+
 ## Forbidden Log Data
 
 Except for annotator payloads in the dedicated transcript below, never log:
@@ -211,6 +219,13 @@ open/write failures in the service log without changing annotation outcomes.
 Success means structural validation passed, not semantic verification or database
 commit. Persistence remains recorded in the service log under the parent
 annotation context. Cancellation leaves the remote outcome unknown.
+
+Place `Progress: completed / total (percentage)` immediately before `END CALL`, using
+committed document progress when the group is written. Keep that write before
+database persistence: calls in one wave may repeat a count, and the final
+transcript group may remain below 100%. Health and existing service-log commit
+entries reflect subsequent commits. Use `Progress: unavailable` without a measured
+document context; add no transcript entries for progress.
 
 `annotation_stage.entity_decisions` records candidate, accepted, and rejected
 counts after exact candidate accounting passes. Rejection is a successful model

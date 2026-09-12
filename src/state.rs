@@ -19,8 +19,8 @@ use crate::{
     policy::EntityMatchPolicy,
     projections::dense_cache::DenseCache,
     types::{
-        AnnotationSummary, HealthBackend, HealthComponent, HealthCount, HealthObservations,
-        HealthResponse, HealthStatus, HealthSummary,
+        AnnotationDocumentProgress, AnnotationSummary, HealthBackend, HealthComponent, HealthCount,
+        HealthObservations, HealthResponse, HealthStatus, HealthSummary,
     },
 };
 
@@ -83,8 +83,8 @@ pub struct AppState {
     // readiness-critical sync summary, and neither can gate the other. Same
     // cross-thread Arc/Mutex slot discipline as sync_health.
     fabric_health: Arc<Mutex<FabricHealth>>,
-    // C10b diagnostic-only annotation-worker health, written every cycle by the
-    // annotation worker thread (its own owning thread) and read by health(). A
+    // Annotation-worker health, written at work/commit and cycle boundaries by
+    // the annotation worker thread and read by health(). A
     // distinct slot because a distinct thread owns it; poison-recovered on read
     // exactly like sync_health.
     annotation_health: Arc<Mutex<AnnotationHealth>>,
@@ -230,11 +230,8 @@ pub struct FabricSourceCounts {
 }
 
 /// Annotation-worker health slot (C10b, spec §21): the worker's own parked
-/// state and its most recent cycle's freshness counts, published each cycle by
-/// the worker thread and surfaced diagnostic-only by `AppState::health()`.
-/// Corpus-aggregate today (no source-system keying): the worker discovers
-/// across all active sources per cycle, so its counts are a single run-wide
-/// bucket, unlike the per-source-system fabric counts.
+/// state, historical cycle counts, and document coverage. The worker publishes
+/// document changes at commit/scheduling boundaries; health reads only this slot.
 #[derive(Debug, Clone, Default)]
 pub struct AnnotationHealth {
     /// True when the worker parked on a client-load failure (a bad key/config
@@ -248,6 +245,9 @@ pub struct AnnotationHealth {
     /// RFC3339 UTC timestamp of the last published cycle — the as-of marker for
     /// `last_cycle`. None before the first cycle completes.
     pub measured_at: Option<String>,
+    /// The active-source inventory captured by discovery; None is not yet measured.
+    pub documents: Option<Vec<AnnotationDocumentProgress>>,
+    pub inventory_measured_at: Option<String>,
 }
 
 /// Per-cycle freshness counts of one annotation discovery/build cycle (C10b),
@@ -520,6 +520,8 @@ impl AppState {
                 })?;
         annotations.last_cycle = None;
         annotations.measured_at = None;
+        annotations.documents = None;
+        annotations.inventory_measured_at = None;
         Ok(())
     }
 
@@ -1432,8 +1434,8 @@ fn sync_health_summary(snapshot: &SyncHealth, maintenance: Option<&str>) -> Heal
     }
 }
 
-/// Report the worker's known parked state and completed-cycle observations;
-/// neither eligible-missing counts nor absence of new failures proves completion.
+/// Keep historical cycle observations separate from measured document coverage.
+/// Worker faults and unfinished failed work need attention independently of readiness.
 fn annotation_health_summary(snapshot: &AnnotationHealth) -> HealthSummary {
     let mut problems = Vec::new();
     if snapshot.parked {
@@ -1464,12 +1466,27 @@ fn annotation_health_summary(snapshot: &AnnotationHealth) -> HealthSummary {
         }
     });
     let status = if !problems.is_empty()
+        || snapshot.documents.as_ref().is_some_and(|documents| {
+            documents.iter().any(|document| {
+                document.detail.is_some()
+                    || document.work.failed > 0
+                    || document.work.exhausted > 0
+                    || document.work.retry_waiting > 0
+            })
+        })
         || last_cycle
             .as_ref()
             .is_some_and(|cycle| cycle.new_failures > 0 || cycle.exhausted > 0)
     {
         HealthStatus::Attention
-    } else if last_cycle.is_none() || snapshot.measured_at.is_none() {
+    } else if snapshot.documents.is_none()
+        || snapshot.inventory_measured_at.is_none()
+        || snapshot.documents.as_ref().is_some_and(|documents| {
+            documents
+                .iter()
+                .any(|document| document.progress.total.is_none() || document.measured_at.is_none())
+        })
+    {
         HealthStatus::Unreported
     } else {
         HealthStatus::Normal
@@ -1481,6 +1498,8 @@ fn annotation_health_summary(snapshot: &AnnotationHealth) -> HealthSummary {
             parked: snapshot.parked,
             last_cycle,
             measured_at: snapshot.measured_at.clone(),
+            documents: snapshot.documents.clone(),
+            inventory_measured_at: snapshot.inventory_measured_at.clone(),
         },
     }
 }

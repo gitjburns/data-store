@@ -245,17 +245,47 @@ Service readiness and startup diagnostics. Public.
 | `observations.kind` | Fields |
 | --- | --- |
 | `ingestion` | `pending`, `in_flight`, `failed` (integer queue observations); `last_success_at` (nullable timestamp of the last successful cycle, not a queue-measurement timestamp). |
-| `annotations` | `parked` (bool), `measured_at` (nullable timestamp), `last_cycle` (nullable object: integer `sources_examined`, `planned`, `eligible_missing`, `new_failures`, `exhausted`). |
+| `annotations` | `parked` (bool), `measured_at` (nullable cycle timestamp), `last_cycle` (nullable object: integer `sources_examined`, `planned`, `eligible_missing`, `new_failures`, `exhausted`); `documents` (nullable array below), `inventory_measured_at` (nullable discovery timestamp). |
 | `corpus` | `source_systems` (sorted string array), `measured_at` (nullable timestamp); exception values remain in the component's typed `counts`. |
 | `queries` | `in_flight`, `max_in_flight` (integer live admission observations). |
 | `models` | `initialized` (bool); `dense`, `colbert`, `reranker` (each `local` or `http`). Initialization does not assert current remote availability. |
 | `logging` | `level`, `file_path` (strings). |
 
-Annotation summaries cover the last completed cycle, which may have ended before
+Annotation `last_cycle` counts cover the last completed cycle, which may have ended before
 all sources were examined. `eligible_missing` excludes retry-waiting and exhausted
 items; `new_failures` excludes older failures. These counts establish neither
-completion nor live activity. The summary adds no worker telemetry or readiness
-gate and preserves the full detailed diagnostics.
+completion nor live activity and retain their historical meaning.
+
+Annotation `documents` contains the active source/parse inventory captured at
+`inventory_measured_at`. Missing or null means not measured; `[]` means a measured
+empty inventory. Newly active or changed sources appear on subsequent discovery.
+Each document contains:
+
+| Field | Meaning |
+| --- | --- |
+| `source_id`, `parse_id`, `source_paths` | Captured source/parse IDs and known path strings. |
+| `plan_id` | Nullable identity of the required excerpt/type plan. |
+| `measured_at` | Nullable timestamp of this document observation. |
+| `progress` | `{ completed, total, percentage }`: integer committed count, nullable integer denominator, nullable server-calculated percentage. |
+| `work` | Integer `pending`, `running`, `failed`, `retry_waiting`, and `exhausted` counts, mutually exclusive among unfinished items. |
+| `by_type` | Array of `{ annotation_type, progress, work }` using the same shapes for entity, relation, and summary work. |
+| `activity` | `discovering`, `pending`, `running`, `awaiting_commit`, `waiting_for_storage`, `retry_wait`, `exhausted`, `complete`, `no_work`, `stopped`, or `unavailable`; classified by the server. |
+| `detail` | Nullable operator-facing explanation. |
+
+One work item is one required excerpt/type pair in the captured plan. Completion
+requires committed fresh coverage; successful empty results and committed memo
+reuse count once. Retries and output-item counts do not increase completion.
+`percentage` is floored to one decimal place so incomplete work cannot display
+100%. Unknown totals use null; zero required work uses `total: 0` and a null
+percentage. Running includes preparation through persistence; `activity`
+distinguishes awaiting commit and storage waits, which remain unfinished.
+
+The worker measures discovered documents before model dispatch and refreshes
+observations after commits and work-state transitions, without waiting for cycle
+completion. Health reads only in-memory snapshots. Completion is reconstructed
+from coverage after restart; rebuild resets the snapshots. Retry counters and
+timers remain process-local. Annotation completion at 100% does not assert
+retrieval projection publication.
 
 Readiness (`ready`) is determined by the `inference` and `sync` components. The
 other components (`logging`, `fabric`, `annotation`, `search_admission`) are
