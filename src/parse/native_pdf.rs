@@ -1,4 +1,4 @@
-//! Native PDF extraction for the standalone evaluation diagnostic.
+//! Native PDF extraction shared by the production child worker and offline diagnostic.
 //! This module preserves MuPDF's block/line order and text without cleanup.
 
 use std::panic::{UnwindSafe, catch_unwind};
@@ -9,22 +9,22 @@ use mupdf::text_page::TextBlockType;
 use mupdf::{
     Document, MetadataName, Quad, Rect, TextBlock, TextCharFlags, TextLine, TextPageFlags,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Exact extraction options recorded beside diagnostic output; no OCR or dehyphenation.
 pub(crate) const EXTRACTION_FLAGS: TextPageFlags =
     TextPageFlags::PRESERVE_IMAGES.union(TextPageFlags::COLLECT_STYLES);
 
 /// Owned document output; pages without native text remain represented.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExtractedPdf {
     pub(crate) pages: Vec<ExtractedPage>,
 }
 
 /// Physical page position and native page geometry, with every extracted block.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExtractedPage {
     pub(crate) page_number: u64,
     pub(crate) bounds: [f32; 4],
@@ -33,7 +33,7 @@ pub(crate) struct ExtractedPage {
 
 /// Known native block categories are shared with diagnostic accounting so adding
 /// a category requires an explicit decision in each consumer.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BlockKind {
     Text,
@@ -44,8 +44,8 @@ pub(crate) enum BlockKind {
 }
 
 /// Native block category and geometry; non-text blocks have no text lines.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExtractedBlock {
     pub(crate) kind: BlockKind,
     pub(crate) bounds: [f32; 4],
@@ -53,16 +53,16 @@ pub(crate) struct ExtractedBlock {
 }
 
 /// A native baseline group, retaining source order rather than inferred reading order.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExtractedLine {
     pub(crate) bounds: [f32; 4],
     pub(crate) spans: Vec<ExtractedSpan>,
 }
 
 /// Adjacent native characters sharing font, style, exact size, and character flags.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExtractedSpan {
     pub(crate) text: String,
     pub(crate) font_name: Option<String>,

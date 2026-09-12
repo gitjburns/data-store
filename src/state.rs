@@ -11,14 +11,17 @@ use std::{
 use tracing::{debug, error, info};
 
 use crate::{
-    config::ServiceConfig,
+    config::{ColbertBackendKind, DenseBackendKind, RerankerBackendKind, ServiceConfig},
     error::ApiError,
     identity::ApplicationIdentity,
     inference::InferenceRuntime,
     maintenance::MaintenanceGate,
     policy::EntityMatchPolicy,
     projections::dense_cache::DenseCache,
-    types::{HealthComponent, HealthCount, HealthResponse},
+    types::{
+        AnnotationSummary, HealthBackend, HealthComponent, HealthCount, HealthObservations,
+        HealthResponse, HealthStatus, HealthSummary,
+    },
 };
 
 /// The exact detail line `/v1/health` serves for the inference component when
@@ -699,6 +702,7 @@ impl AppState {
 
     /// Return current service health and readiness diagnostics.
     pub fn health(&self) -> HealthResponse {
+        let inference_summary = Some(self.inference_summary());
         // Not-ready arms both carry a single detail line. `Failed` renders the
         // `ApiError` verbatim (its "inference initialization failed: " prefix is
         // part of the documented failure detail); `NotInitialized` renders the
@@ -710,12 +714,14 @@ impl AppState {
                 ready: true,
                 details: readiness_details("readiness-critical", runtime.health_details()),
                 counts: Vec::new(),
+                summary: inference_summary,
             },
             InferenceSlot::Failed(error) => HealthComponent {
                 name: "inference".to_string(),
                 ready: false,
                 details: readiness_details("readiness-critical", vec![error.to_string()]),
                 counts: Vec::new(),
+                summary: inference_summary,
             },
             InferenceSlot::NotInitialized => HealthComponent {
                 name: "inference".to_string(),
@@ -725,6 +731,7 @@ impl AppState {
                     vec![DRY_RUN_INFERENCE_NOT_INITIALIZED.to_string()],
                 ),
                 counts: Vec::new(),
+                summary: inference_summary,
             },
         };
         let logging_component = HealthComponent {
@@ -744,6 +751,19 @@ impl AppState {
                 ],
             ),
             counts: Vec::new(),
+            summary: Some(HealthSummary {
+                status: HealthStatus::Normal,
+                problems: Vec::new(),
+                observations: HealthObservations::Logging {
+                    level: self.config.logging.level.as_str().to_string(),
+                    file_path: self
+                        .config
+                        .logging
+                        .resolved_file_path(self.config.config_root())
+                        .display()
+                        .to_string(),
+                },
+            }),
         };
         // The sync slot is written by the scheduler thread; a poisoned lock
         // means that thread panicked mid-publish. The snapshot inside is
@@ -774,6 +794,10 @@ impl AppState {
             ready: sync_snapshot.fabric_ready && maintenance_detail.is_none(),
             details: readiness_details("readiness-critical", sync_details),
             counts: Vec::new(),
+            summary: Some(sync_health_summary(
+                &sync_snapshot,
+                maintenance_detail.as_deref(),
+            )),
         };
         // C10b diagnostic-only components. Each is assembled from an in-memory
         // slot (or two atomics for admission); NONE opens a connection and NONE
@@ -806,6 +830,41 @@ impl AppState {
         }
     }
 
+    /// Describe initialized retrieval backends without presenting startup smoke
+    /// results as evidence that their remote endpoints are currently available.
+    fn inference_summary(&self) -> HealthSummary {
+        let (status, problems, initialized) = match &self.inference {
+            InferenceSlot::Ready(_) => (HealthStatus::Normal, Vec::new(), true),
+            InferenceSlot::Failed(error) => {
+                (HealthStatus::Attention, vec![error.to_string()], false)
+            }
+            InferenceSlot::NotInitialized => (
+                HealthStatus::Unreported,
+                vec![DRY_RUN_INFERENCE_NOT_INITIALIZED.to_string()],
+                false,
+            ),
+        };
+        HealthSummary {
+            status,
+            problems,
+            observations: HealthObservations::Models {
+                initialized,
+                dense: match self.config.models.dense.backend {
+                    DenseBackendKind::Local => HealthBackend::Local,
+                    DenseBackendKind::Http => HealthBackend::Http,
+                },
+                colbert: match self.config.models.colbert.backend {
+                    ColbertBackendKind::Local => HealthBackend::Local,
+                    ColbertBackendKind::Http => HealthBackend::Http,
+                },
+                reranker: match self.config.models.reranker.backend {
+                    RerankerBackendKind::Local => HealthBackend::Local,
+                    RerankerBackendKind::Http => HealthBackend::Http,
+                },
+            },
+        }
+    }
+
     /// Assemble the diagnostic-only `fabric` health component (C10b) from the
     /// scheduler-published fabric-counts slot. Poison-recovered read (the
     /// scheduler thread may have panicked mid-publish; the snapshot inside is
@@ -825,11 +884,30 @@ impl AppState {
             }
         };
         let (details, counts) = fabric_health_view(&snapshot);
+        let mut source_systems: Vec<String> = snapshot.by_source_system.keys().cloned().collect();
+        source_systems.sort();
+        // Reuse the detailed counters so new exception categories cannot vanish
+        // from the compact status while still appearing in the detailed view.
+        let status = if counts.iter().any(|count| count.value > 0) {
+            HealthStatus::Attention
+        } else if source_systems.is_empty() || snapshot.measured_at.is_none() {
+            HealthStatus::Unreported
+        } else {
+            HealthStatus::Normal
+        };
         HealthComponent {
             name: "fabric".to_string(),
             ready: true,
             details: readiness_details("diagnostic-only", details),
             counts,
+            summary: Some(HealthSummary {
+                status,
+                problems: Vec::new(),
+                observations: HealthObservations::Corpus {
+                    source_systems,
+                    measured_at: snapshot.measured_at,
+                },
+            }),
         }
     }
 
@@ -854,6 +932,7 @@ impl AppState {
             ready: true,
             details: readiness_details("diagnostic-only", details),
             counts,
+            summary: Some(annotation_health_summary(&snapshot)),
         }
     }
 
@@ -888,6 +967,18 @@ impl AppState {
             ready: true,
             details: readiness_details("diagnostic-only", details),
             counts,
+            summary: Some(HealthSummary {
+                status: if snapshot.in_flight >= snapshot.max_in_flight {
+                    HealthStatus::Attention
+                } else {
+                    HealthStatus::Normal
+                },
+                problems: Vec::new(),
+                observations: HealthObservations::Queries {
+                    in_flight: snapshot.in_flight,
+                    max_in_flight: snapshot.max_in_flight,
+                },
+            }),
         }
     }
 }
@@ -1307,6 +1398,90 @@ impl From<CutoverBarrierActive> for ApiError {
         ApiError::CutoverBarrierActive {
             message: rejection.to_string(),
         }
+    }
+}
+
+/// Prioritize observed ingestion faults without treating a historical queue
+/// snapshot as live work. Maintenance retains its specific blocking reason.
+fn sync_health_summary(snapshot: &SyncHealth, maintenance: Option<&str>) -> HealthSummary {
+    let mut problems: Vec<String> = snapshot.detail.iter().cloned().collect();
+    if let Some(detail) = maintenance {
+        problems.push(detail.to_string());
+    }
+    if let Some(cycle) = &snapshot.last_cycle
+        && cycle.failures > 0
+    {
+        problems.push(format!("Last scan recorded {} failures", cycle.failures));
+    }
+    let status = if !snapshot.fabric_ready || snapshot.failed > 0 || !problems.is_empty() {
+        HealthStatus::Attention
+    } else if snapshot.last_success_at.is_none() {
+        HealthStatus::Unreported
+    } else {
+        HealthStatus::Normal
+    };
+    HealthSummary {
+        status,
+        problems,
+        observations: HealthObservations::Ingestion {
+            pending: snapshot.pending,
+            in_flight: snapshot.in_flight,
+            failed: snapshot.failed,
+            last_success_at: snapshot.last_success_at.clone(),
+        },
+    }
+}
+
+/// Report the worker's known parked state and completed-cycle observations;
+/// neither eligible-missing counts nor absence of new failures proves completion.
+fn annotation_health_summary(snapshot: &AnnotationHealth) -> HealthSummary {
+    let mut problems = Vec::new();
+    if snapshot.parked {
+        problems.push(format!(
+            "Worker parked: {}",
+            snapshot
+                .parked_detail
+                .as_deref()
+                .unwrap_or("reason not reported")
+        ));
+    }
+    let last_cycle = snapshot.last_cycle.as_ref().map(|cycle| {
+        for (label, count) in [
+            ("source failures", cycle.source_failures),
+            ("projection failures", cycle.projection_failures),
+            ("storage deferrals", cycle.deferred),
+        ] {
+            if count > 0 {
+                problems.push(format!("Last cycle: {count} {label}"));
+            }
+        }
+        AnnotationSummary {
+            sources_examined: cycle.sources_examined,
+            planned: cycle.expected,
+            eligible_missing: cycle.missing,
+            new_failures: cycle.failed,
+            exhausted: cycle.exhausted,
+        }
+    });
+    let status = if !problems.is_empty()
+        || last_cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.new_failures > 0 || cycle.exhausted > 0)
+    {
+        HealthStatus::Attention
+    } else if last_cycle.is_none() || snapshot.measured_at.is_none() {
+        HealthStatus::Unreported
+    } else {
+        HealthStatus::Normal
+    };
+    HealthSummary {
+        status,
+        problems,
+        observations: HealthObservations::Annotations {
+            parked: snapshot.parked,
+            last_cycle,
+            measured_at: snapshot.measured_at.clone(),
+        },
     }
 }
 

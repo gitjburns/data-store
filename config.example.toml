@@ -47,20 +47,21 @@ index_root = "/absolute/path/to/indexes"
 # filesystem connector (spec §6 reservation 3; an external fact).
 governance_domain = "local-corpus"
 
+[pdf]
+# Select docling or mupdf exclusively; failures never switch engines.
+engine = "docling"
+# Per-document timeout in seconds; timeout fails without publishing a partial parse.
+document_timeout_seconds = 7200
+
+# Required for engine = "docling"; validated whenever present.
 [docling]
 # Python executable for the environment where Docling is installed. The service
 # launches docling_path directly, but keeps this path in config so startup and
 # failure diagnostics identify the expected Python environment.
 python_path = "/absolute/path/to/python"
 
-# Docling executable launched directly for PDF-to-markdown conversion.
+# Docling executable launched directly for structured PDF conversion.
 docling_path = "/absolute/path/to/docling"
-
-# Per-document Docling processing timeout in seconds. This is passed as
-# --document-timeout. Very large books, OCR-heavy PDFs, or table-heavy PDFs may
-# need a higher value. If the timeout is reached, Docling aborts and the ingest
-# fails without publishing a partial version.
-document_timeout_seconds = 7200
 
 # PDF parser backend passed as --pdf-backend.
 #

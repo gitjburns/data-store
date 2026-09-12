@@ -40,8 +40,8 @@ operator prompting:
 2. **Acquire** — staged bundles are imported, recording genuine acquisition
    provenance (a `SourceLocation` stamped with the connector's governance
    domain).
-3. **Parse** — the drain dispatches a parse chain per queued item (Docling PDF
-   conversion where applicable, then canonical unit/relationship construction).
+3. **Parse** — the drain dispatches a parse chain per queued item (the configured
+   Docling or MuPDF engine for PDFs, then canonical unit/relationship construction).
    **A source has at most one active parse**; a fresh parse is built and gated
    against the current active parse.
 4. **Build projections** — content-derived retrieval projections (chunk,
@@ -221,22 +221,35 @@ tokenization and remote-ColBERT MaxSim run on the CPU.
 | --- | --- |
 | `governance_domain` | Governance domain stamped on every `SourceLocation` the connector acquires (spec §6 reservation 3): an external governance fact assigned at acquisition, retaggable without re-parse or re-index. Non-empty. |
 
-### 2.8 `[docling]`
+### 2.8 `[pdf]` and `[docling]`
+
+`[pdf]` is required and selects one engine without fallback:
+
+| Key | Meaning |
+| --- | --- |
+| `engine` | Exactly `docling` or `mupdf`. Applies to ingestion, explicit reparsing, and annotation dry runs. |
+| `document_timeout_seconds` | Positive per-document child-process timeout for either engine. This key is no longer accepted under `[docling]`. |
+
+`[docling]` is required when `engine = "docling"`; it may be omitted for MuPDF.
+Whenever supplied, the section is fully validated, including required keys:
 
 | Key | Meaning |
 | --- | --- |
 | `python_path` | Python executable recorded for the configured Docling environment (diagnostic; the service launches `docling_path` directly). Absolute. |
-| `docling_path` | Docling executable launched for PDF→markdown conversion. Absolute. |
-| `document_timeout_seconds` | Per-document conversion timeout. Must be > 0. |
+| `docling_path` | Docling executable launched for PDF→DoclingDocument JSON conversion. Absolute. |
 | `pdf_backend` | One of `pypdfium2`, `docling_parse`, `dlparse_v1`, `dlparse_v2`, `dlparse_v4`. |
 | `ocr_mode` | One of `auto`, `on`, `off`. |
 | `device` | Docling's Python-side device: one of `auto`, `cpu`, `cuda`, `mps`, `xpu` (separate from `[inference].device`). |
 | `num_threads` | Docling worker thread count. Must be > 0. |
 | `page_batch_size` | Docling page batch size. Must be > 0. |
 
-Note: `document_timeout_seconds`, `pdf_backend`, `ocr_mode`, `num_threads`, and
-`page_batch_size` are parser-identity-bearing — they fold into `parserConfigHash`
-and can trigger dominance gating on change.
+The shared timeout and Docling's `pdf_backend`, `ocr_mode`, `device`, `num_threads`,
+and `page_batch_size` are parser-identity-bearing.
+Moving the timeout to `[pdf]` preserves Docling's effective identity for equivalent
+settings. MuPDF has a distinct identity covering extraction flags, candidate
+mapping version, and the compiled dependency-lock hash. Neither engine selection
+nor timeout changes automatically enqueue unchanged indexed sources; explicit
+reparsing remains subject to the no-repeat guard (§10.6) and activation gate (§11).
 
 ### 2.9 `[models.dense]`, `[models.colbert]`, `[models.reranker]`, `[models.annotator]`
 
@@ -519,13 +532,13 @@ Health reports the inference component not-ready with the mode message
 `annotation dry-run mode: inference not initialized` — by design; `ready=false`
 is the expected state of this mode.
 
-The pass **truncates at import-READY**: parses run through acquisition, Docling
-conversion, and import (the `parse_runs` rows reach `ready`), but **no
+The pass **truncates at import-READY**: parses run through acquisition, the selected
+PDF engine or plain-text worker, and import (`parse_runs` reach `ready`). **No
 projections are built, no gating or activation runs**, queue rows are left
 `in_flight`, and acquisition bundles are retained on disk. The next **normal**
-start adopts this state through the §13.5 no-blind-retry guard's
-`GateExisting` arm — it rebuilds the content-derived projections and gates the
-existing ready runs, so **Docling conversion is never re-paid**.
+start with the same parser identity adopts this state through the §13.5
+no-blind-retry guard's `GateExisting` arm — it rebuilds projections and gates the
+existing ready runs without repeating extraction.
 
 Sampling annotates with the **entity and relation** producers only, over the
 **first N excerpts per source per type** in plan order (N is the CLI
@@ -838,6 +851,20 @@ file. Staged bundles are plain JSON claims, not canonical state:
 canonicalization happens exactly once, at import, when the core builds the
 canonical parse bundle.
 
+PDF workers share `src/parse/pdf.rs` for engine selection and parser identity.
+Docling runs its configured CLI; MuPDF runs a private child mode of the same
+service executable before normal initialization. The synchronous parent enforces
+the document timeout, terminates and reaps timed-out children, and records durable
+start/completion/failure diagnostics. Extraction failures become failed parser
+bundles; there is no fallback to the other engine.
+
+MuPDF maps every physical page, nonempty native text block, and image bounds to
+`page`, `text_block`, and `figure` candidates. Page locators preserve source
+geometry; relationships preserve native order. Text and native line boundaries
+remain unchanged, without inferred block roles, headings, tables, paragraph
+reconstruction, or OCR. Pages without embedded text and unsupported native block
+categories produce diagnostics.
+
 ### 10.2 The importer is the sole canonical writer
 
 Candidate records in a bundle carry parser-local string IDs only. **All
@@ -893,9 +920,10 @@ bytes through an identical parser — which fails (or succeeds) identically, so
 re-parsing is pointless or forbidden. Outcomes: dispatch (no prior run),
 dispatch over stale `building` wreckage (surfaced, so a crash cannot block the
 source), gate an existing un-held `ready` run (crash-recovery idempotence), or
-skip. Only new content or a new parser identity licenses a re-parse; Docling's
-identity-bearing config keys (§2.8) fold into `parserConfigHash` and change
-the tuple.
+skip. Only new content or a new parser identity licenses a re-parse; PDF engine
+selection and identity-bearing settings (§2.8) determine this tuple. Returning to
+an engine identity already used for that source does not bypass the guard. An
+archived parse can instead be restored through the existing snapshot lifecycle.
 
 ### 10.7 Pre-worker content-identity check
 
@@ -909,8 +937,8 @@ instant between this check and the worker's own read is a recorded residual.
 
 ### 10.8 Cleanup and original extraction
 
-PDF and plain-text workers apply `src/parse/cleanup.rs` before finalizing candidate
-bundles. Cleanup v2 repairs conservative prose spacing and contractions, preserves
+Docling and plain-text workers apply `src/parse/cleanup.rs` before staging bundles.
+Cleanup v2 repairs conservative prose spacing and contractions, preserves
 recognized code/math and structured content, and removes explicitly marked leaf
 headers/footers. PDF paragraph reflow preserves hard hyphens; only discretionary
 soft hyphens are removed. Cross-page joins require matching parents, consecutive
@@ -919,14 +947,16 @@ breaks remain intact. Merges retain original locators and rebuild sibling order.
 Whitespace-only lines do not trigger indentation protection; nonblank indented
 lines and nonblank lines containing tabs remain protected.
 
-`parser_raw/` contains original extractor output, `pre_cleanup.json` (units and
-relationships), and `cleanup.json` (version, counts, removals, and merge aliases).
+Their `parser_raw/` contains original extractor output, `pre_cleanup.json`
+(units and relationships), and `cleanup.json` (version, counts, removals, merge aliases).
 The importer archives verified raw bytes before either a ready or verified-failure
 commit; `parse_runs.parser_raw_output_uri` points to their artifact manifest.
-Unverified bundles retain the existing staged-failure handling.
+Unverified bundles retain the existing staged-failure handling. MuPDF does not run
+cleanup; its complete native extraction, including fonts and geometry, is archived
+through the same `parser_raw_output_uri` artifact path.
 
-Both parser workers use version 2 and include `cleanupVersion` in their config
-hash. Existing documents require explicit reparsing to receive cleanup; startup
+Docling and plain-text workers use version 2 and hash `cleanupVersion` into their
+parser configuration. Existing documents require explicit reparsing to receive cleanup; startup
 does not rewrite stored content. Snapshot references retain raw artifacts, but
 the existing snapshot verifier does not recursively verify their nested blobs.
 

@@ -49,7 +49,7 @@ use crate::{
     acquisition::{self, AcquisitionContext, ImportOutcome, MIME_TYPE_PDF, MIME_TYPE_PLAIN_TEXT},
     activation::{self, ActivationDecision},
     artifact_store::ArtifactStore,
-    config::{DenseModelConfig, DoclingConfig, StorageConfig},
+    config::{DenseModelConfig, StorageConfig},
     connectors::{
         AcquisitionBundleManifest, BUNDLE_MANIFEST_FILE_NAME, ScanError, acquisition_staging_root,
         bundle_dir_for, filesystem::FilesystemConnector,
@@ -67,7 +67,8 @@ use crate::{
     parse::{
         bundle::{BUNDLE_DIR_NAME_PREFIX, BUNDLE_TEMP_DIR_SUFFIX, parse_staging_root},
         importer::{ImportedParseStatus, import_parser_bundle},
-        pdf_worker, text_worker,
+        pdf::PdfParser,
+        text_worker,
     },
     primitives::utc_now,
     projections::{
@@ -354,7 +355,9 @@ pub(crate) struct ProjectionRuntime {
 /// gate continuation needs belongs on `ParseDispatchContext` instead.
 struct ParsePrefixContext {
     storage: StorageConfig,
-    docling: DoclingConfig,
+    // Identity lookup and execution share this selection, including reparses
+    // and annotation dry runs that reuse the same parse-chain prefix.
+    pdf: PdfParser,
 }
 
 /// Everything the FULL drain-loop parse chain needs beyond the queue entry
@@ -1059,9 +1062,9 @@ fn read_scalar_count(
 }
 
 /// Spawn the sync scheduler thread: one std::thread running fabric
-/// validation, then the adaptive scan/drain loop until shutdown. `docling`
-/// and `registry` feed the drain-loop parse chain (C5c): the PDF worker's
-/// configuration and the per-source cutover barriers activation swaps
+/// validation, then the adaptive scan/drain loop until shutdown. `pdf`
+/// and `registry` feed the drain-loop parse chain (C5c): the selected PDF
+/// producer and the per-source cutover barriers activation swaps
 /// behind. The caller (main) owns the JoinHandle and joins it after the
 /// HTTP server exits so scheduler shutdown is observable.
 // The parameter list is the thread's full startup input set (roots, connector
@@ -1073,7 +1076,7 @@ pub(crate) fn start(
     corpus_root: PathBuf,
     index_root: PathBuf,
     governance_domain: String,
-    docling: DoclingConfig,
+    pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
     // The C6 content-derived build handles (inference runtimes, expected
     // dimensions, the shared model-call gate, the active dense cache). Owned by
@@ -1113,7 +1116,7 @@ pub(crate) fn start(
                     corpus_root,
                     index_root,
                     governance_domain,
-                    docling,
+                    pdf,
                     registry,
                     projections,
                     identity,
@@ -1166,7 +1169,7 @@ fn run_scheduler(
     corpus_root: PathBuf,
     index_root: PathBuf,
     governance_domain: String,
-    docling: DoclingConfig,
+    pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
     projections: ProjectionRuntime,
     identity: ApplicationIdentity,
@@ -1310,7 +1313,7 @@ fn run_scheduler(
                 corpus_root,
                 index_root: index_root.clone(),
             },
-            docling,
+            pdf,
         },
         registry,
         projections,
@@ -1565,7 +1568,7 @@ pub(crate) fn run_annotation_dry_run_pass(
     corpus_root: PathBuf,
     index_root: PathBuf,
     governance_domain: String,
-    docling: DoclingConfig,
+    pdf: PdfParser,
 ) -> Result<DryRunPassOutcome, ApiError> {
     let started = Instant::now();
     info!(
@@ -1607,7 +1610,7 @@ pub(crate) fn run_annotation_dry_run_pass(
             corpus_root,
             index_root: index_root.clone(),
         },
-        docling,
+        pdf,
     };
 
     // ONE full scan (which also stages new/changed items) then a single uncapped
@@ -2525,7 +2528,7 @@ fn parse_chain_prefix(
     // derivation the worker stamps into its bundles, so the §13.5 guard and
     // the staged manifest can never disagree.
     let profile = match route {
-        ParseRoute::Pdf => pdf_worker::effective_capability_profile(&dispatch.docling)?,
+        ParseRoute::Pdf => dispatch.pdf.effective_capability_profile()?,
         ParseRoute::PlainText => text_worker::plain_text_capability_profile()?,
     };
     info!(
@@ -2640,13 +2643,9 @@ fn parse_chain_prefix(
     // workspace itself faulted. A file that vanishes after the check above
     // is the worker's recorded parse outcome.
     let bundle_dir = match route {
-        ParseRoute::Pdf => pdf_worker::run_pdf_parse(
-            &dispatch.docling,
-            index_root,
-            resolved,
-            source_id,
-            source_hash,
-        )?,
+        ParseRoute::Pdf => dispatch
+            .pdf
+            .run(index_root, resolved, source_id, source_hash)?,
         ParseRoute::PlainText => text_worker::run_text_parse(
             index_root,
             &resolved.absolute_path,

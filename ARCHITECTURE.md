@@ -273,7 +273,7 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   are keyed by immutable content identity; locations record where each was seen.
 
 - **Parse.** `dispatch_parse_chain` routes by the stored authoritative MIME type
-  to a worker (`src/parse/pdf_worker.rs`, `src/parse/text_worker.rs`); an
+  to `src/parse/pdf.rs` or `src/parse/text_worker.rs`; an
   unroutable type is warn-only. Workers are untrusted producers outside the hot
   retrieval trust boundary (§12.1): they emit a **staged candidate bundle**, and
   `src/parse/importer.rs` performs digest verification and the **§13.1 hard
@@ -284,7 +284,7 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   or gate breach becomes a durable failed `parse_runs` row (`Ok` with a failed
   status); `Err` is reserved for faults of the canonical side itself.
 
-  Before staging candidates, both workers run versioned Rust cleanup
+  Before staging candidates, Docling and plain-text workers run versioned cleanup
   (`src/parse/cleanup.rs`): conservative prose repair, explicit furniture removal,
   and geometry-supported PDF paragraph reflow. Original locators survive merges;
   reading-order links are rebuilt before canonical hashing. Original extraction,
@@ -316,15 +316,34 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
      new SourceObject by the next scan), so changed bytes can never bind
      old-hash identity to new content.
 
-  The PDF worker's parse engine is an external **Docling CLI child process**
-  (`src/docling.rs`): spawned as a `Command`/`Child`, waited on by a poll
-  loop with a per-document timeout, monitored for live process activity
-  (`src/docling_activity.rs`), its stdout/stderr captured as bounded
-  diagnostics — all on the scheduler thread's synchronous dispatch. The
-  `[docling]` options are **identity-bearing parser configuration** folded
-  into `parserConfigHash`, so a Docling option change is a NEW parser
-  identity: the §13.5 no-retry tuple no longer matches, and unchanged bytes
-  legitimately re-parse into a net-new canonical graph.
+  PDF dispatch (`src/parse/pdf.rs`) selects exactly `[pdf].engine`: `docling`
+  or `mupdf`. Normal ingestion, explicit reparsing, and annotation dry runs share
+  this selection. Both engines run in child processes under the positive
+  `[pdf].document_timeout_seconds` limit; their parent owns waiting, timeout
+  termination/reaping, and durable lifecycle diagnostics. Dispatch remains
+  synchronous, with no automatic fallback.
+
+  Docling (`src/parse/pdf_worker.rs`, `src/docling.rs`) launches its configured
+  external CLI and monitors process activity (`src/docling_activity.rs`). MuPDF
+  (`src/parse/mupdf_worker.rs`) launches the same service executable in a private
+  extraction mode before normal service initialization. Only native extraction
+  (`src/parse/native_pdf.rs`) runs in that child; the parent maps its output into
+  staged candidates. Physical pages, nonempty text blocks, and image bounds become
+  `page`, `text_block`, and `figure` units with page locators and reading-order
+  relationships. Native text and line boundaries are preserved without prose
+  cleanup, OCR, heading/table inference, or paragraph reconstruction. Missing
+  embedded text and unsupported block categories produce diagnostics. The complete
+  native extraction, including font and geometry information, is archived through
+  `parser_raw_output_uri`.
+
+  Each engine has a distinct parser identity. MuPDF identity includes extraction
+  flags, mapping version, and the compiled dependency-lock hash. Moving the
+  timeout to `[pdf]` preserves Docling's effective identity when settings are
+  equivalent. Identity changes permit a new candidate through the §13.5 guard;
+  changing the selector alone does not enqueue unchanged indexed sources.
+  Explicit reparsing uses the existing projection and activation path, including
+  held candidates. Returning to a previously used identity remains subject to the
+  no-repeat guard; archived parses can be restored through the snapshot lifecycle.
 
 - **Build projections.** Between import and gate, `build_content_derived_projections`
   builds the content-derived projections in **one transaction**

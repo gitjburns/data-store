@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 
@@ -28,8 +28,10 @@ pub struct ServiceConfig {
     /// Acquisition connector settings; external facts per spec §35, never
     /// internal capacity guesses.
     pub connectors: ConnectorsConfig,
-    /// Explicit Docling executable and PDF conversion controls.
-    pub docling: DoclingConfig,
+    /// Exclusive PDF extraction engine and per-document execution limit.
+    pub pdf: PdfConfig,
+    /// Docling-specific controls; required only when the PDF engine is Docling.
+    pub docling: Option<DoclingConfig>,
     /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,
     /// Paths to the operator-editable external policy documents (D3
@@ -178,6 +180,27 @@ pub struct FilesystemConnectorConfig {
     pub governance_domain: String,
 }
 
+/// Engine-independent PDF controls, required even when Docling is absent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdfConfig {
+    /// Engine used for every PDF parse; failures never select another engine.
+    pub engine: PdfEngine,
+    /// Maximum processing time for one PDF before the worker is terminated.
+    pub document_timeout_seconds: u64,
+}
+
+/// Supported production PDF extractors, selected explicitly by configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PdfEngine {
+    /// Docling's structured document conversion pipeline.
+    Docling,
+    /// MuPDF's native page-local text and geometry extraction.
+    MuPdf,
+}
+
+/// Docling-only executable and extraction settings, validated whenever supplied.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DoclingConfig {
@@ -185,8 +208,6 @@ pub struct DoclingConfig {
     pub python_path: PathBuf,
     /// Docling executable launched directly for PDF conversion.
     pub docling_path: PathBuf,
-    /// Per-document Docling conversion timeout in seconds.
-    pub document_timeout_seconds: u64,
     /// PDF backend selected by service config rather than callers.
     pub pdf_backend: String,
     /// OCR behavior selected by service config: auto, on, or off.
@@ -628,40 +649,52 @@ impl ServiceConfig {
             "connectors.filesystem.governance_domain",
             &self.connectors.filesystem.governance_domain,
         )?;
-        require_absolute_path("docling.python_path", &self.docling.python_path)?;
-        require_absolute_path("docling.docling_path", &self.docling.docling_path)?;
         require_positive_u64(
-            "docling.document_timeout_seconds",
-            self.docling.document_timeout_seconds,
+            "pdf.document_timeout_seconds",
+            self.pdf.document_timeout_seconds,
         )?;
-        require_non_empty("docling.pdf_backend", &self.docling.pdf_backend)?;
-        if !matches!(
-            self.docling.pdf_backend.trim(),
-            "pypdfium2" | "docling_parse" | "dlparse_v1" | "dlparse_v2" | "dlparse_v4"
-        ) {
+        if self.pdf.engine == PdfEngine::Docling && self.docling.is_none() {
             return Err(ApiError::InvalidConfig {
-                message:
-                    "docling.pdf_backend must be one of pypdfium2, docling_parse, dlparse_v1, dlparse_v2, or dlparse_v4"
+                message: "[docling] is required when pdf.engine = \"docling\"".to_string(),
+            });
+        }
+        // Inactive engine settings still reject invalid values; selecting MuPDF
+        // does not turn a supplied Docling section into unchecked configuration.
+        if let Some(docling) = &self.docling {
+            require_absolute_path("docling.python_path", &docling.python_path)?;
+            require_absolute_path("docling.docling_path", &docling.docling_path)?;
+            require_non_empty("docling.pdf_backend", &docling.pdf_backend)?;
+            if !matches!(
+                docling.pdf_backend.trim(),
+                "pypdfium2" | "docling_parse" | "dlparse_v1" | "dlparse_v2" | "dlparse_v4"
+            ) {
+                return Err(ApiError::InvalidConfig {
+                    message: concat!(
+                        "docling.pdf_backend must be one of pypdfium2, docling_parse, ",
+                        "dlparse_v1, dlparse_v2, or dlparse_v4"
+                    )
+                    .to_owned(),
+                });
+            }
+            require_non_empty("docling.ocr_mode", &docling.ocr_mode)?;
+            if !matches!(docling.ocr_mode.trim(), "auto" | "on" | "off") {
+                return Err(ApiError::InvalidConfig {
+                    message: "docling.ocr_mode must be one of auto, on, or off".to_string(),
+                });
+            }
+            require_non_empty("docling.device", &docling.device)?;
+            if !matches!(
+                docling.device.trim(),
+                "auto" | "cpu" | "cuda" | "mps" | "xpu"
+            ) {
+                return Err(ApiError::InvalidConfig {
+                    message: "docling.device must be one of auto, cpu, cuda, mps, or xpu"
                         .to_string(),
-            });
+                });
+            }
+            require_positive("docling.num_threads", docling.num_threads)?;
+            require_positive("docling.page_batch_size", docling.page_batch_size)?;
         }
-        require_non_empty("docling.ocr_mode", &self.docling.ocr_mode)?;
-        if !matches!(self.docling.ocr_mode.trim(), "auto" | "on" | "off") {
-            return Err(ApiError::InvalidConfig {
-                message: "docling.ocr_mode must be one of auto, on, or off".to_string(),
-            });
-        }
-        require_non_empty("docling.device", &self.docling.device)?;
-        if !matches!(
-            self.docling.device.trim(),
-            "auto" | "cpu" | "cuda" | "mps" | "xpu"
-        ) {
-            return Err(ApiError::InvalidConfig {
-                message: "docling.device must be one of auto, cpu, cuda, mps, or xpu".to_string(),
-            });
-        }
-        require_positive("docling.num_threads", self.docling.num_threads)?;
-        require_positive("docling.page_batch_size", self.docling.page_batch_size)?;
         require_non_empty("models.dense.pooling", &self.models.dense.pooling)?;
         require_positive("models.dense.dimension", self.models.dense.dimension)?;
         validate_dense_backend_fields(&self.models.dense)?;

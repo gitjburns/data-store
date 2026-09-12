@@ -81,6 +81,7 @@ const DOCLING_BOTTOMLEFT_ORIGIN: &str = "BOTTOMLEFT";
 /// `ParserResult` status, not infer success from `Ok`.
 pub(crate) fn run_pdf_parse(
     config: &DoclingConfig,
+    document_timeout_seconds: u64,
     index_root: &Path,
     source: ResolvedSource,
     source_id: &str,
@@ -92,7 +93,7 @@ pub(crate) fn run_pdf_parse(
     // bundle identity carries the exact configuration hash (D3: these
     // Docling options are identity-bearing parser configuration). A config
     // fault here is an infrastructure error — no bundle exists yet.
-    let options = resolve_docling_options(config)?;
+    let options = resolve_docling_options(config, document_timeout_seconds)?;
     let parser_config_hash = pdf_parser_config_hash(&options)?;
     let profile = capability_profile(&parser_config_hash)?;
 
@@ -123,26 +124,32 @@ pub(crate) fn run_pdf_parse(
     // this boundary: scheduler dispatch supplies none, and whether streamed
     // progress returns is the open D2 surface decision, hence `None`.
     let conversion_started = Instant::now();
-    let conversion =
-        match convert_source_to_document_json(config, index_root, source, None, Some(&raw_dir)) {
-            Ok(conversion) => conversion,
-            Err(conversion_error) => {
-                // Tool failure is a recorded parse outcome. The Docling
-                // layer already logged full bounded diagnostics and embeds
-                // bounded stdout/stderr in the error message; no captured
-                // stream bytes exist on this path, so the bundle's log
-                // files stay empty.
-                return finish_failed(
-                    writer,
-                    source_id,
-                    &started_at,
-                    started,
-                    format!("Docling JSON conversion failed: {conversion_error}"),
-                    &[],
-                    &[],
-                );
-            }
-        };
+    let conversion = match convert_source_to_document_json(
+        config,
+        document_timeout_seconds,
+        index_root,
+        source,
+        None,
+        Some(&raw_dir),
+    ) {
+        Ok(conversion) => conversion,
+        Err(conversion_error) => {
+            // Tool failure is a recorded parse outcome. The Docling
+            // layer already logged full bounded diagnostics and embeds
+            // bounded stdout/stderr in the error message; no captured
+            // stream bytes exist on this path, so the bundle's log
+            // files stay empty.
+            return finish_failed(
+                writer,
+                source_id,
+                &started_at,
+                started,
+                format!("Docling JSON conversion failed: {conversion_error}"),
+                &[],
+                &[],
+            );
+        }
+    };
     info!(
         event = "parse.pdf_worker.conversion_completed",
         parser_name = PDF_PARSER_NAME,
@@ -278,8 +285,9 @@ pub(crate) fn run_pdf_parse(
 /// `pdf_parser_config_hash`), never a re-implementation.
 pub(crate) fn effective_capability_profile(
     config: &DoclingConfig,
+    document_timeout_seconds: u64,
 ) -> Result<ParserCapabilityProfile, ApiError> {
-    let options = resolve_docling_options(config)?;
+    let options = resolve_docling_options(config, document_timeout_seconds)?;
     let parser_config_hash = pdf_parser_config_hash(&options)?;
     capability_profile(&parser_config_hash)
 }

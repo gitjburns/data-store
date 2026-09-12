@@ -234,6 +234,28 @@ Service readiness and startup diagnostics. Public.
     - `value` (`u64`).
     - `as_of` (string): the RFC3339 timestamp / cycle marker the count was
       measured at. Every count carries one.
+  - `summary` (object, additive): server-owned compact observations, derived from
+    the same component snapshot as `details` and `counts`. Older responses may
+    omit it; absence means unavailable, not permission to parse `details`.
+    - `status`: `attention`, `unreported`, or `normal`, in display-priority order.
+      This is independent of readiness; diagnostic-only faults still need attention.
+    - `problems`: array of specific operator-facing reasons.
+    - `observations`: tagged object with the following `kind` and fields.
+
+| `observations.kind` | Fields |
+| --- | --- |
+| `ingestion` | `pending`, `in_flight`, `failed` (integer queue observations); `last_success_at` (nullable timestamp of the last successful cycle, not a queue-measurement timestamp). |
+| `annotations` | `parked` (bool), `measured_at` (nullable timestamp), `last_cycle` (nullable object: integer `sources_examined`, `planned`, `eligible_missing`, `new_failures`, `exhausted`). |
+| `corpus` | `source_systems` (sorted string array), `measured_at` (nullable timestamp); exception values remain in the component's typed `counts`. |
+| `queries` | `in_flight`, `max_in_flight` (integer live admission observations). |
+| `models` | `initialized` (bool); `dense`, `colbert`, `reranker` (each `local` or `http`). Initialization does not assert current remote availability. |
+| `logging` | `level`, `file_path` (strings). |
+
+Annotation summaries cover the last completed cycle, which may have ended before
+all sources were examined. `eligible_missing` excludes retry-waiting and exhausted
+items; `new_failures` excludes older failures. These counts establish neither
+completion nor live activity. The summary adds no worker telemetry or readiness
+gate and preserves the full detailed diagnostics.
 
 Readiness (`ready`) is determined by the `inference` and `sync` components. The
 other components (`logging`, `fabric`, `annotation`, `search_admission`) are

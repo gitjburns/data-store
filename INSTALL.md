@@ -15,8 +15,8 @@ REPL (see `SPEC-CLIENT.md`).
 
 The `mupdf` dependency builds bundled native sources and generates bindings with
 libclang. Unix builds require `make` and a C/C++ toolchain. MuPDF uses AGPL-3.0
-licensing. Its standalone evaluation tool is described in section 4; production
-PDF routing still uses Docling.
+licensing. Production PDF extraction selects Docling or MuPDF through `[pdf]`;
+MuPDF needs no Python environment. The standalone evaluator is described in section 4.
 
 ### Copy the example configuration
 
@@ -70,8 +70,14 @@ start, fill in at least the following:
 - **`[storage].index_root`** — the service-owned root for the fabric hot plane
   and the artifact store (see storage setup below).
 
+- **`[pdf].engine`** — required, either `docling` or `mupdf`, without fallback.
+  **`document_timeout_seconds`** is required and positive for either engine;
+  it belongs under `[pdf]`, not `[docling]`.
+
 - **`[docling].python_path`** and **`docling_path`** — the Python environment and
-  the Docling executable launched for PDF-to-markdown conversion.
+  the Docling executable launched for PDF conversion. The `[docling]` section
+  is required when `engine = "docling"`; it may be omitted for MuPDF. When
+  supplied, every Docling setting is validated even if MuPDF is selected.
 
 - **`[models.colbert].backend`** — required, selecting `local` or `http` without
   fallback. Local requires an absolute `path` to ColBERT-Zero artifacts. HTTP
@@ -113,6 +119,27 @@ start, fill in at least the following:
   by content-hashing each document, so do not add one. Both documents are loaded
   once at startup and are strictly validated (unknown keys or invalid values are
   fatal); an edit takes effect only after a service restart.
+
+### PDF engine selection
+
+All shipped configurations select Docling. To select MuPDF, set:
+
+```toml
+[pdf]
+engine = "mupdf"
+document_timeout_seconds = 3600
+```
+
+The selection applies to normal ingestion, explicit reparsing, and annotation
+dry runs. MuPDF preserves embedded text and native line boundaries, physical
+pages, and image bounds. It performs no OCR, heading/table inference, prose
+cleanup, or paragraph reconstruction. Pages without embedded text produce warnings.
+
+Changing the engine does not enqueue unchanged indexed sources. Explicitly
+reparse each source to build a candidate with the selected engine; the normal
+activation gate may hold it for operator acceptance. Selecting an engine identity
+already used for that source remains subject to the no-repeat guard. Use the
+existing snapshot restore operation to restore an archived parse.
 
 ### Remote ColBERT
 
@@ -292,7 +319,8 @@ The evaluator writes `raw.json` (text, fonts, block/line/span bounds),
 status). JSON publication uses sibling `.json.tmp` files, which may remain after
 interruption. It reads the PDF without changing it and does not open the database.
 The cleaned preview applies shared prose normalization while preserving native
-line order. It does not run OCR, infer headings, or remove furniture. Image
+line order; production MuPDF preserves the uncleaned extraction. The evaluator
+does not run OCR, infer headings, or remove furniture. Image
 categories/bounds are recorded, but pixels and per-character quads are not exported.
 MuPDF's default ligature/whitespace handling applies; native dehyphenation is not
 requested. The report records the extraction flags and compiled dependency-lock hash.
@@ -346,6 +374,6 @@ intended procedure is:
    the resulting vocabulary before committing to the rulesets.
 
 6. **Stop the mode** (`data-store --shutdown`) and **start the service
-   normally.** The normal start adopts the dry-run's imported parses (no
-   Docling re-conversion), builds projections, gates and activates, and
-   completes ingestion under the final rulesets.
+   normally.** With the same parser identity, the normal start adopts the
+   dry-run's imported parses without repeating extraction, builds projections,
+   gates and activates, and completes ingestion under the final rulesets.

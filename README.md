@@ -39,8 +39,8 @@ cadence:
   │ ACQUIRE  │   raw bytes land in the content-addressed artifact store first
   └────┬─────┘
        ▼
-  ┌──────────┐   PDF: Docling; plain text: text worker. Imported bundles become
-  │  PARSE   │   canonical units; invalid bundles leave a failed parse run.
+  ┌──────────┐   PDF: configured Docling or MuPDF; plain text: text worker.
+  │  PARSE   │   Imported bundles become canonical units; invalid bundles fail.
   └────┬─────┘
        ▼
   ┌──────────────┐   chunks, lexical index, passage/section dense vectors,
@@ -256,8 +256,17 @@ Components that publish no counters serialize an empty array.
   stuck-building, access-lost, unparseable-mime, verification-halted, annotation
   freshness, retry exhaustion, and so on) are surfaced for observation only.
 
-`--sync-status` reports ingestion, not annotation completion. `--health` shows
-annotation counts from the last completed cycle, with their measurement time.
+`--health` presents a compact operational report, with attention items and
+unreported measurements first. Corpus exceptions appear once per source system;
+zero-valued categories collapse into one line. `--health-details` retains every
+component detail, startup smoke result, and diagnostic counter. Both commands
+read the same endpoint; summaries come from the server's component snapshots.
+
+Annotation counts describe the last completed cycle, with its measurement time.
+Eligible missing work excludes items waiting for retry and exhausted work, so
+zero does not establish completion. Completion and current activity remain
+explicitly unreported; parked workers retain their reason. `--sync-status`
+reports ingestion. Model initialization does not establish live endpoint health.
 For current model activity, read the file configured by `logging.file_path`
 (`logs/data-store.log` as shipped): stage starts, completions, measured
 usage, failures, retry delays, and exhaustion are recorded there. Missing token
@@ -310,7 +319,8 @@ Operator verbs (CLI flag / REPL name):
 
 | Verb | Arguments | What it does |
 | --- | --- | --- |
-| `--health` | — | Read `/v1/health`. |
+| `--health` | — | Show compact operational health, prioritizing attention items. |
+| `--health-details` | — | Show every component detail and diagnostic counter. |
 | `--query` | `<queryText...>` | Run a query; remaining args join into the query text. |
 | `--query-raw` | `<queryText...>` | Run the same query and print the complete response JSON. |
 | `--ingest` | `<sourceSystem> <nativeUri>` | Register/ingest a source. |
@@ -429,11 +439,18 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 | `[inference]` | Accelerator selection for local retrieval models. Required but unused when dense, ColBERT, and the reranker all use HTTP; no local accelerator is initialized in that mode. |
 | `[storage]` | Corpus root and service-owned index root. |
 | `[connectors.filesystem]` | Governance domain stamped on acquired sources. |
-| `[docling]` | Docling executable and PDF conversion controls. |
+| `[pdf]` | Required `engine` (`docling` or `mupdf`) and positive `document_timeout_seconds`; no automatic fallback. |
+| `[docling]` | Docling executable and conversion controls. Required for `engine = "docling"`; validated whenever supplied. |
 | `[models]` | Dense, ColBERT, and reranker each select an exclusive `local` or `http` backend. Remote ColBERT uses vLLM `/pooling` token inference, a matching local tokenizer, persisted document matrices, and CPU MaxSim; no local ColBERT weights are loaded. The annotator uses an external chat-completions endpoint. See **INSTALL.md** for backend fields. |
 | `[policies]` | Paths to the two operator-editable policy documents (entity-match ruleset, annotator naming rules); config holds paths only, and edits require a restart. |
 
 See **INSTALL.md** for the annotated example and the required absolute paths.
+
+MuPDF preserves embedded text blocks, native line boundaries, physical pages,
+and image bounds. It does not perform OCR, infer headings/tables, or reconstruct
+paragraphs. Changing the engine does not automatically replace indexed parses;
+explicit reparsing uses the normal activation gate. See **INSTALL.md** for
+switching engines and the existing-identity restriction.
 
 ### Annotation settings
 

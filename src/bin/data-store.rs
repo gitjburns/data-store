@@ -30,6 +30,14 @@ use provenance::{
     MatchClass, RetrievalChannel, RetrievalProvenance,
 };
 
+// Share health observations with the server; clients render its classification
+// and never reconstruct operational state from diagnostic prose.
+#[path = "../types.rs"]
+mod health_types;
+use health_types::{
+    HealthBackend, HealthComponent, HealthObservations, HealthResponse, HealthStatus,
+};
+
 const PROMPT: &str = "data-store> ";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
@@ -118,7 +126,9 @@ struct ClientContext {
 // `query` are direct request/response. `Exit`/`Help` are local REPL controls.
 #[derive(Debug)]
 enum Command {
-    Health,
+    Health {
+        details: bool,
+    },
     /// `query` carries the operator's bare query text; the dispatch arm wraps it
     /// in the `{"queryText": ...}` request body via serde_json, so raw envelopes
     /// stay curl's job and this field is never itself JSON.
@@ -218,6 +228,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         repl_usage: "health",
         cli_usage: Some("data-store [--config <path>] --health"),
         build: build_health_command,
+    },
+    CommandSpec {
+        repl_name: "health-details",
+        repl_aliases: &[],
+        cli_flag: Some("--health-details"),
+        cli_aliases: &[],
+        repl_usage: "health-details (complete component diagnostics)",
+        cli_usage: Some("data-store [--config <path>] --health-details"),
+        build: build_health_details_command,
     },
     CommandSpec {
         repl_name: "query",
@@ -420,43 +439,6 @@ enum StartupSelection {
         config_path: PathBuf,
         bind_addr: SocketAddr,
     },
-}
-
-/// Client mirror of `GET /v1/health` (the one non-camelCase response on the
-/// surface): plain field names, matching the service `HealthResponse`. FINAL —
-/// `render_health` renders it directly and is not a placeholder.
-#[derive(Debug, Deserialize)]
-struct HealthResponse {
-    service: String,
-    ready: bool,
-    components: Vec<HealthComponent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HealthComponent {
-    name: String,
-    ready: bool,
-    details: Vec<String>,
-    // Additive typed diagnostic counters (C10b). Defaulted so a component body
-    // without the field still deserializes; each count carries its own `as_of`
-    // marker so a value is never shown as current without saying when it was
-    // measured (accuracy over convenience).
-    #[serde(default)]
-    counts: Vec<HealthCount>,
-}
-
-/// One additive diagnostic counter on a `HealthComponent` (C10b). Health is the
-/// one non-camelCase response, and `source_system`/`as_of` are already
-/// snake_case on the wire, so plain field names match. `source_system` is absent
-/// for corpus-aggregate counters; `as_of` is the measurement time surfaced with
-/// the value so the number is never presented as current without its marker.
-#[derive(Debug, Deserialize)]
-struct HealthCount {
-    label: String,
-    #[serde(default)]
-    source_system: Option<String>,
-    value: u64,
-    as_of: String,
 }
 
 /// Client mirror of the §34 `POST /sources` and `POST /sources/{id}/parses`
@@ -1020,7 +1002,13 @@ fn parse_cli_command(spec: &CommandSpec, args: &[String], index: &mut usize) -> 
 /// Build the typed health command from a no-argument registry entry.
 fn build_health_command(args: &[String]) -> Result<Command> {
     require_arg_count(args, 0, "health")?;
-    Ok(Command::Health)
+    Ok(Command::Health { details: false })
+}
+
+/// Preserve full diagnostics through the same public health request.
+fn build_health_details_command(args: &[String]) -> Result<Command> {
+    require_arg_count(args, 0, "health-details")?;
+    Ok(Command::Health { details: true })
 }
 
 /// Build the `query` command from bare query text: every trailing token is joined
@@ -1429,9 +1417,13 @@ fn split_shell_like(line: &str) -> Result<Vec<String>> {
 /// the decoded value so stage 2 can swap them without touching this dispatch.
 fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
     match command {
-        Command::Health => {
+        Command::Health { details } => {
             let health: HealthResponse = get_public(context, HEALTH_PATH)?;
-            render_health(health);
+            if details {
+                render_health_details(health);
+            } else {
+                render_health(health);
+            }
         }
         Command::Query { query_text, raw } => {
             // The client owns the request envelope: the operator supplies bare
@@ -1893,15 +1885,201 @@ fn format_error_detail(error: &ErrorDetail) -> String {
 
 // --- Renderers -------------------------------------------------------------
 //
-// `render_health` and `render_operation` are FINAL for the transport's terminal
-// reporting — the latter carries the mandatory Operation-succeeded-vs-parse-
-// outcome rule. Read renderers keep rich payloads alongside their summaries.
+// Health defaults to the server's compact observations; health-details retains
+// every diagnostic line and counter. Operation rendering preserves the mandatory
+// distinction between Operation success and the domain's parse outcome.
 // Query rendering presents the server's passages; `query-raw` exposes the full
 // response separately without applying the presentation mirror.
 
-/// Print service readiness and component diagnostics in a compact form. FINAL —
-/// `GET /v1/health` has a stable typed mirror.
-fn render_health(response: HealthResponse) {
+/// Give operator work a stable display order within each server-assigned priority.
+fn health_section(observations: &HealthObservations) -> (u8, &'static str) {
+    match observations {
+        HealthObservations::Ingestion { .. } => (0, "Ingestion"),
+        HealthObservations::Annotations { .. } => (1, "Annotations"),
+        HealthObservations::Corpus { .. } => (2, "Corpus"),
+        HealthObservations::Queries { .. } => (3, "Queries"),
+        HealthObservations::Models { .. } => (4, "Models"),
+        HealthObservations::Logging { .. } => (5, "Logging"),
+    }
+}
+
+/// Render the server's priority first, keeping historical observations distinct
+/// from live activity and making absent summaries visible without parsing prose.
+fn render_health(mut response: HealthResponse) {
+    println!(
+        "{} — {}",
+        response.service,
+        if response.ready { "READY" } else { "NOT READY" }
+    );
+    if response.components.is_empty() {
+        println!("\nComponent observations: not reported");
+        return;
+    }
+    response.components.sort_by(|left, right| {
+        let priority = |component: &HealthComponent| match &component.summary {
+            Some(summary) => match summary.status {
+                HealthStatus::Attention => 0,
+                HealthStatus::Unreported => 1,
+                HealthStatus::Normal => 2,
+            },
+            None => 1,
+        };
+        let order = |component: &HealthComponent| {
+            component
+                .summary
+                .as_ref()
+                .map_or(6, |summary| health_section(&summary.observations).0)
+        };
+        (priority(left), order(left)).cmp(&(priority(right), order(right)))
+    });
+    for component in &response.components {
+        println!();
+        let Some(summary) = &component.summary else {
+            println!(
+                "{}: summary unavailable; use --health-details",
+                component.name
+            );
+            continue;
+        };
+        let (_, label) = health_section(&summary.observations);
+        match summary.status {
+            HealthStatus::Normal => print!("{label:<13}"),
+            HealthStatus::Attention | HealthStatus::Unreported => {
+                println!(
+                    "{label:<13}{}",
+                    if summary.status == HealthStatus::Attention {
+                        "ATTENTION"
+                    } else {
+                        "NOT REPORTED"
+                    }
+                );
+                for problem in &summary.problems {
+                    println!("             {problem}");
+                }
+                print!("             ");
+            }
+        }
+        render_health_observations(component, &summary.observations);
+    }
+    println!("\nDetails: --health-details");
+}
+
+/// Print typed observations once per group. The server owns problem detection;
+/// filtering zero corpus counts here only collapses their visual presentation.
+fn render_health_observations(component: &HealthComponent, observations: &HealthObservations) {
+    match observations {
+        HealthObservations::Ingestion {
+            pending,
+            in_flight,
+            failed,
+            last_success_at,
+        } => {
+            println!(
+                "Last reported queue: {pending} pending · {in_flight} active · {failed} failed"
+            );
+            println!(
+                "             Last successful scan: {}",
+                last_success_at.as_deref().unwrap_or("not reported")
+            );
+        }
+        HealthObservations::Annotations {
+            parked,
+            last_cycle,
+            measured_at,
+        } => {
+            if let Some(cycle) = last_cycle {
+                println!(
+                    "Last cycle: {} sources · {} planned items",
+                    cycle.sources_examined, cycle.planned
+                );
+                println!(
+                    "             {} eligible missing · {} new failures · {} exhausted",
+                    cycle.eligible_missing, cycle.new_failures, cycle.exhausted
+                );
+                println!(
+                    "             Measured: {}",
+                    measured_at.as_deref().unwrap_or("not reported")
+                );
+            } else {
+                println!("No completed cycle reported");
+            }
+            if *parked {
+                println!("             Completion: not reported");
+            } else {
+                println!("             Completion and current activity: not reported");
+            }
+        }
+        HealthObservations::Corpus {
+            source_systems,
+            measured_at,
+        } => {
+            if source_systems.is_empty() {
+                println!("No corpus scan reported");
+            }
+            for (index, system) in source_systems.iter().enumerate() {
+                if index > 0 {
+                    print!("             ");
+                }
+                let exceptions: Vec<String> = component
+                    .counts
+                    .iter()
+                    .filter(|count| {
+                        count.source_system.as_deref() == Some(system.as_str()) && count.value > 0
+                    })
+                    .map(|count| format!("{} {}", count.value, count.label.replace('_', " ")))
+                    .collect();
+                if exceptions.is_empty() {
+                    println!("No reported exceptions — {system}");
+                } else {
+                    println!("{} — {system}", exceptions.join(" · "));
+                }
+            }
+            println!(
+                "             Measured: {}",
+                measured_at.as_deref().unwrap_or("not reported")
+            );
+        }
+        HealthObservations::Queries {
+            in_flight,
+            max_in_flight,
+        } => {
+            println!("{in_flight} / {max_in_flight} active — live");
+        }
+        HealthObservations::Models {
+            initialized,
+            dense,
+            colbert,
+            reranker,
+        } => {
+            println!(
+                "{} — dense {} · ColBERT {} · reranker {}",
+                if *initialized {
+                    "Initialized"
+                } else {
+                    "Not initialized"
+                },
+                health_backend_label(dense),
+                health_backend_label(colbert),
+                health_backend_label(reranker)
+            );
+        }
+        HealthObservations::Logging { level, file_path } => {
+            println!("{} · {file_path}", level.to_uppercase());
+        }
+    }
+}
+
+/// Keep backend labels concise while preserving the selected execution location.
+fn health_backend_label(backend: &HealthBackend) -> &'static str {
+    match backend {
+        HealthBackend::Local => "local",
+        HealthBackend::Http => "HTTP",
+    }
+}
+
+/// Retain the original component diagnostics, including every counter and as-of
+/// marker, independently of which observations the compact view emphasizes.
+fn render_health_details(response: HealthResponse) {
     println!("Service: {}", response.service);
     println!("Ready: {}", yes_no(response.ready));
     if response.components.is_empty() {

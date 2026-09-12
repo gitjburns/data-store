@@ -208,6 +208,7 @@ are cross-checked against the router in `src/http.rs`.
 | REPL name (aliases) | One-shot flag | Arguments | Route | Access | Async? |
 |---|---|---|---|---|---|
 | `health` | `--health` | — | `GET /v1/health` | public | no |
+| `health-details` | `--health-details` | — | `GET /v1/health` | public | no |
 | `query` | `--query` | `<queryText...>` | `POST /query` | public | no |
 | `query-raw` | `--query-raw` | `<queryText...>` | `POST /query` | public | no |
 | `ingest` | `--ingest` | `<sourceSystem> <nativeUri>` | `POST /sources` | protected | yes (operation) |
@@ -337,18 +338,29 @@ not as a decode failure.** The claim holds **only** for the
 an "unexpected response body" error (§5.10). Errors of every kind
 render per §5.10.
 
-### 5.1 `health`
+### 5.1 `health` and `health-details`
 
-Prints the service name, readiness (`yes`/`no`), and each component with
-its readiness and detail lines. Components carry typed **`counts`**: each
-count is printed as `count <label> [<sourceSystem>]: <value> (as of
-<timestamp>)` — a count is never shown as current without its as-of
-marker, and the optional `sourceSystem` scopes fabric counts to their
-owner.
+`health` prints `READY` or `NOT READY` followed by compact ingestion, annotation,
+corpus, query-admission, model-initialization, and logging observations. Server
+statuses put attention items first, then unreported measurements, then normal
+observations. Specific problem reasons remain visible. Zero-valued corpus
+exceptions collapse into one line per source system; nonzero counts remain
+explicit. Annotation and corpus measurement times appear once per group.
 
-The annotation component reports counts from the last completed worker cycle,
-including exhausted work. Current model-call activity, retry delays, and failures
-are recorded in the server's configured service log; the CLI does not stream them.
+The shared wire types in `src/types.rs` carry server-owned summaries; the client
+does not parse diagnostic strings or calculate operational status. A missing
+summary is explicitly unavailable, with a pointer to `health-details`.
+
+Annotation observations describe the last completed cycle. `eligible_missing`
+excludes work waiting for retry and exhausted work; `new_failures` counts only
+that cycle's failures. Completion and current activity remain explicitly
+unreported; a parked worker retains its reason. Model initialization is not a
+live endpoint probe. Current model activity and retry details remain in the
+configured service log.
+
+`health-details` makes the same public request and preserves the original display:
+service/component readiness, every detail line, and every counter as
+`count <label> [<sourceSystem>]: <value> (as of <timestamp>)`.
 
 ### 5.2 Operation records (`operation`, and every async admin command)
 

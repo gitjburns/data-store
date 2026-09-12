@@ -33,9 +33,9 @@ const POST_100_FEEDBACK_CADENCE_SECONDS: u64 = 1;
 const POST_100_SAMPLE_SECONDS: u64 = 0;
 
 /// Effective Docling CLI options for one conversion, resolved from
-/// `[docling]` config. These are identity-bearing parser configuration
-/// (D3): they are folded into `parserConfigHash`, so changing any value
-/// yields a new parse identity.
+/// `[docling]` config and the shared `[pdf]` timeout. These are identity-bearing
+/// parser configuration (D3): they are folded into `parserConfigHash`, so
+/// changing any value yields a new parse identity.
 #[derive(Debug, Clone)]
 pub struct ResolvedDoclingOptions {
     pub pdf_backend: String,
@@ -101,11 +101,12 @@ struct DoclingProgressSnapshot {
 }
 
 // Identity facts for one Docling launch, grouped so `run_docling` takes one
-// coherent context instead of a long parameter list; all fields are borrows,
-// so the struct is `Copy` and the body binds them like locals.
+// coherent context instead of a long parameter list. Borrowed settings and the
+// copied PDF timeout stay fixed for the entire launch.
 #[derive(Clone, Copy)]
 struct DoclingLaunch<'a> {
     config: &'a DoclingConfig,
+    document_timeout_seconds: u64,
     args: &'a [String],
     index_root: &'a Path,
     output_dir: &'a Path,
@@ -117,6 +118,7 @@ struct DoclingLaunch<'a> {
 // the same lifecycle identity without changing operation handles.
 struct DoclingProcessContext<'a> {
     config: &'a DoclingConfig,
+    document_timeout_seconds: u64,
     output_dir: &'a Path,
     source: &'a ResolvedSource,
     /// `--to` output format of this conversion (`json`); process lifecycle
@@ -145,12 +147,13 @@ struct DoclingChildOutputContext {
 /// the default service-owned conversion directory.
 pub fn convert_source_to_document_json(
     config: &DoclingConfig,
+    document_timeout_seconds: u64,
     index_root: &Path,
     source: ResolvedSource,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     output_dir_override: Option<&Path>,
 ) -> Result<DoclingJsonConversionResult, ApiError> {
-    let options = resolve_docling_options(config)?;
+    let options = resolve_docling_options(config, document_timeout_seconds)?;
     let output_dir = match output_dir_override {
         Some(dir) => {
             // The caller owns the override directory; create-if-missing
@@ -210,6 +213,7 @@ fn execute_docling_conversion(
     let output = run_docling(
         &DoclingLaunch {
             config,
+            document_timeout_seconds: options.document_timeout_seconds,
             args: &args,
             index_root,
             output_dir,
@@ -247,15 +251,17 @@ fn execute_docling_conversion(
 /// Resolve service-configured Docling options for one conversion attempt.
 /// `pub(crate)` so the PDF parser worker can hash the exact effective
 /// options into its `parserConfigHash` before starting a conversion.
+/// Keeping the shared PDF timeout in the resolved options preserves Docling's
+/// parser identity when only the configuration section owning it changes.
 pub(crate) fn resolve_docling_options(
     config: &DoclingConfig,
+    document_timeout_seconds: u64,
 ) -> Result<ResolvedDoclingOptions, ApiError> {
     let pdf_backend = config.pdf_backend.trim().to_string();
     let ocr_mode = config.ocr_mode.trim().to_string();
     let device = config.device.trim().to_string();
     let num_threads = config.num_threads;
     let page_batch_size = config.page_batch_size;
-    let document_timeout_seconds = config.document_timeout_seconds;
 
     if !matches!(ocr_mode.as_str(), "auto" | "on" | "off") {
         return Err(ApiError::DoclingConversion {
@@ -350,6 +356,7 @@ fn run_docling(
     let _entered = context.enter();
     let DoclingLaunch {
         config,
+        document_timeout_seconds,
         args,
         index_root,
         output_dir,
@@ -367,7 +374,7 @@ fn run_docling(
         output_dir = %output_dir.display(),
         output_format,
         working_dir = %index_root.display(),
-        timeout_seconds = config.document_timeout_seconds,
+        timeout_seconds = document_timeout_seconds,
         args_count = args.len(),
         elapsed_ms = 0_u64,
         "Docling process starting"
@@ -392,7 +399,7 @@ fn run_docling(
                 output_dir = %output_dir.display(),
                 output_format,
                 working_dir = %index_root.display(),
-                timeout_seconds = config.document_timeout_seconds,
+                timeout_seconds = document_timeout_seconds,
                 args_count = args.len(),
                 error = %io_error,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -416,7 +423,7 @@ fn run_docling(
         output_dir = %output_dir.display(),
         output_format,
         process_id,
-        timeout_seconds = config.document_timeout_seconds,
+        timeout_seconds = document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process spawned"
     );
@@ -512,6 +519,7 @@ fn run_docling(
     }));
     let process_context = DoclingProcessContext {
         config,
+        document_timeout_seconds,
         output_dir,
         source,
         output_format,
@@ -536,7 +544,7 @@ fn run_docling(
         timed_out,
         exit_code = ?status.code(),
         signal = ?status.signal(),
-        timeout_seconds = config.document_timeout_seconds,
+        timeout_seconds = document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process wait completed"
     );
@@ -558,7 +566,7 @@ fn run_docling(
             timed_out,
             exit_code = ?status.code(),
             signal = ?status.signal(),
-            timeout_seconds = config.document_timeout_seconds,
+            timeout_seconds = document_timeout_seconds,
             stdout_chars = stdout.chars().count(),
             stderr_chars = stderr.chars().count(),
             stdout = %stdout_diagnostic,
@@ -578,7 +586,7 @@ fn run_docling(
             timed_out,
             exit_code = ?status.code(),
             signal = ?status.signal(),
-            timeout_seconds = config.document_timeout_seconds,
+            timeout_seconds = document_timeout_seconds,
             stdout_chars = stdout.chars().count(),
             stderr_chars = stderr.chars().count(),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -608,7 +616,7 @@ fn wait_for_docling_process(
     let output_format = context.output_format;
     let process_id = context.process_id;
     let started = context.started;
-    let timeout_duration = Duration::from_secs(config.document_timeout_seconds);
+    let timeout_duration = Duration::from_secs(context.document_timeout_seconds);
     let mut last_feedback_at = None;
 
     loop {
@@ -624,7 +632,7 @@ fn wait_for_docling_process(
                     output_dir = %output_dir.display(),
                     output_format,
                     process_id,
-                    timeout_seconds = config.document_timeout_seconds,
+                    timeout_seconds = context.document_timeout_seconds,
                     error = %wait_error,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "Docling process wait failed"
@@ -683,7 +691,7 @@ fn timeout_docling_process(
         output_dir = %output_dir.display(),
         output_format,
         process_id,
-        timeout_seconds = config.document_timeout_seconds,
+        timeout_seconds = context.document_timeout_seconds,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process timeout reached"
     );
@@ -699,7 +707,7 @@ fn timeout_docling_process(
                 output_dir = %output_dir.display(),
                 output_format,
                 process_id,
-                timeout_seconds = config.document_timeout_seconds,
+                timeout_seconds = context.document_timeout_seconds,
                 kill_requested = kill_result.is_ok(),
                 error = %io_error,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -721,7 +729,7 @@ fn timeout_docling_process(
             process_id,
             exit_code = ?status.code(),
             signal = ?status.signal(),
-            timeout_seconds = config.document_timeout_seconds,
+            timeout_seconds = context.document_timeout_seconds,
             error = %kill_error,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Docling process kill after timeout failed"

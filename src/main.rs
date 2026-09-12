@@ -251,6 +251,11 @@ impl StartupReporter {
 
 /// Start the standalone Data Store service.
 fn main() -> anyhow::Result<()> {
+    // The bounded MuPDF child must extract and exit without initializing the
+    // service, opening its store, or competing with the parent's log lifecycle.
+    if let Some(outcome) = parse::mupdf_worker::run_internal_command() {
+        return outcome;
+    }
     let cli_options = resolve_cli_options_from_args()?;
     // Bootstrap output stays on stdout so a launcher can find config/log
     // diagnostics before it backgrounds the service.
@@ -552,7 +557,7 @@ async fn run_http_service(
     let scheduler_corpus_root = config.storage.corpus_root.clone();
     let scheduler_index_root = config.storage.index_root.clone();
     let scheduler_governance_domain = config.connectors.filesystem.governance_domain.clone();
-    let scheduler_docling = config.docling.clone();
+    let scheduler_pdf = parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?;
     let annotation_index_root = config.storage.index_root.clone();
     let annotation_annotator = config.models.annotator.clone();
     let annotation_config_root = config.config_root().to_path_buf();
@@ -747,7 +752,7 @@ async fn run_http_service(
                 scheduler_corpus_root,
                 scheduler_index_root,
                 scheduler_governance_domain,
-                scheduler_docling,
+                scheduler_pdf,
                 Arc::clone(&cutover_registry),
                 scheduler_projection_runtime,
                 application_identity,
@@ -1223,7 +1228,7 @@ async fn run_annotation_dry_run_mode(
         corpus_root: config.storage.corpus_root.clone(),
         index_root: config.storage.index_root.clone(),
         governance_domain: config.connectors.filesystem.governance_domain.clone(),
-        docling: config.docling.clone(),
+        pdf: parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?,
         annotator: config.models.annotator.clone(),
         config_root: config.config_root().to_path_buf(),
         groups_per_source,

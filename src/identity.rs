@@ -18,7 +18,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::canonical;
-use crate::config::ServiceConfig;
+use crate::config::{PdfEngine, ServiceConfig};
 use crate::error::ApiError;
 
 /// Spec version this build implements, stamped into every `ForensicSnapshot`
@@ -163,7 +163,9 @@ struct ConfigurationIdentity {
 
     filesystem_governance_domain: String,
 
-    docling: DoclingIdentity,
+    pdf: PdfIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docling: Option<DoclingIdentity>,
     models: ModelIdentity,
 
     /// PATHS of the operator-editable policy documents (D3 amendment, CA2).
@@ -174,6 +176,15 @@ struct ConfigurationIdentity {
     policy_annotator_naming_file_path: String,
 }
 
+/// The PDF engine and shared execution limit are captured once, regardless of
+/// whether the optional Docling section is present.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfIdentity {
+    engine: PdfEngine,
+    document_timeout_seconds: u64,
+}
+
 /// Docling execution settings that affect conversion output and therefore
 /// replay fidelity. Paths are captured as strings; no secret values exist in
 /// this section.
@@ -182,7 +193,6 @@ struct ConfigurationIdentity {
 struct DoclingIdentity {
     python_path: String,
     docling_path: String,
-    document_timeout_seconds: u64,
     pdf_backend: String,
     ocr_mode: String,
     device: String,
@@ -277,16 +287,19 @@ impl ConfigurationIdentity {
             corpus_root: path_string(&config.storage.corpus_root),
             index_root: path_string(&config.storage.index_root),
             filesystem_governance_domain: config.connectors.filesystem.governance_domain.clone(),
-            docling: DoclingIdentity {
-                python_path: path_string(&config.docling.python_path),
-                docling_path: path_string(&config.docling.docling_path),
-                document_timeout_seconds: config.docling.document_timeout_seconds,
-                pdf_backend: config.docling.pdf_backend.clone(),
-                ocr_mode: config.docling.ocr_mode.clone(),
-                device: config.docling.device.clone(),
-                num_threads: config.docling.num_threads,
-                page_batch_size: config.docling.page_batch_size,
+            pdf: PdfIdentity {
+                engine: config.pdf.engine,
+                document_timeout_seconds: config.pdf.document_timeout_seconds,
             },
+            docling: config.docling.as_ref().map(|docling| DoclingIdentity {
+                python_path: path_string(&docling.python_path),
+                docling_path: path_string(&docling.docling_path),
+                pdf_backend: docling.pdf_backend.clone(),
+                ocr_mode: docling.ocr_mode.clone(),
+                device: docling.device.clone(),
+                num_threads: docling.num_threads,
+                page_batch_size: docling.page_batch_size,
+            }),
             models: ModelIdentity {
                 // Per-backend dense facts: config validation guarantees exactly
                 // one backend's fields are set, so these Options are captured
