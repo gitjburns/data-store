@@ -11,9 +11,11 @@ use mupdf::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Exact extraction options recorded beside diagnostic output; no OCR or dehyphenation.
-pub(crate) const EXTRACTION_FLAGS: TextPageFlags =
-    TextPageFlags::PRESERVE_IMAGES.union(TextPageFlags::COLLECT_STYLES);
+/// Match the reference extractor's native dehyphenation while retaining source
+/// geometry and style for auditing. Cleanup does not use font size or weight.
+pub(crate) const EXTRACTION_FLAGS: TextPageFlags = TextPageFlags::PRESERVE_IMAGES
+    .union(TextPageFlags::COLLECT_STYLES)
+    .union(TextPageFlags::DEHYPHENATE);
 
 /// Owned document output; pages without native text remain represented.
 #[derive(Debug, Serialize, Deserialize)]

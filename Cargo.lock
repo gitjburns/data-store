@@ -617,6 +617,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "fancy-regex",
  "getrandom 0.3.4",
  "mupdf",
  "reqwest",

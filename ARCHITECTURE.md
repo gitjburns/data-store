@@ -328,17 +328,20 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   (`src/parse/mupdf_worker.rs`) launches the same service executable in a private
   extraction mode before normal service initialization. Only native extraction
   (`src/parse/native_pdf.rs`) runs in that child; the parent maps its output into
-  staged candidates. Physical pages, nonempty text blocks, and image bounds become
+  staged candidates. Physical pages, cleaned paragraphs, and image bounds become
   `page`, `text_block`, and `figure` units with page locators and reading-order
-  relationships. Native text and line boundaries are preserved without prose
-  cleanup, OCR, heading/table inference, or paragraph reconstruction. Missing
-  embedded text and unsupported block categories produce diagnostics. The complete
-  native extraction, including font and geometry information, is archived through
+  relationships. Native dehyphenation is enabled. Production and the diagnostic
+  share `src/parse/mupdf_cleanup.rs`: margin/folio removal, paragraph joining,
+  junk filtering, and ordered generic text repairs, without font rules, hierarchy
+  inference, or OCR. Merged paragraphs retain every contributing source page/line locator.
+  Missing embedded text and unsupported block categories produce diagnostics.
+  The complete native extraction and `mupdf_cleanup.json` (source line references,
+  removed text, paragraph preparation, and per-pass repairs) are archived through
   `parser_raw_output_uri`.
 
   Each engine has a distinct parser identity. MuPDF identity includes extraction
-  flags, mapping version, and the compiled dependency-lock hash. Moving the
-  timeout to `[pdf]` preserves Docling's effective identity when settings are
+  flags, mapping and cleanup versions, and the compiled dependency-lock hash.
+  Moving the timeout to `[pdf]` preserves Docling's effective identity when settings are
   equivalent. Identity changes permit a new candidate through the §13.5 guard;
   changing the selector alone does not enqueue unchanged indexed sources.
   Explicit reparsing uses the existing projection and activation path, including

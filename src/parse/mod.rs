@@ -9,6 +9,7 @@ pub(crate) mod bundle;
 pub(crate) mod cleanup;
 pub(crate) mod conformance;
 pub(crate) mod importer;
+pub(crate) mod mupdf_cleanup;
 pub(crate) mod mupdf_worker;
 pub(crate) mod native_pdf;
 pub(crate) mod pdf;

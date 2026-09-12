@@ -1,9 +1,10 @@
 //! MuPDF production producer. Only the child enters native code; the parent owns
 //! its deadline, bounded process diagnostics, and the untrusted parser bundle.
-//! Mapping preserves native text and line boundaries without prose classification.
+//! Script-based cleanup precedes canonical mapping, with raw extraction and repair
+//! traces retained separately from the cleaned paragraphs.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs::{File, OpenOptions},
@@ -37,13 +38,14 @@ use super::{
         CandidateUnitRelationship, CandidateWarning, ParserExecutionStatus, ParserResult,
         parse_staging_root,
     },
+    mupdf_cleanup::{self, CleanedDocument, CleanupReport},
     native_pdf::{self, BlockKind, EXTRACTION_FLAGS, ExtractedPdf},
 };
 
 const WORKER_FLAG: &str = "--internal-mupdf-worker";
 const PARSER_NAME: &str = "mupdf_pdf";
 /// Version the canonical mapping independently from the native library dependency.
-const PARSER_VERSION: &str = "1";
+const PARSER_VERSION: &str = "2";
 const RAW_FILE_NAME: &str = "mupdf.json";
 const DEPENDENCY_LOCK: &str = include_str!("../../Cargo.lock");
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -96,6 +98,7 @@ pub(crate) fn capability_profile(
         "extractionFlags": format!("{EXTRACTION_FLAGS:?}"),
         "dependencyLockSha256": canonical::sha256_hex_bytes(DEPENDENCY_LOCK.as_bytes()),
         "mappingVersion": PARSER_VERSION,
+        "cleanupVersion": mupdf_cleanup::CLEANUP_VERSION,
     }))?;
     let mut profile = ParserCapabilityProfile {
         parser_name: PARSER_NAME.to_owned(),
@@ -390,8 +393,10 @@ fn stage_parse(
             source_hash: source_hash.to_owned(),
         },
     )?;
-    let raw_path = writer.parser_raw_dir()?.join(RAW_FILE_NAME);
+    let raw_dir = writer.parser_raw_dir()?;
+    let raw_path = raw_dir.join(RAW_FILE_NAME);
     let mut process = None;
+    let mut cleanup_report = None;
     let mapped = (|| -> Result<MappedDocument> {
         process = Some(extract_in_child(source, &raw_path, timeout_seconds)?);
         let output = process.as_ref().context("MuPDF process outcome missing")?;
@@ -411,13 +416,40 @@ fn stage_parse(
             .with_context(|| format!("open MuPDF output {}", raw_path.display()))?;
         let document: ExtractedPdf = serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("decode MuPDF output {}", raw_path.display()))?;
+        let cleanup_started = Instant::now();
+        info!(
+            event = "parse.mupdf_worker.cleanup_started",
+            source_id,
+            cleanup_version = mupdf_cleanup::CLEANUP_VERSION,
+            "MuPDF text cleanup starting"
+        );
+        let cleaned = mupdf_cleanup::clean_document(&document).context("clean MuPDF text")?;
+        info!(
+            event = "parse.mupdf_worker.cleanup_completed",
+            source_id,
+            input_text_blocks = cleaned.report.input_text_blocks,
+            output_paragraphs = cleaned.report.output_paragraphs,
+            joined_blocks = cleaned.report.joined_blocks,
+            removed_lines = cleaned.report.removed_lines.len(),
+            dropped_paragraphs = cleaned.report.dropped_paragraphs,
+            repair_passes = cleaned.report.repair_passes,
+            elapsed_ms = cleanup_started.elapsed().as_millis() as u64,
+            "MuPDF cleanup calculated; staging report and canonical candidates next"
+        );
         info!(
             event = "parse.mupdf_worker.mapping_started",
             page_count = document.pages.len(),
             "MuPDF raw output received; mapping canonical candidates"
         );
-        map_document(&document).context("map MuPDF canonical candidates")
+        let mapped = map_document(&document, &cleaned).context("map MuPDF canonical candidates");
+        // Keep successful cleanup evidence even if the following mapping rejects
+        // geometry or another canonical claim from the native output.
+        cleanup_report = Some(cleaned.report);
+        mapped
     })();
+    if let Some(report) = cleanup_report {
+        write_cleanup_report(&raw_dir.join(mupdf_cleanup::REPORT_FILE_NAME), &report)?;
+    }
     let (status, failure, metrics) = match mapped {
         Ok(mapped) => {
             for unit in &mapped.units {
@@ -444,7 +476,7 @@ fn stage_parse(
                 pages_without_text = mapped.pages_without_text,
                 unsupported_blocks = mapped.unsupported_blocks,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "MuPDF candidates staged; native text and line boundaries preserved"
+                "MuPDF cleaned candidates staged with original source locators"
             );
             (ParserExecutionStatus::Succeeded, None, mapped.metrics)
         }
@@ -484,6 +516,27 @@ fn stage_parse(
     writer.finish(&result, &metrics, stdout, stderr)
 }
 
+/// A report write is staging infrastructure, not a producer verdict. Never promote
+/// successful cleaned candidates without the raw-to-cleaned transformation evidence.
+fn write_cleanup_report(path: &Path, report: &CleanupReport) -> Result<(), ApiError> {
+    let write = || -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create cleanup report {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, report).context("serialize MuPDF cleanup report")?;
+        writer.flush().context("flush MuPDF cleanup report")
+    };
+    write().map_err(|source| ApiError::InternalIo {
+        message: format!("{source:#}"),
+    })?;
+    debug!(event = "parse.mupdf_worker.cleanup_report_staged", path = %path.display(),
+        "MuPDF cleanup report staged for bundle archival");
+    Ok(())
+}
+
 /// A failed producer has no complete canonical counts; absence is not measured zero.
 fn empty_metrics() -> ParseMetrics {
     ParseMetrics {
@@ -508,8 +561,9 @@ struct MappedDocument {
     unsupported_blocks: usize,
 }
 
-/// Preserve native page/block order and raw text; text blocks carry no inferred prose role.
-fn map_document(document: &ExtractedPdf) -> Result<MappedDocument> {
+/// Anchor each cleaned paragraph at its first native block while retaining every
+/// contributing page locator. Physical page containers and images keep native order.
+fn map_document(document: &ExtractedPdf, cleaned: &CleanedDocument) -> Result<MappedDocument> {
     let mut mapped = MappedDocument {
         units: Vec::new(),
         relationships: Vec::new(),
@@ -518,6 +572,19 @@ fn map_document(document: &ExtractedPdf) -> Result<MappedDocument> {
         pages_without_text: 0,
         unsupported_blocks: 0,
     };
+    let mut paragraphs = BTreeMap::new();
+    for paragraph in &cleaned.paragraphs {
+        let first = paragraph
+            .sources
+            .first()
+            .context("cleaned paragraph has no source lines")?;
+        ensure!(
+            paragraphs
+                .insert((first.page_number, first.block_index), paragraph)
+                .is_none(),
+            "cleaned paragraphs have duplicate native anchors"
+        );
+    }
     let mut previous_page: Option<String> = None;
     let mut figures = 0;
     for (page_index, page) in document.pages.iter().enumerate() {
@@ -558,41 +625,56 @@ fn map_document(document: &ExtractedPdf) -> Result<MappedDocument> {
         }
         previous_page = Some(page_id.clone());
         let mut previous_block: Option<String> = None;
-        let mut has_text = false;
+        // Cleanup may remove all text or move a continuation into an earlier
+        // paragraph. The no-embedded-text warning still describes extraction.
+        let has_text = page
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::Text))
+            .flat_map(|block| &block.lines)
+            .flat_map(|line| &line.spans)
+            .any(|span| !span.text.trim().is_empty());
         for (block_index, block) in page.blocks.iter().enumerate() {
             let locator = page_locator(page.page_number, bounds, checked_bounds(block.bounds)?);
             let local_id = format!("{page_id}/blocks/{block_index}");
+            let mut appears_on = BTreeSet::from([page.page_number]);
             match block.kind {
                 BlockKind::Text => {
-                    let text = block
-                        .lines
-                        .iter()
-                        .map(|line| {
-                            line.spans
-                                .iter()
-                                .map(|span| span.text.as_str())
-                                .collect::<String>()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.trim().is_empty() {
+                    let Some(paragraph) = paragraphs.remove(&(page.page_number, block_index))
+                    else {
                         continue;
+                    };
+                    let mut locators = Vec::with_capacity(paragraph.sources.len());
+                    for source in &paragraph.sources {
+                        let page_index = usize::try_from(
+                            source
+                                .page_number
+                                .checked_sub(1)
+                                .context("cleaned source page number is zero")?,
+                        )?;
+                        let source_page = document
+                            .pages
+                            .get(page_index)
+                            .context("cleaned paragraph references a missing page")?;
+                        locators.push(page_locator(
+                            source.page_number,
+                            checked_bounds(source_page.bounds)?,
+                            checked_bounds(source.bounds)?,
+                        ));
+                        appears_on.insert(source.page_number);
                     }
-                    has_text = true;
-                    // A native block can be prose, a table fragment, or verse. Do not
-                    // apply paragraph cleanup or claim a semantic role from geometry.
                     push_unit(
                         &mut mapped.units,
                         &local_id,
                         ContentType::TextBlock,
                         &TextBlockBody {
-                            text,
+                            text: paragraph.text.clone(),
                             normalized_text: None,
                             block_role: None,
                             language: None,
                         },
                         Some(&page_id),
-                        vec![locator],
+                        locators,
                     )?;
                 }
                 BlockKind::Image => {
@@ -632,12 +714,14 @@ fn map_document(document: &ExtractedPdf) -> Result<MappedDocument> {
                 &local_id,
                 UnitRelationshipType::PhysicallyContains,
             );
-            push_relationship(
-                &mut mapped.relationships,
-                &local_id,
-                &page_id,
-                UnitRelationshipType::AppearsOn,
-            );
+            for page_number in appears_on {
+                push_relationship(
+                    &mut mapped.relationships,
+                    &local_id,
+                    &format!("#/pages/{page_number}"),
+                    UnitRelationshipType::AppearsOn,
+                );
+            }
             if let Some(previous) = previous_block.as_deref() {
                 push_relationship(
                     &mut mapped.relationships,
@@ -662,6 +746,10 @@ fn map_document(document: &ExtractedPdf) -> Result<MappedDocument> {
             });
         }
     }
+    ensure!(
+        paragraphs.is_empty(),
+        "cleaned paragraph anchors were not mapped"
+    );
     mapped.metrics = ParseMetrics {
         unit_count: Some(mapped.units.len() as u64),
         relationship_count: Some(mapped.relationships.len() as u64),

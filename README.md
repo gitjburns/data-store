@@ -446,9 +446,11 @@ Unknown keys anywhere in the file are fatal startup errors. The sections:
 
 See **INSTALL.md** for the annotated example and the required absolute paths.
 
-MuPDF preserves embedded text blocks, native line boundaries, physical pages,
-and image bounds. It does not perform OCR, infer headings/tables, or reconstruct
-paragraphs. Changing the engine does not automatically replace indexed parses;
+MuPDF extracts embedded text into cleaned paragraphs with source locators,
+physical pages, and image bounds. Cleanup removes margin text, folios, and junk
+paragraphs, joins wrapped lines, and applies generic text repairs. It does not
+perform OCR or infer heading/table hierarchy. Changing the engine or cleanup
+version does not automatically replace indexed parses;
 explicit reparsing uses the normal activation gate. See **INSTALL.md** for
 switching engines and the existing-identity restriction.
 

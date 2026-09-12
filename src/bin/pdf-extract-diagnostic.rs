@@ -10,18 +10,18 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[path = "../parse/mupdf_cleanup.rs"]
+mod mupdf_cleanup;
 #[path = "../parse/native_pdf.rs"]
 mod native_pdf;
-#[path = "../parse/cleanup/prose.rs"]
-mod prose;
 
 use native_pdf::{BlockKind, EXTRACTION_FLAGS, ExtractedPdf};
 
 const USAGE: &str = "pdf-extract-diagnostic <input.pdf> <new-output-directory>\n\
 Both paths must be inside this repository. The output parent must already exist.\n\
-Writes raw.json, extracted.md, cleaned.md, and report.json; never changes the PDF.\n\
-No OCR, heading inference, furniture removal, database writes, or production routing.\n\
-The cleaned preview uses the shared conservative prose normalizer; raw.json retains all native blocks.";
+Writes raw.json, extracted.md, cleaned.md, mupdf_cleanup.json, and report.json.\n\
+No OCR, heading inference, font heuristics, database writes, or production routing.\n\
+The cleaned preview uses the production text cleaner; raw.json retains all native blocks.";
 const DEPENDENCY_LOCK: &str = include_str!("../../Cargo.lock");
 
 /// Stable input and exclusive scratch output chosen explicitly by the operator.
@@ -204,15 +204,22 @@ fn evaluate(options: &Options, report: &mut Report<'_>, started: Instant) -> Res
             "input PDF changed during extraction; discard this comparison and retry with a stable file"
         );
     }
+    report.stage = Stage::WriteArtifacts;
+    checkpoint(options, report, started)?;
+    write_json(&options.output.join("raw.json"), &document)?;
     report.stage = Stage::Render;
     checkpoint(options, report, started)?;
     let rendering_started = Instant::now();
-    let (extracted, cleaned, metrics) = render_markdown(&document);
+    let cleaned_document = mupdf_cleanup::clean_document(&document)?;
+    let (extracted, cleaned, metrics) = render_markdown(&document, &cleaned_document);
     report.rendering_ms = Some(rendering_started.elapsed().as_millis());
     report.metrics = Some(metrics);
     report.stage = Stage::WriteArtifacts;
     checkpoint(options, report, started)?;
-    write_json(&options.output.join("raw.json"), &document)?;
+    write_json(
+        &options.output.join(mupdf_cleanup::REPORT_FILE_NAME),
+        &cleaned_document.report,
+    )?;
     fs::write(options.output.join("extracted.md"), extracted).context("write extracted.md")?;
     fs::write(options.output.join("cleaned.md"), cleaned).context("write cleaned.md")?;
     Ok(())
@@ -225,12 +232,18 @@ fn checkpoint(options: &Options, report: &mut Report<'_>, started: Instant) -> R
     write_json(&options.output.join("report.json"), report)
 }
 
-/// Preserve native block/line order in the baseline; the second preview applies
-/// only shared prose normalization. Font attributes and image bounding boxes
-/// remain available in raw.json; image pixels are not exported.
-fn render_markdown(document: &ExtractedPdf) -> (String, String, Metrics) {
+/// Keep the raw baseline inspectable while rendering exactly the production
+/// paragraphs in cleaned.md. Page notices belong only to the raw baseline.
+fn render_markdown(
+    document: &ExtractedPdf,
+    cleaned_document: &mupdf_cleanup::CleanedDocument,
+) -> (String, String, Metrics) {
     let mut extracted = String::new();
     let mut cleaned = String::new();
+    for paragraph in &cleaned_document.paragraphs {
+        cleaned.push_str(&paragraph.text);
+        cleaned.push_str("\n\n");
+    }
     let mut metrics = Metrics {
         pages: document.pages.len(),
         text_blocks: 0,
@@ -244,7 +257,6 @@ fn render_markdown(document: &ExtractedPdf) -> (String, String, Metrics) {
     for page in &document.pages {
         let marker = format!("<!-- PDF page {} -->\n\n", page.page_number);
         extracted.push_str(&marker);
-        cleaned.push_str(&marker);
         let mut has_text = false;
         for block in &page.blocks {
             match block.kind {
@@ -277,16 +289,11 @@ fn render_markdown(document: &ExtractedPdf) -> (String, String, Metrics) {
             has_text = true;
             extracted.push_str(&text);
             extracted.push_str("\n\n");
-            // Native text blocks have not yet been classified as paragraphs,
-            // tables or verse. Preserve their line boundaries in this preview.
-            cleaned.push_str(&prose::clean_prose(&text, false));
-            cleaned.push_str("\n\n");
         }
         if !has_text {
             metrics.pages_without_text.push(page.page_number);
             let notice = "[No embedded text extracted on this page; OCR was not performed.]\n\n";
             extracted.push_str(notice);
-            cleaned.push_str(notice);
         }
     }
     metrics.extracted_markdown_bytes = extracted.len();

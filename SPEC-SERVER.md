@@ -247,8 +247,8 @@ The shared timeout and Docling's `pdf_backend`, `ocr_mode`, `device`, `num_threa
 and `page_batch_size` are parser-identity-bearing.
 Moving the timeout to `[pdf]` preserves Docling's effective identity for equivalent
 settings. MuPDF has a distinct identity covering extraction flags, candidate
-mapping version, and the compiled dependency-lock hash. Neither engine selection
-nor timeout changes automatically enqueue unchanged indexed sources; explicit
+mapping and cleanup versions, and the compiled dependency-lock hash. Engine,
+timeout, or cleanup changes do not enqueue unchanged indexed sources; explicit
 reparsing remains subject to the no-repeat guard (§10.6) and activation gate (§11).
 
 ### 2.9 `[models.dense]`, `[models.colbert]`, `[models.reranker]`, `[models.annotator]`
@@ -858,12 +858,11 @@ the document timeout, terminates and reaps timed-out children, and records durab
 start/completion/failure diagnostics. Extraction failures become failed parser
 bundles; there is no fallback to the other engine.
 
-MuPDF maps every physical page, nonempty native text block, and image bounds to
-`page`, `text_block`, and `figure` candidates. Page locators preserve source
-geometry; relationships preserve native order. Text and native line boundaries
-remain unchanged, without inferred block roles, headings, tables, paragraph
-reconstruction, or OCR. Pages without embedded text and unsupported native block
-categories produce diagnostics.
+MuPDF maps every physical page, cleaned paragraph, and image bounds to `page`,
+`text_block`, and `figure` candidates. Merged paragraphs retain every contributing
+source page/line locator; relationships preserve paragraph order. Cleanup (§10.8)
+uses no font size/weight rules, hierarchy inference, or OCR. Pages without embedded
+text and unsupported native block categories produce diagnostics.
 
 ### 10.2 The importer is the sole canonical writer
 
@@ -951,9 +950,27 @@ Their `parser_raw/` contains original extractor output, `pre_cleanup.json`
 (units and relationships), and `cleanup.json` (version, counts, removals, merge aliases).
 The importer archives verified raw bytes before either a ready or verified-failure
 commit; `parse_runs.parser_raw_output_uri` points to their artifact manifest.
-Unverified bundles retain the existing staged-failure handling. MuPDF does not run
-cleanup; its complete native extraction, including fonts and geometry, is archived
-through the same `parser_raw_output_uri` artifact path.
+Unverified bundles retain the existing staged-failure handling.
+
+MuPDF enables native dehyphenation, then applies `src/parse/mupdf_cleanup.rs` in
+both production and the diagnostic preview. It removes lines wholly above the
+top 50 PDF points or starting within the bottom 25 points, and standalone numeric
+or lowercase Roman folios. Block lines join into paragraphs; trailing-hyphen
+joins and unterminated/lowercase continuations can span blocks and pages.
+
+Before generic repairs, the junk filter drops paragraphs whose wordlike tokens
+are half or fewer of all tokens. After surrounding punctuation is stripped,
+wordlike tokens require at least three ASCII letters and contain only letters,
+apostrophes, or hyphens. Paragraphs starting with `#` or containing a whole word
+`chapter`, `part`, or `book` (case-insensitive) bypass this filter and remain plain
+text. Ordered generic punctuation, contraction, quote, echo, and hyphen repairs
+then run; echo removal protects doubled initials. There are no book-specific
+substitutions.
+
+MuPDF archives the complete native extraction and `mupdf_cleanup.json` through
+`parser_raw_output_uri`. The cleanup report preserves source line references,
+removed margin/folio/junk text, paragraph preparation, and per-pass repairs.
+Its cleanup version participates in parser identity.
 
 Docling and plain-text workers use version 2 and hash `cleanupVersion` into their
 parser configuration. Existing documents require explicit reparsing to receive cleanup; startup

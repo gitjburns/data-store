@@ -131,12 +131,14 @@ document_timeout_seconds = 3600
 ```
 
 The selection applies to normal ingestion, explicit reparsing, and annotation
-dry runs. MuPDF preserves embedded text and native line boundaries, physical
-pages, and image bounds. It performs no OCR, heading/table inference, prose
-cleanup, or paragraph reconstruction. Pages without embedded text produce warnings.
+dry runs. MuPDF extracts embedded text with native dehyphenation, removes margin
+text and folios, joins lines into paragraphs, filters junk paragraphs, and applies
+generic text repairs. Source locators, physical pages, and image bounds remain
+available. It performs no OCR or heading/table inference. Pages without
+embedded text produce warnings; section 4 describes the cleanup preview and report.
 
-Changing the engine does not enqueue unchanged indexed sources. Explicitly
-reparse each source to build a candidate with the selected engine; the normal
+Changing the engine or cleanup version does not enqueue unchanged indexed sources.
+Explicitly reparse each source to build a candidate with the selected engine; the normal
 activation gate may hold it for operator acceptance. Selecting an engine identity
 already used for that source remains subject to the no-repeat guard. Use the
 existing snapshot restore operation to restore an archived parse.
@@ -315,15 +317,18 @@ Both paths must resolve inside this repository. Use a stable input PDF and a new
 output directory whose parent already exists; existing directories are rejected.
 
 The evaluator writes `raw.json` (text, fonts, block/line/span bounds),
-`extracted.md`, `cleaned.md`, and `report.json` (timings, counts, and terminal
-status). JSON publication uses sibling `.json.tmp` files, which may remain after
-interruption. It reads the PDF without changing it and does not open the database.
-The cleaned preview applies shared prose normalization while preserving native
-line order; production MuPDF preserves the uncleaned extraction. The evaluator
-does not run OCR, infer headings, or remove furniture. Image
-categories/bounds are recorded, but pixels and per-character quads are not exported.
-MuPDF's default ligature/whitespace handling applies; native dehyphenation is not
-requested. The report records the extraction flags and compiled dependency-lock hash.
+`extracted.md`, `cleaned.md`, `mupdf_cleanup.json`, and `report.json` (timings,
+counts, and terminal status). JSON publication uses sibling `.json.tmp` files,
+which may remain after interruption. It reads the PDF without changing it and
+does not open the database.
+
+`extracted.md` shows native extraction with page markers. `cleaned.md` uses the
+production MuPDF cleaner and emits one paragraph per line, without page markers
+or empty-page notices. `mupdf_cleanup.json` records source line references,
+removed margin/folio/junk text, paragraph preparation, and per-pass repairs.
+Native dehyphenation is enabled. Image categories/bounds are recorded, but pixels
+and per-character quads are not exported. The report records extraction flags
+and the compiled dependency-lock hash.
 On macOS, `/usr/bin/time -l` can wrap the command to measure peak memory separately.
 
 ## 5. Annotation dry-run mode (authoring rulesets on a fresh corpus)
