@@ -1,19 +1,65 @@
 # Defects and limitations
 
-Recorded from source inspection on 2026-09-08; D04–D06 descriptions reconciled
-with annotation source on 2026-09-10. This register tracks defects,
-limitations, and proposed enhancements. Proposed remedies are directions for future
-design approval, not approved implementation plans. Their retrieval-quality and
-performance benefits have not been measured.
+Current state reviewed on 2026-09-11 against source and annotation logs. This
+register tracks defects, limitations, and proposed enhancements. Proposed remedies
+require design approval; their retrieval-quality and performance benefits have
+not been established.
 
 | ID | Finding | Status |
 | --- | --- | --- |
 | D04 | Annotation input sizing lacks a complete-request token budget | Open |
-| D05 | Annotation requests lacked structured-output schemas | Resolved in code; endpoint enforcement unverified |
+| D05 | Annotation requests lacked structured-output schemas | Resolved; provider enforcement unverified |
 | D06 | Annotation selection is exhaustive rather than selective | Open |
 | D07 | Graph traversal cannot follow connections across documents | Open |
 | D08 | Derived-data rebuilding is too coarse | Open |
 | D09 | Semantic entity retrieval, independent annotation publication, and document progress | Open |
+
+## Implemented annotation behavior
+
+- **Diagnostics:** `logs/annotator.log`, relative to the config directory,
+  appends each call's request, response, and result as one contiguous group.
+  Requests omit `response_format` and `stream`, retaining temperature. Responses
+  show content, reasoning, and completion/reasoning/prompt/total token counts;
+  unavailable values remain explicit. Service logs retain lifecycle, persistence,
+  retry, and transcript-write diagnostics. Unfinished groups can be lost on exit.
+- **Transport:** calls use `stream: false`; SSE parsing and chunk logs are removed.
+  Timeouts and rebuild/shutdown cancellation remain. The endpoint is the complete
+  chat-completions URL, not a base URL. OpenRouter requests succeeded after using
+  `/api/v1/chat/completions`; the client's `chat_template_kwargs.enable_thinking`
+  remains a vLLM extension whose handling by other providers is unverified.
+- **Entity decisions:** extraction explicitly permits no names. Typing requires
+  `entities` and `rejected` arrays with exact combined candidate accounting and
+  nonempty types/rejection reasons. Accepted `NOT_AN_ENTITY` types are rejected.
+  Only accepted candidates become annotations; an entirely rejected set records
+  successful empty coverage. Rejection reasons remain in the transcript, with
+  accepted/rejected counts in service diagnostics.
+- **Source matching:** statements and quotations share `source_text_matches` in
+  [src/annotations/producer.rs](src/annotations/producer.rs). Unicode lowercasing
+  and alphanumeric filtering precede fuzzy alignment with independent repair and
+  source-omission budgets, defined in ARCHITECTURE.md §3.1. The model's cleaned
+  text is retained. Nonempty text, JSON structure, exact entity-candidate
+  accounting, and relationship-index accounting remain validated.
+- **Completion:** restart skips committed fresh coverage, including empty results.
+  Unfinished chains restart from the beginning; intermediate calls are not
+  checkpointed and retry counters reset. Prompt/schema changes alter memo
+  identity but do not reprocess completed coverage or remove existing annotations.
+- **Documentation:** README now describes projection building before activation,
+  retrieval independent of annotation completion, and all three annotation chains.
+
+**Verification and limits.** Cargo formatting, compilation, and Clippy passed.
+Logs confirmed explicit entity rejection and successful empty extraction. Offline
+prototype evaluation accepted all 779 returned sentences/quotations across the
+102 source-matching failure calls in the 2026-09-11 `call_29456` run. Three
+concatenated-JSON failures were excluded. A normalization comparison found no
+differences between Unicode lowercasing and the prototype's case folding across
+all 881 source/returned strings in those calls.
+
+The Rust matcher has not yet been verified against live calls. False-acceptance
+rates and production matching performance remain unmeasured. Fuzzy acceptance
+can omit qualifications or admit changed names, numbers, or negation; it does not
+establish semantic correctness or persistence. Source-text corruption, long
+reasoning, and request timeouts remain observed issues.
+Independent publication and document progress remain pending under D09.
 
 ## D04 — Character-based annotation budgets
 
@@ -43,13 +89,16 @@ let partial output satisfy an entire unit or conflate distinct fragments.
 [src/annotations/llm_client.rs](src/annotations/llm_client.rs) sends
 `response_format.type = "json_schema"` with `strict: true` and the stage-specific
 schema defined in [src/annotations/stages.rs](src/annotations/stages.rs).
-Application-side output validation remains required.
+All six stage prompts explicitly require a final JSON object, identify its fields
+and record shapes, and define applicable empty results. Markdown fences and
+commentary are excluded from the final answer. Live requests and producer hashing
+use the same composed prompt. Application-side validation remains required.
 
-**Status.** The missing request-schema defect is resolved in code. Enforcement
-by the deployed endpoint, compatibility of generated outputs with application
-validation, and effects on malformed-output retry rates remain unverified.
-Schema conformance does not establish factual correctness or source support
-for an extracted relationship.
+**Status.** The missing request-schema defect is resolved. Log inspection confirmed
+successful structured responses on vLLM and OpenRouter. Provider-side schema
+enforcement and the effect of explicit format instructions on retry rates remain
+unverified. Schema conformance does not establish factual correctness or source
+support for an extracted relationship.
 
 ## D06 — Annotation work is not selected by retrieval value
 
@@ -61,6 +110,7 @@ discovery; they do not combine excerpts into larger requests. Discovery
 in [src/annotations/worker.rs](src/annotations/worker.rs) schedules the matching
 work across eligible active sources. Satisfaction checks and memoization avoid
 repeating completed inputs, but do not select which new inputs merit annotation.
+Explicit entity rejection filters produced candidates; scheduling remains exhaustive.
 
 **Impact.** Annotation can dominate ingestion even when dense and lexical
 retrieval already cover much of the material. The implementation has no policy

@@ -174,7 +174,7 @@ fn entities(
 
 /// Select statements before forming triples, then attach receipts separately.
 /// Statements and quotations share forgiving source matching that tolerates
-/// damaged spacing and punctuation. This does not establish semantic correctness.
+/// text repairs and omissions. This does not establish semantic correctness.
 fn relations(
     client: &AnnotatorClient,
     passage: &str,
@@ -187,14 +187,14 @@ fn relations(
         temperature,
         |raw| {
             let response: StatementsResponse = strict_from_str(raw, Stage::Statements.name(), raw)?;
-            // Compare letters/digits without trusting extracted word boundaries;
-            // downstream requests still receive the original source excerpt.
+            // Validate source support without undoing the model's text repairs;
+            // downstream requests retain both its statement and the original source.
             for statement in &response.sentences {
                 validate_non_empty(statement, "sentences[]", raw)?;
                 if !source_text_matches(passage, statement) {
                     return Err(output_error(
                         Stage::Statements,
-                        "selected statement does not match the source after ignoring spacing and punctuation",
+                        "selected statement does not match the source within the fuzzy repair and omission limits",
                     ));
                 }
             }
@@ -277,11 +277,11 @@ fn attach_evidence(
                     for quote in &item.quotes {
                         validate_non_empty(quote, "evidence[].quotes[]", raw)?;
                         // Use the same comparison as statement selection so model
-                        // formatting repairs do not cause a retry of the chain.
+                        // text repairs and bounded omissions retain their quotations.
                         if !source_text_matches(passage, quote) {
                             return Err(output_error(
                                 Stage::Evidence,
-                                "quotation does not match the source after ignoring spacing and punctuation",
+                                "quotation does not match the source within the fuzzy repair and omission limits",
                             ));
                         }
                     }

@@ -396,12 +396,30 @@ text hash. Section ownership groups discovery; it does not enlarge requests.
 Later requests use the source excerpt and prior outputs from that chain.
 Intermediate candidate arrays are also bounded by the configured excerpt cap.
 Shape checks validate required fields, name mappings, and receipt indexes.
-Statements and supporting quotations share `producer::source_text_matches`:
-retain only letters and digits, then require a nonempty substring match.
-Word boundaries are deliberately ignored because extracted text may join or
-split words. Matching changes neither the source nor the model-returned text.
-Relations retain `evidenceQuotes`.
-Semantic verification is not implemented.
+Statements and supporting quotations share `producer::source_text_matches`.
+Both inputs undergo Unicode lowercasing via `char::to_lowercase`, then filtering
+to alphanumeric characters. Word boundaries are ignored because extracted text
+may join or split words. An empty normalized selection fails; an exact normalized
+substring succeeds immediately.
+
+Otherwise, align the returned characters in order within one source interval,
+using two independent budgets. For normalized returned length `n`, with integer
+division:
+
+- Inserted or substituted returned characters: `min(n / 4, max(4, 3 * n / 20))`.
+- Omitted source characters: `max(32, n)`.
+
+Each affected character spends one unit of its corresponding budget. Source
+text outside the interval is free; there is no consecutive-edit limit. Dynamic
+programming retains the minimum omissions for each repair count and source
+endpoint, using two reusable working layers. Any alignment within both budgets
+passes. A selection requiring more matching source characters than are available
+fails before allocating those layers.
+
+Matching changes neither the source nor the model-returned text; relations
+retain the model's `evidenceQuotes`. Fuzzy acceptance permits repairs and shortened
+quotations but can also admit meaning-changing edits or omissions. Semantic
+verification is not implemented.
 
 Entity typing requires both `entities` (`name`, `entityType`) and `rejected`
 (`name`, `reason`) arrays. Their combined names must match the supplied candidate

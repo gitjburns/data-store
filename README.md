@@ -82,9 +82,10 @@ validates each response before passing its output to the next request.
 - **Relations:** select source statements, form relationship triples for each
   selected statement, then request supporting quotations for bounded batches of
   those relationships. Later calls include the original excerpt. Statements and
-  quotations match the source after retaining only letters and digits, ignoring
-  punctuation, whitespace, and word boundaries. This permits repairs such as
-  `senta letter` → `sent a letter.` without changing stored text. Nonempty-text
+  quotations use a shared fuzzy matcher: Unicode lowercasing and alphanumeric
+  filtering ignore case, punctuation, whitespace, and word boundaries; separate
+  limits allow text repairs and source omissions. The model's cleaned text is
+  retained. Matching does not establish semantic correctness. Nonempty-text
   validation and complete receipt-index accounting remain; empty quotation lists
   are permitted.
 - **Summaries:** request one summary per excerpt and validate its response shape.

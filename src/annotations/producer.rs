@@ -700,18 +700,84 @@ pub(crate) fn strict_from_str<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Match source text using only letters and digits, deliberately ignoring word
-/// boundaries because extraction can join or split words. This is a forgiving
-/// comparison only: source and model text remain unchanged. Punctuation-only
-/// output cannot satisfy the check through an empty substring.
+/// Locate cleaned model text within its source using separate allowances for
+/// repaired output characters and omitted source characters. Unicode lowercasing
+/// and alphanumeric filtering normalize comparisons without trusting word
+/// boundaries; neither input is rewritten and a match proves no semantics.
+/// Punctuation-only output cannot satisfy the check through an empty substring.
 pub(crate) fn source_text_matches(source: &str, selected: &str) -> bool {
-    let letters_and_digits = |text: &str| {
+    // Lowercase before filtering because Unicode case mappings can expand into
+    // multiple characters, including combining marks that comparison ignores.
+    let normalize = |text: &str| {
         text.chars()
+            .flat_map(char::to_lowercase)
             .filter(|character| character.is_alphanumeric())
             .collect::<String>()
     };
-    let selected = letters_and_digits(selected);
-    !selected.is_empty() && letters_and_digits(source).contains(&selected)
+    let selected = normalize(selected);
+    if selected.is_empty() {
+        return false;
+    }
+    let source = normalize(source);
+    if source.contains(&selected) {
+        return true;
+    }
+    let selected: Vec<char> = selected.chars().collect();
+    let source: Vec<char> = source.chars().collect();
+    let selected_length = selected.len();
+    // Allow four repairs for short excerpts and 15% for longer ones, with a
+    // 25% ceiling protecting very short strings. Source omissions have their
+    // own budget so removing furniture does not spend the spelling allowance.
+    let repair_limit = (selected_length / 4).min(4.max(selected_length * 3 / 20));
+    let omission_limit = 32.max(selected_length);
+    if selected_length - repair_limit > source.len() {
+        return false;
+    }
+
+    // At output prefix i, row[e][j] holds the fewest source omissions for an
+    // alignment ending at source prefix j with exactly e inserted/substituted
+    // output characters. Keeping each repair count avoids discarding an
+    // alternative alignment that alone satisfies both independent budgets.
+    let unreachable = omission_limit + 1;
+    let columns = source.len() + 1;
+    let mut previous = vec![vec![unreachable; columns]; repair_limit + 1];
+    let mut current = vec![vec![unreachable; columns]; repair_limit + 1];
+    // An empty output can start anywhere: source text outside the matched
+    // interval is free, while omissions inside it count against the budget.
+    previous[0].fill(0);
+    for (selected_index, selected_character) in selected.iter().enumerate() {
+        let prefix_length = selected_index + 1;
+        for row in &mut current {
+            row.fill(unreachable);
+        }
+        if prefix_length <= repair_limit {
+            current[prefix_length][0] = 0;
+        }
+        for (repairs, row) in current
+            .iter_mut()
+            .enumerate()
+            .take(prefix_length.min(repair_limit) + 1)
+        {
+            for (source_index, source_character) in source.iter().enumerate() {
+                let column = source_index + 1;
+                let mut omissions = row[column - 1] + 1;
+                if selected_character == source_character {
+                    omissions = omissions.min(previous[repairs][column - 1]);
+                } else if repairs > 0 {
+                    omissions = omissions.min(previous[repairs - 1][column - 1]);
+                }
+                if repairs > 0 {
+                    omissions = omissions.min(previous[repairs - 1][column]);
+                }
+                row[column] = omissions.min(unreachable);
+            }
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    // Any source endpoint may finish the match; trailing source text is free.
+    previous
+        .iter()
+        .any(|row| row.iter().any(|omissions| *omissions <= omission_limit))
 }
 
 /// Reject an empty (or whitespace-only) required string field. Empty required
