@@ -25,9 +25,10 @@
 //! in their WHERE clauses, and every SystemEvent is appended on the same
 //! transaction as the transition it records (the `crate::events` invariant).
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{error, info, warn};
@@ -223,7 +224,7 @@ struct ActivationContext<'a> {
 /// error can follow a committed pointer change; commit errors leave durability
 /// unconfirmed, as recorded at the corresponding boundary.
 pub(crate) fn gate_and_activate(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     store: &ArtifactStore,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
@@ -414,7 +415,7 @@ fn publish_dense_cache(
 // handler drives the §31.2 superseded cleanup of that predecessor via
 // `drive_activation_cleanup`.
 pub(crate) fn accept_held_parse(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     store: &ArtifactStore,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
@@ -518,7 +519,10 @@ pub(crate) fn accept_held_parse(
 /// HTTP call site, not built here.
 // Consumed by the C10a discard handler in http.rs (admin held-parse
 // disposition surface).
-pub(crate) fn discard_held_parse(index_root: &Path, parse_run_id: &str) -> Result<(), ApiError> {
+pub(crate) fn discard_held_parse(
+    index_root: &crate::runtime::StorageContext,
+    parse_run_id: &str,
+) -> Result<(), ApiError> {
     let started = Instant::now();
     info!(
         event = "activation.disposition.discard_started",

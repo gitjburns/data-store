@@ -8,13 +8,13 @@
 //! Source-unit hashes, fragment offsets, and exact text hashes identify coverage;
 //! the ordered stage contracts additionally identify reusable producer output.
 
-use rusqlite::Connection;
+use crate::sqlite::Connection;
 use serde_json::json;
 use tracing::debug;
 
 use crate::annotations::{
     chains, excerpt,
-    llm_client::{AnnotatorClient, ENABLE_THINKING, MAX_COMPLETION_TOKENS},
+    llm_client::{AnnotatorClient, ENABLE_THINKING},
     stages::Stage,
 };
 use crate::config::AnnotatorModelConfig;
@@ -223,7 +223,7 @@ impl ProducerKind {
             "outputSchemas": schemas,
             "endpoint": config.endpoint,
             "maxInputChars": config.max_input_chars,
-            "maxCompletionTokens": MAX_COMPLETION_TOKENS,
+            "maxCompletionTokens": config.max_completion_tokens,
             "enableThinking": ENABLE_THINKING,
         }))
     }

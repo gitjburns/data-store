@@ -23,7 +23,8 @@ use std::{
     time::Instant,
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
@@ -233,7 +234,7 @@ struct ImportLinkage {
 /// bundle is a recorded failed outcome (bundle kept for diagnostics), not an
 /// `Err`; `Err` means the canonical side itself failed.
 pub(crate) fn import_staged_bundle(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     bundle_dir: &Path,
 ) -> Result<ImportOutcome, ApiError> {
     let started = Instant::now();
@@ -324,12 +325,12 @@ fn load_staged_bundle(bundle_dir: &Path) -> Result<ValidatedBundle, BundleReject
 /// return the rejected ImportOutcome. The staged bundle directory is
 /// deliberately KEPT so the operator can inspect the malformed input.
 fn reject_staged_bundle(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     bundle_dir: &Path,
     rejection: BundleRejection,
     started: Instant,
 ) -> Result<ImportOutcome, ApiError> {
-    let detail = truncate_persisted_detail(&rejection.detail);
+    let detail = truncate_persisted_detail(&rejection.detail, &index_root.limits().diagnostics);
     let record = failed_record_from_rejection(bundle_dir, rejection.claims, &detail)?;
 
     let mut connection = open_bounded_write(index_root)?;
@@ -455,7 +456,7 @@ fn failed_record_from_rejection(
 /// idempotent for identical content (dedup by source_hash refreshes rather
 /// than duplicates).
 fn import_validated_bundle(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     bundle_dir: &Path,
     bundle: ValidatedBundle,
     started: Instant,
@@ -812,7 +813,7 @@ fn maintain_source_location(
 /// read is operationally meaningful state): failed AcquisitionRecord plus
 /// acquisition.failed event in one transaction. Returns the record id.
 pub(crate) fn record_failed_acquisition(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     context: &AcquisitionContext,
     native_uri: &str,
     failure_class: AcquisitionFailureClass,
@@ -832,7 +833,10 @@ pub(crate) fn record_failed_acquisition(
         governance_domain: context.governance_domain.clone(),
         outcome: AcquisitionOutcome::Failed,
         failure_class: Some(failure_class),
-        failure_detail: Some(truncate_persisted_detail(detail)),
+        failure_detail: Some(truncate_persisted_detail(
+            detail,
+            &index_root.limits().diagnostics,
+        )),
         source_hash: None,
         source_object_id: None,
         source_location_id: None,
@@ -882,7 +886,7 @@ pub(crate) fn record_failed_acquisition(
 /// makes that evidence traceable. No event is emitted: enumeration evidence
 /// anchors deletions, and the deletions themselves carry the events.
 pub(crate) fn record_enumeration(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     context: &AcquisitionContext,
     scope_uri: &str,
     elapsed_ms: u64,
@@ -949,7 +953,7 @@ pub(crate) fn record_enumeration(
 /// that is C9 deletion propagation (spec §11.3). Returns the native_uris of
 /// the deleted locations.
 pub(crate) fn apply_enumeration_deletions(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_system: &str,
     scope_uri: &str,
     enumerated: &BTreeSet<String>,
@@ -1138,7 +1142,7 @@ fn enumeration_deletions_body(
 /// connector treats them as unknown and re-stages them instead of trusting a
 /// hole. Read-only connection; no transaction needed for one SELECT.
 pub(crate) fn known_location_state(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_system: &str,
 ) -> Result<BTreeMap<String, KnownLocationState>, ApiError> {
     let started = Instant::now();
@@ -1293,18 +1297,15 @@ fn append_acquisition_failed_event(
     append_event(tx, &event)
 }
 
-/// Open the hot-plane writer for one acquisition operation. busy_timeout
-/// (bounded lock waiting) is the only statement bounding in effect:
-/// wall-clock enforcement of `hot_plane::STATEMENT_DEADLINE_MS` needs
-/// rusqlite's `hooks` feature (progress_handler), which the crate does not
-/// enable, so that deadline is unenforced pending that dependency decision.
-fn open_bounded_write(index_root: &Path) -> Result<Connection, ApiError> {
+/// Open a writer with configured lock waiting and execution-scoped deadlines.
+/// Idle transactions do not consume the SQL budget while external work proceeds.
+fn open_bounded_write(index_root: &crate::runtime::StorageContext) -> Result<Connection, ApiError> {
     hot_plane::open_write(index_root)
 }
 
 /// Open the hot-plane reader for one acquisition operation; same statement
 /// bounding status as `open_bounded_write`.
-fn open_bounded_read(index_root: &Path) -> Result<Connection, ApiError> {
+fn open_bounded_read(index_root: &crate::runtime::StorageContext) -> Result<Connection, ApiError> {
     hot_plane::open_read(index_root)
 }
 

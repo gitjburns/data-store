@@ -4,9 +4,6 @@ use anyhow::{Context, Result};
 use fancy_regex::{Captures, Regex, RegexBuilder};
 use serde::Serialize;
 
-// A malformed or pathological paragraph must fail cleanup with its rule name,
-// rather than spend unbounded time backtracking or silently miss a repair.
-const REGEX_BACKTRACK_LIMIT: usize = 1_000_000;
 const TOKEN_EDGE_PUNCTUATION: &str = "\"'“”‘’.,;:!?()[]…*_—–-";
 
 // Order follows the supplied script: possessive repairs precede quote pairing,
@@ -98,7 +95,10 @@ pub(super) struct TextCleaner {
 
 impl TextCleaner {
     /// Compilation failures retain the responsible rule before any text changes.
-    pub(super) fn new() -> Result<Self> {
+    pub(super) fn new(backtrack_limit: usize) -> Result<Self> {
+        // The configured budget applies to every rule; malformed input fails
+        // with the rule name rather than consuming unbounded backtracking work.
+        let compile = |rule, pattern| compile(rule, pattern, backtrack_limit);
         let generic = GENERIC_PASSES
             .iter()
             .map(|&(rule, pattern, replacement)| {
@@ -284,9 +284,9 @@ fn record_document_pass(
 }
 
 /// Bound regex backtracking without dropping match errors or input text.
-fn compile(rule: &'static str, pattern: &str) -> Result<Regex> {
+fn compile(rule: &'static str, pattern: &str, backtrack_limit: usize) -> Result<Regex> {
     RegexBuilder::new(pattern)
-        .backtrack_limit(REGEX_BACKTRACK_LIMIT)
+        .backtrack_limit(backtrack_limit)
         .build()
         .with_context(|| format!("failed to compile MuPDF cleanup rule {rule}"))
 }

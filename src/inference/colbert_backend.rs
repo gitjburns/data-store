@@ -22,12 +22,13 @@ use crate::{
             SMOKE_BATCH_SHORT, SMOKE_DOCUMENT, SMOKE_QUERY, format_document, format_query,
             maxsim_score, tokenize_formatted, validate_colbert_config,
         },
+        http_models::{ServedModel, failure_excerpt, verify_capacity},
     },
+    limits::{DiagnosticLimits, RuntimeLimits},
     util::{error_chain, model_call_context},
 };
 
 const HTTP_COLBERT_MODE: &str = "http_vllm_pooling";
-const FAILURE_EXCERPT_CHARS: usize = 2048;
 
 /// Exactly one inference provider is selected; neither variant falls back to the other.
 /// Both are boxed because their tokenizer/model state is large and travels with runtime clones.
@@ -57,9 +58,10 @@ impl ColbertBackend {
     pub fn load_http_with_progress(
         config: &ColbertModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        HttpColbertClient::load_with_progress(config, config_root, progress)
+        HttpColbertClient::load_with_progress(config, config_root, limits, progress)
             .map(|client| Self::Http(Box::new(client)))
     }
 
@@ -81,6 +83,30 @@ impl ColbertBackend {
         match self {
             Self::Local(runtime) => runtime.tokenizer(),
             Self::Http(client) => &client.tokenizer,
+        }
+    }
+
+    /// Bind remote token matrices to the actual advertised checkpoint behind a model alias.
+    pub(super) fn served_model(&self) -> Option<&ServedModel> {
+        match self {
+            Self::Local(_) => None,
+            Self::Http(client) => Some(&client.served),
+        }
+    }
+
+    /// Bound builder batches independently of the permitted document token length.
+    pub fn document_batch_size(&self) -> usize {
+        match self {
+            Self::Local(runtime) => runtime.document_batch_size(),
+            Self::Http(client) => client.document_batch_size,
+        }
+    }
+
+    /// Supply the local length threshold; HTTP scheduling does not use padded local attention.
+    pub fn local_batch_max_tokens(&self) -> usize {
+        match self {
+            Self::Local(runtime) => runtime.local_batch_max_tokens(),
+            Self::Http(client) => client.local_batch_max_tokens,
         }
     }
 
@@ -290,6 +316,10 @@ pub struct HttpColbertClient {
     dimension: usize,
     query_max_tokens: usize,
     document_max_tokens: usize,
+    document_batch_size: usize,
+    local_batch_max_tokens: usize,
+    served: ServedModel,
+    diagnostics: DiagnosticLimits,
     api_key: Option<String>,
     smoke_score: Option<f32>,
 }
@@ -312,7 +342,8 @@ impl fmt::Debug for HttpColbertClient {
     }
 }
 
-/// Token IDs bypass server tokenization so prompts, special tokens and truncation stay identical.
+/// Token IDs preserve client formatting and the existing query/document prefix limits.
+/// Server-side truncation is disabled so the engine cannot silently clip these IDs again.
 #[derive(Serialize)]
 struct PoolingRequest<'request> {
     model: &'request str,
@@ -321,6 +352,7 @@ struct PoolingRequest<'request> {
     use_activation: bool,
     add_special_tokens: bool,
     input: &'request [Vec<u32>],
+    truncate_prompt_tokens: Option<u32>,
 }
 
 /// vLLM supplies one indexed token matrix per input; array ordering is not assumed.
@@ -348,6 +380,7 @@ impl HttpColbertClient {
     fn load_with_progress(
         config: &ColbertModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         validate_colbert_config(config)?;
@@ -376,9 +409,19 @@ impl HttpColbertClient {
             .map_err(|source| {
                 inference_error(format!(
                     "failed to build HTTP ColBERT client: {}",
-                    error_chain(&source)
+                    error_chain(&source, &limits.diagnostics)
                 ))
             })?;
+        progress("colbert_http_capacity_verifying")?;
+        let served = verify_capacity(
+            &client,
+            &endpoint,
+            "colbert",
+            &model,
+            config.max_tokens,
+            api_key.as_deref(),
+            limits,
+        )?;
         let mut backend = Self {
             client,
             endpoint,
@@ -389,6 +432,10 @@ impl HttpColbertClient {
             dimension: config.dimension as usize,
             query_max_tokens: config.query_max_tokens as usize,
             document_max_tokens: config.document_max_tokens as usize,
+            document_batch_size: config.document_batch_size,
+            local_batch_max_tokens: config.local_batch_max_tokens,
+            served,
+            diagnostics: limits.diagnostics,
             api_key,
             smoke_score: None,
         };
@@ -410,13 +457,15 @@ impl HttpColbertClient {
     /// Report the deployed boundary and verified scoring path without credentials.
     fn health_details(&self) -> Vec<String> {
         vec![format!(
-            "ColBERT HTTP backend ready: mode {HTTP_COLBERT_MODE}, endpoint {}, model {}, dimension {}, tokenizer {}, timeout_seconds {}, scoring CPU MaxSim, smoke_score {:?}",
+            "ColBERT HTTP backend ready: mode {HTTP_COLBERT_MODE}, endpoint {}, model {}, dimension {}, tokenizer {}, timeout_seconds {}, scoring CPU MaxSim, smoke_score {:?}, verified_max_tokens {}, checkpoint {}",
             self.endpoint,
             self.model,
             self.dimension,
             self.tokenizer_path.display(),
             self.timeout_seconds,
-            self.smoke_score
+            self.smoke_score,
+            self.served.max_model_len,
+            self.served.root
         )]
     }
 
@@ -574,7 +623,7 @@ impl HttpColbertClient {
                 "HTTP ColBERT request to {} model {} purpose {purpose} failed: {}",
                 self.endpoint,
                 self.model,
-                self.redact(&error_chain(&source))
+                self.redact(&error_chain(&source, &self.diagnostics))
             ))
         });
         match &result {
@@ -608,13 +657,17 @@ impl HttpColbertClient {
             use_activation: true,
             add_special_tokens: false,
             input,
+            truncate_prompt_tokens: None,
         };
         let mut request = self.client.post(&self.endpoint).json(&body);
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
         let response = request.send().map_err(|source| {
-            inference_error(format!("request transport: {}", error_chain(&source)))
+            inference_error(format!(
+                "request transport: {}",
+                error_chain(&source, &self.diagnostics)
+            ))
         })?;
         let status = response.status();
         // Retain the complete raw body through schema and matrix validation at this protocol boundary.
@@ -622,7 +675,7 @@ impl HttpColbertClient {
         let raw = response.text().map_err(|source| {
             inference_error(format!(
                 "response body read failed after status {status}: {}",
-                error_chain(&source)
+                error_chain(&source, &self.diagnostics)
             ))
         })?;
         let parsed = serde_json::from_str::<PoolingResponse>(&raw);
@@ -639,12 +692,11 @@ impl HttpColbertClient {
             elapsed_ms = started_at.elapsed().as_millis() as u64,
             "HTTP ColBERT response received; token matrices not yet validated");
         if !status.is_success() {
-            let excerpt = self
-                .redact(&raw)
-                .chars()
-                .flat_map(char::escape_default)
-                .take(FAILURE_EXCERPT_CHARS)
-                .collect::<String>();
+            let excerpt = failure_excerpt(
+                &raw,
+                self.api_key.as_deref(),
+                self.diagnostics.model_error_excerpt_chars,
+            );
             return Err(inference_error(format!(
                 "HTTP status {status}; body_excerpt={excerpt}"
             )));

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rusqlite::Connection;
+use crate::sqlite::Connection;
 use tracing::{debug, error, info};
 
 use crate::artifact_store::ArtifactStore;

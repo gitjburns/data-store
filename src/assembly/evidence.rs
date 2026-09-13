@@ -8,7 +8,8 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::sqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use tracing::{error, info};
 
@@ -106,7 +107,7 @@ pub(crate) fn build_evidence_pack(
                 error!(event = "assembly.passage.failed", query_id,
                     parse_id = passage.parse_id, unit_id = passage.anchor_unit_id,
                     stage = "passage_inclusion", error = %source,
-                    error_chain = %crate::util::error_chain(source),
+                    error_chain = %crate::util::error_chain(source, &conn.limits().diagnostics),
                     "selected passage could not be assembled");
             })?;
         }
@@ -187,7 +188,7 @@ pub(crate) fn build_evidence_pack(
                 query_id,
                 passage_count = passages.len(),
                 error = %source,
-                error_chain = %crate::util::error_chain(&source),
+                error_chain = %crate::util::error_chain(&source, &conn.limits().diagnostics),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "assembly evidence-pack build failed"
             );
@@ -370,16 +371,19 @@ fn read_unit_content(
     unit_id: &str,
     options: &EvidenceOptions,
 ) -> Result<Option<ResolvedContent>, ApiError> {
+    let body_limit = conn.limits().resources.max_source_body_bytes;
+    let cell_limit = conn.limits().resources.max_json_cell_bytes;
     let row = conn
         .query_row(
             SELECT_EVIDENCE_UNIT_SQL,
-            params![parse_id, unit_id],
+            params![parse_id, unit_id, body_limit, cell_limit],
             |row| {
                 Ok(EvidenceUnitRow {
                     source_id: row.get::<_, String>(0)?,
                     content_type: row.get::<_, String>(1)?,
-                    body_json: row.get::<_, String>(2)?,
+                    body_json: row.get::<_, Option<String>>(2)?,
                     locators_json: row.get::<_, Option<String>>(3)?,
+                    locators_oversized: row.get::<_, bool>(4)?,
                 })
             },
         )
@@ -391,6 +395,18 @@ fn read_unit_content(
         })?;
 
     let Some(row) = row else { return Ok(None) };
+    let body_json = row.body_json.ok_or_else(|| ApiError::StorageOperation {
+        message: format!("resource limit: body of evidence unit {unit_id} in parse {parse_id} exceeds resources.max_source_body_bytes {body_limit}"),
+    })?;
+    // A NULL locator column is valid. The separate SQL flag identifies only an
+    // oversized present cell; its bytes never enter Rust and are never treated as absent.
+    if row.locators_oversized {
+        return Err(ApiError::StorageOperation {
+            message: format!(
+                "resource limit: locators of evidence unit {unit_id} in parse {parse_id} exceed resources.max_json_cell_bytes {cell_limit}"
+            ),
+        });
+    }
 
     // Preserve unit identity when reporting a corrupt stored content type.
     let content_type: ContentType = serde_json::from_value(Value::String(row.content_type.clone()))
@@ -401,7 +417,7 @@ fn read_unit_content(
             ),
         })?;
     let body: Value =
-        serde_json::from_str(&row.body_json).map_err(|source| ApiError::StorageOperation {
+        serde_json::from_str(&body_json).map_err(|source| ApiError::StorageOperation {
             message: format!("persisted body of content unit {unit_id} is unparseable: {source}"),
         })?;
 
@@ -451,14 +467,19 @@ fn render_evidence_unit(sel: &SelectedUnit, options: &EvidenceOptions) -> Eviden
 struct EvidenceUnitRow {
     source_id: String,
     content_type: String,
-    body_json: String,
+    body_json: Option<String>,
     locators_json: Option<String>,
+    locators_oversized: bool,
 }
 
 /// Ordered SELECT of one unit's evidence fields, parse-scoped (§14) and keyed on
 /// the unit id. `locators_json` is nullable (a unit may carry no locators).
+/// Byte guards run before text copying; the explicit locator flag preserves NULL semantics.
 const SELECT_EVIDENCE_UNIT_SQL: &str = "
-SELECT source_id, content_type, body_json, locators_json
+SELECT source_id, content_type,
+       CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END,
+       CASE WHEN length(CAST(locators_json AS BLOB)) <= ?4 THEN locators_json END,
+       COALESCE(length(CAST(locators_json AS BLOB)) > ?4, 0)
 FROM content_units
 WHERE parse_id = ?1 AND id = ?2";
 

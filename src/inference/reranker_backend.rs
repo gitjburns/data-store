@@ -13,7 +13,9 @@ use crate::{
     error::ApiError,
     inference::{
         InferenceProgress, RerankerCandidateInput, RerankerCandidateScore, RerankerRuntime,
+        http_models::{ServedModel, failure_excerpt, verify_capacity},
     },
+    limits::{DiagnosticLimits, RuntimeLimits},
 };
 
 // Retained inference API (pinned contract); consumed at C7c.
@@ -23,16 +25,16 @@ const HTTP_RERANKER_MODE: &str = "http_rerank";
 const SMOKE_QUERY: &str = "clear writing style rules";
 const SMOKE_DOCUMENT: &str = "Prefer specific words and direct sentences.";
 const SMOKE_DISTRACTOR_DOCUMENT: &str = "A recipe lists ingredients and oven temperatures.";
-const HTTP_FAILURE_EXCERPT_CHARS: usize = 2048;
 
 /// Config-selected reranker backend. Exactly one backend is active per service
 /// instance and there is no fallback between variants. Enum dispatch (not trait
-/// objects) keeps the generic progress-closure scoring signature intact, and
-/// boxing only the larger local runtime keeps this selector cheap to move.
+/// objects) keeps the generic progress-closure scoring signature intact. Each
+/// variant owns its provider behind a box, keeping the runtime handle compact
+/// independently of the provider's retained metadata and configuration.
 #[derive(Debug, Clone)]
 pub enum RerankerBackend {
     Local(Box<RerankerRuntime>),
-    Http(HttpRerankerClient),
+    Http(Box<HttpRerankerClient>),
 }
 
 #[derive(Clone)]
@@ -41,6 +43,8 @@ pub struct HttpRerankerClient {
     endpoint: String,
     model: String,
     timeout_seconds: u64,
+    served: ServedModel,
+    diagnostics: DiagnosticLimits,
     api_key: Option<String>,
     api_key_file_path: Option<PathBuf>,
     smoke: HttpRerankerSmoke,
@@ -67,12 +71,16 @@ struct HttpRerankerSmoke {
     first_score: f32,
 }
 
+/// Combined inputs must fit the verified serving capacity; no stage may clip their context.
 #[derive(Debug, Serialize)]
 struct HttpRerankRequest<'request> {
     model: &'request str,
     query: &'request str,
     documents: Vec<&'request str>,
     top_n: usize,
+    truncate_prompt_tokens: Option<u32>,
+    max_tokens_per_query: u32,
+    max_tokens_per_doc: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,9 +102,11 @@ impl RerankerBackend {
     pub fn load_http_with_progress(
         config: &RerankerModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        HttpRerankerClient::load_with_progress(config, config_root, progress).map(Self::Http)
+        HttpRerankerClient::load_with_progress(config, config_root, limits, progress)
+            .map(|client| Self::Http(Box::new(client)))
     }
 
     /// Return the stable backend-kind label used in health and log output.
@@ -179,6 +189,7 @@ impl HttpRerankerClient {
     fn load_with_progress(
         config: &RerankerModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         let endpoint = config.http_endpoint()?.to_string();
@@ -191,16 +202,30 @@ impl HttpRerankerClient {
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
+            // Metadata and inference must stay on the configured serving boundary.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|source| ApiError::InferenceInit {
                 message: format!("failed to build HTTP reranker client: {source}"),
             })?;
 
+        progress("reranker_http_capacity_verifying")?;
+        let served = verify_capacity(
+            &client,
+            &endpoint,
+            "reranker",
+            &model,
+            config.max_tokens,
+            api_key.as_deref(),
+            limits,
+        )?;
         let mut backend = Self {
             client,
             endpoint,
             model,
             timeout_seconds,
+            served,
+            diagnostics: limits.diagnostics,
             api_key,
             api_key_file_path,
             smoke: HttpRerankerSmoke {
@@ -219,7 +244,7 @@ impl HttpRerankerClient {
     /// Return HTTP backend readiness details without exposing credentials.
     fn health_details(&self) -> Vec<String> {
         vec![format!(
-            "reranker HTTP backend ready: mode {}, endpoint {}, model {}, timeout_seconds {}, api_key_file {}, smoke_candidates {}, smoke_score {:.6}",
+            "reranker HTTP backend ready: mode {}, endpoint {}, model {}, timeout_seconds {}, api_key_file {}, smoke_candidates {}, smoke_score {:.6}, verified_max_tokens {}, checkpoint {}",
             HTTP_RERANKER_MODE,
             self.endpoint,
             self.model,
@@ -229,7 +254,9 @@ impl HttpRerankerClient {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "absent".to_string()),
             self.smoke.candidate_count,
-            self.smoke.first_score
+            self.smoke.first_score,
+            self.served.max_model_len,
+            self.served.root
         )]
     }
 
@@ -416,6 +443,9 @@ impl HttpRerankerClient {
             query,
             top_n: documents.len(),
             documents,
+            truncate_prompt_tokens: None,
+            max_tokens_per_query: 0,
+            max_tokens_per_doc: 0,
         };
         let mut request_builder = self.client.post(&self.endpoint).json(&request);
         if let Some(api_key) = &self.api_key {
@@ -430,12 +460,13 @@ impl HttpRerankerClient {
             endpoint = %self.endpoint,
             model = %self.model,
             candidates = candidates.len(),
+            configured_max_tokens = self.served.max_model_len,
             "HTTP reranker request started"
         );
         let response = match request_builder.send() {
             Ok(response) => response,
             Err(source) => {
-                let error_detail = crate::util::error_chain(&source);
+                let error_detail = crate::util::error_chain(&source, &self.diagnostics);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "reranker",
@@ -461,7 +492,7 @@ impl HttpRerankerClient {
         let body = match response.text() {
             Ok(body) => body,
             Err(source) => {
-                let error_detail = crate::util::error_chain(&source);
+                let error_detail = crate::util::error_chain(&source, &self.diagnostics);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "reranker",
@@ -485,7 +516,11 @@ impl HttpRerankerClient {
             }
         };
         if !status.is_success() {
-            let body_excerpt = bounded_excerpt(&body);
+            let body_excerpt = failure_excerpt(
+                &body,
+                self.api_key.as_deref(),
+                self.diagnostics.model_error_excerpt_chars,
+            );
             error!(
                 event = "model_call.http_request.failed",
                 model_role = "reranker",
@@ -500,13 +535,17 @@ impl HttpRerankerClient {
                 elapsed_ms = http_started.elapsed().as_millis() as u64,
                 "HTTP reranker request failed"
             );
-            return Err(http_status_error(&self.endpoint, status, &body));
+            return Err(http_status_error(&self.endpoint, status, &body_excerpt));
         }
 
         let parsed = match serde_json::from_str::<HttpRerankResponse>(&body) {
             Ok(parsed) => parsed,
             Err(source) => {
-                let body_excerpt = bounded_excerpt(&body);
+                let body_excerpt = failure_excerpt(
+                    &body,
+                    self.api_key.as_deref(),
+                    self.diagnostics.model_error_excerpt_chars,
+                );
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "reranker",
@@ -695,26 +734,12 @@ fn validate_api_key_file_permissions(_path: &Path) -> Result<(), ApiError> {
 }
 
 /// Build an inference error for an unsuccessful HTTP reranker status response.
-fn http_status_error(endpoint: &str, status: StatusCode, body: &str) -> ApiError {
+fn http_status_error(endpoint: &str, status: StatusCode, body_excerpt: &str) -> ApiError {
     ApiError::InferenceInit {
         message: format!(
             "HTTP reranker request to {endpoint} failed with status {}; body_excerpt={}",
             status.as_u16(),
-            bounded_excerpt(body)
+            body_excerpt
         ),
     }
-}
-
-/// Return a bounded single-line excerpt for provider failure diagnostics.
-fn bounded_excerpt(value: &str) -> String {
-    let excerpt = value
-        .chars()
-        .flat_map(|character| character.escape_default())
-        .take(HTTP_FAILURE_EXCERPT_CHARS)
-        .collect::<String>();
-    if value.chars().count() > HTTP_FAILURE_EXCERPT_CHARS {
-        return format!("{excerpt}...");
-    }
-
-    excerpt
 }

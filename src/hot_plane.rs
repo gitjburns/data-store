@@ -14,13 +14,16 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Instant,
 };
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{OpenFlags, TransactionBehavior};
 use tracing::{debug, error, info};
 
 use crate::error::ApiError;
+use crate::runtime::{RuntimeSettings, StorageContext};
+use crate::sqlite::{Connection, Transaction};
 
 /// Directory under `storage.index_root` holding all fabric state (hot plane
 /// and artifact store); part of the persisted D1 layout contract.
@@ -39,30 +42,6 @@ const FABRIC_SCHEMA_SQL: &str = include_str!("../sql/fabric/schema.sql");
 /// other value means the database was created by a different schema revision
 /// and the process must stop rather than guess.
 const EXPECTED_FABRIC_SCHEMA_VERSION: i64 = 1;
-
-/// D1 connection policy: how long one connection waits for a competing
-/// lock before a statement fails with SQLITE_BUSY. Applied to every fabric
-/// connection so writers and readers degrade to bounded waiting, never to
-/// unbounded blocking.
-pub(crate) const BUSY_TIMEOUT_MS: u64 = 5_000;
-
-/// D1 statement policy: wall-clock budget for one fabric statement. Query
-/// consumers (C3 onward) must bound each statement by this deadline via
-/// `statement_deadline()`; until those consumers exist this constant is the
-/// documented policy and its helper is the enforcement hook.
-// Consumed by the first fabric query consumers (C3 onward); remove the allow when wired.
-#[allow(dead_code)]
-pub(crate) const STATEMENT_DEADLINE_MS: u64 = 5_000;
-
-/// The `STATEMENT_DEADLINE_MS` policy as a `Duration` — the value query
-/// consumers pass to their per-statement execution boundary. Full
-/// per-statement enforcement arrives with the first query consumers; keeping
-/// the conversion here keeps the policy single-sourced.
-// Consumed by the first fabric query consumers (C3 onward); remove the allow when wired.
-#[allow(dead_code)]
-pub(crate) fn statement_deadline() -> Duration {
-    Duration::from_millis(STATEMENT_DEADLINE_MS)
-}
 
 /// One column of the fabric schema contract: declared name and type, and
 /// whether NULL must be rejected (satisfied by NOT NULL or by PRIMARY KEY
@@ -456,7 +435,7 @@ fn fabric_database_path(index_root: &Path) -> PathBuf {
 /// from a different schema revision is a fatal error, not an upgrade target.
 /// This function owns the setup diagnostic boundary and logs start, terminal
 /// success, and terminal failure with elapsed time.
-pub(crate) fn setup_fabric_storage(index_root: &Path) -> Result<PathBuf, ApiError> {
+pub(crate) fn setup_fabric_storage(index_root: &StorageContext) -> Result<PathBuf, ApiError> {
     let started = Instant::now();
     let db_path = fabric_database_path(index_root);
     let already_exists = db_path.exists();
@@ -466,7 +445,7 @@ pub(crate) fn setup_fabric_storage(index_root: &Path) -> Result<PathBuf, ApiErro
         already_exists,
         "fabric hot-plane setup starting"
     );
-    match setup_fabric_database(&db_path, already_exists) {
+    match setup_fabric_database(&db_path, already_exists, index_root.shared_settings()) {
         Ok(()) => {
             info!(
                 event = "hot_plane.setup_completed",
@@ -493,7 +472,11 @@ pub(crate) fn setup_fabric_storage(index_root: &Path) -> Result<PathBuf, ApiErro
 /// Perform the setup work behind `setup_fabric_storage`, which owns the
 /// diagnostic boundary: create the fabric directory, then either create and
 /// stamp a fresh database or validate an existing one untouched.
-fn setup_fabric_database(db_path: &Path, already_exists: bool) -> Result<(), ApiError> {
+fn setup_fabric_database(
+    db_path: &Path,
+    already_exists: bool,
+    settings: Arc<RuntimeSettings>,
+) -> Result<(), ApiError> {
     // The fabric directory is shared with the artifact store; creating it
     // here keeps setup self-sufficient on a fresh index root.
     if let Some(parent) = db_path.parent() {
@@ -509,7 +492,7 @@ fn setup_fabric_database(db_path: &Path, already_exists: bool) -> Result<(), Api
         // Idempotent re-run: an existing database is validated, never
         // recreated and never migrated. `open_write` already enforces the
         // per-connection policy and the WAL check.
-        let connection = open_write_at(db_path)?;
+        let connection = open_write_at(db_path, settings)?;
         return validate_fabric_schema(&connection);
     }
 
@@ -519,7 +502,7 @@ fn setup_fabric_database(db_path: &Path, already_exists: bool) -> Result<(), Api
     // permanently rejected by the never-recreate policy — only an inert
     // temp file the next setup run overwrites.
     let temp_path = db_path.with_extension("sqlite3.setup-tmp");
-    let build_result = build_fresh_fabric_database(&temp_path);
+    let build_result = build_fresh_fabric_database(&temp_path, settings);
     if let Err(source) = build_result {
         // Best-effort cleanup keeps failed setups re-runnable; the build
         // error stays the primary diagnostic.
@@ -540,13 +523,17 @@ fn setup_fabric_database(db_path: &Path, already_exists: bool) -> Result<(), Api
 /// opens with the CREATE flag directly instead of going through `open_write`
 /// (which refuses to create). The connection is closed before the caller
 /// renames the finished file into place, so no WAL sidecar files survive.
-fn build_fresh_fabric_database(build_path: &Path) -> Result<(), ApiError> {
-    let connection = Connection::open(build_path).map_err(|source| ApiError::StorageInit {
-        message: format!(
-            "failed to create fabric database at {}: {source}",
-            build_path.display()
-        ),
-    })?;
+fn build_fresh_fabric_database(
+    build_path: &Path,
+    settings: Arc<RuntimeSettings>,
+) -> Result<(), ApiError> {
+    let connection =
+        Connection::open(build_path, settings).map_err(|source| ApiError::StorageInit {
+            message: format!(
+                "failed to create fabric database at {}: {source}",
+                build_path.display()
+            ),
+        })?;
     apply_connection_policy(&connection, build_path)?;
     // journal_mode=WAL is persistent database state (stored in the file
     // header); it is set once here and only verified everywhere else.
@@ -580,22 +567,21 @@ fn build_fresh_fabric_database(build_path: &Path) -> Result<(), ApiError> {
         .map_err(|source| ApiError::StorageInit {
             message: format!("failed to checkpoint fresh fabric database: {source}"),
         })?;
-    connection
-        .close()
-        .map_err(|(_, source)| ApiError::StorageInit {
-            message: format!("failed to close fresh fabric database: {source}"),
-        })
+    connection.close().map_err(|source| ApiError::StorageInit {
+        message: format!("failed to close fresh fabric database: {source}"),
+    })
 }
 
 /// Open a read-only connection to the fabric hot plane with the D1
 /// per-connection policy applied and the WAL journal mode verified. A
 /// missing or non-WAL database is a fatal error pointing at setup — the
 /// read path never creates or repairs anything.
-pub(crate) fn open_read(index_root: &Path) -> Result<Connection, ApiError> {
+pub(crate) fn open_read(index_root: &StorageContext) -> Result<Connection, ApiError> {
     let db_path = fabric_database_path(index_root);
     let connection = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        index_root.shared_settings(),
     )
     .map_err(|source| {
         open_failed(&db_path, "read", &source);
@@ -615,17 +601,18 @@ pub(crate) fn open_read(index_root: &Path) -> Result<Connection, ApiError> {
 /// explicit and narrowly scoped: the connection never creates the database
 /// (setup owns creation), applies the D1 per-connection policy plus FULL
 /// synchronous durability, and fails fatally if the journal mode is not WAL.
-pub(crate) fn open_write(index_root: &Path) -> Result<Connection, ApiError> {
+pub(crate) fn open_write(index_root: &StorageContext) -> Result<Connection, ApiError> {
     let db_path = fabric_database_path(index_root);
-    open_write_at(&db_path)
+    open_write_at(&db_path, index_root.shared_settings())
 }
 
 /// `open_write` body shared with the setup validation path, which already
 /// holds the resolved database path.
-fn open_write_at(db_path: &Path) -> Result<Connection, ApiError> {
+fn open_write_at(db_path: &Path, settings: Arc<RuntimeSettings>) -> Result<Connection, ApiError> {
     let connection = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        settings,
     )
     .map_err(|source| {
         open_failed(db_path, "write", &source);
@@ -847,18 +834,9 @@ fn open_failed(db_path: &Path, mode: &'static str, source: &rusqlite::Error) {
     );
 }
 
-/// Apply the per-connection D1 policy every fabric connection needs:
-/// bounded lock waiting and foreign-key enforcement. Both are connection
-/// state in SQLite, so no DDL or setup step can make them stick.
+/// Enable foreign keys on every connection. The bounded SQLite owner already
+/// installed configured lock waiting and execution deadlines before this call.
 fn apply_connection_policy(connection: &Connection, db_path: &Path) -> Result<(), ApiError> {
-    connection
-        .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
-        .map_err(|source| ApiError::StorageInit {
-            message: format!(
-                "failed to set fabric busy_timeout on {}: {source}",
-                db_path.display()
-            ),
-        })?;
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|source| ApiError::StorageInit {

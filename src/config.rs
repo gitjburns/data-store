@@ -7,6 +7,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::limits::{
+    ClientLimits, DiagnosticLimits, IndexingLimits, ParsingLimits, ResourceLimits, RetrievalLimits,
+    RuntimeLimits, SchedulingLimits, SqliteLimits, WorkerLimits,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +24,23 @@ pub struct ServiceConfig {
     /// CLI client settings sharing this config file. The server parses and
     /// validates this section so `deny_unknown_fields` accepts the shared
     /// file, but never reads it at runtime; it is client-owned.
-    pub client: ClientConfig,
+    pub client: ClientLimits,
+    /// Query candidate selection, evidence, and passage budgets.
+    pub retrieval: RetrievalLimits,
+    /// Construction limits recorded with newly published projection artifacts.
+    pub indexing: IndexingLimits,
+    /// File, matrix, inventory, and allocation guards.
+    pub resources: ResourceLimits,
+    /// Synchronous worker batch, admission, and polling limits.
+    pub workers: WorkerLimits,
+    /// Independent lock-wait and SQL execution deadlines.
+    pub sqlite: SqliteLimits,
+    /// Parser acceptance limits and subprocess observation controls.
+    pub parsing: ParsingLimits,
+    /// Filesystem sweep cadence and lifecycle observation intervals.
+    pub scheduling: SchedulingLimits,
+    /// Bounded diagnostics and previews.
+    pub diagnostics: DiagnosticLimits,
     /// Accelerator selection for all model runtimes.
     pub inference: InferenceConfig,
     /// Corpus and durable index/artifact paths owned by the service.
@@ -34,10 +54,8 @@ pub struct ServiceConfig {
     pub docling: Option<DoclingConfig>,
     /// Local model artifact locations and runtime shape limits.
     pub models: ModelConfig,
-    /// Paths to the operator-editable external policy documents (D3
-    /// amendment, CA2): config holds the PATH to a policy document, never
-    /// its values. Documents are loaded once at startup, strictly validated,
-    /// and content-hashed; versions are system-assigned (`policy_versions`).
+    /// External policy document paths. Entity-match enable flags are composed
+    /// with retrieval.entity_matching limits before effective-policy hashing.
     pub policies: PoliciesConfig,
     /// Directory of the loaded config file; the base every relative config
     /// path resolves against. Set by `load`, never deserialized.
@@ -99,26 +117,15 @@ pub struct AdminConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoliciesConfig {
-    /// Entity-match policy document (graph-entry fuzzy-match ruleset,
-    /// D9 amendment). Relative paths resolve against the config file's
-    /// directory. The document is operator-editable; its identity is its
-    /// content hash and its version is system-assigned at startup.
+    /// Entity-match enable flags, resolved relative to the config directory.
+    /// Flags combine with retrieval.entity_matching limits before startup
+    /// assigns the effective policy's content hash and version.
     pub entity_match_file_path: PathBuf,
     /// Annotator naming-rules policy document, composed into the entity and
     /// relation producer prompts (producer-identity-bearing: an edit changes
     /// promptHash and invalidates memo reuse). Relative paths resolve against
     /// the config file's directory.
     pub annotator_naming_file_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientConfig {
-    /// Timeout in seconds the CLI client applies to each individual HTTP request
-    /// (including each Operation poll). It does NOT bound the total poll-loop
-    /// duration, which runs until the Operation reaches a terminal status.
-    /// Server-validated, client-consumed.
-    pub operation_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -249,9 +256,18 @@ pub struct DenseModelConfig {
     /// Local model artifact directory for Qwen3 dense embeddings. Required
     /// when backend = "local"; forbidden otherwise.
     pub path: Option<PathBuf>,
-    /// Runtime token cap for dense embedding inputs. Required when
-    /// backend = "local"; forbidden otherwise.
-    pub max_tokens: Option<u32>,
+    /// Encoded input capacity; HTTP must match the engine and never truncates.
+    pub max_tokens: u32,
+    /// Maximum inputs per HTTP embeddings call; local inference does not batch here.
+    pub http_batch_size: usize,
+    /// Maximum concurrent HTTP embeddings requests from one projection build.
+    pub http_concurrent_requests: usize,
+    /// Transient HTTP failure retries; zero permits only the initial request.
+    pub http_max_retries: usize,
+    /// First transient-failure retry delay in milliseconds.
+    pub http_retry_initial_delay_ms: u64,
+    /// Maximum transient-failure retry delay in milliseconds.
+    pub http_retry_max_delay_ms: u64,
     /// OpenAI-compatible embeddings endpoint URL. Required when
     /// backend = "http"; forbidden otherwise.
     pub endpoint: Option<String>,
@@ -288,11 +304,10 @@ impl DenseModelConfig {
         }
     }
 
-    /// Return the local runtime token cap. Config validation guarantees
-    /// presence for the local backend; the http backend has no local token cap.
+    /// Expose the shared input capacity only to the selected local runtime.
     pub fn local_max_tokens(&self) -> Result<u32, ApiError> {
         match (self.backend, self.max_tokens) {
-            (DenseBackendKind::Local, Some(max_tokens)) => Ok(max_tokens),
+            (DenseBackendKind::Local, max_tokens) => Ok(max_tokens),
             _ => Err(ApiError::InvalidConfig {
                 message: "models.dense has no local max_tokens unless backend = \"local\""
                     .to_string(),
@@ -355,10 +370,16 @@ pub struct ColbertModelConfig {
     pub path: Option<PathBuf>,
     /// Expected ColBERT token-vector width.
     pub dimension: u32,
+    /// Checkpoint/engine encoded sequence capacity, including special tokens.
+    pub max_tokens: u32,
     /// Runtime token cap for ColBERT query inputs.
     pub query_max_tokens: u32,
     /// Runtime token cap for ColBERT document/unit inputs.
     pub document_max_tokens: u32,
+    /// Maximum document windows per embedding call.
+    pub document_batch_size: usize,
+    /// Maximum document length admitted to the local padded batch path.
+    pub local_batch_max_tokens: usize,
     /// Full vLLM pooling route URL. Required only for the HTTP backend.
     pub endpoint: Option<String>,
     /// Served ColBERT model name sent in pooling requests. HTTP only.
@@ -455,9 +476,8 @@ pub struct RerankerModelConfig {
     /// Local model artifact directory for ModernBERT sequence-classification
     /// reranking. Required when backend = "local"; forbidden otherwise.
     pub path: Option<PathBuf>,
-    /// Runtime token cap for reranker query/document pairs. Required when
-    /// backend = "local"; forbidden otherwise.
-    pub max_tokens: Option<u32>,
+    /// Encoded query/document capacity; HTTP must match the engine and never truncates.
+    pub max_tokens: u32,
     /// Cohere-compatible rerank endpoint URL. Required when backend = "http";
     /// forbidden otherwise.
     pub endpoint: Option<String>,
@@ -494,11 +514,10 @@ impl RerankerModelConfig {
         }
     }
 
-    /// Return the local runtime token cap. Config validation guarantees
-    /// presence for the local backend; the http backend has no local token cap.
+    /// Expose the shared pair capacity only to the selected local runtime.
     pub fn local_max_tokens(&self) -> Result<u32, ApiError> {
         match (self.backend, self.max_tokens) {
-            (RerankerBackendKind::Local, Some(max_tokens)) => Ok(max_tokens),
+            (RerankerBackendKind::Local, max_tokens) => Ok(max_tokens),
             _ => Err(ApiError::InvalidConfig {
                 message: "models.reranker has no local max_tokens unless backend = \"local\""
                     .to_string(),
@@ -568,6 +587,8 @@ pub struct AnnotatorModelConfig {
     /// Maximum source-excerpt length in Unicode characters. Prompts and prior
     /// stage outputs are additional; this is not a model token-budget estimate.
     pub max_input_chars: usize,
+    /// Provider completion-token allowance per call, including reasoning tokens.
+    pub max_completion_tokens: u64,
     /// Malformed-output retry allowance per annotation; zero permits only the
     /// initial attempt. This budget also determines the temperature ramp.
     pub annotation_max_retries: u32,
@@ -623,8 +644,26 @@ impl ServiceConfig {
         self.server.bind_address
     }
 
+    /// Copy validated leaf settings into the startup-owned runtime context.
+    pub fn runtime_limits(&self) -> RuntimeLimits {
+        RuntimeLimits {
+            retrieval: self.retrieval,
+            indexing: self.indexing,
+            resources: self.resources,
+            workers: self.workers,
+            sqlite: self.sqlite,
+            parsing: self.parsing,
+            scheduling: self.scheduling,
+            diagnostics: self.diagnostics,
+            client: self.client,
+        }
+    }
+
     /// Validate cross-field config invariants that TOML deserialization cannot express.
     fn validate(&self) -> Result<(), ApiError> {
+        self.runtime_limits()
+            .validate()
+            .map_err(|message| ApiError::InvalidConfig { message })?;
         require_positive_usize(
             "server.max_request_body_bytes",
             self.server.max_request_body_bytes,
@@ -639,10 +678,6 @@ impl ServiceConfig {
         )?;
         require_non_empty_path("logging.file_path", &self.logging.file_path)?;
         require_non_empty_path("admin.token_file_path", &self.admin.token_file_path)?;
-        require_positive_u64(
-            "client.operation_timeout_seconds",
-            self.client.operation_timeout_seconds,
-        )?;
         require_absolute_path("storage.corpus_root", &self.storage.corpus_root)?;
         require_absolute_path("storage.index_root", &self.storage.index_root)?;
         require_non_empty(
@@ -718,6 +753,10 @@ impl ServiceConfig {
         require_positive_usize(
             "models.annotator.max_input_chars",
             self.models.annotator.max_input_chars,
+        )?;
+        require_positive_u64(
+            "models.annotator.max_completion_tokens",
+            self.models.annotator.max_completion_tokens,
         )?;
         // Zero retry allowances are valid, but enabled retry paths must never
         // become a busy loop. The annotation interval has no execution ceiling.
@@ -910,6 +949,27 @@ pub fn resolve_cli_options_from_args() -> Result<CliOptions, ApiError> {
 /// backend's fields must be absent so misconfiguration fails at startup
 /// instead of being silently ignored.
 fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiError> {
+    require_positive("models.dense.max_tokens", dense.max_tokens)?;
+    require_positive_usize("models.dense.http_batch_size", dense.http_batch_size)?;
+    require_positive_usize(
+        "models.dense.http_concurrent_requests",
+        dense.http_concurrent_requests,
+    )?;
+    require_positive_u64(
+        "models.dense.http_retry_initial_delay_ms",
+        dense.http_retry_initial_delay_ms,
+    )?;
+    require_positive_u64(
+        "models.dense.http_retry_max_delay_ms",
+        dense.http_retry_max_delay_ms,
+    )?;
+    if dense.http_retry_initial_delay_ms > dense.http_retry_max_delay_ms {
+        return Err(ApiError::InvalidConfig {
+            message:
+                "models.dense.http_retry_initial_delay_ms must not exceed http_retry_max_delay_ms"
+                    .into(),
+        });
+    }
     match dense.backend {
         DenseBackendKind::Local => {
             let Some(path) = dense.path.as_ref() else {
@@ -918,13 +978,6 @@ fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiErro
                 });
             };
             require_absolute_path("models.dense.path", path)?;
-            let Some(max_tokens) = dense.max_tokens else {
-                return Err(ApiError::InvalidConfig {
-                    message: "models.dense.max_tokens is required when backend = \"local\""
-                        .to_string(),
-                });
-            };
-            require_positive("models.dense.max_tokens", max_tokens)?;
             if dense.endpoint.is_some()
                 || dense.model.is_some()
                 || dense.timeout_seconds.is_some()
@@ -938,10 +991,9 @@ fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiErro
             }
         }
         DenseBackendKind::Http => {
-            if dense.path.is_some() || dense.max_tokens.is_some() {
+            if dense.path.is_some() {
                 return Err(ApiError::InvalidConfig {
-                    message: "models.dense with backend = \"http\" must not set path or max_tokens"
-                        .to_string(),
+                    message: "models.dense with backend = \"http\" must not set path".to_string(),
                 });
             }
             let Some(endpoint) = dense.endpoint.as_deref() else {
@@ -984,6 +1036,23 @@ fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiErro
 /// Reject missing or mixed ColBERT backend settings before model initialization;
 /// HTTP keeps a matching tokenizer locally but must never require model weights.
 fn validate_colbert_backend_fields(colbert: &ColbertModelConfig) -> Result<(), ApiError> {
+    require_positive("models.colbert.max_tokens", colbert.max_tokens)?;
+    require_positive_usize(
+        "models.colbert.document_batch_size",
+        colbert.document_batch_size,
+    )?;
+    require_positive_usize(
+        "models.colbert.local_batch_max_tokens",
+        colbert.local_batch_max_tokens,
+    )?;
+    // Backend capacity is distinct from window policy, but no configured input
+    // path may exceed the capacity that initialization verifies with the model.
+    if colbert.query_max_tokens > colbert.max_tokens
+        || colbert.document_max_tokens > colbert.max_tokens
+        || colbert.local_batch_max_tokens > colbert.max_tokens as usize
+    {
+        return Err(ApiError::InvalidConfig { message: "models.colbert query_max_tokens, document_max_tokens, and local_batch_max_tokens must not exceed max_tokens".into() });
+    }
     match colbert.backend {
         ColbertBackendKind::Local => {
             let Some(path) = colbert.path.as_ref() else {
@@ -1061,6 +1130,7 @@ fn validate_colbert_backend_fields(colbert: &ColbertModelConfig) -> Result<(), A
 /// backend's fields must be absent so misconfiguration fails at startup
 /// instead of being silently ignored.
 fn validate_reranker_backend_fields(reranker: &RerankerModelConfig) -> Result<(), ApiError> {
+    require_positive("models.reranker.max_tokens", reranker.max_tokens)?;
     match reranker.backend {
         RerankerBackendKind::Local => {
             let Some(path) = reranker.path.as_ref() else {
@@ -1070,13 +1140,6 @@ fn validate_reranker_backend_fields(reranker: &RerankerModelConfig) -> Result<()
                 });
             };
             require_absolute_path("models.reranker.path", path)?;
-            let Some(max_tokens) = reranker.max_tokens else {
-                return Err(ApiError::InvalidConfig {
-                    message: "models.reranker.max_tokens is required when backend = \"local\""
-                        .to_string(),
-                });
-            };
-            require_positive("models.reranker.max_tokens", max_tokens)?;
             if reranker.endpoint.is_some()
                 || reranker.model.is_some()
                 || reranker.timeout_seconds.is_some()
@@ -1090,11 +1153,10 @@ fn validate_reranker_backend_fields(reranker: &RerankerModelConfig) -> Result<()
             }
         }
         RerankerBackendKind::Http => {
-            if reranker.path.is_some() || reranker.max_tokens.is_some() {
+            if reranker.path.is_some() {
                 return Err(ApiError::InvalidConfig {
-                    message:
-                        "models.reranker with backend = \"http\" must not set path or max_tokens"
-                            .to_string(),
+                    message: "models.reranker with backend = \"http\" must not set path"
+                        .to_string(),
                 });
             }
             let Some(endpoint) = reranker.endpoint.as_deref() else {

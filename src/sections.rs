@@ -2,13 +2,12 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{Connection, params};
+use crate::sqlite::Connection;
+use rusqlite::params;
 use serde_json::Value;
 
-use crate::assembly::model::MAX_PASSAGE_UNITS;
 use crate::error::ApiError;
 
-const MAX_SECTION_BODY_BYTES: usize = 1_048_576;
 const PARENT_SQL: &str = "
 SELECT DISTINCT p.id, p.content_type,
        CASE WHEN length(CAST(p.body_json AS BLOB)) <= ?3 THEN p.body_json END
@@ -33,15 +32,22 @@ pub(crate) fn read_section(
             "prepare logical ancestry of {unit_id} in {parse_id}: {source}"
         ))
     })?;
-    for _ in 0..MAX_PASSAGE_UNITS {
+    for _ in 0..conn.limits().retrieval.max_section_ancestry {
         let parents = statement
-            .query_map(params![parse_id, current, MAX_SECTION_BODY_BYTES], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
+            .query_map(
+                params![
+                    parse_id,
+                    current,
+                    conn.limits().resources.max_source_body_bytes
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
             .map_err(|source| {
                 failure(format!(
                     "read logical parent of {current} in {parse_id}: {source}"
@@ -68,7 +74,7 @@ pub(crate) fn read_section(
         }
         let body = body.ok_or_else(|| {
             failure(format!(
-                "section ancestor {id} in {parse_id} exceeds {MAX_SECTION_BODY_BYTES} body bytes"
+                "resource limit: section ancestor {id} in {parse_id} exceeds configured body bytes"
             ))
         })?;
         let body: Value = serde_json::from_str(&body).map_err(|source| {
@@ -83,7 +89,7 @@ pub(crate) fn read_section(
         current = id;
     }
     Err(failure(format!(
-        "logical section ancestry of {unit_id} exceeds {MAX_PASSAGE_UNITS} hops in {parse_id}"
+        "resource limit: logical section ancestry of {unit_id} exceeds configured hops in {parse_id}"
     )))
 }
 

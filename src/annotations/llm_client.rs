@@ -26,6 +26,7 @@ use tracing::{error, info};
 use super::transcript::{Transcript, TranscriptCall};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
+use crate::limits::DiagnosticLimits;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::types::AnnotationProgressCount;
 use crate::util::{LogContext, truncate_diagnostic_text};
@@ -35,9 +36,6 @@ use crate::util::{LogContext, truncate_diagnostic_text};
 /// `annotator_http.` prefix so an operator can grep annotator calls distinctly
 /// from reranker calls.
 const ANNOTATOR_HTTP_MODE: &str = "openai_chat_completions";
-
-/// Thinking and the final answer share the tested provider output allowance.
-pub(crate) const MAX_COMPLETION_TOKENS: u64 = 150_000;
 
 /// Producer identity and live requests share the tested reasoning-mode contract.
 pub(crate) const ENABLE_THINKING: bool = true;
@@ -65,6 +63,9 @@ pub(crate) struct AnnotatorClient {
     model: String,
     timeout_seconds: u64,
     max_input_chars: usize,
+    // Thinking and final output share this configured provider allowance.
+    max_completion_tokens: u64,
+    diagnostics: DiagnosticLimits,
     api_key: Option<String>,
     api_key_file_path: Option<PathBuf>,
     // Producer clones must share one writer lock for indivisible transcript blocks.
@@ -168,13 +169,13 @@ struct CompletionTokenDetails {
 impl CompletedResponse {
     /// Decode one completed chat response. Retain its original body separately;
     /// protocol errors expose compact context to the service log, not payloads.
-    fn accept_body(&mut self) -> Result<(), String> {
+    fn accept_body(&mut self, diagnostics: &DiagnosticLimits) -> Result<(), String> {
         let event: serde_json::Value = serde_json::from_slice(&self.body)
             .map_err(|source| format!("response JSON decoding failed: {source}"))?;
         if event.get("error").is_some_and(|error| !error.is_null()) {
             return Err(format!(
                 "provider response error: {}",
-                provider_error_detail(&event)
+                provider_error_detail(&event, diagnostics)
             ));
         }
         if let Some(id) = optional_response_text(&event, "id")? {
@@ -288,7 +289,7 @@ fn validate_protocol_label(value: &str, field: &str) -> Result<(), String> {
 
 /// Retain bounded provider rejection detail without dumping a successful model
 /// response. Only standard error fields enter this diagnostic representation.
-fn provider_error_detail(envelope: &serde_json::Value) -> String {
+fn provider_error_detail(envelope: &serde_json::Value, diagnostics: &DiagnosticLimits) -> String {
     let error = envelope.get("error").unwrap_or(envelope);
     let fields = ["type", "code", "message"]
         .into_iter()
@@ -301,7 +302,7 @@ fn provider_error_detail(envelope: &serde_json::Value) -> String {
                         Some(text) => text.to_string(),
                         None => value.to_string(),
                     };
-                    format!("{key}={}", bounded_error_text(&text))
+                    format!("{key}={}", bounded_error_text(&text, diagnostics))
                 })
         })
         .collect::<Vec<_>>();
@@ -313,13 +314,13 @@ fn provider_error_detail(envelope: &serde_json::Value) -> String {
 }
 
 /// Bound diagnostic text before escaping it so error bodies cannot inflate logs.
-fn bounded_error_text(value: &str) -> String {
-    let bounded = truncate_diagnostic_text(value);
+fn bounded_error_text(value: &str, diagnostics: &DiagnosticLimits) -> String {
+    let bounded = truncate_diagnostic_text(value, diagnostics);
     let escaped = bounded
         .chars()
         .flat_map(char::escape_default)
         .collect::<String>();
-    truncate_diagnostic_text(&escaped)
+    truncate_diagnostic_text(&escaped, diagnostics)
 }
 
 impl AnnotatorClient {
@@ -335,6 +336,7 @@ impl AnnotatorClient {
     pub(crate) fn load(
         config: &AnnotatorModelConfig,
         config_root: &Path,
+        diagnostics: DiagnosticLimits,
         cancellation: AnnotationCancellation,
     ) -> Result<Self, ApiError> {
         let endpoint = config.endpoint.trim().to_string();
@@ -384,6 +386,8 @@ impl AnnotatorClient {
             model,
             timeout_seconds,
             max_input_chars: config.max_input_chars,
+            max_completion_tokens: config.max_completion_tokens,
+            diagnostics,
             api_key,
             api_key_file_path,
             transcript: Arc::new(Transcript::open(config_root)),
@@ -451,7 +455,7 @@ impl AnnotatorClient {
             timeout_seconds = self.timeout_seconds,
             temperature,
             input_chars,
-            max_completion_tokens = MAX_COMPLETION_TOKENS,
+            max_completion_tokens = self.max_completion_tokens,
             enable_thinking = ENABLE_THINKING,
             structured_output = true,
             streaming = false,
@@ -580,7 +584,7 @@ impl AnnotatorClient {
                 },
             ],
             temperature,
-            max_completion_tokens: MAX_COMPLETION_TOKENS,
+            max_completion_tokens: self.max_completion_tokens,
             stream: false,
             response_format: ResponseFormat {
                 r#type: "json_schema",
@@ -609,7 +613,7 @@ impl AnnotatorClient {
                 None,
                 &format!(
                     "request failed before response: {}",
-                    crate::util::error_chain(&source)
+                    crate::util::error_chain(&source, &self.diagnostics)
                 ),
             )
         })?;
@@ -624,7 +628,7 @@ impl AnnotatorClient {
                     Some(status),
                     &format!(
                         "response body read failed: {}",
-                        crate::util::error_chain(&source)
+                        crate::util::error_chain(&source, &self.diagnostics)
                     ),
                 )
             })?
@@ -635,10 +639,10 @@ impl AnnotatorClient {
             // Preserve provider rejection details in the bounded terminal error;
             // the transcript displays selected response fields and that RESULT.
             let detail = match serde_json::from_slice::<serde_json::Value>(body) {
-                Ok(envelope) => provider_error_detail(&envelope),
+                Ok(envelope) => provider_error_detail(&envelope, &self.diagnostics),
                 Err(source) => format!(
                     "error-body JSON decoding failed: {source}; body_excerpt={}",
-                    bounded_error_text(&String::from_utf8_lossy(body))
+                    bounded_error_text(&String::from_utf8_lossy(body), &self.diagnostics)
                 ),
             };
             return Err(self.call_error(
@@ -653,7 +657,7 @@ impl AnnotatorClient {
             "annotator response body received"
         );
         completed
-            .accept_body()
+            .accept_body(&self.diagnostics)
             .map_err(|detail| self.call_error(Some(status), &detail))?;
         // A token-limit finish is still an execution failure. Only a complete,
         // nonempty answer proceeds to the stage's structural parser.

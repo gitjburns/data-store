@@ -62,6 +62,8 @@ pub struct ColbertRuntime {
     encoder: ColbertEncoderRuntime,
     query_max_tokens: usize,
     document_max_tokens: usize,
+    document_batch_size: usize,
+    local_batch_max_tokens: usize,
     attention_smoke: ColbertAttentionSmoke,
     single_layer_smoke: ColbertLayerSmoke,
     full_encoder_smoke: ColbertFullEncoderSmoke,
@@ -352,6 +354,12 @@ impl ColbertRuntime {
         progress("colbert_config_loading")?;
         let model_config = load_modernbert_config(&artifacts.config_path)?;
         validate_modernbert_config(&model_config)?;
+        if config.max_tokens as usize > model_config.max_position_embeddings {
+            return Err(inference_error(format!(
+                "models.colbert.max_tokens {} exceeds checkpoint max_position_embeddings {}",
+                config.max_tokens, model_config.max_position_embeddings
+            )));
+        }
         progress("colbert_config_ready")?;
         progress("colbert_tokenizer_contract_validating")?;
         validate_tokenizer_contract(artifacts, config)?;
@@ -559,6 +567,8 @@ impl ColbertRuntime {
             encoder,
             query_max_tokens: config.query_max_tokens as usize,
             document_max_tokens: config.document_max_tokens as usize,
+            document_batch_size: config.document_batch_size,
+            local_batch_max_tokens: config.local_batch_max_tokens,
             attention_smoke,
             single_layer_smoke,
             full_encoder_smoke,
@@ -646,10 +656,20 @@ impl ColbertRuntime {
         self.document_max_tokens
     }
 
+    /// Bound padded document batches at the builder's admission boundary.
+    pub(super) fn document_batch_size(&self) -> usize {
+        self.document_batch_size
+    }
+
+    /// Route long inputs to batch-one inference where padding would multiply attention work.
+    pub(super) fn local_batch_max_tokens(&self) -> usize {
+        self.local_batch_max_tokens
+    }
+
     /// Encode and flatten one unit's ColBERT document token matrix. Production
     /// path for LONG units under the CPd length-threshold hybrid (2026-07-18):
-    /// the C6e builder routes units above `COLBERT_BATCH_ROUTE_MAX_TOKENS`
-    /// (multivector.rs) here — padded quadratic attention makes the batched
+    /// the C6e builder routes units above configured `local_batch_max_tokens`
+    /// here — padded quadratic attention makes the batched
     /// path slower past the ~130-token crossover — and packs the rest through
     /// `embed_documents`. Also consumed by the colbert-diagnostic bin, and
     /// remains the pinned byte-compatibility reference the batched path is
@@ -2452,11 +2472,14 @@ pub(super) fn validate_colbert_config(config: &ColbertModelConfig) -> Result<(),
         )));
     }
 
-    if config.query_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
-        || config.document_max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
+    // The checkpoint's positional contract is a physical constraint, not an operator override.
+    if config.max_tokens as usize > EXPECTED_TOKENIZER_MAX_LENGTH
+        || config.query_max_tokens > config.max_tokens
+        || config.document_max_tokens > config.max_tokens
     {
         return Err(inference_error(format!(
-            "models.colbert query/document max tokens must be <= {EXPECTED_TOKENIZER_MAX_LENGTH}"
+            "models.colbert query/document max tokens must fit max_tokens {}, within ColBERT-Zero capacity {EXPECTED_TOKENIZER_MAX_LENGTH}",
+            config.max_tokens
         )));
     }
 
@@ -2845,6 +2868,8 @@ pub(super) fn format_document(text: &str) -> String {
 }
 
 /// Tokenize one formatted ColBERT text and apply the configured service truncation.
+/// Legacy whole-unit inputs and queries retain their existing prefix policy;
+/// annotation representations arrive through complete, verified document windows.
 pub(super) fn tokenize_formatted(
     tokenizer: &Tokenizer,
     text: &str,

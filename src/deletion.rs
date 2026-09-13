@@ -39,9 +39,8 @@
 // scan-failure steps in `run_cycle` dispatch all three (C9 wiring landed), so
 // no module-level dead-code allow is needed.
 
-use std::path::Path;
-
-use rusqlite::{Transaction, params};
+use crate::sqlite::Transaction;
+use rusqlite::params;
 use serde_json::Map;
 use tracing::{debug, error, info};
 
@@ -170,7 +169,7 @@ WHERE id = ?1 AND status = 'current'";
 /// `deactivate_one_source`). The order matches the candidate scan (ORDER BY
 /// objects.id).
 pub(crate) fn propagate_deletions(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     // Captured once at startup and threaded to the pre-deactivation snapshot
@@ -226,7 +225,7 @@ pub(crate) fn propagate_deletions(
 /// materialized before any deactivation writes so the per-source barrier +
 /// transaction sequence below never races this cursor.
 fn load_deactivation_candidates(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_system: &str,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let connection = hot_plane::open_write(index_root)?;
@@ -279,7 +278,7 @@ fn load_deactivation_candidates(
 /// than a barrier may be held) and keeps deactivation reversible: the hot delete
 /// is not, so it is dispatched by the caller, not folded into the flag write.
 fn deactivate_one_source(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     identity: &ApplicationIdentity,
@@ -406,7 +405,7 @@ fn deactivate_source_body(
 /// visible on the queryable plane without its restored hot records is a broken
 /// publish, worse than staying deactivated until the next cycle retries.
 pub(crate) fn restore_reappeared_sources(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -459,7 +458,7 @@ pub(crate) fn restore_reappeared_sources(
 /// connection, materialized before any restore so the per-source restore +
 /// flag-clear below never races this cursor.
 fn load_reactivation_candidates(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_system: &str,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let connection = hot_plane::open_write(index_root)?;
@@ -490,7 +489,7 @@ fn load_reactivation_candidates(
 /// restore-failure policy on `restore_reappeared_sources`: the flag clears only
 /// after restore succeeds.
 fn restore_one_source(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -558,7 +557,7 @@ fn restore_one_source(
 /// publish (inside restore) → this flag-clear. `reason` tags the reactivation
 /// event for the calling context.
 pub(crate) fn restore_and_reactivate_source(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -643,7 +642,7 @@ fn reactivate_source_body(
 /// scheduler recorded for this source-side failure; it is carried into each
 /// access-lost event so the transition traces back to the observing attempt.
 pub(crate) fn mark_scope_access_lost(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_system: &str,
     scope_uri: &str,
     acquisition_record_id: &str,

@@ -21,6 +21,8 @@ pub struct Qwen3Config {
     pub hidden_act: String,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Declared positional capacity; operator limits cannot extend the checkpoint.
+    pub max_position_embeddings: usize,
     pub model_type: String,
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,

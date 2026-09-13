@@ -55,7 +55,7 @@ All request and response bodies are `application/json`. Request bodies for the
 routes that accept one must be valid JSON; the JSON envelopes reject unknown
 fields (`deny_unknown_fields`) — see the note under each route.
 
-There is a global request-body size limit. A body over that limit is rejected
+`server.max_request_body_bytes` sets the global request-body limit. Excess is rejected
 with HTTP `413` (`payload_too_large`) when the handler decodes the body. On
 protected routes the bearer token is checked **before** the body is decoded, so
 an oversized request without valid credentials gets `401`, not `413`.
@@ -351,7 +351,7 @@ intersection yields an empty result, not an error.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `maxFinalEvidenceUnits` | `u32` | Maximum returned passages, `1..=100`; default `10`. Does not limit candidate generation or raw canonical-unit count. |
+| `maxFinalEvidenceUnits` | `u32` | Maximum returned passages, `1..=retrieval.max_results`; omitted uses `retrieval.default_results` (shipped values: 100 and 10). Does not limit candidate generation or raw canonical-unit count. |
 
 `evidencePolicy` (`deny_unknown_fields`):
 
@@ -379,7 +379,7 @@ absence is a deliberate MVP narrowing, not a gap to work around.
 - `queryText` empty after trimming whitespace → `"queryText must not be empty"`.
 - `queryText` longer than the configured character cap →
   `"queryText exceeds maximum length of N characters"`.
-- `maxFinalEvidenceUnits` outside `1..=max_top_k` →
+- `maxFinalEvidenceUnits` outside `1..=retrieval.max_results` →
   `"maxFinalEvidenceUnits must be between 1 and N"`.
 
 Under capacity saturation the query is rejected with `503`
@@ -443,7 +443,7 @@ when the request set `debug: true`:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `text` | string | Passage text in canonical reading order, bounded to 512 ColBERT tokens. |
+| `text` | string | Passage text in canonical reading order, bounded to `retrieval.passage_max_tokens` ColBERT tokens. |
 | `sourceId`, `parseId` | string | Captured source and active parse. |
 | `unitIds` | array of string | Canonical units contributing to the passage, in reading order. |
 | `sourceExcerpts` | array | Displayed canonical ranges, in passage order: `unitId`, `startChar`, `endChar`, `textHash`. Offsets are Unicode-scalar positions; `endChar` is exclusive and the hash covers the excerpt's UTF-8 bytes. |
@@ -485,10 +485,17 @@ Each `annotationMatches` entry contains `projectionId`, `representationId`,
 targets. Attribution contains identities and ranges; annotation bodies remain
 controlled by evidence inclusion options.
 
-Retrieval profile v4 uses three outer RRF contributions: source dense, lexical,
+Retrieval profile v5 seals the configured retrieval `limits` object and uses
+three outer RRF contributions: source dense, lexical,
 and grouped graph plus semantic annotation retrieval. Passage/section/source-window
 ranks merge within source dense; individual and combined annotations share the
 annotation contribution. Diagnostic fused scores are RRF scores, not raw cosine.
+The configured reranker candidate depth is raised for larger valid result requests
+within the ColBERT pool cap. Matched graph context has no separate token cutoff.
+HTTP reranking sends the complete assembled pair with server truncation disabled;
+an engine overlength rejection fails the query visibly. Existing local-model and
+ColBERT token-ID prefix handling remains unchanged. AssemblyPolicy v3 applies
+configured raw-evidence ceilings using complete token counts, without expansion controls.
 Queries return `503 service_unavailable` with rebuild instructions when any
 scoped active parse lacks the required persisted passage/section representation.
 
@@ -847,6 +854,9 @@ existence check — the file may legitimately land before the next scan); a
 URI that passes but names no corpus file still fails asynchronously, as the
 Operation, at the next scan cycle.
 
+Both ingest routes reject references exceeding `server.max_ingest_source_chars`
+with `400 bad_request` before creating an Operation or queue entry.
+
 **Response `202`** — `{ operationId }`.
 
 ```bash
@@ -950,6 +960,8 @@ Mint a corpus-wide snapshot (detached async task). Writes a `pending` Operation
 
 Scope and exported rows share one SQLite read snapshot. Published annotation
 manifests and their dense/ColBERT payloads are included with their recorded lineage.
+New chunk construction descriptors and versioned section/annotation settings are
+pinned with their payloads; legacy snapshots retain their original formats.
 
 **Request body** — `SnapshotRequest` (`camelCase`, `deny_unknown_fields`); all
 fields optional:
@@ -995,6 +1007,9 @@ Snapshots without required passage/section dense projections are rejected before
 restore writes. Section and archived annotation embedding payloads are verified
 and restored without model calls. Graph reconstruction uses each archived
 projection's declared annotation inputs, preserving its publication state.
+Construction validation uses recorded settings rather than current indexing
+limits. Current read/allocation guards may reject a historical artifact with an
+explicit resource-limit error; this is not an artifact-corruption verdict.
 
 **Response `202`** — `{ operationId }`.
 
@@ -1216,7 +1231,8 @@ operator policy documents from the corpus's own observed vocabulary.
   `"GET /annotations/vocabulary scope must be active|all; got ..."`.
 
 Both responses share a common frame of counters. The reader is bounded: it reads
-at most `MAX_ROWS_READ = 200_000` rows and forms at most `MAX_GROUPS = 50_000`
+at most `resources.vocabulary_scan_rows` rows and forms at most
+`resources.vocabulary_groups`
 groups; `truncated` is `true` when either cap was hit. Rows whose body is the
 empty-marker `[]` (the "no annotations here" convention) are counted into
 `skippedMarkerCount` and never grouped; rows with an otherwise-unparseable body
@@ -1232,7 +1248,7 @@ are counted into `malformedRowCount` and never grouped.
 | `skippedMarkerCount` | `u64` | always — empty-`[]` marker rows skipped |
 | `malformedRowCount` | `u64` | always — unparseable non-marker rows skipped |
 | `truncated` | bool | always — a row or group cap was hit |
-| `rowsRead` | `u64` | always — total rows read (≤ `MAX_ROWS_READ`) |
+| `rowsRead` | `u64` | always — total rows read (≤ `resources.vocabulary_scan_rows`) |
 | `groupCount` | `u64` | always — number of groups returned |
 
 Entity group fields (`camelCase`):

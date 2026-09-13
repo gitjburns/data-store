@@ -37,10 +37,11 @@
 //! deterministic planes; it never re-embeds, re-parses, or re-scores. A grep for
 //! `embed|InferenceRuntime|score_|docling` over this file must stay empty.
 
-use std::path::Path;
+use crate::runtime::StorageContext;
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value};
 use tracing::{error, info};
 
@@ -57,6 +58,7 @@ use crate::projections::dense_cache::DenseCache;
 use crate::projections::envelope;
 use crate::snapshot::verify::{verify_deletion_gate, verify_mechanical};
 use crate::state::CutoverRegistry;
+use crate::util::hash_prefix;
 
 /// Log-event namespace passed to the shared hot-plane transaction helpers and
 /// stamped on this module's boundary logs, so every superseded-cleanup and
@@ -287,7 +289,7 @@ pub(crate) enum SupersededCleanupMode {
 // each Activated gate decision) and its deactivation-flow cleanup loop
 // (`Deactivation` over each pair `propagate_deletions` returns).
 pub(crate) fn complete_superseded_parse(
-    index_root: &Path,
+    index_root: &StorageContext,
     source_id: &str,
     superseded_parse_id: &str,
     mode: SupersededCleanupMode,
@@ -773,7 +775,7 @@ fn cleanup_flow_label(mode: &SupersededCleanupMode) -> &'static str {
 /// restore). Restore-path failures are `RestoreFailed`; `SnapshotVerificationFailed`
 /// from the mechanical tier propagates untouched. NO re-parse, NO re-embed.
 pub(crate) fn restore_source_from_snapshot(
-    index_root: &Path,
+    index_root: &StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     dense_dimension: usize,
@@ -1168,7 +1170,7 @@ fn reimport_blob_plane(
             .map_err(|source| ApiError::RestoreFailed {
                 message: format!(
                     "restore of {table}: archived blob {} failed to load: {source}",
-                    hash_prefix(&blob_hash)
+                    hash_prefix(&blob_hash, &store.limits().diagnostics)
                 ),
             })?;
         insert_blob_row_from_object(tx, table, object, blob_column, &hash_key, &blob)?;
@@ -1395,7 +1397,7 @@ fn load_archived_jsonl(
         .map_err(|source| ApiError::RestoreFailed {
             message: format!(
                 "restore: archived {artifact_type} ({}) failed to load: {source}",
-                hash_prefix(&artifact.hash)
+                hash_prefix(&artifact.hash, &store.limits().diagnostics)
             ),
         })
 }
@@ -1484,13 +1486,6 @@ fn decode_json_string_array(
             ApiError::StorageOperation { message }
         }
     })
-}
-
-/// First 12 hex chars of a hash for bounded logging/messages (never the full
-/// digest, never content — DIAGNOSTICS forbidden-data rule).
-fn hash_prefix(hash: &str) -> &str {
-    let end = hash.len().min(12);
-    &hash[..end]
 }
 
 /// The snake_case wire name of a `SnapshotType` for the subject-snapshot lookup

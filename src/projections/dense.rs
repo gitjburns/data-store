@@ -54,7 +54,8 @@
 
 use std::time::Instant;
 
-use rusqlite::{Connection, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use tracing::{error, info};
 
 use crate::error::ApiError;
@@ -84,25 +85,6 @@ const DENSE_PRODUCER_VERSION: &str = "1";
 /// the same identifiers the gate's `model_gate.*` events use.
 const DENSE_MODEL_ROLE: &str = "dense";
 const DENSE_CALL_PURPOSE: &str = "passage_embedding";
-
-/// Number of chunk passages sent per batched HTTP embeddings request. Applies to
-/// the HTTP dense backend ONLY; the local path stays batch-1 (CPa revert — the
-/// 8B forward already saturates this GPU at batch 1, so right-padding a batch was
-/// a net regression). Engineering fact, not an operator config knob: 32 is an
-/// initial value pending the HTTP-backend re-benchmark measurements — mirror of
-/// the `COLBERT_BATCH_ROUTE_MAX_TOKENS` engineering-fact style. Revisit against
-/// that re-benchmark's throughput/latency data.
-const DENSE_HTTP_BATCH_SIZE: usize = 32;
-
-/// Number of `DENSE_HTTP_BATCH_SIZE` windows dispatched concurrently on scoped
-/// OS threads for the HTTP dense backend ONLY (the local path stays batch-1,
-/// gate-serialized — concurrency is impossible and wrong there). Engineering
-/// fact, not an operator config knob: this initial value is sized against
-/// provider rate limits; a failed window fails the source's whole projection
-/// build, so this bound is deliberately conservative — revisit with observed
-/// 429 rates. Each in-flight thread holds exactly one HTTP request; SQLite
-/// persistence stays serial on the scheduler thread (see `build_all_chunks`).
-const DENSE_HTTP_CONCURRENT_REQUESTS: usize = 8;
 
 /// Ordered SELECT of a parse's chunks. Ordering by `id` keeps the per-parse
 /// build and its logs deterministic across runs; the dense channel does not
@@ -182,8 +164,8 @@ pub(crate) struct DenseBuildOutcome {
 ///
 /// Backend routing (approved design). The LOCAL backend embeds one chunk at a
 /// time (batch-1, CPa revert) under the caller-held model gate. The HTTP backend
-/// packs chunks into `DENSE_HTTP_BATCH_SIZE`-sized windows and embeds up to
-/// `DENSE_HTTP_CONCURRENT_REQUESTS` windows CONCURRENTLY on scoped OS threads
+/// packs chunks into configured batches and limits concurrent HTTP requests
+/// using the client's validated settings on scoped OS threads
 /// (holding NO gate), then persists every vector serially in chunk order on this
 /// scheduler thread. Persistence is byte-identical across backends: every chunk
 /// still flows through the same validate → encode → INSERT helper in chunk order,
@@ -216,6 +198,7 @@ pub(crate) fn build_dense_vectors(
     dense_backend: &DenseEmbeddingBackend,
     expected_dimension: usize,
     _gate: Option<&ModelCallPermit>,
+    model_identity: &str,
 ) -> Result<DenseBuildOutcome, ApiError> {
     let started = Instant::now();
 
@@ -235,8 +218,10 @@ pub(crate) fn build_dense_vectors(
         "per-parse dense build started"
     );
 
-    let projection_id =
-        envelope::insert_building(tx, &new_projection(source_id, parse_id, &chunks))?;
+    let projection_id = envelope::insert_building(
+        tx,
+        &new_projection(source_id, parse_id, &chunks, model_identity),
+    )?;
 
     // From here the envelope exists; any failure marks it `failed` on the same
     // transaction before returning, so the lifecycle never stalls in `building`.
@@ -329,8 +314,8 @@ struct DenseBuildCounts {
 ///   throughput on this hardware (the 8B forward already saturates the GPU at
 ///   batch 1) while right-padding inflated useful work ~1.7x, a net regression,
 ///   so CPa was reverted to this singular loop. Every chunk counts as singular.
-/// - HTTP: chunks packed into `DENSE_HTTP_BATCH_SIZE`-sized windows; windows are
-///   dispatched up to `DENSE_HTTP_CONCURRENT_REQUESTS` at a time on scoped OS
+/// - HTTP: chunks packed into configured batches; batches are dispatched under
+///   the configured concurrent-request ceiling on scoped OS
 ///   threads (see `embed_windows_concurrently`), each window's returned vectors
 ///   aligning 1:1 with its chunks in order. A window of size >1 counts its chunks
 ///   as batched, a trailing window of size 1 as singular (it is one round-trip
@@ -390,18 +375,18 @@ fn build_all_chunks(
             }
         }
         // HTTP path: no gate is held across the network round-trips. Pack chunks
-        // into DENSE_HTTP_BATCH_SIZE windows and embed the windows CONCURRENTLY
-        // (up to DENSE_HTTP_CONCURRENT_REQUESTS in flight), then persist every
+        // into configured batches and embed them within the configured request
+        // concurrency, then persist every
         // vector serially in chunk order below. Fanning out ONLY the HTTP calls
         // keeps all SQLite writes on this thread's `tx`; the fan-out returns
         // per-window vectors in window order, so window order == chunk order.
         DenseEmbeddingBackend::Http(client) => {
-            let windows: Vec<&[StoredChunk]> = chunks.chunks(DENSE_HTTP_BATCH_SIZE).collect();
+            let windows: Vec<&[StoredChunk]> = chunks.chunks(client.batch_size()).collect();
             let texts: Vec<&str> = chunks
                 .iter()
                 .map(|chunk| chunk.targeting_text.as_str())
                 .collect();
-            let text_windows: Vec<&[&str]> = texts.chunks(DENSE_HTTP_BATCH_SIZE).collect();
+            let text_windows: Vec<&[&str]> = texts.chunks(client.batch_size()).collect();
             let window_vectors = embed_windows_concurrently(client, &text_windows, parse_id)?;
 
             // All windows embedded and length-checked; now persist serially in
@@ -431,12 +416,12 @@ fn build_all_chunks(
     Ok(counts)
 }
 
-/// Embed a parse's `DENSE_HTTP_BATCH_SIZE` windows concurrently and return each
+/// Embed a parse's configured batches concurrently and return each
 /// window's validated vectors in WINDOW ORDER (== chunk order), so the caller can
 /// persist them serially without reordering.
 ///
-/// Concurrency model: windows are processed in successive WAVES of up to
-/// `DENSE_HTTP_CONCURRENT_REQUESTS`. Each wave opens one `std::thread::scope` and
+/// Concurrency model: windows are processed in waves bounded by the client's
+/// concurrent-request setting. Each wave opens one `std::thread::scope` and
 /// spawns one scoped thread per window in the wave; every thread borrows the SAME
 /// `&HttpDenseClient` (its methods take `&self` and it is `Sync` — it holds a
 /// `reqwest::blocking::Client`, which is `Send + Sync`, plus immutable
@@ -464,12 +449,11 @@ fn embed_windows_concurrently(
 ) -> Result<Vec<Vec<Vec<f32>>>, ApiError> {
     let mut results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(windows.len());
 
-    // Wave-bounded fan-out: at most DENSE_HTTP_CONCURRENT_REQUESTS HTTP calls are
-    // in flight per scope. A conservative bound (see the constant) sized against
-    // provider rate limits. An open scope holds only Rust borrows locally — but
+    // The client's configured concurrency bounds HTTP calls in flight per scope.
+    // An open scope holds only Rust borrows locally — but
     // the caller's write transaction (and the hot-plane writer lock) remains
     // held around this whole function; see the HELD LOCKS note above.
-    for wave in windows.chunks(DENSE_HTTP_CONCURRENT_REQUESTS) {
+    for wave in windows.chunks(client.concurrent_requests()) {
         // Per-window outcomes collected in window order. Each scoped thread only
         // performs the pure HTTP call; the length check and error selection happen
         // on this thread after join so the abort/propagate order is deterministic.
@@ -497,7 +481,10 @@ fn embed_windows_concurrently(
                     Err(payload) => Err(ApiError::StorageOperation {
                         message: format!(
                             "HTTP dense embed thread panicked for parse {parse_id}: {}",
-                            crate::util::panic_payload_message(payload.as_ref())
+                            crate::util::panic_payload_message(
+                                payload.as_ref(),
+                                client.diagnostics()
+                            )
                         ),
                     }),
                 })
@@ -541,7 +528,7 @@ pub(crate) fn embed_texts(
             .map(|text| runtime.embed_complete_passage_vector(text))
             .collect(),
         DenseEmbeddingBackend::Http(client) => {
-            let windows: Vec<&[&str]> = texts.chunks(DENSE_HTTP_BATCH_SIZE).collect();
+            let windows: Vec<&[&str]> = texts.chunks(client.batch_size()).collect();
             Ok(embed_windows_concurrently(client, &windows, parse_id)?
                 .into_iter()
                 .flatten()
@@ -568,6 +555,7 @@ fn persist_chunk_vector(
     chunk: &StoredChunk,
     raw_vector: Vec<f32>,
 ) -> Result<(), ApiError> {
+    super::annotation_io::admitted_value_count(1, expected_dimension, &tx.limits().resources)?;
     let validated =
         validate_vector(chunk.id.clone(), raw_vector, expected_dimension).map_err(|message| {
             ApiError::StorageOperation {
@@ -612,6 +600,7 @@ pub(crate) fn visit_dense_vectors_for_parse(
     expected_dimension: usize,
     mut visit: impl FnMut(&StoredDenseVectorRow) -> Result<(), ApiError>,
 ) -> Result<usize, ApiError> {
+    super::annotation_io::admitted_value_count(1, expected_dimension, &conn.limits().resources)?;
     let expected_bytes = expected_dimension
         .checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| i64::try_from(bytes).ok())
@@ -812,7 +801,12 @@ fn chunk_from_raw(row: ChunkRawRow) -> Result<StoredChunk, ApiError> {
 /// as input refs, the chunk projections it embeds (spec §20/§22). Chunk ids are
 /// the honest inputs — the dense plane is derived from `chunk_projections`, not
 /// directly from content units.
-fn new_projection(source_id: &str, parse_id: &str, chunks: &[StoredChunk]) -> NewProjection {
+fn new_projection(
+    source_id: &str,
+    parse_id: &str,
+    chunks: &[StoredChunk],
+    model_identity: &str,
+) -> NewProjection {
     let input_refs = chunks
         .iter()
         .map(|chunk| ProvenanceInputRef {
@@ -826,7 +820,8 @@ fn new_projection(source_id: &str, parse_id: &str, chunks: &[StoredChunk]) -> Ne
         producer_type: ProducerType::Model,
         producer_name: DENSE_PRODUCER_NAME.to_string(),
         producer_version: Some(DENSE_PRODUCER_VERSION.to_string()),
-        config_hash: None,
+        // Preserve configured model/capacity identity with the archived envelope.
+        config_hash: Some(model_identity.to_owned()),
         model_name: None,
         model_version: None,
         prompt_hash: None,

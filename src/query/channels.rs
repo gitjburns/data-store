@@ -22,7 +22,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::sqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 use tracing::{debug, error, info};
 
 use crate::artifact_store::ArtifactStore;
@@ -215,7 +216,8 @@ fn lexical_channel(
 
     // Build the FTS5 MATCH string once (it is query-scoped, not parse-scoped).
     // No eligible terms → no lexical candidates for any parse.
-    let Some(queries) = build_bm25_queries(query_text) else {
+    let Some(queries) = build_bm25_queries(query_text, conn.limits().retrieval.min_fts_term_chars)
+    else {
         debug!(
             event = "query.channel.lexical.no_terms",
             query_id, "lexical channel produced no candidates: query has no eligible FTS terms"
@@ -266,8 +268,12 @@ fn load_chunk_unit_map(
     conn: &Connection,
     parses: &[CapturedParse],
 ) -> Result<HashMap<String, Vec<String>>, ApiError> {
-    const SELECT_CHUNK_UNITS_SQL: &str =
-        "SELECT id, input_unit_ids_json FROM chunk_projections WHERE parse_id = ?1";
+    // The database checks byte length before the JSON cell becomes an owned Rust String.
+    const SELECT_CHUNK_UNITS_SQL: &str = "
+SELECT id, CASE WHEN length(CAST(input_unit_ids_json AS BLOB)) <= ?2
+               THEN input_unit_ids_json END
+FROM chunk_projections WHERE parse_id = ?1";
+    let max_cell_bytes = conn.limits().resources.max_json_cell_bytes;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for parse in parses {
         let mut statement =
@@ -279,9 +285,9 @@ fn load_chunk_unit_map(
                     ),
                 })?;
         let rows = statement
-            .query_map(params![parse.parse_id], |row| {
+            .query_map(params![parse.parse_id, max_cell_bytes], |row| {
                 let chunk_id: String = row.get(0)?;
-                let input_unit_ids_json: String = row.get(1)?;
+                let input_unit_ids_json: Option<String> = row.get(1)?;
                 Ok((chunk_id, input_unit_ids_json))
             })
             .map_err(|source| ApiError::StorageOperation {
@@ -298,6 +304,9 @@ fn load_chunk_unit_map(
                         parse.parse_id
                     ),
                 })?;
+            let input_unit_ids_json = input_unit_ids_json.ok_or_else(|| ApiError::StorageOperation {
+                message: format!("resource limit: input unit IDs of chunk {chunk_id} in parse {} exceed resources.max_json_cell_bytes {max_cell_bytes}", parse.parse_id),
+            })?;
             // `input_unit_ids_json` is canonical JSON per §16.2; a value that no
             // longer parses is corruption surfaced with the chunk identity, not
             // silently dropped (PRINCIPLES.md: never hide a specific error).
@@ -442,7 +451,7 @@ fn section_nominations(
 ) -> Result<SectionNominations, ApiError> {
     let query_norm = l2_norm(query_vector);
     let mut windows: Vec<SectionWindowCandidate<'_>> = Vec::new();
-    let limit = profile.section_candidate_limit as usize;
+    let limit = profile.limits.section_candidate_limit as usize;
     for parse in parses {
         let plane = parse.dense_plane.as_ref().ok_or_else(|| ApiError::ServiceUnavailable {
             message: format!("source {} parse {} requires rebuilding passage and section dense projections; run data-store --config <config-path> --rebuild-all", parse.source_id, parse.parse_id),
@@ -550,7 +559,7 @@ fn section_nominations(
                 .then_with(|| left.0.cmp(right.0))
         });
         candidates.dedup_by(|left, right| left.0 == right.0);
-        candidates.truncate(profile.section_passages_per_window as usize);
+        candidates.truncate(profile.limits.section_passages_per_window as usize);
         for (unit_id, chunk) in candidates {
             if output.evidence.contains_key(unit_id) {
                 continue;
@@ -679,11 +688,12 @@ fn merge_dense_representations(
         .enumerate()
         .chain(sections.iter().map(String::as_str).enumerate())
     {
-        *scores.entry(unit_id).or_default() += 1.0 / (f64::from(profile.rrf_k) + (rank + 1) as f64);
+        *scores.entry(unit_id).or_default() +=
+            1.0 / (f64::from(profile.limits.rrf_k) + (rank + 1) as f64);
     }
     let mut ranked: Vec<_> = scores.into_iter().collect();
     ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
-    ranked.truncate(profile.default_max_candidates_per_channel as usize);
+    ranked.truncate(profile.limits.max_candidates_per_channel as usize);
     ranked
         .into_iter()
         .enumerate()
@@ -782,13 +792,13 @@ pub(crate) fn collect_channels(
     profile: &RetrievalProfile,
 ) -> Result<ChannelCandidates, ApiError> {
     let started_at = Instant::now();
-    let candidate_limit = profile.default_max_candidates_per_channel as usize;
+    let candidate_limit = profile.limits.max_candidates_per_channel as usize;
     info!(
         event = "query.channels.started",
         query_id,
         parse_count = parses.len(),
         candidate_limit,
-        rrf_k = profile.rrf_k,
+        rrf_k = profile.limits.rrf_k,
         graph_input_hits = graph_hits.len(),
         "dense, lexical, and graph candidate collection started"
     );
@@ -845,8 +855,8 @@ pub(crate) fn collect_channels(
         info!(
             event = "query.channel.section_dense.started",
             query_id,
-            section_limit = profile.section_candidate_limit,
-            passages_per_window = profile.section_passages_per_window,
+            section_limit = profile.limits.section_candidate_limit,
+            passages_per_window = profile.limits.section_passages_per_window,
             "section-guided dense candidate generation started"
         );
         let sections = section_nominations(
@@ -942,7 +952,7 @@ pub(crate) fn collect_channels(
     result.inspect_err(|source| {
         error!(event = "query.channels.failed", query_id, stage,
             parse_count = parses.len(), error = %source,
-            error_chain = %crate::util::error_chain(source),
+            error_chain = %crate::util::error_chain(source, &conn.limits().diagnostics),
             elapsed_ms = started_at.elapsed().as_millis() as u64,
             "retrieval channel candidate collection failed");
     })
@@ -1035,16 +1045,21 @@ fn validate_candidate_unit(
         }
         return Ok(());
     }
-    const SELECT_CANDIDATE_SQL: &str = "SELECT source_id, content_type, body_json FROM content_units WHERE id = ?1 AND parse_id = ?2";
+    // Even ineligible candidates must not allocate an oversized canonical body before validation.
+    const SELECT_CANDIDATE_SQL: &str = "
+SELECT source_id, content_type,
+       CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END
+FROM content_units WHERE id = ?1 AND parse_id = ?2";
+    let max_body_bytes = conn.limits().resources.max_source_body_bytes;
     let row = conn
         .prepare_cached(SELECT_CANDIDATE_SQL)
         .and_then(|mut statement| {
             statement
-                .query_row(params![unit_id, parse_id], |row| {
+                .query_row(params![unit_id, parse_id, max_body_bytes], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 })
                 .optional()
@@ -1066,6 +1081,9 @@ fn validate_candidate_unit(
             ),
         });
     }
+    let body_json = body_json.ok_or_else(|| ApiError::StorageOperation {
+        message: format!("resource limit: body of candidate unit {unit_id} in parse {parse_id} exceeds resources.max_source_body_bytes {max_body_bytes}"),
+    })?;
     let content_type: ContentType = serde_json::from_value(serde_json::Value::String(content_type))
         .map_err(|source| ApiError::StorageOperation {
             message: format!("invalid content type for candidate unit {unit_id}: {source}"),
@@ -1265,20 +1283,13 @@ fn candidate_entity_names(query_text: &str, max_name_tokens: usize) -> Vec<Strin
     names
 }
 
-/// The widest entity name (in tokens) the D9 entry probes for. Entity-annotation
-/// names are short; probing every contiguous run up to this width finds
-/// multi-word names without an unbounded probe count. Not a config knob — a
-/// query-path derivation constant local to the graph entry.
-const MAX_ENTITY_NAME_TOKENS: usize = 6;
-
 // ===========================================================================
 // D9 fuzzy match classes (D9 amendment, CA2-P2 2026-07-19).
 //
 // Two DETERMINISTIC fuzzy classes augment the always-on EXACT class, each gated
-// by the operator-editable entity-match policy document
-// (`crate::policy::EntityMatchPolicy`) loaded at startup — deliberately NOT the
-// sealed RetrievalProfile (D3 amendment): the knobs are corpus-dependent and
-// operator-tunable. Both classes operate on ALREADY-NORMALIZED strings — the
+// by the entity-match policy's enable flags. The effective EntityMatchPolicy
+// carries numeric limits from config.toml, also sealed in the retrieval profile.
+// Both classes operate on ALREADY-NORMALIZED strings — the
 // query side is normalized by `candidate_entity_names`, the stored side by the
 // builder's `normalize_entity_name` — so no side is re-normalized here.
 //
@@ -1608,7 +1619,8 @@ pub(crate) fn graph_channel(
     // D9 entry: derive candidate entity n-grams from the query text. Each is
     // already normalized by `candidate_entity_names`, so it is both the exact
     // probe key AND (for fuzzy) the query side compared against stored names.
-    let query_ngrams = candidate_entity_names(query_text, MAX_ENTITY_NAME_TOKENS);
+    let query_ngrams =
+        candidate_entity_names(query_text, conn.limits().retrieval.max_entity_name_tokens);
 
     // Whether ANY fuzzy class runs at all. When false the fuzzy scan surface
     // (`entity_names_for_parse`) is NEVER read — the disabled default does zero

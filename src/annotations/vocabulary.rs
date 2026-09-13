@@ -31,28 +31,12 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
+use crate::sqlite::Connection;
 use serde_json::Value;
 
 use crate::error::ApiError;
 use crate::model::SemanticAnnotationType;
 use crate::projections::graph::normalize_entity_name;
-
-/// Hard cap on rows READ from `semantic_annotations` per request. A bounded scan
-/// keeps one inspection request from touching an unbounded row set (D1 bounded
-/// read discipline). When the scan hits this cap the response is flagged
-/// truncated so the operator knows the vocabulary is a partial view. Chosen
-/// generously (the vocabulary of a real corpus is far smaller than its annotation
-/// row count, but a single normalized name can have many raw-form rows) while
-/// still bounding a single request's work.
-const MAX_ROWS_READ: usize = 200_000;
-
-/// Hard cap on GROUPS returned in one response (distinct normalized names for
-/// entity, distinct predicates for relation). Groups past this cap are dropped
-/// and the response is flagged truncated. Bounds the response size independently
-/// of `MAX_ROWS_READ`: a pathological corpus could stay under the row cap yet
-/// still produce an unwieldy group list.
-const MAX_GROUPS: usize = 50_000;
 
 /// Bucket label for rows whose provenance carries no `modelName`. Model
 /// attribution is Option on `Provenance` (`model_name`), so a row without it is
@@ -75,12 +59,16 @@ pub(crate) enum VocabularyScope {
 /// requested type whose parse is its source's CURRENT active parse. The
 /// active-parse subselect is the same §21-rule-1 discipline
 /// `SELECT_FRESH_FOR_ACTIVE_PARSE_SQL` uses in `store.rs`; correlating it to
-/// `source_id` scopes each row to its own source's active parse. Only the three
-/// columns aggregation needs are read, ordered by id for a deterministic
-/// truncation frontier when the row cap is hit. The `LIMIT` is `MAX_ROWS_READ + 1`
+/// `source_id` scopes each row to its own source's active parse. Three bounded
+/// aggregation values plus a byte-refusal flag are read, ordered by id for a deterministic
+/// truncation frontier when the configured row cap is hit. `LIMIT` includes one sentinel
 /// so reading one extra row proves truncation without a second COUNT query.
 const SELECT_ACTIVE_SQL: &str = "
-SELECT source_id, body_json, provenance_json
+SELECT source_id,
+ CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END,
+ CASE WHEN length(CAST(provenance_json AS BLOB)) > ?3 THEN '' ELSE provenance_json END,
+ COALESCE(length(CAST(body_json AS BLOB)) > ?3, 0)
+ OR COALESCE(length(CAST(provenance_json AS BLOB)) > ?3, 0)
 FROM semantic_annotations sa
 WHERE sa.annotation_type = ?1
   AND sa.freshness_status = 'fresh'
@@ -93,10 +81,14 @@ LIMIT ?2";
 
 /// ALL-scope entity/relation row read: every fresh, non-deleted annotation of
 /// the requested type regardless of active status, so dry-run output on
-/// never-activated parses is inspectable. Same three columns, same deterministic
-/// id ordering, same `MAX_ROWS_READ + 1` limit as the active variant.
+/// never-activated parses is inspectable. Same bounded columns and refusal flag, deterministic
+/// id ordering, and the same configured row limit plus a sentinel as the active variant.
 const SELECT_ALL_SQL: &str = "
-SELECT source_id, body_json, provenance_json
+SELECT source_id,
+ CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END,
+ CASE WHEN length(CAST(provenance_json AS BLOB)) > ?3 THEN '' ELSE provenance_json END,
+ COALESCE(length(CAST(body_json AS BLOB)) > ?3, 0)
+ OR COALESCE(length(CAST(provenance_json AS BLOB)) > ?3, 0)
 FROM semantic_annotations
 WHERE annotation_type = ?1
   AND freshness_status = 'fresh'
@@ -116,10 +108,9 @@ pub(crate) struct EntityVocabulary {
     /// Rows whose body was neither a valid entity body nor the empty marker:
     /// counted here, never grouped, never fatal (inspection reveals anomalies).
     pub(crate) malformed_rows: usize,
-    /// True when the row scan hit `MAX_ROWS_READ` OR the group set was clipped to
-    /// `MAX_GROUPS`; the served vocabulary is then a partial view.
+    /// True when the configured row scan or returned-group limit clipped the view.
     pub(crate) truncated: bool,
-    /// Total rows READ (bounded by `MAX_ROWS_READ`), for the handler-boundary log.
+    /// Total rows read under the configured scan limit, for the handler-boundary log.
     pub(crate) rows_read: usize,
 }
 
@@ -267,7 +258,7 @@ struct EntityAccumulator {
 /// Empty-marker rows are skipped-and-counted; malformed rows (not the marker, and
 /// missing a string `name`) are counted into `malformed_rows` and never grouped.
 /// Groups are sorted by normalized name ascending so spelling variants sit
-/// adjacent, then clipped to `MAX_GROUPS` (setting `truncated`).
+/// adjacent, then clipped to the configured group limit (setting `truncated`).
 pub(crate) fn entity_vocabulary(
     conn: &Connection,
     scope: VocabularyScope,
@@ -331,10 +322,10 @@ pub(crate) fn entity_vocabulary(
 
     // BTreeMap iteration is already normalized-name ascending (variants adjacent).
     let group_total = accumulators.len();
-    let groups_truncated = group_total > MAX_GROUPS;
+    let groups_truncated = group_total > conn.limits().resources.vocabulary_groups;
     let groups: Vec<EntityGroup> = accumulators
         .into_iter()
-        .take(MAX_GROUPS)
+        .take(conn.limits().resources.vocabulary_groups)
         .map(|(normalized_name, accumulator)| EntityGroup {
             normalized_name,
             raw_forms: accumulator
@@ -379,7 +370,7 @@ struct RelationAccumulator {
 /// verbatim; normalization is a read-plane concern applied HERE only. Empty
 /// markers skipped-and-counted; malformed rows (missing a string `predicate`)
 /// counted, never grouped. Groups sorted by normalized predicate ascending,
-/// clipped to `MAX_GROUPS`.
+/// clipped to the configured group limit.
 pub(crate) fn relation_vocabulary(
     conn: &Connection,
     scope: VocabularyScope,
@@ -430,10 +421,10 @@ pub(crate) fn relation_vocabulary(
 
     // BTreeMap iteration is already normalized-predicate ascending.
     let group_total = accumulators.len();
-    let groups_truncated = group_total > MAX_GROUPS;
+    let groups_truncated = group_total > conn.limits().resources.vocabulary_groups;
     let groups: Vec<RelationGroup> = accumulators
         .into_iter()
-        .take(MAX_GROUPS)
+        .take(conn.limits().resources.vocabulary_groups)
         .map(|(predicate, accumulator)| RelationGroup {
             predicate,
             raw_forms: accumulator
@@ -476,17 +467,25 @@ fn read_rows_with_source(
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to prepare vocabulary scan for {type_wire}: {source}"),
         })?;
-    let scan_limit = MAX_ROWS_READ as i64 + 1;
+    let scan_limit = conn.limits().resources.vocabulary_scan_rows as i64 + 1;
     let mapped = statement
-        .query_map(rusqlite::params![type_wire, scan_limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                VocabularyRow {
-                    body_json: row.get(1)?,
-                    provenance_json: row.get(2)?,
-                },
-            ))
-        })
+        .query_map(
+            rusqlite::params![
+                type_wire,
+                scan_limit,
+                conn.limits().resources.max_json_cell_bytes
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    VocabularyRow {
+                        body_json: row.get(1)?,
+                        provenance_json: row.get(2)?,
+                    },
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query vocabulary rows for {type_wire}: {source}"),
         })?;
@@ -494,17 +493,27 @@ fn read_rows_with_source(
     let mut rows = Vec::new();
     let mut source_ids = Vec::new();
     for entry in mapped {
-        let (source_id, row) = entry.map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to read vocabulary row for {type_wire}: {source}"),
-        })?;
+        let (source_id, row, exceeded_bytes) =
+            entry.map_err(|source| ApiError::StorageOperation {
+                message: format!("failed to read vocabulary row for {type_wire}: {source}"),
+            })?;
+        // A real NULL remains an inspectable malformed row; a budget refusal
+        // is explicit and must never inflate the corpus's malformed-row count.
+        if exceeded_bytes {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "resource limit: {type_wire} vocabulary row for source {source_id} exceeds resources.max_json_cell_bytes"
+                ),
+            });
+        }
         rows.push(row);
         source_ids.push(source_id);
     }
 
-    let truncated = rows.len() > MAX_ROWS_READ;
+    let truncated = rows.len() > conn.limits().resources.vocabulary_scan_rows;
     if truncated {
-        rows.truncate(MAX_ROWS_READ);
-        source_ids.truncate(MAX_ROWS_READ);
+        rows.truncate(conn.limits().resources.vocabulary_scan_rows);
+        source_ids.truncate(conn.limits().resources.vocabulary_scan_rows);
     }
     let rows_read = rows.len();
     Ok((rows, source_ids, truncated, rows_read))

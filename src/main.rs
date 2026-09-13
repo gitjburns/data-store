@@ -4,6 +4,7 @@ mod annotations;
 mod artifact_store;
 mod assembly;
 mod canonical;
+mod client_limits;
 mod config;
 mod connectors;
 mod deletion;
@@ -17,6 +18,7 @@ mod http;
 mod identity;
 mod ids;
 mod inference;
+mod limits;
 mod logging;
 mod maintenance;
 mod model;
@@ -28,10 +30,12 @@ mod projections;
 mod query;
 mod reset;
 mod restore;
+mod runtime;
 mod scheduler;
 mod sections;
 mod snapshot;
 mod source;
+mod sqlite;
 mod state;
 mod types;
 mod util;
@@ -309,7 +313,11 @@ fn main() -> anyhow::Result<()> {
         // One deliberate operator action sets up the fabric hot plane. The
         // legacy schema plane was retired at cluster CR; the fabric plane is
         // the only durable store.
-        match setup_fabric_storage(&config.storage.index_root) {
+        let storage = runtime::StorageContext::new(
+            config.storage.index_root.clone(),
+            runtime::RuntimeSettings::from_config(&config)?,
+        );
+        match setup_fabric_storage(&storage) {
             Ok(db_path) => {
                 println!("fabric storage schema ready at {}", db_path.display());
                 info!(
@@ -370,6 +378,12 @@ async fn run_http_service(
     mut reporter: StartupReporter,
 ) -> anyhow::Result<()> {
     let startup_started_at = Instant::now();
+    // One immutable settings owner is shared by schema checks, workers, HTTP,
+    // and snapshots; no storage caller reloads configuration independently.
+    let storage = runtime::StorageContext::new(
+        config.storage.index_root.clone(),
+        runtime::RuntimeSettings::from_config(&config)?,
+    );
     let bind_address = config.bind_address();
     reporter.report(format!(
         "data-store startup mode={} bind_address={bind_address}",
@@ -497,7 +511,7 @@ async fn run_http_service(
     // until delayed initialization; the scheduler then validates and owns health.
     // Missing or invalid storage remains a health-visible setup condition.
     reporter.report("data-store startup sync_schema=validating")?;
-    let fabric_ready_at_startup = match crate::hot_plane::open_read(&config.storage.index_root)
+    let fabric_ready_at_startup = match crate::hot_plane::open_read(&storage)
         .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
     {
         Ok(()) => {
@@ -526,6 +540,7 @@ async fn run_http_service(
         &config
             .policies
             .resolved_entity_match_file_path(config.config_root()),
+        &config.retrieval.entity_matching,
     )
     .and_then(|entity_match| {
         let naming = policy::load_annotator_naming_policy(
@@ -555,10 +570,10 @@ async fn run_http_service(
     // AppState next; the shared health slot is the only channel between the
     // scheduler thread and health reporting.
     let scheduler_corpus_root = config.storage.corpus_root.clone();
-    let scheduler_index_root = config.storage.index_root.clone();
+    let scheduler_index_root = storage.clone();
     let scheduler_governance_domain = config.connectors.filesystem.governance_domain.clone();
     let scheduler_pdf = parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?;
-    let annotation_index_root = config.storage.index_root.clone();
+    let annotation_index_root = storage.clone();
     let annotation_annotator = config.models.annotator.clone();
     let annotation_config_root = config.config_root().to_path_buf();
     // §30.2 application identity captured ONCE here, right after config load and
@@ -610,12 +625,14 @@ async fn run_http_service(
     let scheduler_colbert_runtime = inference.colbert.clone();
     let scheduler_dense_dimension = config.models.dense.dimension as usize;
     let scheduler_colbert_dimension = config.models.colbert.dimension as usize;
+    let scheduler_embedding_identity = inference.embedding_identity.clone();
     // The shared active dense cache (§1.6 successor). Phase 1 hands the scheduler
     // this clone; the second clone below rides AppState so the C7 dense
     // retrieval channel scores against the same swapped planes (C8d-1 seam).
     let dense_cache = Arc::new(projections::dense_cache::DenseCache::new());
     let state = Arc::new(AppState::new(
         config,
+        storage,
         state::InferenceSlot::Ready(inference),
         admin_shutdown_token.clone(),
         Arc::clone(&shutdown_signal),
@@ -639,7 +656,7 @@ async fn run_http_service(
     // The reset marker survives row clearing. Never let a process restart turn
     // a partially cleared store into normal ingestion without explicit retry.
     if fabric_ready_at_startup {
-        let recovery_root = state.config.storage.index_root.clone();
+        let recovery_root = state.storage.clone();
         let recovery = tokio::task::spawn_blocking(
             util::LogContext::current()
                 .wrap(move || operations::unresolved_rebuild(&recovery_root)),
@@ -675,6 +692,7 @@ async fn run_http_service(
         colbert: scheduler_colbert_runtime,
         dense_dimension: scheduler_dense_dimension,
         colbert_dimension: scheduler_colbert_dimension,
+        embedding_identity: scheduler_embedding_identity,
         gate: state.model_call_gate_handle(),
         dense_cache: Arc::clone(&dense_cache),
     };
@@ -724,6 +742,7 @@ async fn run_http_service(
         app,
         Arc::clone(&shutdown_signal),
         http_started,
+        state.config.diagnostics,
     )));
     // Retain every successfully spawned worker until common shutdown cleanup,
     // even if a later startup stage fails or panics.
@@ -799,7 +818,7 @@ async fn run_http_service(
             .map_err(|payload| ApiError::InternalIo {
                 message: format!(
                     "annotation worker startup panicked: {}",
-                    util::panic_payload_message(payload.as_ref())
+                    util::panic_payload_message(payload.as_ref(), &state.config.diagnostics)
                 ),
             })?,
         );
@@ -807,7 +826,7 @@ async fn run_http_service(
         // waves. A spawn fault is visible in its diagnostic-only health slot.
         projection_worker_handle =
             match projections::worker::start(projections::worker::WorkerInputs {
-                index_root: state.config.storage.index_root.clone(),
+                index_root: state.storage.clone(),
                 runtime: Some(Arc::new(state.inference()?.clone())),
                 dense_dimension: state.config.models.dense.dimension as usize,
                 colbert_dimension: state.config.models.colbert.dimension as usize,
@@ -907,6 +926,7 @@ async fn serve_during_startup(
     app: axum::Router,
     shutdown: Arc<ShutdownSignal>,
     started: oneshot::Sender<()>,
+    diagnostics: limits::DiagnosticLimits,
 ) -> io::Result<()> {
     let mut serving = std::pin::pin!(
         axum::serve(listener, app)
@@ -930,7 +950,7 @@ async fn serve_during_startup(
             Ok(result) => result,
             Err(payload) => std::task::Poll::Ready(Err(io::Error::other(format!(
                 "HTTP serving panicked: {}",
-                util::panic_payload_message(payload.as_ref())
+                util::panic_payload_message(payload.as_ref(), &diagnostics)
             )))),
         }
     })
@@ -976,7 +996,7 @@ fn initialize_startup_corpus(
     let load_existing_corpus = fabric_ready_at_startup && permit.generation() == 0;
     if load_existing_corpus {
         let registration = register_policy_versions(
-            &state.config.storage.index_root,
+            &state.storage,
             &state.application_identity().entity_match_policy_hash,
             &state.application_identity().annotator_naming_policy_hash,
         );
@@ -995,7 +1015,7 @@ fn initialize_startup_corpus(
         // Cache loading can create artifact directories. Keep it inside
         // the same delayed, blocking storage boundary as registration.
         let loaded = load_startup_dense_cache(
-            &state.config.storage.index_root,
+            &state.storage,
             state.dense_cache(),
             state.config.models.dense.dimension as usize,
         );
@@ -1019,11 +1039,11 @@ fn initialize_startup_corpus(
 /// parses remain identifiable with absent section data so queries can request a
 /// deliberate rebuild while the admin routes remain available. No inference runs.
 fn load_startup_dense_cache(
-    index_root: &std::path::Path,
+    index_root: &runtime::StorageContext,
     cache: &projections::dense_cache::DenseCache,
     dimension: usize,
 ) -> Result<(), ApiError> {
-    const MAX_STARTUP_PARSES: usize = 100_000;
+    let max_startup_parses = index_root.limits().resources.max_startup_parses;
     const ACTIVE_PARSES_SQL: &str = "SELECT active_parse_id FROM source_objects
         WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL
         ORDER BY id LIMIT ?1";
@@ -1041,7 +1061,7 @@ fn load_startup_dense_cache(
                 message: format!("startup active-parse query preparation failed: {source}"),
             })?;
     let parses = statement
-        .query_map([MAX_STARTUP_PARSES as i64 + 1], |row| {
+        .query_map([max_startup_parses as i64 + 1], |row| {
             row.get::<_, String>(0)
         })
         .map_err(|source| ApiError::StorageOperation {
@@ -1051,9 +1071,9 @@ fn load_startup_dense_cache(
         .map_err(|source| ApiError::StorageOperation {
             message: format!("startup active-parse row decoding failed: {source}"),
         })?;
-    if parses.len() > MAX_STARTUP_PARSES {
+    if parses.len() > max_startup_parses {
         return Err(ApiError::StorageOperation {
-            message: format!("startup dense cache exceeds {MAX_STARTUP_PARSES} active parses"),
+            message: format!("startup dense cache exceeds {max_startup_parses} active parses"),
         });
     }
     let mut rebuild_required = 0usize;
@@ -1087,7 +1107,7 @@ fn load_startup_dense_cache(
 /// event. Shared by the normal startup path and the annotation dry-run mode so
 /// both record versions through identical mechanics.
 fn register_policy_versions(
-    index_root: &std::path::Path,
+    index_root: &runtime::StorageContext,
     entity_match_hash: &str,
     annotator_naming_hash: &str,
 ) -> Result<(), ApiError> {
@@ -1135,6 +1155,10 @@ async fn run_annotation_dry_run_mode(
     groups_per_source: usize,
 ) -> anyhow::Result<()> {
     let started_at = Instant::now();
+    let storage = runtime::StorageContext::new(
+        config.storage.index_root.clone(),
+        runtime::RuntimeSettings::from_config(&config)?,
+    );
     let bind_address = config.bind_address();
     info!(
         event = "dry_run.mode_started",
@@ -1164,6 +1188,7 @@ async fn run_annotation_dry_run_mode(
         &config
             .policies
             .resolved_entity_match_file_path(config.config_root()),
+        &config.retrieval.entity_matching,
     )
     .inspect_err(|source| dry_run_fatal("policy_document_load", source))?;
     let annotator_naming_policy = policy::load_annotator_naming_policy(
@@ -1177,12 +1202,12 @@ async fn run_annotation_dry_run_mode(
     // path's degrade-to-unready: the pass writes acquisition/parse/annotation
     // rows and the inspection surface reads them, so a missing plane leaves
     // nothing to do. Registration then runs unconditionally.
-    crate::hot_plane::open_read(&config.storage.index_root)
+    crate::hot_plane::open_read(&storage)
         .and_then(|connection| crate::hot_plane::validate_fabric_schema(&connection))
         .inspect_err(|source| dry_run_fatal("fabric_plane_validation", source))?;
     // Dry-run also writes corpus state; it cannot bypass the recovery marker
     // left by an interrupted normal-mode rebuild-all.
-    let recovery_root = config.storage.index_root.clone();
+    let recovery_root = storage.clone();
     let recovery = tokio::task::spawn_blocking(
         util::LogContext::current().wrap(move || operations::unresolved_rebuild(&recovery_root)),
     )
@@ -1202,7 +1227,7 @@ async fn run_annotation_dry_run_mode(
         return Err(source.into());
     }
     register_policy_versions(
-        &config.storage.index_root,
+        &storage,
         &entity_match_policy.content_hash,
         &annotator_naming_policy.content_hash,
     )
@@ -1255,7 +1280,7 @@ async fn run_annotation_dry_run_mode(
     // Pass inputs cloned out BEFORE `config` moves into AppState.
     let pass_inputs = dry_run::DryRunInputs {
         corpus_root: config.storage.corpus_root.clone(),
-        index_root: config.storage.index_root.clone(),
+        index_root: storage.clone(),
         governance_domain: config.connectors.filesystem.governance_domain.clone(),
         pdf: parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?,
         annotator: config.models.annotator.clone(),
@@ -1266,6 +1291,7 @@ async fn run_annotation_dry_run_mode(
     let shutdown_signal = Arc::new(ShutdownSignal::default());
     let state = Arc::new(AppState::new(
         config,
+        storage,
         // No inference in this mode: deliberately not initialized, NOT a
         // failure. Any accidental inference-touching path still fails loudly
         // (the accessor turns this into an InferenceInit error), while health

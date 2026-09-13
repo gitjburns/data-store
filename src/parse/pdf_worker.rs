@@ -21,7 +21,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Instant,
 };
 
@@ -82,7 +82,7 @@ const DOCLING_BOTTOMLEFT_ORIGIN: &str = "BOTTOMLEFT";
 pub(crate) fn run_pdf_parse(
     config: &DoclingConfig,
     document_timeout_seconds: u64,
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source: ResolvedSource,
     source_id: &str,
     source_hash: &str,
@@ -115,7 +115,11 @@ pub(crate) fn run_pdf_parse(
         source_id: source_id.to_string(),
         source_hash: source_hash.to_string(),
     };
-    let mut writer = BundleWriter::create(&parse_staging_root(index_root), identity)?;
+    let mut writer = BundleWriter::create(
+        &parse_staging_root(index_root),
+        identity,
+        *index_root.limits(),
+    )?;
     let raw_dir = writer.parser_raw_dir()?;
 
     // Docling writes its JSON artifact directly into the bundle's
@@ -346,6 +350,8 @@ fn parser_profile_hash_of(profile: &ParserCapabilityProfile) -> Result<String, A
 /// output format. Changing any of these values yields a different
 /// `parserConfigHash` and therefore a new parse identity.
 fn pdf_parser_config_hash(options: &ResolvedDoclingOptions) -> Result<String, ApiError> {
+    // Operational acceptance settings are recorded in application configuration,
+    // preserving the existing identity of successful canonical parsing.
     let value = serde_json::json!({
         "pdfBackend": options.pdf_backend,
         "ocrMode": options.ocr_mode,
@@ -389,7 +395,7 @@ fn finish_failed(
     stdout_log: &[u8],
     stderr_log: &[u8],
 ) -> Result<PathBuf, ApiError> {
-    let bounded_detail = truncate_persisted_detail(&detail);
+    let bounded_detail = truncate_persisted_detail(&detail, &writer.limits().diagnostics);
     // A failed parse is an expected untrusted-input outcome (warn), recorded
     // durably in the staged failure bundle.
     warn!(

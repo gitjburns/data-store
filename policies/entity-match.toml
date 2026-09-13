@@ -4,33 +4,23 @@
 #
 # Strictly validated at startup: every field below is REQUIRED, unknown keys are
 # rejected, and out-of-range values are a fatal error. There is no version field
-# here — versions are SYSTEM-ASSIGNED. Each time the parsed content changes, the
-# service records the next version automatically (whitespace/comment-only edits
-# do not count as a change).
+# here — versions are SYSTEM-ASSIGNED from these flags plus numeric limits in
+# config.toml [retrieval.entity_matching]. Unchanged effective values retain
+# their existing hash; whitespace/comment-only edits do not create a version.
 #
 # This shipped document is NEUTRAL: both match classes are disabled, so it
 # changes no matching behavior until an operator enables a class. Rulesets should
 # be authored from OBSERVED vocabulary, not guessed — use the `--vocabulary`
 # dump and dry-run tooling to see the real stored names before enabling a class.
 
-# Cap on the number of fuzzy-matched stored names considered per query. Must be
-# greater than 0. Bounds query-time fuzzy work regardless of the classes below.
-max_fuzzy_candidates = 20
-
 # Acronym class: match a single query token against the first-letter acronym of
 # a multi-token stored name (e.g. query "ecb" against "European Central Bank").
 [acronym]
 # Whether this class participates at query time.
 enabled = false
-# Minimum stored-name token count from which to derive an acronym. Must be >= 2
-# (a single-token name has no multi-token acronym).
-min_name_tokens = 2
 
 # Token-prefix class: each query token must be a prefix of the corresponding
 # stored-name token, in order (e.g. query "eur cen" against "European Central").
 [token_prefix]
 # Whether this class participates at query time.
 enabled = false
-# Minimum query-token length for that token to participate as a prefix. Must be
-# >= 1 (a zero-length token would match vacuously).
-min_token_len = 3

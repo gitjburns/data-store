@@ -173,7 +173,7 @@ Two physical planes live under `{index_root}/fabric/`.
 
 `{index_root}/fabric/fabric.sqlite3` (`src/hot_plane.rs`). Rows are envelopes and
 pipeline state; heavy payloads are referenced by URI + hash into the artifact
-store. Policy, all as code constants and never operator-tunable:
+store. Durability policy is fixed; operational budgets come from `[sqlite]`:
 
 - `journal_mode=WAL`, set at setup and **validated fatally at startup** — a
   missing or non-WAL database points at setup and is never repaired at runtime.
@@ -182,8 +182,11 @@ store. Policy, all as code constants and never operator-tunable:
 - Read paths open `SQLITE_OPEN_READ_ONLY` (`open_read`); write paths use
   `open_write`.
 - `foreign_keys=ON` applied per connection (not in the DDL).
-- `busy_timeout` and statement deadlines are code constants
-  (`BUSY_TIMEOUT_MS = 5_000`, `STATEMENT_DEADLINE_MS = 5_000`), not config.
+- `busy_timeout_ms` bounds lock waiting; `execution_timeout_ms` bounds SQL
+  execution through cooperative callbacks every `progress_operations` VM steps.
+  Open row iteration includes caller work between rows; idle connections and
+  model calls outside an active statement have no SQL timer. Rollback cleanup
+  receives a fresh budget and records its outcome.
 - Its own `PRAGMA user_version`, starting at **1**.
 - A fresh connection per operation; writes go through the shared IMMEDIATE
   transaction helpers (`begin_write_transaction`/`commit_transaction`/
@@ -236,6 +239,10 @@ Annotation manifests reference separate dense-vector and ColBERT-matrix blobs.
 The paired `retrieval_projections` envelopes publish one immutable manifest URI
 per excerpt cohort and model/input version.
 
+Vector query reads retain bounded working buffers and use operating-system file
+caching. Chunk mappings and canonical metadata remain corpus-proportional;
+forensic raw payloads and full archive/build representations retain their owners.
+
 ### 2.3 Event log
 
 `system_events` is an in-plane table, written inside the owning operation's
@@ -250,15 +257,15 @@ transaction/boundary discipline.
 ## 3. The autonomous cycle
 
 The scheduler (`src/scheduler.rs`) drives one `std::thread` scan/drain loop at a
-**knob-free adaptive cadence**. Detection coalesces into a **durable sync queue**
+configured adaptive cadence. Detection coalesces into a **durable sync queue**
 (`sync_queue`): at most one pending change per `source_key`
 (`"{source_system}:{native_uri}"`), advanced by `enqueue_coalesced`; a new
-detection is what re-pends a failed row. Cadence is an internal EMA with no
-operator knob — it backs off multiplicatively after change-free cycles, when the
+detection is what re-pends a failed row. Cadence uses the EMA and growth settings
+in `[scheduling]`; it backs off after change-free cycles, when the
 queue will not drain, and after failed cycles, and tightens when work appears.
-The shared `MAX_BACKOFF_MS` in `src/util.rs` caps scheduler waits, including the
-scan-duration floor, and dense HTTP retry backoff at 60 seconds. Annotation
-retries use independent configured timing (Section 3.1). The ceiling bounds
+`scheduling.max_backoff_ms` caps scheduler waits, including the scan-duration
+floor. Dense HTTP and annotation retries use independent configured timing.
+The scheduling ceiling bounds
 sleep, not work duration or request timeouts; cadence logs report delay changes.
 
 ```
@@ -520,7 +527,7 @@ per annotation and process run. Malformed outputs use
 Execution failures (call/protocol failures, token-limit termination, and internal
 producer faults) use `execution_max_retries`; their delay doubles from
 `execution_retry_initial_delay_seconds` to `execution_retry_max_delay_seconds`.
-Annotation intervals have no ceiling; neither path uses `MAX_BACKOFF_MS`.
+Annotation intervals have no ceiling; neither path uses the scheduler backoff cap.
 
 A category is exhausted when its failure count exceeds its retry allowance.
 Zero permits the initial attempt only. Exhaustion skips the annotation, emits
@@ -547,17 +554,14 @@ for the run; annotation health is diagnostic-only and never gates readiness.
 ### 3.2 Operator policy documents and the auto-versioning registry
 
 Two **operator-editable policy documents** (`src/policy.rs`) sit beside the
-sealed code documents of Section 6, but their identity is content-hashed rather
-than build-sealed. `[policies]` config holds their **paths only**
+sealed runtime documents of Section 6. `[policies]` config holds their **paths only**
 (`entity_match_file_path`, `annotator_naming_file_path`, `src/config.rs`,
 `deny_unknown_fields`); the documents themselves are strict TOML
 (`deny_unknown_fields` on every struct):
 
-- **`policies/entity-match.toml`** — the graph-entry fuzzy-match ruleset
-  (`EntityMatchPolicy`: `acronym.{enabled,min_name_tokens}`,
-  `token_prefix.{enabled,min_token_len}`, `max_fuzzy_candidates`) consumed by
-  the query graph channel (Section 6). Shipped neutral: both fuzzy classes
-  disabled.
+- **`policies/entity-match.toml`** — graph-entry acronym and token-prefix enable
+  flags. Numeric limits come from `[retrieval.entity_matching]`; both sources
+  form the effective `EntityMatchPolicy` hash. Both fuzzy classes ship disabled.
 - **`policies/annotator-naming.toml`** — retained as a required, validated and
   versioned document, but not applied to the single-goal annotation prompts.
   Its hash remains in application identity; edits do not change producer memo
@@ -672,6 +676,13 @@ probe/tolerance machinery is post-MVP — see Section 9).
   bytes and re-derives from archived rows — it **never re-embeds**.
 
 The verifier returns only a verdict; the caller owns the consequences.
+
+New chunks pin a typed construction descriptor through their envelope. Section
+and annotation payloads record versioned construction settings; explicit v1
+readers preserve prior chunk, 2,048-token section, and annotation formats.
+Validation uses recorded settings, while current read/memory guards can refuse
+an artifact as a resource-limit failure. Restore invokes no models. `[parsing]`
+resource/observation budgets retain successful parser identities and do not trigger reparsing.
 
 ### 5.3 Archive-verify-delete (`src/restore.rs::complete_superseded_parse`)
 
@@ -795,15 +806,15 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   combined annotations, and canonical source windows. Semantic entity matches can
   seed the graph; relation and summary matches nominate supporting excerpts directly.
   Outer RRF has three contributions: source dense, lexical, and grouped graph plus
-  semantic annotations. Each is capped at 100; the final pool contains at most
-  100 source targets. Whole-unit and exact full-unit candidates consolidate, while
+  semantic annotations. Discovery and final pool depths use the sealed runtime
+  retrieval limits. Whole-unit and exact full-unit candidates consolidate, while
   distinct partial excerpts retain separate identities.
 
-  Dense retrieval uses the same query vector to shortlist 20 section windows.
-  Each nominates up to five eligible units by their best fine-chunk cosine,
+  Dense retrieval uses the same query vector to shortlist `section_candidate_limit`
+  windows. Each nominates up to `section_passages_per_window` eligible units by their best fine-chunk cosine,
   strictly within that window's canonical membership. Units lacking fine vectors
   contribute context but cannot be nominated. Direct and section-guided lists
-  merge with equal-weight RRF, deduplicate, and cap at 100 before contributing
+  merge with equal-weight RRF, deduplicate, and apply the per-channel cap before contributing
   one dense ranking to outer fusion. Result provenance retains both routes and
   their section headings.
 
@@ -819,51 +830,46 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   `TokenPrefix` < `Semantic`), then matched-name character length descending, then
   name, unitId, and parseId ascending. Disabling fuzzy classes skips stored-name
   enumeration; semantic entry remains available. Traversal stays within one parse.
-  These knobs live in the entity-match policy document, deliberately **not** the
-  `RetrievalProfile`.
+  Enable flags live in the entity-match policy document; numeric matching limits
+  live in `config.toml` and the sealed `RetrievalProfile`.
 - **MaxSim** (`src/query/rerank.rs`, `src/query/annotation.rs`). Score admitted
   whole units and exact excerpts using persisted matrices. Each excerpt takes
   the best source or matched-annotation MaxSim score, never their sum. Queries
   embed the query only; document matrices are loaded in bounded buffers.
 - **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked units and excerpts,
-  construct same-section passages in canonical reading order, bounded to 512
-  ColBERT tokens and 64 contributing units. Merge overlapping passages when they
+  construct same-section passages in canonical reading order, bounded by
+  `passage_max_tokens` and `max_passage_units`. Merge overlapping passages when they
   fit; preserve structured-content boundaries and retrieved source ranges.
   Candidate IDs describe source ranges separately from canonical anchor IDs.
   Legacy oversized whole-unit prefixes carry `truncated: true`; exact retrieved
   windows remain complete and raw evidence retains full canonical bodies.
-- **Reranker** (`src/query/rerank.rs`). Scores up to 30 passages, or the requested
-  count if larger (maximum 100), with source text, headings, and separately labeled
-  matched annotation/graph context via the
+- **Reranker** (`src/query/rerank.rs`). Scores `reranker_candidate_pool_size`
+  passages (shipped value: 100), raised for larger valid result requests within
+  the ColBERT pool cap, with source text, headings, and separately labeled
+  matched annotation/graph context. Graph context has no separate token cutoff;
+  the reranker enforces its total input capacity through the
   config-selected backend. Model-call gating is **caller-side and
   backend-aware**: the shared model-call gate is acquired only when a local
   accelerator-backed model is invoked; a remote HTTP reranker is not gated behind
   the local runtime lock.
 - **Final results and assembly** (`src/query/passages.rs`, `src/assembly/`).
-  Apply the requested passage count (default 10, maximum 100), resolve source
+  Apply the requested passage count within configured result bounds, resolve source
   locations and physical PDF page references, and retain exactly the selected
-  canonical constituents in `evidencePack`. AssemblyPolicy v2 adds no neighbors
+  canonical constituents in `evidencePack`. AssemblyPolicy v3 adds no neighbors
   or containers; raw safety-limit failures are errors. Citation and evidence
   reads share the query transaction, and every pack includes an assembly trace.
 
 ### Sealed policy documents
 
-Three compile-sealed policy documents capture retrieval, evidence-retention,
-and annotation requirements. Each has a stable version and self-hash over its
-canonical serialization, excluding the hash field, and an `active_*()` accessor.
+Policy documents retain stable versions and canonical self-hashes. Validated
+configuration is loaded once; `StorageContext` and SQLite/artifact handles share
+immutable runtime settings without rereading TOML during operations.
 
-- The **`RetrievalProfile`** (`src/query/profile.rs`, `active_profile` /
-  `seal_mvp_profile`, version 4) seals `grouped_rrf`, semantic annotation retrieval,
-  best source/annotation MaxSim scoring, and the RRF
-  fusion constant (`rrf_k = 60`), per-channel and MaxSim candidate pool sizes
-  (`100`), section shortlist (`20`) and nominations per window (`5`), the reranker
-  passage pool size (`30`, raised to the requested count up to `100`), and the D9 graph hop budget (`1`). These are
-  deliberately NOT config keys: the D3 ruling moved
-  every retrieval knob out of operational config into this hashed document,
-  because a mutable config surface cannot guarantee a stable, auditable
-  retrieval identity.
-- The **`AssemblyPolicy`** (`src/assembly/policy.rs`) records selected-passage
-  retention and raw safety ceilings — the Assembly stage above.
+- **`RetrievalProfile` v5** (`src/query/profile.rs::from_limits`) owns one
+  configured `limits` object and seals the fixed grouped-RRF algorithm.
+- **`AssemblyPolicy` v3** (`src/assembly/policy.rs`) records selected-passage
+  retention and configured raw safety ceilings. Dormant expansion controls are
+  absent; token accounting counts complete text with truncation/padding disabled.
 - The **§21.4 required-annotation-set policy** (`src/annotations/policy.rs`,
   `RequiredAnnotationSetPolicy`) rules which annotation types must be fresh
   BEFORE activation (empty in the MVP document: nothing blocks activation)
@@ -904,9 +910,8 @@ database connections. Slots are poison-recovered on read.
   `inference_component.ready && sync_component.ready`. The fabric, annotation, and projection
   counts are **diagnostic-only** and NEVER gate readiness; a degraded diagnostic
   must not make a running service look down.
-- `AdmissionGate` (`search_admission`) enforces a **single in-flight search**
-  (`MAX_IN_FLIGHT_SEARCH = 1`, a code constant, not operator-tunable). The
-  `/query` handler acquires the permit **first**, before `spawn_blocking`;
+- `AdmissionGate` (`search_admission`) enforces `retrieval.max_concurrent_queries`.
+  The `/query` handler acquires the permit **first**, before `spawn_blocking`;
   over-capacity fails fast. `AdmissionGate::snapshot` feeds a diagnostic-only
   `search_admission` health component.
 - The **inference** ready details are **per-backend**. The dense line carries
@@ -960,6 +965,16 @@ holds the three selected retrieval backends and an optional local accelerator:
   Exactly one instance exists and the variants are **exclusive — there is no
   cross-backend fallback**.
 
+`models.*.max_tokens` declares model capacity; indexing windows and ColBERT
+query/document limits are separate. HTTP initialization checks the configured
+capacity against `/v1/models`; requests disable server-side truncation and expose
+overlength rejections. Existing local-model prefix allocation and ColBERT token-ID
+prefix handling remain unchanged. Annotation representations use complete windows.
+
+Optional Docling native sampling drains bounded output while polling and shares
+the remaining PDF deadline. Sampling timeout or partial capture is reported as
+unavailable telemetry, not a complete sample.
+
 **Accelerator initialization is conditional.** If any retrieval backend is local,
 `[inference]` selects its CUDA or Metal device and the binary must include the
 matching Cargo feature; local model inference has no CPU fallback. If dense,
@@ -991,9 +1006,10 @@ smoke round-trip through the configured endpoint (`dense_http_smoke_embedding` �
 `dense_http_smoke_ready` progress stages) that exercises the full receive path
 (dimension, finiteness, nonzero norm), so a misconfigured or unreachable
 endpoint fails startup rather than surfacing per-request. Requests carry a
-**bounded 429-only retry**: `DENSE_HTTP_RETRY_LIMIT = 3` retries on HTTP 429
+**bounded 429-only retry** using `models.dense.http_max_retries` on HTTP 429
 only (every other status and every transport failure keeps the fail-immediately
-policy), backoff `2/4/8s`, each retry logged `model_call.http_retry` at WARN, and
+policy), with configured initial/maximum backoff delays, each retry logged
+`model_call.http_retry` at WARN, and
 the retry count folded into the terminal `retried_attempts` field on the
 completed/failed logs.
 
@@ -1001,15 +1017,15 @@ completed/failed logs.
 on scoped OS threads while keeping **every SQLite write serial on the owning
 thread** (rusqlite `Transaction`/`Connection` is not `Sync`, and the atomicity
 contract requires one writer). The dense builder (`src/projections/dense.rs`)
-packs `DENSE_HTTP_BATCH_SIZE = 32` passage windows and dispatches up to
-`DENSE_HTTP_CONCURRENT_REQUESTS = 8` at a time; all windows join, then vectors
+packs `models.dense.http_batch_size` passage windows and dispatches up to
+`models.dense.http_concurrent_requests` at a time; all windows join, then vectors
 persist serially in chunk order, byte-identical to the local path. Honest
 caveat, documented in `dense.rs`: because the builder runs on the **caller's**
 transaction, the scheduler's `projection_build` writer lock is held **across the
 HTTP fan-out** — a pre-existing take-the-caller's-tx property, accepted pending
 the banked structural fix (embed before opening the transaction, lock only for
 the commit). The annotation worker (`src/annotations/worker.rs`) fans out
-up to `ANNOTATOR_CONCURRENT_CALLS = 32` independent producer chains per wave.
+up to `workers.annotation_concurrent_calls` independent producer chains per wave.
 Dependent stage calls within each chain are sequential, with no nested fan-out.
 The prepare/dispatch/commit split commits each chain's result serially; the pre-paid /
 post-paid deferral ruling keeps its writes off the hot writer lock during the

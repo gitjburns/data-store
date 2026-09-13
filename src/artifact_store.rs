@@ -21,7 +21,10 @@ use std::{
     fs,
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -31,6 +34,8 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::error::ApiError;
+use crate::limits::RuntimeLimits;
+use crate::runtime::{RuntimeSettings, StorageContext};
 
 /// Directory under `{index_root}/fabric/artifacts` naming the hash algorithm;
 /// part of the persisted D1 layout contract and must never change for
@@ -95,11 +100,13 @@ impl<R: Read> Read for HashingReader<R> {
 pub(crate) struct ArtifactStore {
     /// `{index_root}/fabric/artifacts` — the root of the hash-sharded tree.
     root: PathBuf,
+    // Readers and writers retain the operation's immutable resource admission policy.
+    settings: Arc<RuntimeSettings>,
 }
 
 impl ArtifactStore {
     /// Query readers require an existing store and never create filesystem state.
-    pub(crate) fn open_existing(index_root: &Path) -> Result<Self, ApiError> {
+    pub(crate) fn open_existing(index_root: &StorageContext) -> Result<Self, ApiError> {
         let root = index_root.join("fabric").join("artifacts");
         let directory = root.join(HASH_ALGORITHM_DIR);
         let metadata = fs::metadata(&directory).map_err(|source| ApiError::StorageOperation {
@@ -116,14 +123,17 @@ impl ArtifactStore {
                 ),
             });
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            settings: index_root.shared_settings(),
+        })
     }
 
     /// Open (creating if absent) the artifact store under
     /// `{index_root}/fabric/artifacts`. Callers pass `config.storage.index_root`;
     /// this constructor owns root creation and logs that boundary. It does not
     /// scan or validate existing blobs — reads verify integrity per blob.
-    pub(crate) fn open(index_root: &Path) -> Result<Self, ApiError> {
+    pub(crate) fn open(index_root: &StorageContext) -> Result<Self, ApiError> {
         let root = index_root.join("fabric").join("artifacts");
         // Shard directories are created on demand at write time; only the
         // algorithm root is created here so an empty store is recognizable.
@@ -147,7 +157,20 @@ impl ArtifactStore {
             root = %root.display(),
             "artifact store root ready"
         );
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            settings: index_root.shared_settings(),
+        })
+    }
+
+    /// Archive integrity uses recorded policies; allocation admission uses these current limits.
+    pub(crate) fn limits(&self) -> &RuntimeLimits {
+        &self.settings.limits
+    }
+
+    /// Snapshot policy records come from the same runtime that opened the store.
+    pub(crate) fn settings(&self) -> &RuntimeSettings {
+        &self.settings
     }
 
     /// Store raw bytes under their SHA-256 hash. Write-once semantics: if the

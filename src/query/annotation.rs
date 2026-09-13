@@ -6,7 +6,8 @@ use std::{
     time::Instant,
 };
 
-use rusqlite::{Connection, params};
+use crate::sqlite::Connection;
+use rusqlite::params;
 use serde::Serialize;
 use tracing::{error, info};
 
@@ -99,7 +100,7 @@ pub(crate) fn scan(
     query_id: &str,
 ) -> Result<AnnotationScan, ApiError> {
     let started = Instant::now();
-    let limit = profile.default_max_candidates_per_channel as usize;
+    let limit = profile.limits.max_candidates_per_channel as usize;
     let mut lists: BTreeMap<AnnotationRepresentation, Vec<WindowMatch>> = BTreeMap::new();
     let mut publications = 0_usize;
     let mut vectors = 0_usize;
@@ -280,8 +281,9 @@ pub(crate) fn fuse(
         query_id,
         source_hits = source.channel_hits.len(),
         representation_matches = scan.lists.values().map(Vec::len).sum::<usize>(),
-        candidate_limit = profile.colbert_candidate_pool_size,
-        rrf_k = profile.rrf_k,
+        candidate_limit = profile.limits.colbert_candidate_pool_size,
+        channel_limit = profile.limits.max_candidates_per_channel,
+        rrf_k = profile.limits.rrf_k,
         "fusing source dense, lexical, and grouped annotation rankings"
     );
     let result = fuse_candidates(conn, scan, source, profile);
@@ -312,7 +314,8 @@ fn fuse_candidates(
     source: ChannelCandidates,
     profile: &RetrievalProfile,
 ) -> Result<AnnotationFusion, ApiError> {
-    let limit = profile.colbert_candidate_pool_size as usize;
+    let pool_limit = profile.limits.colbert_candidate_pool_size as usize;
+    let channel_limit = profile.limits.max_candidates_per_channel as usize;
     let mut records: BTreeMap<String, RetrievalHit> = BTreeMap::new();
     let mut pointers: BTreeMap<String, Vec<WindowMatch>> = BTreeMap::new();
     let mut representation_lists = Vec::new();
@@ -384,20 +387,27 @@ fn fuse_candidates(
         merge_record(&mut records, &key, &hit);
         base_hits.push((key, hit));
     }
-    let semantic = fuse_ranked_lists(&representation_lists, limit, profile.rrf_k);
+    // Multiple representations share one discovery channel's budget. The larger
+    // final pool cannot expand either dense or semantic channel admission.
+    let semantic = fuse_ranked_lists(&representation_lists, channel_limit, profile.limits.rrf_k);
     let semantic_keys: Vec<String> = semantic.iter().map(|(key, _)| key.clone()).collect();
-    let dense = fuse_ranked_lists(&[dense, source_windows], limit, profile.rrf_k);
+    let dense = fuse_ranked_lists(
+        &[dense, source_windows],
+        channel_limit,
+        profile.limits.rrf_k,
+    );
+    // Graph and semantic are separate discoveries but one final fusion contribution.
     let annotation = fuse_ranked_lists(
         &[graph.clone(), semantic_keys.clone()],
-        limit,
-        profile.rrf_k,
+        pool_limit,
+        profile.limits.rrf_k,
     );
     let final_lists = vec![
         dense.iter().map(|(key, _)| key.clone()).collect(),
         lexical.clone(),
         annotation.iter().map(|(key, _)| key.clone()).collect(),
     ];
-    let fused = fuse_ranked_lists(&final_lists, limit, profile.rrf_k);
+    let fused = fuse_ranked_lists(&final_lists, pool_limit, profile.limits.rrf_k);
     let mut channel_hits = Vec::new();
     for (index, (key, score)) in dense.iter().enumerate() {
         let mut hit = records[key].clone();

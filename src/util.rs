@@ -8,6 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::limits::DiagnosticLimits;
 use tracing::{Instrument, Span, field::Empty};
 
 /// Process-local diagnostic correlation; canonical object IDs retain their
@@ -138,12 +139,12 @@ pub(crate) fn model_call_context(role: &'static str, purpose: &str) -> LogContex
 
 /// Preserve nested provider/OS causes that Display alone can omit. Bound even a
 /// pathological cyclic error chain and mark truncation explicitly.
-pub(crate) fn error_chain(error: &dyn Error) -> String {
+pub(crate) fn error_chain(error: &dyn Error, limits: &DiagnosticLimits) -> String {
     let mut detail = error.to_string();
     let mut next = error.source();
-    for _ in 0..16 {
+    for _ in 0..limits.error_chain_depth {
         let Some(cause) = next else {
-            return truncate_diagnostic_text(&detail);
+            return truncate_diagnostic_text(&detail, limits);
         };
         detail.push_str("; caused by: ");
         detail.push_str(&cause.to_string());
@@ -152,43 +153,29 @@ pub(crate) fn error_chain(error: &dyn Error) -> String {
     if next.is_some() {
         detail.push_str(" [cause chain truncated]");
     }
-    truncate_diagnostic_text(&detail)
+    truncate_diagnostic_text(&detail, limits)
 }
 
-/// Maximum sleep between retry attempts or background cycles. This ceiling
-/// bounds backoff, not request timeouts, work duration, or total retry lifetime.
-pub(crate) const MAX_BACKOFF_MS: u64 = 60_000;
-
-/// Upper bound on diagnostic text carried into API errors and logs.
-pub(crate) const MAX_DIAGNOSTIC_CHARS: usize = 16_000;
-
-/// Truncate diagnostic text so API errors remain readable.
-pub(crate) fn truncate_diagnostic_text(value: &str) -> String {
+/// Bound visible error details using the owning operation's configured character budget.
+pub(crate) fn truncate_diagnostic_text(value: &str, limits: &DiagnosticLimits) -> String {
     let mut truncated = value
         .trim()
         .chars()
-        .take(MAX_DIAGNOSTIC_CHARS)
+        .take(limits.max_error_chars)
         .collect::<String>();
-    if value.chars().count() > MAX_DIAGNOSTIC_CHARS {
+    if value.chars().count() > limits.max_error_chars {
         truncated.push_str("...");
     }
     truncated
 }
 
-/// Cap applied to failure/error detail text before it is persisted into
-/// hot-plane detail columns (acquisition_records.failure_detail,
-/// sync_queue.last_error), so a pathological connector or drain error can
-/// never bloat records or logs.
-pub(crate) const PERSISTED_DETAIL_MAX_CHARS: usize = 500;
-
-/// Bound detail text to PERSISTED_DETAIL_MAX_CHARS before persisting or
-/// logging it; truncation is marked explicitly so a capped detail is never
-/// mistaken for the complete message.
-pub(crate) fn truncate_persisted_detail(detail: &str) -> String {
-    if detail.chars().count() <= PERSISTED_DETAIL_MAX_CHARS {
+/// Bound persisted summaries and mark truncation; the original operation error
+/// remains available at its authoritative boundary under the separate error budget.
+pub(crate) fn truncate_persisted_detail(detail: &str, limits: &DiagnosticLimits) -> String {
+    if detail.chars().count() <= limits.persisted_detail_chars {
         return detail.to_owned();
     }
-    let mut bounded: String = detail.chars().take(PERSISTED_DETAIL_MAX_CHARS).collect();
+    let mut bounded: String = detail.chars().take(limits.persisted_detail_chars).collect();
     bounded.push_str(" [truncated]");
     bounded
 }
@@ -198,7 +185,10 @@ pub(crate) fn truncate_persisted_detail(detail: &str) -> String {
 /// Shared across thread-join boundaries so panic diagnostics stay consistent
 /// across spawned-work owners. Returns a bounded diagnostic string safe for
 /// logs.
-pub(crate) fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_payload_message(
+    payload: &(dyn Any + Send),
+    limits: &DiagnosticLimits,
+) -> String {
     let message = if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -207,5 +197,15 @@ pub(crate) fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
         "unknown panic payload".to_string()
     };
 
-    truncate_diagnostic_text(&message)
+    truncate_diagnostic_text(&message, limits)
+}
+
+/// Diagnostic prefixes never decide identity; character boundaries also make
+/// malformed non-ASCII identifiers safe to report before validation rejects them.
+pub(crate) fn hash_prefix<'a>(hash: &'a str, limits: &DiagnosticLimits) -> &'a str {
+    let end = hash
+        .char_indices()
+        .nth(limits.hash_prefix_chars)
+        .map_or(hash.len(), |(byte, _)| byte);
+    &hash[..end]
 }

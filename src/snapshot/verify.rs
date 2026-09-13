@@ -45,7 +45,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
-use rusqlite::{Connection, params};
+use crate::runtime::StorageContext;
+use crate::sqlite::Connection;
+use rusqlite::params;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracing::{error, info};
@@ -64,6 +66,7 @@ use crate::projections::section_dense::{
 };
 use crate::projections::{annotation, annotation_io};
 use crate::query::provenance::{AnnotationRepresentation, SourceExcerpt};
+use crate::util::hash_prefix;
 
 /// Log-event namespace for this module's verification boundary logs, so every
 /// verify line is attributable to snapshot verification.
@@ -83,7 +86,7 @@ const CAPABILITY_PROFILE_HASH_MARKER_TYPE: &str = "capability_profile_hash_refer
 /// means the snapshot is mechanically sound; Err carries the first failing
 /// artifact's context so the lifecycle halt is diagnosable.
 pub(crate) fn verify_mechanical(
-    index_root: &Path,
+    index_root: &StorageContext,
     snapshot: &ForensicSnapshot,
 ) -> Result<(), ApiError> {
     let verification_log = crate::util::LogContext::new("snapshot", &snapshot.id);
@@ -114,6 +117,8 @@ pub(crate) fn verify_mechanical(
         .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
     let annotation_publications = verified_annotation_publications(&store, &snapshot.id, &manifest)
         .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
+    verified_chunk_policies(&store, snapshot, &manifest)
+        .map_err(|source| log_tier_failure("mechanical", snapshot, started, source))?;
 
     info!(
         event = "snapshot.verify.mechanical_succeeded",
@@ -131,6 +136,154 @@ pub(crate) fn verify_mechanical(
         "mechanical snapshot verification succeeded"
     );
     Ok(())
+}
+
+/// Authenticate each chunk's producer against its pinned construction settings.
+/// The descriptor-free v1 path accepts only the exact historical identity.
+fn verified_chunk_policies(
+    store: &ArtifactStore,
+    snapshot: &ForensicSnapshot,
+    manifest: &ForensicSnapshotManifest,
+) -> Result<BTreeMap<String, String>, ApiError> {
+    let mut refs = BTreeMap::new();
+    for reference in manifest.retrieval_projections.iter().filter(|reference| {
+        reference.artifact_type == crate::projections::CHUNK_CONFIG_PAYLOAD_TYPE
+    }) {
+        let id = reference
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("projectionId"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: chunk policy reference lacks projection identity",
+                    snapshot.id
+                ))
+            })?;
+        if refs.insert(id.to_owned(), reference).is_some() {
+            return Err(verification_failure(format!(
+                "snapshot {}: repeated chunk policy reference {id}",
+                snapshot.id
+            )));
+        }
+    }
+    let envelopes = load_archived_jsonl(store, snapshot, manifest, "retrieval_projections")?;
+    let mut policies = BTreeMap::new();
+    for envelope in &envelopes {
+        let object = as_object(envelope, snapshot, "retrieval_projections")?;
+        if json_str(object, "projection_type") != Some("chunk") {
+            continue;
+        }
+        let id = required_str(object, "id", snapshot, "retrieval_projections")?;
+        let producer: Provenance = serde_json::from_str(&required_str(
+            object,
+            "producer_json",
+            snapshot,
+            "retrieval_projections",
+        )?)
+        .map_err(|source| {
+            verification_failure(format!(
+                "snapshot {}: chunk producer {id}: {source}",
+                snapshot.id
+            ))
+        })?;
+        let policy = if let Some(uri) = json_str(object, "payload_uri") {
+            let reference = refs.remove(&id).ok_or_else(|| {
+                verification_failure(format!(
+                    "snapshot {}: chunk projection {id} has no pinned policy",
+                    snapshot.id
+                ))
+            })?;
+            if reference.uri != uri {
+                return Err(verification_failure(format!(
+                    "snapshot {}: chunk projection {id} policy URI differs",
+                    snapshot.id
+                )));
+            }
+            let policy: ChunkerConfig = store.with_verified_reader(
+                uri,
+                Some(store.limits().resources.max_json_cell_bytes as u64),
+                |reader| {
+                    serde_json::from_reader(reader).map_err(|source| {
+                        verification_failure(format!(
+                            "snapshot {}: chunk policy {id}: {source}",
+                            snapshot.id
+                        ))
+                    })
+                },
+            )?;
+            policy.validate()?;
+            let config_hash = policy.config_hash()?;
+            if reference.hash != config_hash
+                || producer.config_hash.as_deref() != Some(config_hash.as_str())
+            {
+                return Err(verification_failure(format!(
+                    "snapshot {}: chunk projection {id} producer/reference/config disagreement",
+                    snapshot.id
+                )));
+            }
+            policy
+        } else {
+            // Unpublished attempts have no rows to restore and no completed descriptor.
+            if matches!(
+                json_str(object, "freshness_status"),
+                Some("building" | "failed")
+            ) {
+                continue;
+            }
+            let policy = ChunkerConfig::legacy();
+            if producer.config_hash.is_some() {
+                return Err(verification_failure(format!(
+                    "snapshot {}: descriptor-free chunk projection {id} has a nonlegacy config hash",
+                    snapshot.id
+                )));
+            }
+            policy
+        };
+        if producer.producer_name != policy.chunker_name
+            || producer.producer_version.as_deref() != Some(policy.chunker_version.as_str())
+        {
+            return Err(verification_failure(format!(
+                "snapshot {}: chunk projection {id} has unsupported producer identity",
+                snapshot.id
+            )));
+        }
+        policies.insert(id, policy);
+    }
+    if !refs.is_empty() {
+        return Err(verification_failure(format!(
+            "snapshot {}: chunk construction reference has no owning envelope",
+            snapshot.id
+        )));
+    }
+    for record in load_archived_jsonl(store, snapshot, manifest, "chunk_projections")? {
+        let object = as_object(&record, snapshot, "chunk_projections")?;
+        let id = required_str(object, "id", snapshot, "chunk_projections")?;
+        let owner = required_str(object, "projection_id", snapshot, "chunk_projections")?;
+        let policy = policies.get(&owner).ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: chunk {id} has no completed producer",
+                snapshot.id
+            ))
+        })?;
+        if json_str(object, "chunker_config_hash") != Some(policy.config_hash()?.as_str())
+            || json_str(object, "chunker_name") != Some(policy.chunker_name.as_str())
+            || json_str(object, "chunker_version") != Some(policy.chunker_version.as_str())
+            || object
+                .get("token_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|tokens| tokens > policy.max_unit_tokens as u64)
+        {
+            return Err(verification_failure(format!(
+                "snapshot {}: chunk {id} disagrees with its recorded construction policy",
+                snapshot.id
+            )));
+        }
+    }
+    policies
+        .into_iter()
+        .map(|(id, policy)| Ok((id, policy.config_hash()?)))
+        .collect()
 }
 
 /// Verified immutable publications retain compact row identities for the final
@@ -1686,7 +1839,12 @@ pub(crate) fn verified_section_planes(
                 snapshot.id
             )));
         }
-        crate::projections::section_dense::validate_archived_plane(&units, &relationships, &plane)?;
+        crate::projections::section_dense::validate_archived_plane(
+            &units,
+            &relationships,
+            &plane,
+            store.limits(),
+        )?;
         if completed {
             completed_section_parses.insert(parse_id);
         }
@@ -1718,7 +1876,7 @@ pub(crate) fn verified_section_planes(
 /// re-taken). Ok clears the deletion gate; Err halts before deletion and — by
 /// the caller's duty — retains superseded state.
 pub(crate) fn verify_deletion_gate(
-    index_root: &Path,
+    index_root: &StorageContext,
     snapshot: &ForensicSnapshot,
 ) -> Result<(), ApiError> {
     // Mechanical is the floor: a deletion gate that skipped it could delete over
@@ -1983,8 +2141,8 @@ fn load_and_check_manifest(
         return Err(verification_failure(format!(
             "snapshot {}: manifest self-hash mismatch (recorded {}, recomputed {})",
             snapshot.id,
-            hash_prefix(&manifest.manifest_hash),
-            hash_prefix(&recomputed)
+            hash_prefix(&manifest.manifest_hash, &store.limits().diagnostics),
+            hash_prefix(&recomputed, &store.limits().diagnostics)
         )));
     }
     // The recorded self-hash must also be the address the header points at, or
@@ -1994,8 +2152,8 @@ fn load_and_check_manifest(
             "snapshot {}: header manifest_hash {} does not match the manifest's own \
              manifestHash {}",
             snapshot.id,
-            hash_prefix(&snapshot.manifest_hash),
-            hash_prefix(&manifest.manifest_hash)
+            hash_prefix(&snapshot.manifest_hash, &store.limits().diagnostics),
+            hash_prefix(&manifest.manifest_hash, &store.limits().diagnostics)
         )));
     }
     Ok(manifest)
@@ -2059,7 +2217,7 @@ fn verify_all_refs_hash(
                     "snapshot {}: section {} artifact {} ({}) failed hash verification: {source}",
                     snapshot.id,
                     section_name,
-                    hash_prefix(&artifact.hash),
+                    hash_prefix(&artifact.hash, &store.limits().diagnostics),
                     artifact.artifact_type
                 ))
             })?;
@@ -2125,18 +2283,16 @@ fn manifest_ref_sections(
 /// `chunk_projections` JSONL record set against the live hot `chunk_projections`
 /// rows for the subject parse, bounded to what `chunk.rs` DETERMINISTICALLY
 /// derives: row identity/count, `input_unit_ids`, `targeting_text`, and the
-/// `chunker_config_hash`. It additionally requires every archived chunk's
-/// `chunker_config_hash` to equal the banked `ChunkerConfig::active().config_hash()`
-/// — the single source of the §22 chunker identity.
+/// `chunker_config_hash`. Construction settings come from the pinned descriptor,
+/// or the exact frozen v1 identity for snapshots predating descriptors.
 ///
 /// DELIBERATELY NOT CHECKED: this does NOT re-run the chunker's text splitter.
 /// `chunk.rs::split_units_into_chunks` requires a caller-supplied ColBERT
 /// `Tokenizer` (a model runtime handle), and §38 forbids any model call here.
 /// The deterministic-rebuild guarantee is instead established by (a) proving the
 /// archived and live chunk sets agree byte-for-byte on the deterministic
-/// columns, and (b) pinning the producing config identity to the banked hash —
-/// together these show the captured chunks are the ones the banked deterministic
-/// producer would yield, without re-running the tokenizer-bearing split.
+/// columns, and (b) authenticating their recorded construction settings without
+/// re-running the tokenizer-bearing split or applying current indexing limits.
 fn verify_chunk_plane(
     store: &ArtifactStore,
     connection: &Connection,
@@ -2146,8 +2302,7 @@ fn verify_chunk_plane(
 ) -> Result<usize, ApiError> {
     let archived = load_archived_jsonl(store, snapshot, manifest, "chunk_projections")?;
 
-    // Banked config identity: every archived chunk must carry this exact hash.
-    let banked_config_hash = ChunkerConfig::active().config_hash()?;
+    let policies = verified_chunk_policies(store, snapshot, manifest)?;
 
     // Index the archived chunk records for this parse by their deterministic
     // comparison key. Only the subject parse's chunks are in scope (the archived
@@ -2159,15 +2314,20 @@ fn verify_chunk_plane(
             continue;
         }
         let comparison = chunk_comparison(object, snapshot)?;
-        if comparison.chunker_config_hash != banked_config_hash {
+        let projection_id = required_str(object, "projection_id", snapshot, "chunk_projections")?;
+        let expected_hash = policies.get(&projection_id).ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: chunk {} has no captured construction policy",
+                snapshot.id, comparison.id
+            ))
+        })?;
+        if &comparison.chunker_config_hash != expected_hash {
             return Err(verification_failure(format!(
-                "snapshot {}: archived chunk {} has chunker_config_hash {} but the banked \
-                 ChunkerConfig hashes to {}; the captured chunks were not produced by the \
-                 current deterministic chunker identity",
+                "snapshot {}: archived chunk {} has chunker_config_hash {} but its captured construction policy hashes to {}",
                 snapshot.id,
                 comparison.id,
-                hash_prefix(&comparison.chunker_config_hash),
-                hash_prefix(&banked_config_hash)
+                hash_prefix(&comparison.chunker_config_hash, &store.limits().diagnostics),
+                hash_prefix(expected_hash, &store.limits().diagnostics)
             )));
         }
         archived_chunks.insert(comparison.id.clone(), comparison);
@@ -2182,6 +2342,7 @@ fn verify_chunk_plane(
     compare_keyed_sets(
         snapshot,
         "chunk_projections",
+        &store.limits().diagnostics,
         &archived_chunks,
         &hot_chunks,
         |id, archived, hot| {
@@ -2243,7 +2404,7 @@ fn verify_dense_plane(
             verification_failure(format!(
                 "snapshot {}: dense vector blob {} for chunk {} failed to load: {source}",
                 snapshot.id,
-                hash_prefix(&blob_hash),
+                hash_prefix(&blob_hash, &store.limits().diagnostics),
                 chunk_id
             ))
         })?;
@@ -2352,7 +2513,7 @@ fn verify_multivector_plane(
             verification_failure(format!(
                 "snapshot {}: multivector blob {} for row {} failed to load: {source}",
                 snapshot.id,
-                hash_prefix(&blob_hash),
+                hash_prefix(&blob_hash, &store.limits().diagnostics),
                 row_id
             ))
         })?;
@@ -2425,6 +2586,7 @@ fn verify_graph_plane(
     compare_keyed_sets(
         snapshot,
         "graph_entity_mentions",
+        &store.limits().diagnostics,
         &expected_mentions
             .iter()
             .map(|(name, expectation)| {
@@ -2438,7 +2600,7 @@ fn verify_graph_plane(
                     "snapshot {}: graph mention for normalized entity name {:?} has archived-derived \
                      unit set differing from the hot plane",
                     snapshot.id,
-                    bounded_name(name)
+                    bounded_name(name, &store.limits().diagnostics)
                 )));
             }
             Ok(())
@@ -2777,7 +2939,7 @@ fn load_archived_jsonl(
         verification_failure(format!(
             "snapshot {}: archived {artifact_type} ({}) failed to load: {source}",
             snapshot.id,
-            hash_prefix(&artifact.hash)
+            hash_prefix(&artifact.hash, &store.limits().diagnostics)
         ))
     })
 }
@@ -2804,6 +2966,7 @@ fn find_ref_by_type<'m>(
 fn compare_keyed_sets<V>(
     snapshot: &ForensicSnapshot,
     plane: &str,
+    diagnostics: &crate::limits::DiagnosticLimits,
     archived: &BTreeMap<String, V>,
     hot: &BTreeMap<String, V>,
     on_match: impl Fn(&str, &V, &V) -> Result<(), ApiError>,
@@ -2815,7 +2978,7 @@ fn compare_keyed_sets<V>(
                 return Err(verification_failure(format!(
                     "snapshot {}: {plane} key {:?} is archived but absent from the hot plane",
                     snapshot.id,
-                    bounded_name(key)
+                    bounded_name(key, diagnostics)
                 )));
             }
         }
@@ -2825,7 +2988,7 @@ fn compare_keyed_sets<V>(
             return Err(verification_failure(format!(
                 "snapshot {}: {plane} key {:?} exists in the hot plane but not in the archive",
                 snapshot.id,
-                bounded_name(key)
+                bounded_name(key, diagnostics)
             )));
         }
     }
@@ -2924,7 +3087,7 @@ fn prepare<'c>(
     connection: &'c Connection,
     sql: &str,
     what: &str,
-) -> Result<rusqlite::Statement<'c>, ApiError> {
+) -> Result<crate::sqlite::Statement<'c>, ApiError> {
     connection
         .prepare(sql)
         .map_err(|source| ApiError::StorageOperation {
@@ -2980,22 +3143,18 @@ fn log_tier_failure(
     source
 }
 
-/// First 12 hex characters of a hash for bounded logging/messages — enough to
-/// disambiguate in practice, never the full digest, and never content.
-fn hash_prefix(hash: &str) -> &str {
-    let end = hash.len().min(12);
-    &hash[..end]
-}
-
 /// Bound a normalized entity name / key for logging so a failure message never
 /// carries an unbounded (or content-revealing) name. Entity names are already
 /// derived identities, but the DIAGNOSTICS rule against logging document
 /// contents is honored by capping length.
-fn bounded_name(name: &str) -> String {
-    const MAX: usize = 64;
-    if name.len() <= MAX {
-        name.to_owned()
-    } else {
-        format!("{}…", &name[..MAX])
+fn bounded_name(name: &str, diagnostics: &crate::limits::DiagnosticLimits) -> String {
+    let mut chars = name.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(diagnostics.identifier_preview_chars)
+        .collect();
+    if chars.next().is_some() {
+        bounded.push('…');
     }
+    bounded
 }

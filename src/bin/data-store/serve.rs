@@ -119,9 +119,24 @@ async fn serve_index() -> Response {
     asset_response(CONTENT_TYPE_HTML, INDEX_HTML)
 }
 
-/// Serve the embedded application script.
-async fn serve_app_js() -> Response {
-    asset_response(CONTENT_TYPE_JS, APP_JS)
+/// Supply validated numeric client settings with the embedded script; no service config or secrets cross.
+async fn serve_app_js(State(context): State<Arc<ClientContext>>) -> Response {
+    let settings = match serde_json::to_string(&context.settings) {
+        Ok(settings) => settings,
+        Err(source) => {
+            eprintln!("failed to serialize web client settings: {source}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "client_configuration",
+                &source.to_string(),
+            );
+        }
+    };
+    // JSON contains only validated numeric fields. The prefix keeps strict mode
+    // active and makes the loaded client configuration authoritative for previews.
+    let body =
+        format!("'use strict';\nconst CLIENT_SETTINGS = Object.freeze({settings});\n{APP_JS}");
+    ([(header::CONTENT_TYPE, CONTENT_TYPE_JS)], body).into_response()
 }
 
 /// Serve the embedded stylesheet.

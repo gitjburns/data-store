@@ -14,6 +14,8 @@ use crate::{error::ApiError, state::ShutdownSignal};
 pub(crate) struct MaintenanceGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    /// Shutdown uses a separate latch, so waits periodically observe it.
+    poll_interval: Duration,
     annotation_cancellation: watch::Sender<Option<AnnotationCancelReason>>,
 }
 
@@ -67,13 +69,14 @@ impl AnnotationCancellation {
     }
 }
 
-impl Default for MaintenanceGate {
-    /// The sender retains state even before an annotation client subscribes.
-    fn default() -> Self {
+impl MaintenanceGate {
+    /// Capture validated polling cadence; cancellation retains state before subscription.
+    pub(crate) fn new(poll_interval_ms: u64) -> Self {
         let (annotation_cancellation, _) = watch::channel(None);
         Self {
             state: Mutex::new(GateState::default()),
             changed: Condvar::new(),
+            poll_interval: Duration::from_millis(poll_interval_ms),
             annotation_cancellation,
         }
     }
@@ -165,9 +168,9 @@ impl MaintenanceGate {
             // Poll shutdown's separate latch without building an Instant deadline
             // from the unbounded configured seconds. Rebuild wakes this wait directly.
             let interval = if delay_pending {
-                remaining.min(Duration::from_millis(100))
+                remaining.min(self.poll_interval)
             } else {
-                Duration::from_millis(100)
+                self.poll_interval
             };
             state = self
                 .changed
@@ -269,11 +272,11 @@ impl MaintenanceGate {
                 parked = true;
             }
             let interval = if state.detail.is_some() || state.startup_detail.is_some() {
-                Duration::from_millis(100)
+                self.poll_interval
             } else {
                 delay
                     .saturating_sub(started.elapsed())
-                    .min(Duration::from_millis(100))
+                    .min(self.poll_interval)
             };
             state = self
                 .changed

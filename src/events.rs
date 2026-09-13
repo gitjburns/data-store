@@ -33,7 +33,7 @@ INSERT INTO system_events (
 /// itself. Failures are explicit `StorageOperation` errors carrying the
 /// event's identity; callers must propagate them, never swallow them.
 pub(crate) fn append_event(
-    connection: &rusqlite::Connection,
+    connection: &crate::sqlite::Connection,
     event: &SystemEvent,
 ) -> Result<(), ApiError> {
     let event_type = event_type_wire_name(event.event_type)?;

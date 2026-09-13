@@ -27,16 +27,18 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, BufWriter, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::error::ApiError;
+use crate::limits::RuntimeLimits;
 use crate::model::{
     ContentType, Locator, ParseMetrics, ParseWarningSeverity, UnitRelationshipType,
 };
@@ -118,14 +120,6 @@ const REQUIRED_BUNDLE_FILES: [&str; 7] = [
     BUNDLE_STDOUT_LOG_FILE_NAME,
     BUNDLE_STDERR_LOG_FILE_NAME,
 ];
-
-/// Cap on the PRESERVED payload of each captured process log stream
-/// (stdout.log, stderr.log). A truncated log gets an explicit marker line
-/// appended after the preserved bytes, so the file may exceed the cap by
-/// the marker's length and a capped log is never mistaken for a complete
-/// one. 64 KiB keeps failure diagnostics useful without letting a chatty
-/// external tool bloat staging.
-pub(crate) const BUNDLE_STREAM_LOG_CAP_BYTES: usize = 64 * 1024;
 
 /// Prefix of every bundle directory name this writer creates, promoted and
 /// temp alike (`bundle-{epoch_ms}-{seq}`). Shared with the scheduler's
@@ -350,18 +344,28 @@ pub(crate) enum BundleReadError {
     Internal(ApiError),
     /// The bundle violates the staged-output contract: missing or unlisted
     /// files, digest/size mismatch, bad schema version, or malformed
-    /// records. `detail` names the offending file, is bounded via
-    /// `truncate_persisted_detail`, and is safe to persist as a ParseRun
-    /// failure detail as-is.
+    /// records. The public read boundary bounds detail before logging/returning it.
     ContractViolation { detail: String },
+    /// Current resource admission refused valid-or-unverified bytes; not corruption.
+    ResourceLimit {
+        detail: String,
+        /// Present only after complete file verification; importer must archive
+        /// these bytes before recording the admission refusal.
+        verified_parser_raw_files: Option<VerifiedParserRaw>,
+    },
 }
 
-/// Build a bounded `ContractViolation`, applying the persisted-detail cap at
-/// construction so no caller can accidentally persist unbounded producer
-/// output.
+/// Tie rejected-bundle raw bytes to the verified manifest for the importer's claims check.
+#[derive(Debug)]
+pub(crate) struct VerifiedParserRaw {
+    pub(crate) manifest_hash: String,
+    pub(crate) files: BTreeMap<String, Vec<u8>>,
+}
+
+/// Classify an intermediate contract failure; the public read boundary bounds detail.
 fn violation(detail: impl AsRef<str>) -> BundleReadError {
     BundleReadError::ContractViolation {
-        detail: truncate_persisted_detail(detail.as_ref()),
+        detail: detail.as_ref().to_owned(),
     }
 }
 
@@ -435,6 +439,8 @@ impl JsonlStream {
 /// will ever read it, and the scheduler removes such orphans at thread
 /// start (its sweep keys on BUNDLE_DIR_NAME_PREFIX/BUNDLE_TEMP_DIR_SUFFIX).
 pub(crate) struct BundleWriter {
+    /// Immutable admission/diagnostic limits survive failed producer completion.
+    limits: RuntimeLimits,
     identity: BundleIdentity,
     /// In-progress directory (`<bundle>.tmp`); renamed to `bundle_dir` on
     /// successful `finish`.
@@ -452,7 +458,11 @@ impl BundleWriter {
     /// a unique temp directory, and eagerly create the three JSONL stream
     /// files so even a zero-record bundle contains the full required file
     /// set.
-    pub(crate) fn create(staging_root: &Path, identity: BundleIdentity) -> Result<Self, ApiError> {
+    pub(crate) fn create(
+        staging_root: &Path,
+        identity: BundleIdentity,
+        limits: RuntimeLimits,
+    ) -> Result<Self, ApiError> {
         fs::create_dir_all(staging_root).map_err(|source| ApiError::InternalIo {
             message: format!(
                 "failed to create parse staging root at {}: {source}",
@@ -492,6 +502,7 @@ impl BundleWriter {
         );
 
         Ok(Self {
+            limits,
             identity,
             temp_dir,
             bundle_dir,
@@ -500,6 +511,11 @@ impl BundleWriter {
             warnings,
             started: Instant::now(),
         })
+    }
+
+    /// Keep failure summaries and process capture on the writer's original settings.
+    pub(crate) fn limits(&self) -> &RuntimeLimits {
+        &self.limits
     }
 
     /// Stream one candidate unit to `candidate_content_units.jsonl`.
@@ -636,7 +652,10 @@ impl BundleWriter {
         // importer builds from it.
         let mut bounded_result = parser_result.clone();
         if let Some(error_detail) = &bounded_result.error {
-            bounded_result.error = Some(truncate_persisted_detail(error_detail));
+            bounded_result.error = Some(truncate_persisted_detail(
+                error_detail,
+                &self.limits.diagnostics,
+            ));
         }
         write_json_file(
             &self.temp_dir.join(BUNDLE_PARSER_RESULT_FILE_NAME),
@@ -648,8 +667,16 @@ impl BundleWriter {
             BUNDLE_METRICS_FILE_NAME,
             metrics,
         )?;
-        write_bounded_log(&self.temp_dir.join(BUNDLE_STDOUT_LOG_FILE_NAME), stdout_log)?;
-        write_bounded_log(&self.temp_dir.join(BUNDLE_STDERR_LOG_FILE_NAME), stderr_log)?;
+        write_bounded_log(
+            &self.temp_dir.join(BUNDLE_STDOUT_LOG_FILE_NAME),
+            stdout_log,
+            self.limits.parsing.process_log_bytes,
+        )?;
+        write_bounded_log(
+            &self.temp_dir.join(BUNDLE_STDERR_LOG_FILE_NAME),
+            stderr_log,
+            self.limits.parsing.process_log_bytes,
+        )?;
 
         // Digest the exact bytes on disk (read back after flush) so every
         // manifest claim describes what the bundle actually contains,
@@ -662,19 +689,15 @@ impl BundleWriter {
         })?;
         let mut files = BTreeMap::new();
         for (rel_path, abs_path) in &disk_files {
-            let bytes = fs::read(abs_path).map_err(|source| ApiError::InternalIo {
-                message: format!(
-                    "failed to read staged bundle file {rel_path} at {}: {source}",
-                    abs_path.display()
-                ),
+            let digest = file_digest(abs_path, self.limits.resources.embedding_read_buffer_bytes)
+                .map_err(|source| match source {
+                BundleReadError::Internal(source) => source,
+                BundleReadError::ContractViolation { detail }
+                | BundleReadError::ResourceLimit { detail, .. } => {
+                    ApiError::InternalIo { message: detail }
+                }
             })?;
-            files.insert(
-                rel_path.clone(),
-                FileDigest {
-                    sha256: crate::canonical::sha256_hex_bytes(&bytes),
-                    size_bytes: bytes.len() as u64,
-                },
-            );
+            files.insert(rel_path.clone(), digest);
         }
         let file_count = files.len();
 
@@ -726,22 +749,22 @@ fn write_json_file<T: Serialize>(path: &Path, file_name: &str, value: &T) -> Res
 }
 
 /// Write one captured process log stream, preserving at most
-/// [`BUNDLE_STREAM_LOG_CAP_BYTES`] bytes and appending an explicit
+/// the configured process-log byte cap and appending an explicit
 /// truncation marker when anything was omitted. Logs are opaque bytes (a
 /// child process owns their encoding), so the cut may split a UTF-8
 /// sequence; the marker makes the truncation unmistakable either way.
-fn write_bounded_log(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
+fn write_bounded_log(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(), ApiError> {
     let io_error = |source: &io::Error| ApiError::InternalIo {
         message: format!(
             "failed to write bounded log at {}: {source}",
             path.display()
         ),
     };
-    if bytes.len() <= BUNDLE_STREAM_LOG_CAP_BYTES {
+    if bytes.len() <= max_bytes {
         return fs::write(path, bytes).map_err(|source| io_error(&source));
     }
-    let omitted = bytes.len() - BUNDLE_STREAM_LOG_CAP_BYTES;
-    let mut bounded = bytes[..BUNDLE_STREAM_LOG_CAP_BYTES].to_vec();
+    let omitted = bytes.len() - max_bytes;
+    let mut bounded = bytes[..max_bytes].to_vec();
     bounded.extend_from_slice(
         format!("\n--- log truncated: {omitted} bytes omitted ---\n").as_bytes(),
     );
@@ -831,14 +854,17 @@ fn collect_regular_files_into(
 /// of the §12.1 trust split: nothing from a bundle reaches the importer's
 /// validation logic without passing it. Content is still candidate claims —
 /// §13.1 structural validation is the importer's job, not this function's.
-pub(crate) fn read_bundle(bundle_dir: &Path) -> Result<ParserOutputBundle, BundleReadError> {
+pub(crate) fn read_bundle(
+    bundle_dir: &Path,
+    limits: &RuntimeLimits,
+) -> Result<ParserOutputBundle, BundleReadError> {
     let started = Instant::now();
     info!(
         event = "parse.bundle.read_started",
         bundle_dir = %bundle_dir.display(),
         "parser output bundle read starting"
     );
-    match read_bundle_inner(bundle_dir) {
+    match read_bundle_inner(bundle_dir, limits) {
         Ok(bundle) => {
             info!(
                 event = "parse.bundle.read_succeeded",
@@ -855,7 +881,14 @@ pub(crate) fn read_bundle(bundle_dir: &Path) -> Result<ParserOutputBundle, Bundl
             );
             Ok(bundle)
         }
-        Err(read_error) => {
+        Err(mut read_error) => {
+            // Intermediate validation keeps full context; only this externally
+            // observable boundary applies the configured persisted-detail budget.
+            if let BundleReadError::ContractViolation { detail }
+            | BundleReadError::ResourceLimit { detail, .. } = &mut read_error
+            {
+                *detail = truncate_persisted_detail(detail, &limits.diagnostics);
+            }
             // Two log severities for the two failure arms: a rejected
             // bundle is an expected untrusted-producer outcome (warn), an
             // internal fault is our own infrastructure failing (error).
@@ -866,6 +899,13 @@ pub(crate) fn read_bundle(bundle_dir: &Path) -> Result<ParserOutputBundle, Bundl
                     detail,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "parser output bundle violates the staged-output contract"
+                ),
+                BundleReadError::ResourceLimit { detail, .. } => warn!(
+                    event = "parse.bundle.resource_limited",
+                    bundle_dir = %bundle_dir.display(),
+                    detail,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "configured resource limit refused parser bundle admission"
                 ),
                 BundleReadError::Internal(source) => error!(
                     event = "parse.bundle.read_failed",
@@ -881,34 +921,105 @@ pub(crate) fn read_bundle(bundle_dir: &Path) -> Result<ParserOutputBundle, Bundl
 }
 
 /// Read/verify steps shared by the logging wrapper `read_bundle`.
-fn read_bundle_inner(bundle_dir: &Path) -> Result<ParserOutputBundle, BundleReadError> {
-    let manifest = load_manifest(bundle_dir)?;
-    let record_bytes = verify_listed_files(bundle_dir, &manifest)?;
+fn read_bundle_inner(
+    bundle_dir: &Path,
+    limits: &RuntimeLimits,
+) -> Result<ParserOutputBundle, BundleReadError> {
+    let manifest = load_manifest(bundle_dir, limits)?;
+    let reader = BundleReader {
+        limits,
+        paths: listed_files(bundle_dir, &manifest)?,
+        manifest: &manifest,
+    };
 
-    // Deserialize the record files out of the already-verified bytes; every
-    // shape carries deny_unknown_fields, so undeclared fields are rejected
-    // here rather than silently dropped.
-    let parser_result: ParserResult =
-        parse_json_record(BUNDLE_PARSER_RESULT_FILE_NAME, &record_bytes)?;
-    let metrics: ParseMetrics = parse_json_record(BUNDLE_METRICS_FILE_NAME, &record_bytes)?;
-    let candidate_units = parse_jsonl_records(BUNDLE_CANDIDATE_UNITS_FILE_NAME, &record_bytes)?;
-    let candidate_relationships =
-        parse_jsonl_records(BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME, &record_bytes)?;
-    let warnings = parse_jsonl_records(BUNDLE_WARNINGS_FILE_NAME, &record_bytes)?;
-    // Transfer verified bytes to the importer; reopening staging paths after
-    // digest validation would archive potentially different, unverified data.
-    let parser_raw_files = record_bytes
-        .into_iter()
-        .filter(|(path, _)| is_parser_raw_path(path))
-        .collect();
+    // JSONL is decoded and counted while reading; no full encoded plane is
+    // retained beside the typed rows. Results escape only after their digest passes.
+    let parser_result = reader.json_record(BUNDLE_PARSER_RESULT_FILE_NAME)?;
+    let metrics = reader.json_record(BUNDLE_METRICS_FILE_NAME)?;
+    let candidate_units = reader.jsonl_records(
+        BUNDLE_CANDIDATE_UNITS_FILE_NAME,
+        limits.parsing.max_candidate_units,
+        |unit: &CandidateContentUnit| {
+            let body = serde_json::to_vec(&unit.body).map_err(|source| {
+                violation(format!(
+                    "unit {} body serialization: {source}",
+                    unit.local_id
+                ))
+            })?;
+            if body.len() > limits.parsing.max_unit_body_bytes {
+                return Err(resource_limit(format!(
+                    "unit {} body exceeds parsing.max_unit_body_bytes={}",
+                    unit.local_id, limits.parsing.max_unit_body_bytes
+                )));
+            }
+            Ok(())
+        },
+    )?;
+    let candidate_relationships = reader.jsonl_records(
+        BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME,
+        limits.parsing.max_candidate_relationships,
+        |_| Ok(()),
+    )?;
+    let warnings = reader.jsonl_records(
+        BUNDLE_WARNINGS_FILE_NAME,
+        limits.parsing.max_candidate_warnings,
+        |_| Ok(()),
+    )?;
+    let mut parser_raw_files = BTreeMap::new();
+    for name in manifest.files.keys() {
+        if matches!(
+            name.as_str(),
+            BUNDLE_PARSER_RESULT_FILE_NAME
+                | BUNDLE_METRICS_FILE_NAME
+                | BUNDLE_CANDIDATE_UNITS_FILE_NAME
+                | BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME
+                | BUNDLE_WARNINGS_FILE_NAME
+        ) {
+            continue;
+        }
+        let (path, expected) = reader.file(name)?;
+        if is_parser_raw_path(name) {
+            // Forensic payloads retain their original bytes and ownership. Record
+            // admission limits do not cap or silently abbreviate opaque raw evidence.
+            let bytes = fs::read(path)
+                .map_err(|source| internal_io("read parser raw evidence", path, &source))?;
+            verify_digest(
+                name,
+                expected,
+                bytes.len() as u64,
+                &crate::canonical::sha256_hex_bytes(&bytes),
+            )?;
+            parser_raw_files.insert(name.clone(), bytes);
+        } else {
+            let actual = file_digest(path, limits.resources.embedding_read_buffer_bytes)?;
+            verify_digest(name, expected, actual.size_bytes, &actual.sha256)?;
+        }
+    }
 
+    if let Some(detail) = candidate_units
+        .refusal
+        .or(candidate_relationships.refusal)
+        .or(warnings.refusal)
+    {
+        // Rejected typed planes never reach canonicalization. Complete verified
+        // raw bytes still reach the importer's durable failed-run archival path.
+        let manifest_hash = crate::canonical::canonical_sha256_hex_of(&manifest)
+            .map_err(BundleReadError::Internal)?;
+        return Err(BundleReadError::ResourceLimit {
+            detail,
+            verified_parser_raw_files: Some(VerifiedParserRaw {
+                manifest_hash,
+                files: parser_raw_files,
+            }),
+        });
+    }
     Ok(ParserOutputBundle {
         bundle_dir: bundle_dir.to_path_buf(),
         manifest,
         parser_result,
-        candidate_units,
-        candidate_relationships,
-        warnings,
+        candidate_units: candidate_units.records,
+        candidate_relationships: candidate_relationships.records,
+        warnings: warnings.records,
         metrics,
         parser_raw_files,
     })
@@ -919,18 +1030,12 @@ fn read_bundle_inner(bundle_dir: &Path) -> Result<ParserOutputBundle, BundleRead
 /// contract-mandated file to be listed. A missing manifest is a contract
 /// violation (the atomic promotion invariant means a visible bundle is
 /// complete), while any other read fault is an internal error.
-fn load_manifest(bundle_dir: &Path) -> Result<ParserOutputManifest, BundleReadError> {
+fn load_manifest(
+    bundle_dir: &Path,
+    limits: &RuntimeLimits,
+) -> Result<ParserOutputManifest, BundleReadError> {
     let manifest_path = bundle_dir.join(BUNDLE_MANIFEST_FILE_NAME);
-    let manifest_bytes = fs::read(&manifest_path).map_err(|source| {
-        if source.kind() == io::ErrorKind::NotFound {
-            violation(format!(
-                "missing {BUNDLE_MANIFEST_FILE_NAME} at {}",
-                manifest_path.display()
-            ))
-        } else {
-            internal_io("failed to read bundle manifest", &manifest_path, &source)
-        }
-    })?;
+    let manifest_bytes = read_capped_bytes(&manifest_path, limits.resources.max_manifest_bytes)?;
     let manifest: ParserOutputManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|source| violation(format!("invalid {BUNDLE_MANIFEST_FILE_NAME}: {source}")))?;
 
@@ -950,16 +1055,12 @@ fn load_manifest(bundle_dir: &Path) -> Result<ParserOutputManifest, BundleReadEr
     Ok(manifest)
 }
 
-/// Verify the manifest's digest coverage against the bytes on disk, both
-/// directions: every listed file must exist with matching recomputed
-/// SHA-256 and size, and every on-disk file (except the manifest itself)
-/// must be listed — an unlisted file is unaccounted producer content and
-/// fails verification. Retains record files and parser_raw/ bytes so deserialization
-/// and archival both consume the exact bytes checked here, with one read per file.
-fn verify_listed_files(
+/// Prove two-way file coverage and safe path containment before opening any listed file.
+/// Each consumer subsequently verifies the bytes from its single read of that file.
+fn listed_files(
     bundle_dir: &Path,
     manifest: &ParserOutputManifest,
-) -> Result<BTreeMap<String, Vec<u8>>, BundleReadError> {
+) -> Result<BTreeMap<String, PathBuf>, BundleReadError> {
     let disk_files = collect_regular_files(bundle_dir).map_err(|walk| match walk {
         WalkError::Io { detail } => BundleReadError::Internal(ApiError::InternalIo {
             message: format!("bundle file enumeration failed: {detail}"),
@@ -976,47 +1077,15 @@ fn verify_listed_files(
         }
     }
 
-    // Record files feed canonical import; parser_raw/ files feed lossless archival.
-    // Logs and optional artifacts retain their existing verification-only behavior.
-    let retained: [&str; 5] = [
-        BUNDLE_PARSER_RESULT_FILE_NAME,
-        BUNDLE_METRICS_FILE_NAME,
-        BUNDLE_CANDIDATE_UNITS_FILE_NAME,
-        BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME,
-        BUNDLE_WARNINGS_FILE_NAME,
-    ];
-    let mut record_bytes = BTreeMap::new();
-    for (rel_path, digest) in &manifest.files {
+    for rel_path in manifest.files.keys() {
         // The walk already proved every disk path is inside the bundle, so
         // resolving listed files through it also blocks any traversal via
         // hostile manifest keys (`../`, absolute paths).
-        let Some(abs_path) = disk_files.get(rel_path) else {
+        if !disk_files.contains_key(rel_path) {
             return Err(violation(format!("listed file missing: {rel_path}")));
-        };
-        let bytes = fs::read(abs_path).map_err(|source| {
-            internal_io("failed to read listed bundle file", abs_path, &source)
-        })?;
-        if bytes.len() as u64 != digest.size_bytes {
-            return Err(violation(format!(
-                "size mismatch for {rel_path}: manifest claims {} bytes, found {}",
-                digest.size_bytes,
-                bytes.len()
-            )));
-        }
-        // Trust boundary: the recomputed digest is what verification means;
-        // the manifest value is only a claim checked against it.
-        let recomputed = crate::canonical::sha256_hex_bytes(&bytes);
-        if recomputed != digest.sha256 {
-            return Err(violation(format!(
-                "sha256 mismatch for {rel_path}: manifest claims {}, bytes hash to {recomputed}",
-                digest.sha256
-            )));
-        }
-        if retained.contains(&rel_path.as_str()) || is_parser_raw_path(rel_path) {
-            record_bytes.insert(rel_path.clone(), bytes);
         }
     }
-    Ok(record_bytes)
+    Ok(disk_files)
 }
 
 /// Match only descendants of the dedicated raw-output directory, not sibling names.
@@ -1025,45 +1094,204 @@ fn is_parser_raw_path(path: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Deserialize one singular JSON record file out of the verified bytes; a
-/// listed-but-unretained file is a caller bug, not producer input, hence
-/// the internal arm.
-fn parse_json_record<T: DeserializeOwned>(
-    file_name: &str,
-    record_bytes: &BTreeMap<String, Vec<u8>>,
-) -> Result<T, BundleReadError> {
-    let bytes = record_bytes.get(file_name).ok_or_else(|| {
-        BundleReadError::Internal(ApiError::InternalIo {
-            message: format!("verified bytes for {file_name} were not retained"),
-        })
-    })?;
-    serde_json::from_slice(bytes)
-        .map_err(|source| violation(format!("invalid {file_name}: {source}")))
+/// One verified file inventory and immutable admission contract for a bundle read.
+struct BundleReader<'a> {
+    paths: BTreeMap<String, PathBuf>,
+    manifest: &'a ParserOutputManifest,
+    limits: &'a RuntimeLimits,
 }
 
-/// Deserialize one JSONL record file out of the verified bytes: UTF-8 text,
-/// one record per LF-separated line (a trailing LF is tolerated; blank
-/// lines are not). An empty file is a valid empty record set.
-fn parse_jsonl_records<T: DeserializeOwned>(
-    file_name: &str,
-    record_bytes: &BTreeMap<String, Vec<u8>>,
-) -> Result<Vec<T>, BundleReadError> {
-    let bytes = record_bytes.get(file_name).ok_or_else(|| {
-        BundleReadError::Internal(ApiError::InternalIo {
-            message: format!("verified bytes for {file_name} were not retained"),
-        })
-    })?;
-    let text = std::str::from_utf8(bytes)
-        .map_err(|source| violation(format!("{file_name} is not valid UTF-8: {source}")))?;
-    let mut records = Vec::new();
-    for (line_index, line) in text.lines().enumerate() {
-        let record: T = serde_json::from_str(line).map_err(|source| {
-            violation(format!(
-                "invalid record in {file_name} line {}: {source}",
-                line_index + 1
-            ))
-        })?;
-        records.push(record);
+impl BundleReader<'_> {
+    /// Resolve only paths already proven to be covered and contained by the bundle walk.
+    fn file(&self, name: &str) -> Result<(&Path, &FileDigest), BundleReadError> {
+        let path = self
+            .paths
+            .get(name)
+            .ok_or_else(|| violation(format!("listed file missing: {name}")))?;
+        let digest = self
+            .manifest
+            .files
+            .get(name)
+            .ok_or_else(|| violation(format!("file not listed: {name}")))?;
+        Ok((path, digest))
     }
-    Ok(records)
+
+    /// Bound one JSON document before decoding, then verify the same bytes it supplies.
+    fn json_record<T: DeserializeOwned>(&self, name: &str) -> Result<T, BundleReadError> {
+        let (path, expected) = self.file(name)?;
+        let bytes = read_capped_bytes(path, self.limits.resources.max_json_cell_bytes)?;
+        verify_digest(
+            name,
+            expected,
+            bytes.len() as u64,
+            &crate::canonical::sha256_hex_bytes(&bytes),
+        )?;
+        serde_json::from_slice(&bytes)
+            .map_err(|source| violation(format!("invalid {name}: {source}")))
+    }
+
+    /// Stream complete JSONL records under byte/count guards; decoded rows remain
+    /// provisional until EOF and the full original-file digest have been checked.
+    fn jsonl_records<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        max_records: usize,
+        mut validate: impl FnMut(&T) -> Result<(), BundleReadError>,
+    ) -> Result<BoundedRecords<T>, BundleReadError> {
+        let (path, expected) = self.file(name)?;
+        let file =
+            File::open(path).map_err(|source| internal_io("open parser JSONL", path, &source))?;
+        let mut reader = BufReader::new(file);
+        let mut digest = Sha256::new();
+        let mut bytes_read = 0_u64;
+        let mut records = Vec::new();
+        let mut line = Vec::new();
+        let mut refusal = None;
+        loop {
+            line.clear();
+            let read = Read::by_ref(&mut reader)
+                .take(self.limits.resources.max_json_cell_bytes as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|source| internal_io("read parser JSONL", path, &source))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&line);
+            bytes_read = bytes_read
+                .checked_add(read as u64)
+                .ok_or_else(|| resource_limit(format!("{name} byte count overflow")))?;
+            // A refusal stops decoding/allocation but continues byte verification.
+            // This preserves forensic archival without admitting an oversized plane.
+            if refusal.is_some() {
+                continue;
+            }
+            if line.len() > self.limits.resources.max_json_cell_bytes {
+                refusal = Some(format!(
+                    "resource limit: {name} line {} exceeds resources.max_json_cell_bytes={}",
+                    records.len() + 1,
+                    self.limits.resources.max_json_cell_bytes
+                ));
+                records = Vec::new();
+                continue;
+            }
+            if records.len() == max_records {
+                refusal = Some(format!(
+                    "resource limit: {name} exceeds configured record count {max_records}"
+                ));
+                records = Vec::new();
+                continue;
+            }
+            let record = serde_json::from_slice(&line).map_err(|source| {
+                violation(format!(
+                    "invalid {name} line {}: {source}",
+                    records.len() + 1
+                ))
+            })?;
+            match validate(&record) {
+                Ok(()) => {}
+                Err(BundleReadError::ResourceLimit { detail, .. }) => {
+                    refusal = Some(detail);
+                    records = Vec::new();
+                    continue;
+                }
+                Err(source) => return Err(source),
+            }
+            if let Err(source) = records.try_reserve(1) {
+                refusal = Some(format!("resource limit: allocate {name} records: {source}"));
+                records = Vec::new();
+                continue;
+            }
+            records.push(record);
+        }
+        verify_digest(
+            name,
+            expected,
+            bytes_read,
+            &format!("{:x}", digest.finalize()),
+        )?;
+        Ok(BoundedRecords { records, refusal })
+    }
+}
+
+/// Rejected rows stay private until all file digests and preserved raw bytes are verified.
+struct BoundedRecords<T> {
+    records: Vec<T>,
+    refusal: Option<String>,
+}
+
+/// Refuse current admission without falsely declaring the stored content corrupt.
+fn resource_limit(detail: String) -> BundleReadError {
+    BundleReadError::ResourceLimit {
+        detail: format!("resource limit: {detail}"),
+        verified_parser_raw_files: None,
+    }
+}
+
+/// Read at most the configured document bytes plus one overflow sentinel.
+pub(crate) fn read_capped_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BundleReadError> {
+    let file = File::open(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            violation(format!("missing {}: {source}", path.display()))
+        } else {
+            internal_io("open bounded parser record", path, &source)
+        }
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| internal_io("read bounded parser record", path, &source))?;
+    if bytes.len() > max_bytes {
+        return Err(resource_limit(format!(
+            "{} exceeds configured JSON document bytes {max_bytes}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Check both complete-byte identity claims; neither a decoded subset nor a prefix suffices.
+fn verify_digest(
+    name: &str,
+    expected: &FileDigest,
+    bytes: u64,
+    hash: &str,
+) -> Result<(), BundleReadError> {
+    if bytes != expected.size_bytes {
+        return Err(violation(format!(
+            "size mismatch for {name}: expected {}, found {bytes}",
+            expected.size_bytes
+        )));
+    }
+    if hash != expected.sha256 {
+        return Err(violation(format!(
+            "sha256 mismatch for {name}: expected {}, found {hash}",
+            expected.sha256
+        )));
+    }
+    Ok(())
+}
+
+/// Hash files that need no retained payload using one configured read buffer.
+fn file_digest(path: &Path, buffer_bytes: usize) -> Result<FileDigest, BundleReadError> {
+    let mut file =
+        File::open(path).map_err(|source| internal_io("open parser bundle file", path, &source))?;
+    let mut buffer = vec![0_u8; buffer_bytes];
+    let mut digest = Sha256::new();
+    let mut size_bytes = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| internal_io("hash parser bundle file", path, &source))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| resource_limit(format!("{} size overflow", path.display())))?;
+    }
+    Ok(FileDigest {
+        sha256: format!("{:x}", digest.finalize()),
+        size_bytes,
+    })
 }

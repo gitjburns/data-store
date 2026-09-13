@@ -29,7 +29,8 @@
 //! parses is the cache's entire purpose — so it is never removed when a parse
 //! is superseded.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

@@ -5,18 +5,19 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, error, info};
 
 use crate::artifact_store::{ArtifactRef, ArtifactStore};
 use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
 use crate::inference::InferenceRuntime;
+use crate::limits::DiagnosticLimits;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation, MaintenanceGate};
 use crate::model::{ProducerType, Provenance};
 use crate::primitives::utc_now;
@@ -29,16 +30,6 @@ use super::annotation_io;
 use super::envelope::{self, NewProjection, ProjectionType};
 use super::{dense, graph, view};
 
-const CYCLE_INTERVAL: Duration = Duration::from_secs(5);
-const COMMIT_WAIT: Duration = Duration::from_millis(100);
-const MODEL_BATCH_SIZE: usize = 8;
-// Bound each model phase so newly committed graph/summary inputs are revisited
-// even while a large embedding backlog remains. Cursors preserve fair progress.
-const COHORTS_PER_CYCLE: usize = 16;
-const COHORTS_PER_SOURCE: usize = 4;
-const MAX_SOURCES: usize = 100_000;
-const MAX_INPUTS: usize = 1_000_000;
-const MAX_CELL_BYTES: usize = 16 * 1024 * 1024;
 const TX_NAMESPACE: &str = "projection_worker";
 const ACTIVE_SOURCES_SQL: &str = "
 WITH active AS (
@@ -83,7 +74,7 @@ const CAPTURED_PAIR_SQL: &str = "SELECT id FROM retrieval_projections
 /// Owned process handles are explicit; only the runtime and small health slot
 /// cross thread boundaries. SQLite connections stay on the publication thread.
 pub(crate) struct WorkerInputs {
-    pub(crate) index_root: PathBuf,
+    pub(crate) index_root: crate::runtime::StorageContext,
     pub(crate) runtime: Option<Arc<InferenceRuntime>>,
     pub(crate) dense_dimension: usize,
     pub(crate) colbert_dimension: usize,
@@ -177,6 +168,8 @@ impl Materialization {
 /// The caller retains and joins the handle during common shutdown cleanup.
 pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
     let failed_health = Arc::clone(&inputs.health);
+    // Spawn failures occur after the closure has taken ownership of inputs.
+    let diagnostics = inputs.index_root.limits().diagnostics;
     thread::Builder::new()
         .name("projection-worker".to_owned())
         .spawn(move || {
@@ -196,13 +189,13 @@ pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
                 Ok(Err(source)) => {
                     error!(event = "projection_worker.thread_failed", error = %source,
                     "annotation projection worker stopped after a lifecycle failure");
-                    unavailable(&inputs.health, &source.to_string());
+                    unavailable(&inputs.health, &source.to_string(), &diagnostics);
                 }
                 Err(payload) => {
-                    let detail = panic_payload_message(payload.as_ref());
+                    let detail = panic_payload_message(payload.as_ref(), &diagnostics);
                     error!(event = "projection_worker.thread_panicked", is_panic = true,
                     panic_message = %detail, "annotation projection worker panicked");
-                    unavailable(&inputs.health, &detail);
+                    unavailable(&inputs.health, &detail, &diagnostics);
                 }
             }
         })
@@ -212,7 +205,7 @@ pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
             ));
             error!(event = "projection_worker.spawn_failed", error = %error,
             "annotation projection publication unavailable");
-            unavailable(&failed_health, &error.to_string());
+            unavailable(&failed_health, &error.to_string(), &diagnostics);
             error
         })
 }
@@ -251,6 +244,7 @@ fn run_worker(inputs: &WorkerInputs) -> Result<(), ApiError> {
                     &inputs.health,
                     ProjectionActivity::RetryWait,
                     Some(source.to_string()),
+                    &inputs.index_root.limits().diagnostics,
                 )?;
             }
         }
@@ -260,7 +254,7 @@ fn run_worker(inputs: &WorkerInputs) -> Result<(), ApiError> {
         // Existing HTTP clients finish or reach configured timeouts before this
         // point. Dropping the lease earlier would race rebuild artifact cleanup.
         drop(permit);
-        delay = CYCLE_INTERVAL;
+        delay = Duration::from_millis(inputs.index_root.limits().workers.projection_interval_ms);
     }
     stop_activity(&inputs.health, "shutdown")
 }
@@ -300,7 +294,12 @@ fn run_cycle(
             sources.partition_point(|source| source.source_id.as_str() <= last)
         });
         let mut budget = EmbeddingBudget {
-            remaining: COHORTS_PER_CYCLE,
+            // Revisit cheap graph/summary publications between bounded embedding phases.
+            remaining: inputs
+                .index_root
+                .limits()
+                .workers
+                .projection_cohorts_per_cycle,
             cursor,
         };
         for offset in 0..sources.len() {
@@ -324,7 +323,10 @@ fn run_cycle(
                     parse_id = %source.parse_id, error = %source_error, error_kind = source_error.error_kind(),
                     "annotation embedding discovery failed for one source");
                 document.activity = ProjectionActivity::RetryWait;
-                document.detail = Some(truncate_persisted_detail(&source_error.to_string()));
+                document.detail = Some(truncate_persisted_detail(
+                    &source_error.to_string(),
+                    &inputs.index_root.limits().diagnostics,
+                ));
                 publish_document(&inputs.health, document)?;
             }
         }
@@ -371,6 +373,7 @@ fn run_cycle(
             .runtime
             .is_none()
             .then(|| "Annotation embedding runtime is unavailable.".to_owned()),
+        &inputs.index_root.limits().diagnostics,
     )?;
     debug!(
         event = "projection_worker.cycle_completed",
@@ -390,24 +393,32 @@ fn discover_sources(inputs: &WorkerInputs) -> Result<Vec<ActiveSource>, ApiError
         .prepare(ACTIVE_SOURCES_SQL)
         .map_err(|source| failure(format!("prepare projection source inventory: {source}")))?;
     let rows = statement
-        .query_map(params![MAX_SOURCES + 1, MAX_CELL_BYTES], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })
+        .query_map(
+            params![
+                connection.limits().resources.max_sources + 1,
+                connection.limits().resources.max_json_cell_bytes
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
         .map_err(|source| failure(format!("read projection source inventory: {source}")))?;
     let mut sources = Vec::new();
     for row in rows {
         let (source_id, parse_id, paths) =
             row.map_err(|source| failure(format!("decode projection source inventory: {source}")))?;
-        if sources.len() == MAX_SOURCES {
-            return Err(failure("projection source inventory exceeds its row limit"));
+        if sources.len() == connection.limits().resources.max_sources {
+            return Err(failure(
+                "resource limit: projection source inventory exceeds resources.max_sources",
+            ));
         }
         let paths = paths.ok_or_else(|| {
             failure(format!(
-                "projection source {source_id} locations exceed {MAX_CELL_BYTES} bytes"
+                "resource limit: projection source {source_id} locations exceed resources.max_json_cell_bytes"
             ))
         })?;
         let source_paths = serde_json::from_str(&paths).map_err(|source| {
@@ -452,16 +463,16 @@ fn materialization_current(
                 source.parse_id,
                 first,
                 second,
-                MAX_INPUTS + 1
+                conn.limits().resources.max_annotation_inputs + 1
             ],
             |row| row.get::<_, String>(0),
         )
         .map_err(|error| failure(format!("read {} annotation IDs: {error}", family.name())))?;
     let mut current = BTreeSet::new();
     for row in rows {
-        if current.len() == MAX_INPUTS {
+        if current.len() == conn.limits().resources.max_annotation_inputs {
             return Err(failure(
-                "materialization input membership exceeds its row limit",
+                "resource limit: materialization input membership exceeds resources.max_annotation_inputs",
             ));
         }
         current.insert(
@@ -477,7 +488,7 @@ fn materialization_current(
                 source.source_id,
                 source.parse_id,
                 family.name(),
-                MAX_CELL_BYTES
+                conn.limits().resources.max_json_cell_bytes
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
@@ -869,7 +880,13 @@ fn publish_document_embeddings(
         let start = pending.partition_point(|plan| plan.cohort_id.as_str() <= last.as_str());
         pending.rotate_left(start);
     }
-    let allowance = budget.remaining.min(COHORTS_PER_SOURCE);
+    let allowance = budget.remaining.min(
+        inputs
+            .index_root
+            .limits()
+            .workers
+            .projection_cohorts_per_source,
+    );
     for plan in pending.into_iter().take(allowance) {
         if let Some(reason) = cancelled(inputs, cancellation) {
             document.activity = ProjectionActivity::Stopped;
@@ -919,7 +936,10 @@ fn publish_document_embeddings(
             Err(source_error) => {
                 counts.pending -= 1;
                 counts.failed += 1;
-                document.detail = Some(truncate_persisted_detail(&source_error.to_string()));
+                document.detail = Some(truncate_persisted_detail(
+                    &source_error.to_string(),
+                    &inputs.index_root.limits().diagnostics,
+                ));
                 error!(event = "projection_worker.embedding_failed", source_id = %plan.source_id,
                     parse_id = %plan.parse_id, cohort_id = %plan.cohort_id, error = %source_error,
                     error_kind = source_error.error_kind(),
@@ -993,7 +1013,14 @@ fn embed_and_archive(
     let mut representations = Vec::new();
     let mut texts = texts.into_iter();
     loop {
-        let batch: Vec<_> = texts.by_ref().take(MODEL_BATCH_SIZE).collect();
+        // Both the worker's working set and the model's document-call bound apply.
+        let batch_size = inputs
+            .index_root
+            .limits()
+            .workers
+            .projection_batch_size
+            .min(runtime.colbert.document_batch_size());
+        let batch: Vec<_> = texts.by_ref().take(batch_size).collect();
         if batch.is_empty() {
             break;
         }
@@ -1112,7 +1139,9 @@ fn publish_cohort(
                         "annotation embeddings archived; waiting for publication writer lock");
                     waited = true;
                 }
-                inputs.shutdown.wait_timeout(COMMIT_WAIT);
+                inputs.shutdown.wait_timeout(Duration::from_millis(
+                    inputs.index_root.limits().workers.projection_commit_wait_ms,
+                ));
                 continue;
             }
         };
@@ -1211,7 +1240,10 @@ fn apply_materialization_result(
         }
         Err(source_error) => {
             counts.failed = 1;
-            document.detail = Some(truncate_persisted_detail(&source_error.to_string()));
+            document.detail = Some(truncate_persisted_detail(
+                &source_error.to_string(),
+                &inputs.index_root.limits().diagnostics,
+            ));
             error!(event = "projection_worker.materialization_failed", source_id = %source.source_id,
                 parse_id = %source.parse_id, projection_type = family.name(), error = %source_error,
                 "annotation materialization failed; independent publications continue");
@@ -1265,7 +1297,14 @@ fn record_failure(
                 return Ok(false);
             }
             let id = envelope::insert_building(&tx, request)?;
-            envelope::mark_failed(&tx, &id, &truncate_persisted_detail(&original.to_string()))?;
+            envelope::mark_failed(
+                &tx,
+                &id,
+                &truncate_persisted_detail(
+                    &original.to_string(),
+                    &inputs.index_root.limits().diagnostics,
+                ),
+            )?;
             Ok(true)
         })();
         let recorded = match body {
@@ -1472,11 +1511,12 @@ fn worker_activity(
     slot: &Mutex<ProjectionHealth>,
     activity: ProjectionActivity,
     detail: Option<String>,
+    diagnostics: &DiagnosticLimits,
 ) -> Result<(), ApiError> {
     let now = utc_now()?;
     update_health(slot, |health| {
         health.activity = activity;
-        health.detail = detail.map(|detail| truncate_persisted_detail(&detail));
+        health.detail = detail.map(|detail| truncate_persisted_detail(&detail, diagnostics));
         health.measured_at = Some(now);
     });
     Ok(())
@@ -1506,7 +1546,7 @@ fn stop_activity(slot: &Mutex<ProjectionHealth>, reason: &str) -> Result<(), Api
 }
 
 /// Publish an unavailable lifecycle even if timestamp acquisition also fails.
-fn unavailable(slot: &Mutex<ProjectionHealth>, detail: &str) {
+fn unavailable(slot: &Mutex<ProjectionHealth>, detail: &str, diagnostics: &DiagnosticLimits) {
     let now = match utc_now() {
         Ok(now) => Some(now),
         Err(source) => {
@@ -1517,7 +1557,7 @@ fn unavailable(slot: &Mutex<ProjectionHealth>, detail: &str) {
     };
     update_health(slot, |health| {
         health.activity = ProjectionActivity::Unavailable;
-        health.detail = Some(truncate_persisted_detail(detail));
+        health.detail = Some(truncate_persisted_detail(detail, diagnostics));
         health.measured_at = now;
         for document in health.documents.iter_mut().flatten() {
             if matches!(

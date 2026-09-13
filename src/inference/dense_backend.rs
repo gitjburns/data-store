@@ -15,8 +15,9 @@ use crate::{
     inference::{
         DenseEmbeddingRuntime, InferenceProgress,
         dense::{DENSE_SMOKE_TEXT, format_dense_passage_text, format_dense_query_text},
+        http_models::{ServedModel, failure_excerpt, verify_capacity},
     },
-    util::MAX_BACKOFF_MS,
+    limits::{DiagnosticLimits, RuntimeLimits},
 };
 
 /// Stable adapter-mode label carried in this client's boundary logs, mirroring
@@ -24,46 +25,17 @@ use crate::{
 /// `model_role="dense"`, so an operator greps dense calls the same way across
 /// the local and HTTP backends.
 const HTTP_DENSE_MODE: &str = "http_openai_embeddings";
-const HTTP_FAILURE_EXCERPT_CHARS: usize = 2048;
-
-// Bounded 429-only retry policy for the dense embeddings endpoint.
-//
-// Engineering fact this encodes: the OpenRouter provider intermittently returns
-// HTTP 429 with an upstream `engine_overloaded` body under transient load, and
-// those overload windows have been observed clearing within seconds. A short
-// bounded retry rides through that window instead of failing the whole query or
-// projection build on a blip.
-//
-// Invariant: retry is transient-class ONLY. We retry on HTTP status 429 and
-// nothing else — every other status and every transport failure keeps the
-// module's fail-immediately policy byte-for-byte (no alternate endpoints, no
-// model switching, no queuing). The bound is deliberate: at most
-// `DENSE_HTTP_RETRY_LIMIT` retries (so `DENSE_HTTP_RETRY_LIMIT + 1` attempts
-// total) with the fixed backoff schedule below, which keeps a genuinely
-// hard-down provider failing within ~15s of backoff (2+4+8) plus per-attempt
-// request timeouts rather than hanging indefinitely.
-const DENSE_HTTP_RETRY_LIMIT: usize = 3;
-
-// Fixed backoff slept BEFORE each retry attempt, indexed by prior-attempt count:
-// 2s before attempt 2, 4s before attempt 3, 8s before attempt 4. Length equals
-// `DENSE_HTTP_RETRY_LIMIT`; the loop only ever indexes it for a retry it is
-// allowed to make.
-const DENSE_HTTP_RETRY_BACKOFF: [Duration; DENSE_HTTP_RETRY_LIMIT] = [
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-];
 
 /// Config-selected dense-embedding backend. Exactly one backend is active per
 /// service instance and there is NO fallback between variants (approved design):
 /// the local Candle runtime and the HTTP OpenAI-compatible client are mutually
 /// exclusive. Enum dispatch (not a trait object) keeps the concrete embedding
-/// signatures intact; boxing only the larger local runtime keeps this selector
-/// cheap to move and clone.
+/// signatures intact. Each variant owns its provider behind a box so this
+/// frequently moved runtime handle stays compact as provider settings grow.
 #[derive(Debug, Clone)]
 pub enum DenseEmbeddingBackend {
     Local(Box<DenseEmbeddingRuntime>),
-    Http(HttpDenseClient),
+    Http(Box<HttpDenseClient>),
 }
 
 impl DenseEmbeddingBackend {
@@ -77,9 +49,11 @@ impl DenseEmbeddingBackend {
     pub fn load_http_with_progress(
         config: &DenseModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
-        HttpDenseClient::load_with_progress(config, config_root, progress).map(Self::Http)
+        HttpDenseClient::load_with_progress(config, config_root, limits, progress)
+            .map(|client| Self::Http(Box::new(client)))
     }
 
     /// Return the stable backend-kind label used in health and log output.
@@ -108,6 +82,14 @@ impl DenseEmbeddingBackend {
             DenseEmbeddingBackend::Http(client) => details.extend(client.health_details()),
         }
         details
+    }
+
+    /// Bind remote embeddings to the advertised checkpoint behind the request-facing alias.
+    pub(super) fn served_model(&self) -> Option<&ServedModel> {
+        match self {
+            Self::Local(_) => None,
+            Self::Http(client) => Some(&client.served),
+        }
     }
 
     /// Embed one retrieval query, returning its unit-norm dense vector. The
@@ -139,6 +121,13 @@ pub struct HttpDenseClient {
     model: String,
     timeout_seconds: u64,
     dimension: usize,
+    served: ServedModel,
+    diagnostics: DiagnosticLimits,
+    batch_size: usize,
+    concurrent_requests: usize,
+    max_retries: usize,
+    retry_initial_delay: Duration,
+    retry_max_delay: Duration,
     api_key: Option<String>,
     api_key_file_path: Option<PathBuf>,
     smoke: HttpDenseSmoke,
@@ -169,13 +158,13 @@ struct HttpDenseSmoke {
     first_norm: f32,
 }
 
-/// OpenAI-compatible embeddings request body. Only `model` and `input` are sent;
-/// the endpoint's own defaults govern everything else. `input` is the batch of
-/// already-formatted texts (query prefix / passage identity applied upstream).
+/// The engine must reject excess input; truncation would silently change persisted vectors.
+/// Inputs already contain the authoritative query/passage formatting.
 #[derive(Debug, Serialize)]
 struct EmbeddingsRequest<'request> {
     model: &'request str,
     input: Vec<&'request str>,
+    truncate_prompt_tokens: Option<u32>,
 }
 
 /// Minimal typed view of the OpenAI embeddings response. `data` carries one
@@ -224,6 +213,7 @@ impl HttpDenseClient {
     fn load_with_progress(
         config: &DenseModelConfig,
         config_root: &Path,
+        limits: &RuntimeLimits,
         progress: InferenceProgress<'_>,
     ) -> Result<Self, ApiError> {
         let endpoint = config.http_endpoint()?.to_string();
@@ -240,17 +230,36 @@ impl HttpDenseClient {
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
+            // Metadata and inference must stay on the configured serving boundary.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|source| ApiError::InferenceInit {
                 message: format!("failed to build HTTP dense client: {source}"),
             })?;
 
+        progress("dense_http_capacity_verifying")?;
+        let served = verify_capacity(
+            &client,
+            &endpoint,
+            "dense",
+            &model,
+            config.max_tokens,
+            api_key.as_deref(),
+            limits,
+        )?;
         let mut backend = Self {
             client,
             endpoint,
             model,
             timeout_seconds,
             dimension,
+            served,
+            diagnostics: limits.diagnostics,
+            batch_size: config.http_batch_size,
+            concurrent_requests: config.http_concurrent_requests,
+            max_retries: config.http_max_retries,
+            retry_initial_delay: Duration::from_millis(config.http_retry_initial_delay_ms),
+            retry_max_delay: Duration::from_millis(config.http_retry_max_delay_ms),
             api_key,
             api_key_file_path,
             smoke: HttpDenseSmoke {
@@ -269,7 +278,7 @@ impl HttpDenseClient {
     /// Return HTTP backend readiness details without exposing credentials.
     fn health_details(&self) -> Vec<String> {
         vec![format!(
-            "dense HTTP backend ready: mode {}, endpoint {}, model {}, dimension {}, timeout_seconds {}, api_key_file {}, smoke_vectors {}, smoke_norm {:.6}",
+            "dense HTTP backend ready: mode {}, endpoint {}, model {}, dimension {}, timeout_seconds {}, api_key_file {}, smoke_vectors {}, smoke_norm {:.6}, verified_max_tokens {}, checkpoint {}",
             HTTP_DENSE_MODE,
             self.endpoint,
             self.model,
@@ -280,8 +289,25 @@ impl HttpDenseClient {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "absent".to_string()),
             self.smoke.vector_count,
-            self.smoke.first_norm
+            self.smoke.first_norm,
+            self.served.max_model_len,
+            self.served.root
         )]
+    }
+
+    /// Limit each builder window before formatting or allocating an HTTP batch.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Bound parallel builder requests without holding the local accelerator gate.
+    pub fn concurrent_requests(&self) -> usize {
+        self.concurrent_requests
+    }
+
+    /// Keep builder-thread failures under the same diagnostic bounds as their model client.
+    pub(crate) fn diagnostics(&self) -> &DiagnosticLimits {
+        &self.diagnostics
     }
 
     /// Run the startup smoke round-trip: embed the shared smoke text as a
@@ -328,7 +354,7 @@ impl HttpDenseClient {
     /// single-passage method; a one-chunk trailing window is simply a batch of
     /// one). Each passage is routed through the shared passage-formatting
     /// boundary; the returned vectors align 1:1 with `texts`. The builder packs
-    /// its own `DENSE_HTTP_BATCH_SIZE`-sized windows, so this method embeds
+    /// its own configured `batch_size()` windows, so this method embeds
     /// exactly the window it is handed.
     pub fn embed_passage_vectors(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ApiError> {
         let formatted: Vec<&str> = texts
@@ -434,8 +460,8 @@ impl HttpDenseClient {
 
     /// Retry loop owner for the embeddings request. Delegates each attempt to
     /// `send_request_once`; on a transient HTTP 429 (`AttemptOutcome::Overloaded`)
-    /// it backs off per `DENSE_HTTP_RETRY_BACKOFF` and retries up to
-    /// `DENSE_HTTP_RETRY_LIMIT` times. Retry is 429-ONLY: any other status and any
+    /// it backs off exponentially within the configured delay and retry limits.
+    /// Retry is 429-ONLY: any other status and any
     /// transport/body/parse failure is already a terminal `Err` from the attempt
     /// helper and returns immediately (fail-immediately, byte-for-byte). When the
     /// bound is exhausted the last 429 becomes a terminal failure whose error
@@ -446,11 +472,10 @@ impl HttpDenseClient {
         shape: DenseCallShape,
         retried_attempts: &mut usize,
     ) -> Result<EmbeddingsResponse, ApiError> {
-        // `attempt` is 1-based; attempt 1 is the initial request, attempts
-        // 2..=DENSE_HTTP_RETRY_LIMIT+1 are retries each preceded by the fixed
-        // backoff for the just-failed attempt. The output count is the number
-        // of retries performed (`attempt - 1`, so 0 on a first-attempt success).
+        // Retry accounting excludes the initial attempt. Delay growth saturates
+        // before applying the configured ceiling, even for large retry budgets.
         let mut attempt: usize = 1;
+        let mut retry_delay = self.retry_initial_delay.min(self.retry_max_delay);
         loop {
             *retried_attempts = attempt - 1;
             let context = crate::util::LogContext::new("http_attempt", &attempt.to_string());
@@ -458,13 +483,8 @@ impl HttpDenseClient {
             match self.send_request_once(texts, shape)? {
                 AttemptOutcome::Parsed(response) => return Ok(response),
                 AttemptOutcome::Overloaded { body_excerpt } => {
-                    // `attempt - 1` prior 429s indexes the backoff schedule; once
-                    // it reaches DENSE_HTTP_RETRY_LIMIT the bound is exhausted.
-                    if attempt <= DENSE_HTTP_RETRY_LIMIT {
-                        // Preserve shorter scheduled waits while enforcing the
-                        // shared ceiling before both logging and sleeping.
-                        let delay = DENSE_HTTP_RETRY_BACKOFF[attempt - 1]
-                            .min(Duration::from_millis(MAX_BACKOFF_MS));
+                    if attempt <= self.max_retries {
+                        let delay = retry_delay;
                         warn!(
                             event = "model_call.http_retry",
                             model_role = "dense",
@@ -476,6 +496,7 @@ impl HttpDenseClient {
                             "HTTP dense request overloaded (429); backing off before retry"
                         );
                         thread::sleep(delay);
+                        retry_delay = retry_delay.saturating_mul(2).min(self.retry_max_delay);
                         attempt += 1;
                         continue;
                     }
@@ -530,6 +551,7 @@ impl HttpDenseClient {
         let request = EmbeddingsRequest {
             model: &self.model,
             input: texts.to_vec(),
+            truncate_prompt_tokens: None,
         };
         let mut request_builder = self.client.post(&self.endpoint).json(&request);
         if let Some(api_key) = &self.api_key {
@@ -544,6 +566,8 @@ impl HttpDenseClient {
             endpoint = %self.endpoint,
             model = %self.model,
             text_count = texts.len(),
+            configured_max_tokens = self.served.max_model_len,
+            max_retries = self.max_retries,
             "HTTP dense request started"
         );
         // Transport-level failure (DNS, connect, TLS, timeout) surfaces before
@@ -551,7 +575,7 @@ impl HttpDenseClient {
         let response = match request_builder.send() {
             Ok(response) => response,
             Err(source) => {
-                let error_detail = crate::util::error_chain(&source);
+                let error_detail = crate::util::error_chain(&source, &self.diagnostics);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "dense",
@@ -577,7 +601,7 @@ impl HttpDenseClient {
         let body = match response.text() {
             Ok(body) => body,
             Err(source) => {
-                let error_detail = crate::util::error_chain(&source);
+                let error_detail = crate::util::error_chain(&source, &self.diagnostics);
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "dense",
@@ -607,11 +631,19 @@ impl HttpDenseClient {
         // fall through to the unchanged terminal failure path below.
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Ok(AttemptOutcome::Overloaded {
-                body_excerpt: bounded_excerpt(&body),
+                body_excerpt: failure_excerpt(
+                    &body,
+                    self.api_key.as_deref(),
+                    self.diagnostics.model_error_excerpt_chars,
+                ),
             });
         }
         if !status.is_success() {
-            let body_excerpt = bounded_excerpt(&body);
+            let body_excerpt = failure_excerpt(
+                &body,
+                self.api_key.as_deref(),
+                self.diagnostics.model_error_excerpt_chars,
+            );
             error!(
                 event = "model_call.http_request.failed",
                 model_role = "dense",
@@ -626,13 +658,17 @@ impl HttpDenseClient {
                 elapsed_ms = http_started.elapsed().as_millis() as u64,
                 "HTTP dense request failed"
             );
-            return Err(http_status_error(&self.endpoint, status, &body));
+            return Err(http_status_error(&self.endpoint, status, &body_excerpt));
         }
 
         let parsed = match serde_json::from_str::<EmbeddingsResponse>(&body) {
             Ok(parsed) => parsed,
             Err(source) => {
-                let body_excerpt = bounded_excerpt(&body);
+                let body_excerpt = failure_excerpt(
+                    &body,
+                    self.api_key.as_deref(),
+                    self.diagnostics.model_error_excerpt_chars,
+                );
                 error!(
                     event = "model_call.http_request.failed",
                     model_role = "dense",
@@ -886,26 +922,12 @@ fn validate_api_key_file_permissions(_path: &Path) -> Result<(), ApiError> {
 }
 
 /// Build an inference error for an unsuccessful HTTP dense status response.
-fn http_status_error(endpoint: &str, status: StatusCode, body: &str) -> ApiError {
+fn http_status_error(endpoint: &str, status: StatusCode, body_excerpt: &str) -> ApiError {
     ApiError::InferenceInit {
         message: format!(
             "HTTP dense request to {endpoint} failed with status {}; body_excerpt={}",
             status.as_u16(),
-            bounded_excerpt(body)
+            body_excerpt
         ),
     }
-}
-
-/// Return a bounded single-line excerpt for provider failure diagnostics.
-fn bounded_excerpt(value: &str) -> String {
-    let excerpt = value
-        .chars()
-        .flat_map(|character| character.escape_default())
-        .take(HTTP_FAILURE_EXCERPT_CHARS)
-        .collect::<String>();
-    if value.chars().count() > HTTP_FAILURE_EXCERPT_CHARS {
-        return format!("{excerpt}...");
-    }
-
-    excerpt
 }

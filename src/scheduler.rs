@@ -38,7 +38,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::limits::SchedulingLimits;
+use crate::runtime::StorageContext;
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value};
 use tracing::{debug, error, info, warn};
 
@@ -79,7 +82,7 @@ use crate::{
         CutoverRegistry, ExclusiveGate, FabricHealth, FabricSourceCounts, ShutdownSignal,
         SyncCycleStats, SyncHealth, acquire_model_call_gate_on,
     },
-    util::{MAX_BACKOFF_MS, panic_payload_message, truncate_persisted_detail},
+    util::{panic_payload_message, truncate_persisted_detail},
 };
 
 /// Looks up the row owning one coalescing key (UNIQUE source_key); state is
@@ -244,31 +247,6 @@ ORDER BY created_at, id";
 /// for a new or changed item.
 const REASON_STAGED_BY_FULL_SCAN: &str = "staged_by_full_scan";
 
-/// Multiplicative cadence growth after a cycle that observed no changes:
-/// quiet sources are sampled progressively more rarely (spec §9.5 observed
-/// change frequency). A code constant, never config (§9.5 is knob-free).
-const QUIET_CYCLE_GROWTH: f64 = 1.5;
-
-/// Multiplicative cadence growth while the queue is non-empty at cycle end:
-/// the pipeline is not draining as fast as detection produces work, so
-/// sampling slows and coalescing sheds load (spec §9.5 pipeline
-/// backpressure).
-const BACKPRESSURE_GROWTH: f64 = 2.0;
-
-/// Multiplicative cadence growth after a failed cycle: errors throttle from
-/// the source side (spec §9.5 source-system pushback) and keep the scheduler
-/// from crash-looping against a broken dependency.
-const ERROR_CYCLE_GROWTH: f64 = 2.0;
-
-/// Base retry delay when a cycle fails before any scan has established a
-/// measured cadence; the first successful scan's duration replaces it.
-const ERROR_RETRY_BASE_MS: u64 = 1_000;
-
-/// Weight of the newest observation in the inter-change-interval EMA: one
-/// third new keeps the estimate responsive to real churn shifts without
-/// whipsawing on one busy cycle.
-const INTER_CHANGE_EMA_WEIGHT: f64 = 0.3;
-
 /// Log-event namespace this module passes to the shared hot-plane
 /// transaction helpers, so boundary logs stay attributable to the scheduler.
 const TX_LOG_NAMESPACE: &str = "scheduler";
@@ -333,6 +311,8 @@ pub(crate) struct ProjectionRuntime {
     pub(crate) colbert: ColbertBackend,
     pub(crate) dense_dimension: usize,
     pub(crate) colbert_dimension: usize,
+    /// Shared tokenizer/model identity sealed by inference initialization.
+    pub(crate) embedding_identity: String,
     /// Shared process-global model-call serializer (same instance AppState
     /// uses); acquired via `acquire_model_call_gate_on` so acquisition logging
     /// matches the HTTP path byte-for-byte.
@@ -463,7 +443,7 @@ fn source_key(source_system: &str, native_uri: &str) -> String {
 /// INSERT/COALESCE SQL: a fresh row stores it, a coalesced row keeps whichever
 /// of the new-or-existing link is non-null).
 pub(crate) fn enqueue_coalesced(
-    index_root: &Path,
+    index_root: &StorageContext,
     source_system: &str,
     native_uri: &str,
     reason: &str,
@@ -575,7 +555,7 @@ pub(crate) fn enqueue_coalesced(
 /// replay re-imports idempotently and re-runs the parse chain; if the bundle
 /// is nevertheless gone (crash mid-removal), the importer's missing-bundle
 /// rejection parks the row failed, unlatching backpressure.
-pub(crate) fn claim_pending(index_root: &Path) -> Result<Vec<SyncQueueEntry>, ApiError> {
+pub(crate) fn claim_pending(index_root: &StorageContext) -> Result<Vec<SyncQueueEntry>, ApiError> {
     let now = utc_now()?;
 
     let mut connection = hot_plane::open_write(index_root)?;
@@ -632,7 +612,7 @@ pub(crate) fn claim_pending(index_root: &Path) -> Result<Vec<SyncQueueEntry>, Ap
 /// dispatch step was skipped. The operation_id is read from the row BEFORE the
 /// DELETE (it is gone afterward), and `mark_succeeded` runs AFTER the row is
 /// removed — the queue unit of work is finished at that point.
-pub(crate) fn complete(index_root: &Path, entry_id: &str) -> Result<(), ApiError> {
+pub(crate) fn complete(index_root: &StorageContext, entry_id: &str) -> Result<(), ApiError> {
     let connection = hot_plane::open_write(index_root)?;
     let operation_id: Option<String> = connection
         .query_row(SELECT_ENTRY_OPERATION_ID_SQL, params![entry_id], |row| {
@@ -695,8 +675,12 @@ pub(crate) fn complete(index_root: &Path, entry_id: &str) -> Result<(), ApiError
 /// ran) leaves it `pending`, and this flips it running → failed so it still
 /// reaches a terminal record. `mark_failed` bounds the detail itself, so the raw
 /// `error_detail` is passed through.
-pub(crate) fn fail(index_root: &Path, entry_id: &str, error_detail: &str) -> Result<(), ApiError> {
-    let bounded = truncate_persisted_detail(error_detail);
+pub(crate) fn fail(
+    index_root: &StorageContext,
+    entry_id: &str,
+    error_detail: &str,
+) -> Result<(), ApiError> {
+    let bounded = truncate_persisted_detail(error_detail, &index_root.limits().diagnostics);
     let operation_id = entry_operation_id(index_root, entry_id)?;
     let connection = hot_plane::open_write(index_root)?;
     let updated = connection
@@ -735,7 +719,7 @@ pub(crate) fn fail(index_root: &Path, entry_id: &str, error_detail: &str) -> Res
 /// terminal one is a broken/idempotent case handled without a loud panic: a
 /// terminal operation is left untouched; an absent one surfaces loudly.
 fn drive_operation_failed(
-    index_root: &Path,
+    index_root: &StorageContext,
     operation_id: &str,
     error_detail: &str,
 ) -> Result<(), ApiError> {
@@ -778,7 +762,10 @@ fn drive_operation_failed(
 /// coupled Operation `pending → running` before it does the entry's work — the
 /// C10a HTTP handler wrote only `pending`, and the drain owns the rest of the
 /// lifecycle for queue-coupled operation types.
-fn entry_operation_id(index_root: &Path, entry_id: &str) -> Result<Option<String>, ApiError> {
+fn entry_operation_id(
+    index_root: &StorageContext,
+    entry_id: &str,
+) -> Result<Option<String>, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
     let operation_id: Option<String> = connection
         .query_row(SELECT_ENTRY_OPERATION_ID_SQL, params![entry_id], |row| {
@@ -806,7 +793,7 @@ fn entry_operation_id(index_root: &Path, entry_id: &str) -> Result<Option<String
 /// skips them and the drain never gets a bundle. Read-only connection; one
 /// SELECT needs no transaction.
 fn pending_operator_override_uris(
-    index_root: &Path,
+    index_root: &StorageContext,
     source_system: &str,
 ) -> Result<BTreeSet<String>, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
@@ -846,7 +833,10 @@ fn pending_operator_override_uris(
 /// current status first and only transitions a still-`pending` operation; an
 /// already-running one is left as-is (the replay owns its terminal transition).
 /// Autonomous rows (operation_id None) are a no-op.
-fn mark_operation_running_at_dispatch(index_root: &Path, entry_id: &str) -> Result<(), ApiError> {
+fn mark_operation_running_at_dispatch(
+    index_root: &StorageContext,
+    entry_id: &str,
+) -> Result<(), ApiError> {
     let Some(operation_id) = entry_operation_id(index_root, entry_id)? else {
         return Ok(());
     };
@@ -889,7 +879,7 @@ fn mark_operation_running_at_dispatch(index_root: &Path, entry_id: &str) -> Resu
 
 /// Measure queue backlog by state plus the coalesced total, on a read-only
 /// connection (health inspection must never contend as a writer).
-pub(crate) fn queue_depths(index_root: &Path) -> Result<QueueDepths, ApiError> {
+pub(crate) fn queue_depths(index_root: &StorageContext) -> Result<QueueDepths, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
     let mut statement = connection
         .prepare(SELECT_QUEUE_DEPTHS_SQL)
@@ -941,7 +931,10 @@ pub(crate) fn queue_depths(index_root: &Path) -> Result<QueueDepths, ApiError> {
 /// `source_objects` carry no source_system column, and are attributed to the one
 /// operating source_system at MVP. The publish shape is still a per-source-system
 /// map, so a second source-system would slot in without a shape change.
-fn fabric_counts(index_root: &Path, source_system: &str) -> Result<FabricSourceCounts, ApiError> {
+fn fabric_counts(
+    index_root: &StorageContext,
+    source_system: &str,
+) -> Result<FabricSourceCounts, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
 
     let held = read_scalar_count(&connection, SELECT_HELD_COUNT_SQL, params![], "held")?;
@@ -1002,7 +995,7 @@ fn fabric_counts(index_root: &Path, source_system: &str) -> Result<FabricSourceC
 /// honest than a partial or timestamp-less overwrite, and this diagnostic must
 /// never disturb the sync summary or the adaptive cadence.
 fn publish_cycle_fabric_health(
-    index_root: &Path,
+    index_root: &StorageContext,
     source_system: &str,
     fabric_slot: &Mutex<FabricHealth>,
 ) {
@@ -1074,7 +1067,7 @@ fn read_scalar_count(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     corpus_root: PathBuf,
-    index_root: PathBuf,
+    index_root: StorageContext,
     governance_domain: String,
     pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
@@ -1099,6 +1092,8 @@ pub(crate) fn start(
     // Tracing scopes are thread-local; retain startup identity across the
     // dedicated scheduler thread boundary, including panic diagnostics.
     let worker_log = crate::util::LogContext::current();
+    // Retain the diagnostic budget after run_scheduler takes ownership of storage.
+    let diagnostics = index_root.limits().diagnostics;
     thread::Builder::new()
         .name("sync-scheduler".to_string())
         .spawn(move || {
@@ -1127,7 +1122,7 @@ pub(crate) fn start(
                 )
             }));
             if let Err(payload) = body {
-                let message = panic_payload_message(payload.as_ref());
+                let message = panic_payload_message(payload.as_ref(), &diagnostics);
                 error!(
                     event = "scheduler.thread_panicked",
                     is_panic = true,
@@ -1167,7 +1162,7 @@ pub(crate) fn start(
 #[allow(clippy::too_many_arguments)]
 fn run_scheduler(
     corpus_root: PathBuf,
-    index_root: PathBuf,
+    index_root: StorageContext,
     governance_domain: String,
     pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
@@ -1311,7 +1306,7 @@ fn run_scheduler(
         prefix: ParsePrefixContext {
             storage: StorageConfig {
                 corpus_root,
-                index_root: index_root.clone(),
+                index_root: index_root.to_path_buf(),
             },
             pdf,
         },
@@ -1322,7 +1317,7 @@ fn run_scheduler(
 
     let mut generation = startup_permit.generation();
     drop(startup_permit);
-    let mut cadence = CadenceState::new();
+    let mut cadence = CadenceState::new(index_root.limits().scheduling);
     let mut delay = Duration::ZERO;
     loop {
         // A permit covers the full cycle, including its final storage reads and
@@ -1351,7 +1346,7 @@ fn run_scheduler(
         };
         if permit.generation() != generation {
             generation = permit.generation();
-            cadence = CadenceState::new();
+            cadence = CadenceState::new(index_root.limits().scheduling);
             health = SyncHealth::startup_pending();
             health.fabric_ready = true;
             health.detail = None;
@@ -1383,7 +1378,12 @@ fn run_scheduler(
         ) {
             Ok(outcome) => match queue_depths(&index_root) {
                 Ok(depths) => {
-                    let spacing_ms = spacing_ms.unwrap_or_else(|| outcome.stats.elapsed_ms.max(1));
+                    let spacing_ms = spacing_ms.unwrap_or_else(|| {
+                        outcome
+                            .stats
+                            .elapsed_ms
+                            .max(index_root.limits().scheduling.min_interval_ms)
+                    });
                     // Backpressure means undrained work: pending plus
                     // in-flight. Failed rows are excluded — they are
                     // terminal until a new detection, so counting them
@@ -1566,7 +1566,7 @@ pub(crate) struct DryRunPassOutcome {
 /// `ParsePrefixContext` is what makes the mode wireable without inference.
 pub(crate) fn run_annotation_dry_run_pass(
     corpus_root: PathBuf,
-    index_root: PathBuf,
+    index_root: StorageContext,
     governance_domain: String,
     pdf: PdfParser,
 ) -> Result<DryRunPassOutcome, ApiError> {
@@ -1608,7 +1608,7 @@ pub(crate) fn run_annotation_dry_run_pass(
     let dispatch = ParsePrefixContext {
         storage: StorageConfig {
             corpus_root,
-            index_root: index_root.clone(),
+            index_root: index_root.to_path_buf(),
         },
         pdf,
     };
@@ -1855,7 +1855,7 @@ struct CycleOutcome {
 /// (which is first recorded as a durable failed acquisition at scope
 /// level). Per-item problems are recorded and counted, not propagated.
 fn run_cycle(
-    index_root: &Path,
+    index_root: &StorageContext,
     staging_root: &Path,
     connector: &FilesystemConnector,
     context: &AcquisitionContext,
@@ -2474,7 +2474,7 @@ fn run_cycle(
 /// (see ParsePrefixContext's ownership boundary).
 fn parse_chain_prefix(
     dispatch: &ParsePrefixContext,
-    index_root: &Path,
+    index_root: &StorageContext,
     entry: &SyncQueueEntry,
     import: &ImportOutcome,
 ) -> Result<ParseChainPrefix, ApiError> {
@@ -2712,7 +2712,7 @@ fn parse_chain_prefix(
 /// now shared by both ready arms.
 fn dispatch_parse_chain(
     dispatch: &ParseDispatchContext,
-    index_root: &Path,
+    index_root: &StorageContext,
     entry: &SyncQueueEntry,
     import: &ImportOutcome,
 ) -> Result<ParseChainOutcome, ApiError> {
@@ -2794,7 +2794,7 @@ fn dispatch_parse_chain(
 /// design (mechanic 1), leaving the ready run un-held for normal-cycle adoption.
 fn gate_ready_parse(
     dispatch: &ParseDispatchContext,
-    index_root: &Path,
+    index_root: &StorageContext,
     source_id: &str,
     parse_run_id: &str,
     consumed_bundle: Option<&Path>,
@@ -2902,7 +2902,7 @@ fn gate_ready_parse(
 /// write transaction so all projection rows still commit or roll back together.
 fn build_content_derived_projections(
     runtime: &ProjectionRuntime,
-    index_root: &Path,
+    index_root: &StorageContext,
     source_id: &str,
     parse_id: &str,
 ) -> Result<(), ApiError> {
@@ -2979,7 +2979,8 @@ fn build_projection_transaction(
     //    so they are built first. Token counts are measured against the ColBERT
     //    tokenizer (C6b contract) via the runtime accessor.
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::Chunk)?;
-    let chunk_count = chunk::build_chunks(tx, source_id, parse_id, runtime.colbert.tokenizer())?;
+    let chunk_count =
+        chunk::build_chunks(tx, source_id, parse_id, runtime.colbert.tokenizer(), store)?;
 
     // 2. Lexical — FTS5 index over the chunks just built.
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::LexicalDocument)?;
@@ -3008,6 +3009,7 @@ fn build_projection_transaction(
             &runtime.dense,
             runtime.dense_dimension,
             Some(&permit),
+            &runtime.embedding_identity,
         )?;
         section_dense::build_section_dense(
             tx,
@@ -3018,13 +3020,14 @@ fn build_projection_transaction(
             &runtime.dense_config,
             runtime.colbert.tokenizer(),
             Some(&permit),
+            &runtime.embedding_identity,
         )?;
         // `permit` drops here: the dense gate release precedes the colbert
         // acquire, honoring the non-overlapping-roles gate boundary.
         outcome
     } else {
         // HTTP backend: no gate across network I/O (§1.5). The builder packs its
-        // own DENSE_HTTP_BATCH_SIZE windows.
+        // configured HTTP batches of windows.
         let outcome = dense::build_dense_vectors(
             tx,
             source_id,
@@ -3032,6 +3035,7 @@ fn build_projection_transaction(
             &runtime.dense,
             runtime.dense_dimension,
             None,
+            &runtime.embedding_identity,
         )?;
         section_dense::build_section_dense(
             tx,
@@ -3042,6 +3046,7 @@ fn build_projection_transaction(
             &runtime.dense_config,
             runtime.colbert.tokenizer(),
             None,
+            &runtime.embedding_identity,
         )?;
         outcome
     };
@@ -3068,6 +3073,7 @@ fn build_projection_transaction(
             &runtime.colbert,
             runtime.colbert_dimension,
             permit.as_ref(),
+            &runtime.embedding_identity,
         )?;
         // The local ColBERT permit drops before the non-model view builder.
     }
@@ -3208,7 +3214,7 @@ fn superseded_held_ids(decision: &ActivationDecision) -> &[String] {
 /// normally empty or one id (§12 rule 4); a defensively larger list is cleaned
 /// id by id. Safe identifiers only in the boundary logs (no tokens/contents).
 fn clean_superseded_held(
-    index_root: &Path,
+    index_root: &StorageContext,
     source_id: &str,
     decision: &ActivationDecision,
 ) -> Result<(), ApiError> {
@@ -3390,10 +3396,6 @@ fn remove_consumed_acquisition_bundle(bundle_dir: &Path, acquisition_record_id: 
     }
 }
 
-/// Bounded example-path count in the orphan-sweep summary log, so a large
-/// orphan set never bloats one log line (the count stays exact).
-const SWEEP_EXAMPLE_PATH_CAP: usize = 3;
-
 /// Startup sweep of orphaned parser temp workspaces: remove every directory
 /// under the parse staging root matching the bundle writer's temp naming
 /// (`bundle-*` + `.tmp`, see `crate::parse::bundle`). Safe by the
@@ -3403,7 +3405,7 @@ const SWEEP_EXAMPLE_PATH_CAP: usize = 3;
 /// alone: one may be an unimported bundle from a crash, and the
 /// queue/importer interplay owns those. Sweep faults are logged, never
 /// terminal — temp directories are inert by the promotion naming invariant.
-fn sweep_orphan_parse_temp_dirs(index_root: &Path) {
+fn sweep_orphan_parse_temp_dirs(index_root: &StorageContext) {
     let started = Instant::now();
     let staging_root = parse_staging_root(index_root);
     // Start boundary: the sweep enumerates and recursively removes
@@ -3467,7 +3469,7 @@ fn sweep_orphan_parse_temp_dirs(index_root: &Path) {
         match fs::remove_dir_all(&path) {
             Ok(()) => {
                 swept += 1;
-                if example_paths.len() < SWEEP_EXAMPLE_PATH_CAP {
+                if example_paths.len() < index_root.limits().diagnostics.sweep_example_paths {
                     example_paths.push(path.display().to_string());
                 }
             }
@@ -3488,10 +3490,12 @@ fn sweep_orphan_parse_temp_dirs(index_root: &Path) {
     );
 }
 
-/// Adaptive-cadence state (spec §9.5, knob-free): every adjustment derives
+/// Adaptive cadence within configured bounds: every adjustment derives
 /// from observed signals — scan duration, measured churn, backlog — and is
 /// individually logged with its cause and old/new values.
 struct CadenceState {
+    /// Startup settings remain fixed when rebuild resets only measured state.
+    limits: SchedulingLimits,
     /// Next inter-cycle delay; None until the first scan establishes it.
     next_delay_ms: Option<u64>,
     /// EMA of the observed inter-change interval (spacing / changes).
@@ -3504,9 +3508,10 @@ struct CadenceState {
 }
 
 impl CadenceState {
-    /// Fresh cadence state: nothing measured yet, no backpressure.
-    fn new() -> Self {
+    /// Reset measurements while retaining the configured adaptation contract.
+    fn new(limits: SchedulingLimits) -> Self {
         Self {
+            limits,
             next_delay_ms: None,
             ema_inter_change_ms: None,
             last_cycle_started: None,
@@ -3526,8 +3531,9 @@ impl CadenceState {
     ) -> (u64, Option<bool>) {
         // Pace from scan cost, but the shared sleep ceiling takes precedence
         // even when scanning itself takes longer. The cap bounds idle waiting,
-        // not scan/work duration; the 1 ms floor prevents a zero-delay loop.
-        let floor_ms = scan_elapsed_ms.clamp(1, MAX_BACKOFF_MS);
+        // not scan/work duration; the positive floor prevents a zero-delay loop.
+        let floor_ms =
+            scan_elapsed_ms.clamp(self.limits.min_interval_ms, self.limits.max_backoff_ms);
 
         let mut delay_ms = match self.next_delay_ms {
             Some(current) => current,
@@ -3549,10 +3555,12 @@ impl CadenceState {
             // spacing/changes, EMA-smoothed. Changes only pull the delay
             // DOWN toward the scan-duration floor; slowing down is the
             // quiet path's job.
-            let observed = (spacing_ms as f64 / changes as f64).max(1.0);
+            let observed =
+                (spacing_ms as f64 / changes as f64).max(self.limits.min_interval_ms as f64);
             let ema = match self.ema_inter_change_ms {
                 Some(previous) => {
-                    INTER_CHANGE_EMA_WEIGHT * observed + (1.0 - INTER_CHANGE_EMA_WEIGHT) * previous
+                    self.limits.inter_change_ema_weight * observed
+                        + (1.0 - self.limits.inter_change_ema_weight) * previous
                 }
                 None => observed,
             };
@@ -3574,8 +3582,8 @@ impl CadenceState {
             // Round upward so 1 ms grows instead of truncating 1.5 back to 1.
             // Apply the ceiling before comparing/logging: a saturated backoff
             // must not claim further growth or postpone detection indefinitely.
-            let grown =
-                (((delay_ms as f64) * QUIET_CYCLE_GROWTH).ceil() as u64).min(MAX_BACKOFF_MS);
+            let grown = (((delay_ms as f64) * self.limits.quiet_growth).ceil() as u64)
+                .min(self.limits.max_backoff_ms);
             if grown != delay_ms {
                 info!(
                     event = "scheduler.cadence_adapted",
@@ -3592,7 +3600,8 @@ impl CadenceState {
         if backlog > 0 {
             // Undrained work slows detection, subject to the same shared cap
             // as quiet/error backoff. Clamp before publishing the adjustment.
-            let grown = (((delay_ms as f64) * BACKPRESSURE_GROWTH) as u64).min(MAX_BACKOFF_MS);
+            let grown = (((delay_ms as f64) * self.limits.backpressure_growth) as u64)
+                .min(self.limits.max_backoff_ms);
             if grown != delay_ms {
                 info!(
                     event = "scheduler.cadence_adapted",
@@ -3637,10 +3646,12 @@ impl CadenceState {
     /// ceiling bounds each retry sleep; cycle failures remain logged even when
     /// the effective delay no longer changes at the ceiling.
     fn back_off_after_error(&mut self) -> u64 {
-        let old_delay_ms = self.next_delay_ms.unwrap_or(ERROR_RETRY_BASE_MS);
-        let new_delay_ms = (((old_delay_ms as f64) * ERROR_CYCLE_GROWTH)
-            .max(ERROR_RETRY_BASE_MS as f64) as u64)
-            .min(MAX_BACKOFF_MS);
+        let old_delay_ms = self
+            .next_delay_ms
+            .unwrap_or(self.limits.error_retry_base_ms);
+        let new_delay_ms = (((old_delay_ms as f64) * self.limits.error_growth)
+            .max(self.limits.error_retry_base_ms as f64) as u64)
+            .clamp(self.limits.min_interval_ms, self.limits.max_backoff_ms);
         if new_delay_ms != old_delay_ms {
             info!(
                 event = "scheduler.cadence_adapted",
@@ -3659,7 +3670,7 @@ impl CadenceState {
 /// read-only and check the full schema contract. The scheduler never
 /// creates, repairs, or migrates schema — a mismatch is the operator's
 /// signal to run --setup-storage.
-fn validate_fabric_plane(index_root: &Path) -> Result<(), ApiError> {
+fn validate_fabric_plane(index_root: &StorageContext) -> Result<(), ApiError> {
     let connection = hot_plane::open_read(index_root)?;
     hot_plane::validate_fabric_schema(&connection)
 }
@@ -3669,7 +3680,7 @@ fn validate_fabric_plane(index_root: &Path) -> Result<(), ApiError> {
 /// its own connection: the event is the only state change, so no explicit
 /// transaction is needed.
 fn emit_backpressure_event(
-    index_root: &Path,
+    index_root: &StorageContext,
     entered: bool,
     source_system: &str,
     depths: &QueueDepths,

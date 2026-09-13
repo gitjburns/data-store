@@ -6,7 +6,9 @@ use std::fmt;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use rusqlite::{Connection, Transaction, params};
+use crate::limits::{ResourceLimits, RuntimeLimits};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,10 +31,7 @@ use super::envelope::{self, NewProjection, ProjectionType};
 
 /// Distinguishes archived section vectors from the fine passage dense plane.
 pub(crate) const SECTION_DENSE_INDEX_NAME: &str = "section_dense_v1";
-const MAX_WINDOW_TOKENS: usize = 2048;
-const MAX_PARSE_UNITS: usize = 100_000;
-const MAX_CELL_BYTES: usize = 1_048_576;
-const MAX_ENVELOPE_BYTES: usize = 16_777_216;
+// This exact string is the archived v1 policy, never the current build setting.
 const WINDOW_POLICY: &str = "section_dense_v1;nearest_logical_section;canonical_sequence;heading_path_slash;paragraph_separator_double_newline;utf8_prefix_split;max_tokens=2048;special_tokens=true;no_truncation;no_padding;exclude_header_footer;retain_short_text";
 const UNITS_SQL: &str = "
 SELECT id, source_id, content_type,
@@ -54,6 +53,8 @@ FROM retrieval_projections WHERE parse_id = ?1 AND index_name = ?2 LIMIT 2";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SectionDensePlane {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) construction: Option<SectionConstruction>,
     pub(crate) source_id: String,
     pub(crate) parse_id: String,
     pub(crate) dimension: usize,
@@ -63,6 +64,43 @@ pub(crate) struct SectionDensePlane {
     pub(crate) model_name: String,
     pub(crate) model_pooling: String,
     pub(crate) windows: Vec<SectionDenseWindow>,
+}
+
+/// Archived construction semantics are independent of current admission budgets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SectionConstruction {
+    version: u32,
+    window_max_tokens: u32,
+    tokenizer_hash: String,
+    model_identity: String,
+}
+
+impl SectionDensePlane {
+    /// The unversioned payload is explicitly the frozen 2048-token v1 format.
+    fn window_max_tokens(&self) -> usize {
+        self.construction
+            .as_ref()
+            .map_or(2048, |policy| policy.window_max_tokens as usize)
+    }
+
+    /// Fail closed for unknown versions and authenticate the complete recorded policy.
+    fn recorded_policy_hash(&self) -> Result<String, ApiError> {
+        match &self.construction {
+            None => Ok(policy_hash()),
+            Some(policy)
+                if policy.version == 2
+                    && policy.window_max_tokens > 0
+                    && policy.tokenizer_hash == self.tokenizer_hash
+                    && !policy.model_identity.is_empty() =>
+            {
+                crate::canonical::canonical_sha256_hex_of(&(WINDOW_POLICY, policy))
+            }
+            Some(_) => Err(failure(
+                "unsupported or invalid section construction policy".to_owned(),
+            )),
+        }
+    }
 }
 
 /// Captured immutable section publication; vector and canonical-text bytes stay
@@ -129,16 +167,22 @@ pub(crate) fn build_section_dense(
     config: &DenseModelConfig,
     tokenizer: &Tokenizer,
     permit: Option<&ModelCallPermit>,
+    model_identity: &str,
 ) -> Result<usize, ApiError> {
     let started = Instant::now();
     info!(
         event = "section_dense.build.started",
         source_id,
         parse_id,
-        max_tokens = MAX_WINDOW_TOKENS,
+        max_tokens = tx.limits().indexing.section_max_tokens,
         "building section context vectors"
     );
     let result = (|| {
+        super::annotation_io::admitted_value_count(
+            1,
+            config.dimension as usize,
+            &tx.limits().resources,
+        )?;
         if backend.uses_local_model_gate() != permit.is_some() {
             return Err(failure(format!(
                 "section dense model gate does not match backend for {parse_id}"
@@ -159,7 +203,9 @@ pub(crate) fn build_section_dense(
         let tokenizer_value: Value = serde_json::from_str(&tokenizer_json)
             .map_err(|source| failure(format!("decode section tokenizer identity: {source}")))?;
         let leaves = read_leaves(tx, source_id, parse_id)?;
-        let windows = build_windows(&leaves, parse_id, &counter)?;
+        let max_tokens = tx.limits().indexing.section_max_tokens;
+        let windows = build_windows(&leaves, parse_id, &counter, max_tokens as usize)?;
+        let tokenizer_hash = sha256_hex(&canonical_json_bytes_of(&tokenizer_value)?);
         let (model_backend, model_name) = match config.backend {
             DenseBackendKind::Local => ("local", config.local_path()?.display().to_string()),
             DenseBackendKind::Http => (
@@ -170,16 +216,23 @@ pub(crate) fn build_section_dense(
             ),
         };
         let mut plane = SectionDensePlane {
+            construction: Some(SectionConstruction {
+                version: 2,
+                window_max_tokens: max_tokens,
+                tokenizer_hash: tokenizer_hash.clone(),
+                model_identity: model_identity.to_owned(),
+            }),
             source_id: source_id.to_owned(),
             parse_id: parse_id.to_owned(),
             dimension: config.dimension as usize,
-            policy_hash: policy_hash(),
-            tokenizer_hash: sha256_hex(&canonical_json_bytes_of(&tokenizer_value)?),
+            policy_hash: String::new(),
+            tokenizer_hash,
             model_backend: model_backend.to_owned(),
             model_name,
             model_pooling: config.pooling.clone(),
             windows,
         };
+        plane.policy_hash = plane.recorded_policy_hash()?;
         info!(event = "section_dense.windows.ready", source_id, parse_id, unit_count = leaves.len(), window_count = plane.windows.len(), policy_hash = %plane.policy_hash, elapsed_ms = started.elapsed().as_millis() as u64, "section inputs constructed");
         let projection = envelope::insert_building(tx, &new_projection(&plane))?;
         let built = (|| {
@@ -254,7 +307,11 @@ fn read_section_envelope(
         .map_err(|source| failure(format!("prepare section envelope for {parse_id}: {source}")))?;
     let envelopes = statement
         .query_map(
-            params![parse_id, SECTION_DENSE_INDEX_NAME, MAX_ENVELOPE_BYTES],
+            params![
+                parse_id,
+                SECTION_DENSE_INDEX_NAME,
+                conn.limits().resources.max_json_cell_bytes
+            ],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
@@ -287,12 +344,12 @@ fn read_section_envelope(
         .ok_or_else(|| failure(format!("section envelope source missing for {parse_id}")))?;
     let uri = uri.ok_or_else(|| {
         failure(format!(
-            "section payload URI missing or exceeds {MAX_ENVELOPE_BYTES} bytes for {parse_id}"
+            "section payload URI missing or exceeds configured JSON bytes for {parse_id}"
         ))
     })?;
     let inputs = inputs.ok_or_else(|| {
         failure(format!(
-            "section envelope inputs missing or exceed {MAX_ENVELOPE_BYTES} bytes for {parse_id}"
+            "section envelope inputs missing or exceed configured JSON bytes for {parse_id}"
         ))
     })?;
     let inputs: Vec<String> = serde_json::from_str(&inputs)
@@ -322,9 +379,10 @@ pub(crate) fn load_section_dense_reference(
         window_count: 0,
         payload_uri: envelope.payload_uri,
     };
-    reference.window_count = stream_section_payload(store, &reference, |window| {
+    let (_, window_count) = stream_section_payload(store, &reference, |window| {
         canonical.validate_window(conn, &reference, window)
     })?;
+    reference.window_count = window_count;
     canonical.finish(&reference.parse_id)?;
     let ids: BTreeSet<&str> = canonical.ordered.iter().map(String::as_str).collect();
     if envelope
@@ -364,7 +422,7 @@ pub(crate) fn visit_section_dense(
     }
     let expected: BTreeSet<&str> = envelope.input_unit_ids.iter().map(String::as_str).collect();
     let mut seen = BTreeSet::new();
-    let count = stream_section_payload(store, reference, |window| {
+    let (_, count) = stream_section_payload(store, reference, |window| {
         for id in &window.input_unit_ids {
             if !expected.contains(id.as_str()) {
                 return Err(failure(format!(
@@ -512,13 +570,18 @@ fn read_canonical_leaf(
     let (kind, body) = conn
         .query_row(
             CANONICAL_LEAF_SQL,
-            params![id, reference.source_id, reference.parse_id, MAX_CELL_BYTES],
+            params![
+                id,
+                reference.source_id,
+                reference.parse_id,
+                conn.limits().resources.max_source_body_bytes
+            ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .map_err(|source| failure(format!("read canonical section leaf {id}: {source}")))?;
     let body = body.ok_or_else(|| {
         failure(format!(
-            "section leaf {id} exceeds {MAX_CELL_BYTES} body bytes"
+            "resource limit: section leaf {id} exceeds configured body bytes"
         ))
     })?;
     let kind: ContentType = serde_json::from_value(Value::String(kind))
@@ -542,9 +605,10 @@ fn stream_section_payload(
     store: &ArtifactStore,
     reference: &SectionDenseReference,
     mut visit: impl FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
-) -> Result<usize, ApiError> {
+) -> Result<(SectionDensePlane, usize), ApiError> {
+    super::annotation_io::admitted_value_count(1, reference.dimension, &store.limits().resources)?;
     store.with_verified_reader(&reference.payload_uri, None, |reader| {
-        let remaining = Cell::new(MAX_ENVELOPE_BYTES);
+        let remaining = Cell::new(store.limits().resources.max_json_cell_bytes);
         let reader = SectionRecordReader {
             reader: BufReader::new(reader),
             remaining: &remaining,
@@ -553,6 +617,7 @@ fn stream_section_payload(
         let mut callback_error = None;
         let result = SectionPayloadSeed {
             reference,
+            limits: &store.limits().resources,
             remaining: &remaining,
             visit: &mut visit,
             callback_error: &mut callback_error,
@@ -596,7 +661,7 @@ impl<R: Read> Read for SectionRecordReader<'_, R> {
         if allowed == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "section JSON record exceeds its bounded byte budget",
+                "resource limit: section JSON record exceeds its configured byte budget",
             ));
         }
         let read = self.reader.read(&mut buffer[..allowed])?;
@@ -608,13 +673,14 @@ impl<R: Read> Read for SectionRecordReader<'_, R> {
 /// Carry expected identity and the provisional callback across serde's map/array boundary.
 struct SectionPayloadSeed<'a> {
     reference: &'a SectionDenseReference,
+    limits: &'a ResourceLimits,
     remaining: &'a Cell<usize>,
     visit: &'a mut dyn FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
     callback_error: &'a mut Option<ApiError>,
 }
 
 impl<'de> DeserializeSeed<'de> for SectionPayloadSeed<'_> {
-    type Value = usize;
+    type Value = (SectionDensePlane, usize);
 
     /// Deserialize the envelope map while delegating its windows to an incremental reader.
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -626,7 +692,7 @@ impl<'de> DeserializeSeed<'de> for SectionPayloadSeed<'_> {
 }
 
 impl<'de> Visitor<'de> for SectionPayloadSeed<'_> {
-    type Value = usize;
+    type Value = (SectionDensePlane, usize);
 
     /// Preserve useful format context in malformed artifact errors.
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -644,6 +710,7 @@ impl<'de> Visitor<'de> for SectionPayloadSeed<'_> {
                 }
                 window_count = Some(map.next_value_seed(SectionWindowsSeed {
                     reference: self.reference,
+                    limits: self.limits,
                     remaining: self.remaining,
                     visit: self.visit,
                     callback_error: self.callback_error,
@@ -662,15 +729,17 @@ impl<'de> Visitor<'de> for SectionPayloadSeed<'_> {
                         | "modelBackend"
                         | "modelName"
                         | "modelPooling"
+                        | "construction"
                 ) {
                     return Err(M::Error::custom(format!("unknown section field {key}")));
                 }
                 header.insert(key, map.next_value::<Value>()?);
             }
         }
-        let count = window_count.ok_or_else(|| M::Error::missing_field("windows"))?;
+        let (count, max_tokens) = window_count.ok_or_else(|| M::Error::missing_field("windows"))?;
         header.insert("windows".to_owned(), Value::Array(Vec::new()));
-        let plane = serde_json::from_value(Value::Object(header)).map_err(M::Error::custom)?;
+        let plane: SectionDensePlane =
+            serde_json::from_value(Value::Object(header)).map_err(M::Error::custom)?;
         validate_payload(
             &plane,
             &self.reference.source_id,
@@ -678,20 +747,28 @@ impl<'de> Visitor<'de> for SectionPayloadSeed<'_> {
             self.reference.dimension,
         )
         .map_err(M::Error::custom)?;
-        Ok(count)
+        // Header order is unrestricted. Retain only the largest observed count
+        // until the archived construction policy can authenticate every window.
+        if max_tokens > plane.window_max_tokens() {
+            return Err(M::Error::custom(
+                "section window exceeds its recorded construction token limit",
+            ));
+        }
+        Ok((plane, count))
     }
 }
 
 /// Sequence visits release each window before deserializing its successor.
 struct SectionWindowsSeed<'a> {
     reference: &'a SectionDenseReference,
+    limits: &'a ResourceLimits,
     remaining: &'a Cell<usize>,
     visit: &'a mut dyn FnMut(&SectionDenseWindow) -> Result<(), ApiError>,
     callback_error: &'a mut Option<ApiError>,
 }
 
 impl<'de> DeserializeSeed<'de> for SectionWindowsSeed<'_> {
-    type Value = usize;
+    type Value = (usize, usize);
 
     /// Enter the array without serde allocating a vector for all windows.
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -703,7 +780,7 @@ impl<'de> DeserializeSeed<'de> for SectionWindowsSeed<'_> {
 }
 
 impl<'de> Visitor<'de> for SectionWindowsSeed<'_> {
-    type Value = usize;
+    type Value = (usize, usize);
 
     /// Report the expected collection at the array boundary.
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -717,9 +794,10 @@ impl<'de> Visitor<'de> for SectionWindowsSeed<'_> {
             .reference
             .dimension
             .checked_mul(32)
-            .and_then(|bytes| bytes.checked_add(MAX_ENVELOPE_BYTES))
+            .and_then(|bytes| bytes.checked_add(self.limits.max_json_cell_bytes))
             .ok_or_else(|| S::Error::custom("section record byte budget overflow"))?;
         let mut count = 0;
+        let mut max_tokens = 0;
         loop {
             self.remaining.set(record_bytes);
             let Some(window) = sequence.next_element_seed(SectionWindowSeed {
@@ -733,8 +811,10 @@ impl<'de> Visitor<'de> for SectionWindowsSeed<'_> {
                 &self.reference.parse_id,
                 self.reference.dimension,
                 count,
+                usize::MAX,
             )
             .map_err(S::Error::custom)?;
+            max_tokens = max_tokens.max(window.token_count);
             if let Err(error) = (self.visit)(&window) {
                 *self.callback_error = Some(error);
                 return Err(S::Error::custom("section window callback failed"));
@@ -742,8 +822,8 @@ impl<'de> Visitor<'de> for SectionWindowsSeed<'_> {
             count += 1;
         }
         // Header data after windows receives the same cap as data before it.
-        self.remaining.set(MAX_ENVELOPE_BYTES);
-        Ok(count)
+        self.remaining.set(self.limits.max_json_cell_bytes);
+        Ok((count, max_tokens))
     }
 }
 
@@ -884,13 +964,21 @@ pub(crate) fn read_section_payload(
     parse_id: &str,
     expected_dimension: usize,
 ) -> Result<SectionDensePlane, ApiError> {
-    let bytes = store.get_bytes_by_uri(uri)?;
-    let plane: SectionDensePlane = serde_json::from_slice(&bytes).map_err(|source| {
-        failure(format!(
-            "decode section payload {uri} for {parse_id}: {source}"
-        ))
+    let reference = SectionDenseReference {
+        source_id: source_id.to_owned(),
+        parse_id: parse_id.to_owned(),
+        dimension: expected_dimension,
+        window_count: 0,
+        payload_uri: uri.to_owned(),
+    };
+    let mut windows = Vec::new();
+    // Full archive consumers use the same bounded record parser as query scans.
+    // They still retain the full verified plane, unlike incremental query readers.
+    let (mut plane, _) = stream_section_payload(store, &reference, |window| {
+        windows.push(window.clone());
+        Ok(())
     })?;
-    validate_payload(&plane, source_id, parse_id, expected_dimension)?;
+    plane.windows = windows;
     Ok(plane)
 }
 
@@ -907,6 +995,7 @@ pub(crate) fn validate_archived_plane(
     units: &[Value],
     relationships: &[Value],
     plane: &SectionDensePlane,
+    limits: &RuntimeLimits,
 ) -> Result<(), ApiError> {
     let mut nodes = BTreeMap::new();
     let mut order = Vec::new();
@@ -925,9 +1014,9 @@ pub(crate) fn validate_archived_plane(
         ))
         .map_err(|source| failure(format!("archived section leaf type {id}: {source}")))?;
         let raw_body = archived_string(unit, "body_json")?;
-        if raw_body.len() > MAX_CELL_BYTES {
+        if raw_body.len() > limits.resources.max_source_body_bytes {
             return Err(failure(format!(
-                "archived section unit {id} exceeds {MAX_CELL_BYTES} body bytes"
+                "resource limit: archived section unit {id} exceeds configured body bytes"
             )));
         }
         let body: Value = serde_json::from_str(raw_body)
@@ -945,9 +1034,9 @@ pub(crate) fn validate_archived_plane(
         }
         order.push((sequence.is_none(), sequence, id));
     }
-    if nodes.len() > MAX_PARSE_UNITS {
+    if nodes.len() > limits.resources.max_parse_units {
         return Err(failure(format!(
-            "archived section parse {} exceeds {MAX_PARSE_UNITS} units",
+            "resource limit: archived section parse {} exceeds configured unit count",
             plane.parse_id
         )));
     }
@@ -979,7 +1068,13 @@ pub(crate) fn validate_archived_plane(
         let Some(text) = eligible_text(*kind, body) else {
             continue;
         };
-        let (section_id, section_path) = archived_section(id, &plane.parse_id, &nodes, &parents)?;
+        let (section_id, section_path) = archived_section(
+            id,
+            &plane.parse_id,
+            &nodes,
+            &parents,
+            limits.retrieval.max_section_ancestry,
+        )?;
         leaves.push(Leaf {
             id: id.to_owned(),
             text,
@@ -997,10 +1092,11 @@ fn archived_section(
     parse_id: &str,
     nodes: &BTreeMap<&str, (ContentType, Value)>,
     parents: &BTreeMap<&str, BTreeSet<&str>>,
+    max_ancestry: usize,
 ) -> Result<(Option<String>, Vec<String>), ApiError> {
     let mut current = unit_id;
     let mut visited = BTreeSet::from([current]);
-    for _ in 0..crate::assembly::model::MAX_PASSAGE_UNITS {
+    for _ in 0..max_ancestry {
         let Some(links) = parents.get(current) else {
             return Ok((None, Vec::new()));
         };
@@ -1029,7 +1125,7 @@ fn archived_section(
         current = id;
     }
     Err(failure(format!(
-        "archived logical section ancestry of {unit_id} in {parse_id} exceeds depth limit"
+        "resource limit: archived logical section ancestry of {unit_id} in {parse_id} exceeds configured depth limit"
     )))
 }
 
@@ -1051,7 +1147,7 @@ fn validate_payload(
         || plane.parse_id != parse_id
         || plane.dimension != dimension
         || dimension == 0
-        || plane.policy_hash != policy_hash()
+        || plane.policy_hash != plane.recorded_policy_hash()?
         || plane.tokenizer_hash.len() != 64
         || !plane
             .tokenizer_hash
@@ -1066,7 +1162,13 @@ fn validate_payload(
         )));
     }
     for (index, window) in plane.windows.iter().enumerate() {
-        validate_window(window, parse_id, dimension, index)?;
+        validate_window(
+            window,
+            parse_id,
+            dimension,
+            index,
+            plane.window_max_tokens(),
+        )?;
     }
     Ok(())
 }
@@ -1077,6 +1179,7 @@ fn validate_window(
     parse_id: &str,
     dimension: usize,
     index: usize,
+    max_tokens: usize,
 ) -> Result<(), ApiError> {
     // The shared validator owns its input; retain the archived vector while
     // checking its norm with exactly the same arithmetic as fresh embeddings.
@@ -1086,7 +1189,7 @@ fn validate_window(
     // set that grows with every streamed vector.
     if window.window_id != window_id(parse_id, index)
         || window.token_count == 0
-        || window.token_count > MAX_WINDOW_TOKENS
+        || window.token_count > max_tokens
         || window.targeting_text.trim().is_empty()
         || window.input_unit_ids.is_empty()
         || window.fragments.len() != window.input_unit_ids.len()
@@ -1131,12 +1234,17 @@ fn visit_leaves(
     parse_id: &str,
     mut visit: impl FnMut(Leaf) -> Result<(), ApiError>,
 ) -> Result<(), ApiError> {
+    let limits = &conn.limits().resources;
     let mut statement = conn
         .prepare(UNITS_SQL)
         .map_err(|source| failure(format!("prepare section leaves for {parse_id}: {source}")))?;
     let rows = statement
         .query_map(
-            params![parse_id, MAX_CELL_BYTES, MAX_PARSE_UNITS + 1],
+            params![
+                parse_id,
+                limits.max_source_body_bytes,
+                limits.max_parse_units + 1
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1148,9 +1256,9 @@ fn visit_leaves(
         )
         .map_err(|source| failure(format!("read section leaves for {parse_id}: {source}")))?;
     for (index, row) in rows.enumerate() {
-        if index == MAX_PARSE_UNITS {
+        if index == limits.max_parse_units {
             return Err(failure(format!(
-                "section parse {parse_id} exceeds {MAX_PARSE_UNITS} canonical units"
+                "resource limit: section parse {parse_id} exceeds configured canonical unit count"
             )));
         }
         let (id, source, kind, body) =
@@ -1164,7 +1272,7 @@ fn visit_leaves(
             .map_err(|source| failure(format!("section leaf type {id}: {source}")))?;
         let body = body.ok_or_else(|| {
             failure(format!(
-                "section leaf {id} exceeds {MAX_CELL_BYTES} body bytes"
+                "resource limit: section leaf {id} exceeds configured body bytes"
             ))
         })?;
         let body: Value = serde_json::from_str(&body)
@@ -1218,6 +1326,7 @@ fn build_windows(
     leaves: &[Leaf],
     parse_id: &str,
     tokenizer: &Tokenizer,
+    max_tokens: usize,
 ) -> Result<Vec<SectionDenseWindow>, ApiError> {
     let mut windows = Vec::new();
     for group in grouped_leaves(leaves) {
@@ -1236,7 +1345,7 @@ fn build_windows(
                     window.targeting_text,
                     &leaf.text[offset..]
                 );
-                if count_tokens(tokenizer, &full)? <= MAX_WINDOW_TOKENS {
+                if count_tokens(tokenizer, &full)? <= max_tokens {
                     window.targeting_text = full;
                     window.input_unit_ids.push(leaf.id.clone());
                     window.fragments.push(SectionDenseFragment {
@@ -1246,10 +1355,14 @@ fn build_windows(
                     });
                     offset = leaf.text.len();
                 } else if !window.fragments.is_empty() {
-                    flush_window(&mut pending, &mut windows, parse_id, tokenizer)?;
+                    flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
                 } else {
-                    let length =
-                        fitting_prefix(tokenizer, &window.targeting_text, &leaf.text[offset..])?;
+                    let length = fitting_prefix(
+                        tokenizer,
+                        &window.targeting_text,
+                        &leaf.text[offset..],
+                        max_tokens,
+                    )?;
                     window
                         .targeting_text
                         .push_str(&leaf.text[offset..offset + length]);
@@ -1260,11 +1373,11 @@ fn build_windows(
                         end_byte: offset + length,
                     });
                     offset += length;
-                    flush_window(&mut pending, &mut windows, parse_id, tokenizer)?;
+                    flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
                 }
             }
         }
-        flush_window(&mut pending, &mut windows, parse_id, tokenizer)?;
+        flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
     }
     Ok(windows)
 }
@@ -1299,6 +1412,7 @@ fn flush_window(
     windows: &mut Vec<SectionDenseWindow>,
     parse_id: &str,
     tokenizer: &Tokenizer,
+    max_tokens: usize,
 ) -> Result<(), ApiError> {
     if let Some(mut window) = pending.take() {
         if window.fragments.is_empty() {
@@ -1306,7 +1420,7 @@ fn flush_window(
         }
         window.window_id = window_id(parse_id, windows.len());
         window.token_count = count_tokens(tokenizer, &window.targeting_text)?;
-        if window.token_count > MAX_WINDOW_TOKENS {
+        if window.token_count > max_tokens {
             return Err(failure(format!(
                 "section window {} exceeds token cap",
                 window.window_id
@@ -1319,7 +1433,12 @@ fn flush_window(
 
 /// Search UTF-8 boundaries and keep only measured fitting prefixes. Token counts
 /// need not be monotone: the search may underfill a window but can never overfill it.
-fn fitting_prefix(tokenizer: &Tokenizer, prefix: &str, text: &str) -> Result<usize, ApiError> {
+fn fitting_prefix(
+    tokenizer: &Tokenizer,
+    prefix: &str,
+    text: &str,
+    max_tokens: usize,
+) -> Result<usize, ApiError> {
     let boundaries: Vec<usize> = text
         .char_indices()
         .map(|(index, _)| index)
@@ -1332,7 +1451,7 @@ fn fitting_prefix(tokenizer: &Tokenizer, prefix: &str, text: &str) -> Result<usi
     while low < high {
         let middle = low + (high - low) / 2;
         let length = boundaries[middle];
-        if count_tokens(tokenizer, &format!("{prefix}{}", &text[..length]))? <= MAX_WINDOW_TOKENS {
+        if count_tokens(tokenizer, &format!("{prefix}{}", &text[..length]))? <= max_tokens {
             fitting = length;
             low = middle + 1;
         } else {
@@ -1340,9 +1459,9 @@ fn fitting_prefix(tokenizer: &Tokenizer, prefix: &str, text: &str) -> Result<usi
         }
     }
     if fitting == 0 {
-        return Err(failure(
-            "section heading leaves no room for canonical text under the 2048-token cap".to_owned(),
-        ));
+        return Err(failure(format!(
+            "section heading leaves no room for canonical text under the {max_tokens}-token cap"
+        )));
     }
     Ok(fitting)
 }
@@ -1437,7 +1556,14 @@ fn new_projection(plane: &SectionDensePlane) -> NewProjection {
         producer: Provenance {
             producer_type: ProducerType::Model,
             producer_name: "fabric-section-dense".to_owned(),
-            producer_version: Some("1".to_owned()),
+            producer_version: Some(
+                if plane.construction.is_some() {
+                    "2"
+                } else {
+                    "1"
+                }
+                .to_owned(),
+            ),
             config_hash: Some(plane.policy_hash.clone()),
             model_name: Some(plane.model_name.clone()),
             model_version: None,

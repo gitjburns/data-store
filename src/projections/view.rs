@@ -32,7 +32,8 @@
 
 use std::time::Instant;
 
-use rusqlite::{Connection, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use serde_json::Value;
 use tracing::{debug, error, info};
 

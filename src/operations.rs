@@ -37,8 +37,6 @@
 // completes queue-coupled operations through the same mark_* functions, and
 // GET /operations/{operationId} reads via get. The module-level dead-code allow
 // this module carried while unwired is removed accordingly.
-use std::path::Path;
-
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
@@ -98,7 +96,7 @@ WHERE id = ?1";
 /// later flips it to `running` and then a terminal state. Opens its own write
 /// connection (see the module transaction-shape note).
 pub(crate) fn insert_pending(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     operation_type: OperationType,
     target_object_type: &str,
     target_object_id: &str,
@@ -128,7 +126,10 @@ pub(crate) fn insert_pending(
 /// Transition `pending → running`, stamping started_at. The UPDATE is
 /// status-guarded and asserted to hit exactly one row, so starting a missing
 /// or non-pending operation is a loud failure, never a silent no-op.
-pub(crate) fn mark_running(index_root: &Path, operation_id: &str) -> Result<(), ApiError> {
+pub(crate) fn mark_running(
+    index_root: &crate::runtime::StorageContext,
+    operation_id: &str,
+) -> Result<(), ApiError> {
     let now = utc_now()?;
     let connection = hot_plane::open_write(index_root)?;
     let updated = connection
@@ -145,7 +146,10 @@ pub(crate) fn mark_running(index_root: &Path, operation_id: &str) -> Result<(), 
 /// Transition `running → succeeded`, stamping completed_at. Status-guarded and
 /// asserted to hit exactly one row, so completing a non-running operation
 /// fails loudly.
-pub(crate) fn mark_succeeded(index_root: &Path, operation_id: &str) -> Result<(), ApiError> {
+pub(crate) fn mark_succeeded(
+    index_root: &crate::runtime::StorageContext,
+    operation_id: &str,
+) -> Result<(), ApiError> {
     let now = utc_now()?;
     let connection = hot_plane::open_write(index_root)?;
     let updated = connection
@@ -164,11 +168,11 @@ pub(crate) fn mark_succeeded(index_root: &Path, operation_id: &str) -> Result<()
 /// persisted. Status-guarded and asserted to hit exactly one row, so failing a
 /// non-running operation is a loud failure.
 pub(crate) fn mark_failed(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     operation_id: &str,
     bounded_error: &str,
 ) -> Result<(), ApiError> {
-    let detail = truncate_persisted_detail(bounded_error);
+    let detail = truncate_persisted_detail(bounded_error, &index_root.limits().diagnostics);
     let now = utc_now()?;
     let connection = hot_plane::open_write(index_root)?;
     let updated = connection
@@ -184,7 +188,9 @@ pub(crate) fn mark_failed(
 
 /// Find durable evidence of an incomplete destructive reset before starting workers.
 /// A successful retry deletes earlier markers, so any remaining non-success blocks admission.
-pub(crate) fn unresolved_rebuild(index_root: &Path) -> Result<Option<String>, ApiError> {
+pub(crate) fn unresolved_rebuild(
+    index_root: &crate::runtime::StorageContext,
+) -> Result<Option<String>, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
     let kind = enum_wire_name(&OperationType::RebuildAll, "operation type")?;
     connection.query_row(
@@ -199,7 +205,10 @@ pub(crate) fn unresolved_rebuild(index_root: &Path) -> Result<Option<String>, Ap
 /// Read one Operation by id, re-typed into the model shape, for
 /// `GET /operations/{operationId}`. Returns `None` when the id is absent so
 /// the handler maps that to a 404. Opens a fresh read-only connection.
-pub(crate) fn get(index_root: &Path, operation_id: &str) -> Result<Option<Operation>, ApiError> {
+pub(crate) fn get(
+    index_root: &crate::runtime::StorageContext,
+    operation_id: &str,
+) -> Result<Option<Operation>, ApiError> {
     let connection = hot_plane::open_read(index_root)?;
     let row = connection
         .query_row(SELECT_OPERATION_SQL, params![operation_id], |row| {

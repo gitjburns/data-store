@@ -37,17 +37,17 @@
 //! boundary (a `spawn_blocking` seam), so this function does no async and holds
 //! no runtime.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::{Connection, params, params_from_iter};
+use crate::{runtime::StorageContext, sqlite::Connection};
+use rusqlite::{params, params_from_iter};
 use tracing::{error, info, warn};
 
 use crate::artifact_store::ArtifactStore;
 use crate::assembly::evidence::{EvidenceOptions, PassageEvidence, build_evidence_pack};
 use crate::assembly::model::EvidencePack;
-use crate::assembly::policy::{CapturedParseRef, active_policy};
+use crate::assembly::policy::CapturedParseRef;
 use crate::error::ApiError;
 use crate::inference::{ColbertCandidateScore, InferenceRuntime};
 use crate::policy::EntityMatchPolicy;
@@ -228,7 +228,7 @@ pub(crate) fn execute_query(
     dense_cache: &DenseCache,
     inference: &InferenceRuntime,
     gate: &Arc<ExclusiveGate>,
-    index_root: &Path,
+    index_root: &StorageContext,
     profile: &RetrievalProfile,
     entity_match_policy: &EntityMatchPolicy,
     colbert_expected_dimension: usize,
@@ -246,8 +246,8 @@ pub(crate) fn execute_query(
         scope_kind = ?scope.kind,
         // Keep the established log field; it now caps final passages only.
         top_k = request_ctx.max_final_evidence_units as usize,
-        colbert_candidate_pool_size = profile.colbert_candidate_pool_size,
-        reranker_candidate_pool_size = profile.reranker_candidate_pool_size,
+        colbert_candidate_pool_size = profile.limits.colbert_candidate_pool_size,
+        reranker_candidate_pool_size = profile.limits.reranker_candidate_pool_size,
         "query pipeline started"
     );
 
@@ -263,7 +263,7 @@ pub(crate) fn execute_query(
             query_id,
             stage = "open_read",
             error = %error,
-            error_chain = %crate::util::error_chain(error),
+            error_chain = %crate::util::error_chain(error, &index_root.limits().diagnostics),
             elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
             "query pipeline failed opening the read connection"
         );
@@ -279,7 +279,7 @@ pub(crate) fn execute_query(
             query_id,
             stage = "begin_read_transaction",
             error = %error,
-            error_chain = %crate::util::error_chain(error),
+            error_chain = %crate::util::error_chain(error, &index_root.limits().diagnostics),
             elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
             "query pipeline failed beginning the read transaction"
         );
@@ -347,7 +347,7 @@ pub(crate) fn execute_query(
                 query_id,
                 stage,
                 error = %error,
-                error_chain = %crate::util::error_chain(&error),
+                error_chain = %crate::util::error_chain(&error, &index_root.limits().diagnostics),
                 snapshot_held_ms = latencies.snapshot_held_ms,
                 elapsed_ms = operation_started_at.elapsed().as_millis() as u64,
                 "query pipeline failed"
@@ -364,7 +364,7 @@ pub(crate) fn execute_query(
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_body(
     conn: &Connection,
-    index_root: &Path,
+    index_root: &StorageContext,
     registry: &CutoverRegistry,
     dense_cache: &DenseCache,
     inference: &InferenceRuntime,
@@ -460,7 +460,7 @@ fn run_pipeline_body(
         query_id,
         &captured,
         query_text,
-        profile.graph_hop_budget as usize,
+        profile.limits.graph_hop_budget as usize,
         entity_match_policy,
         &annotation_scan.semantic_names,
     )?;
@@ -524,7 +524,7 @@ fn run_pipeline_body(
         &prepared_query,
         &fusion.pool,
         colbert_expected_dimension,
-        profile.colbert_candidate_pool_size as usize,
+        profile.limits.colbert_candidate_pool_size as usize,
     )?;
     let annotation_scoring_started = Instant::now();
     let annotation_maxsim = annotation_query::score_excerpts(
@@ -544,9 +544,9 @@ fn run_pipeline_body(
     // raise passage candidate depth without exceeding the already-bounded seeds.
     let passage_started_at = Instant::now();
     *stage = "passage_construction";
-    let passage_limit = (profile.reranker_candidate_pool_size as usize)
+    let passage_limit = (profile.limits.reranker_candidate_pool_size as usize)
         .max(top_k)
-        .min(profile.colbert_candidate_pool_size as usize);
+        .min(profile.limits.colbert_candidate_pool_size as usize);
     let mut passage_candidates = build_passages(
         conn,
         &maxsim,
@@ -557,7 +557,7 @@ fn run_pipeline_body(
         query_id,
     )?;
     for passage in &mut passage_candidates {
-        passage.attach_graph_context(&fusion.channel_hits, inference.colbert.tokenizer())?;
+        passage.attach_graph_context(&fusion.channel_hits);
     }
     latencies.passage_build_ms = passage_started_at.elapsed().as_millis() as u64;
 
@@ -636,7 +636,7 @@ fn assemble_evidence_pack(
     query_id: &str,
     query_text: &str,
 ) -> Result<EvidencePack, ApiError> {
-    let policy = active_policy()?;
+    let policy = &conn.settings().assembly_policy;
 
     // Captured active parses → C8a's borrowed-primitive capture contract.
     let captured_refs: Vec<CapturedParseRef<'_>> = captured
@@ -672,7 +672,15 @@ fn assemble_evidence_pack(
     // matches the chunker. This is CPU-only tokenizer work and MUST NOT acquire
     // the model-call gate: the gate protects accelerator (dense/colbert/reranker)
     // calls only, and assembly never touches it.
-    let tokenizer = inference.colbert.tokenizer();
+    // Inference tokenizers may clip and pad. Raw-evidence accounting must see
+    // every original token or the configured budget would be silently undercharged.
+    let mut tokenizer = inference.colbert.tokenizer().clone();
+    tokenizer
+        .with_truncation(None)
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("failed to disable assembly token-counter truncation: {source}"),
+        })?;
+    tokenizer.with_padding(None);
     let count_tokens = |text: &str| -> Result<usize, ApiError> {
         tokenizer
             .encode(text, true)
@@ -761,7 +769,7 @@ fn capture_all_active(conn: &Connection) -> Result<Vec<ActiveParse>, ApiError> {
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query active sources: {source}"),
         })?;
-    collect_active_parses(rows)
+    collect_active_parses(rows, conn.limits().resources.max_sources)
 }
 
 /// Capture active parses for an explicit `source_ids` set (`SourceSet` scope).
@@ -795,7 +803,7 @@ fn capture_active_by_source_ids(
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query source-set active sources: {source}"),
         })?;
-    collect_active_parses(rows)
+    collect_active_parses(rows, conn.limits().resources.max_sources)
 }
 
 /// Capture active parses for a `governance_domains` set (`DomainSet` scope), by
@@ -835,7 +843,7 @@ fn capture_active_by_domains(
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query domain-set active sources: {source}"),
         })?;
-    collect_active_parses(rows)
+    collect_active_parses(rows, conn.limits().resources.max_sources)
 }
 
 /// Capture active parses for the R3 CONJUNCTION scope: sources whose id is in
@@ -888,7 +896,7 @@ fn capture_active_by_source_ids_and_domains(
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query source-and-domain active sources: {source}"),
         })?;
-    collect_active_parses(rows)
+    collect_active_parses(rows, conn.limits().resources.max_sources)
 }
 
 /// Build a `?,?,…` placeholder list of `count` positional parameters for an
@@ -907,14 +915,23 @@ fn sql_placeholder_list(count: usize) -> String {
 
 /// Drain a mapped active-parse row iterator into a vector, surfacing a row read
 /// error with local context (never a generic message; PRINCIPLES.md).
+/// Stop before retaining an extra source; a capped capture cannot masquerade as a complete scope.
 fn collect_active_parses(
     rows: impl Iterator<Item = rusqlite::Result<ActiveParse>>,
+    max_sources: usize,
 ) -> Result<Vec<ActiveParse>, ApiError> {
     let mut parses = Vec::new();
     for row in rows {
         let parse = row.map_err(|source| ApiError::StorageOperation {
             message: format!("failed to read active-source row: {source}"),
         })?;
+        if parses.len() == max_sources {
+            return Err(ApiError::StorageOperation {
+                message: format!(
+                    "resource limit: query scope exceeds resources.max_sources {max_sources}"
+                ),
+            });
+        }
         parses.push(parse);
     }
     Ok(parses)

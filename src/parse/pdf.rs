@@ -2,7 +2,8 @@
 //! Identity lookup and execution use the same variant, so the importer's expected
 //! capability profile cannot disagree with the worker that produced its bundle.
 
-use std::path::{Path, PathBuf};
+use crate::runtime::StorageContext;
+use std::path::PathBuf;
 
 use crate::{
     config::{DoclingConfig, PdfConfig, PdfEngine},
@@ -62,7 +63,7 @@ impl PdfParser {
     /// Stage one successful or failed candidate bundle for the canonical importer.
     pub(crate) fn run(
         &self,
-        index_root: &Path,
+        index_root: &StorageContext,
         source: ResolvedSource,
         source_id: &str,
         source_hash: &str,

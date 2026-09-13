@@ -49,7 +49,7 @@ pub(crate) fn reserve(state: &AppState) -> Result<String, ApiError> {
         );
 
         operations::insert_pending(
-            &state.config.storage.index_root,
+            &state.storage,
             OperationType::RebuildAll,
             "corpus",
             &state.config.storage.corpus_root.to_string_lossy(),
@@ -60,7 +60,7 @@ pub(crate) fn reserve(state: &AppState) -> Result<String, ApiError> {
         Err(payload) => Err(ApiError::InternalIo {
             message: format!(
                 "rebuild-all acceptance panicked: {}",
-                crate::util::panic_payload_message(payload.as_ref())
+                crate::util::panic_payload_message(payload.as_ref(), &state.config.diagnostics)
             ),
         }),
     };
@@ -98,14 +98,14 @@ pub(crate) fn run(state: &AppState, operation_id: &str) {
         clear_storage(state, operation_id)?;
         state
             .maintenance()
-            .complete(|| operations::mark_succeeded(&state.config.storage.index_root, operation_id))
+            .complete(|| operations::mark_succeeded(&state.storage, operation_id))
     }));
     let result = match outcome {
         Ok(result) => result,
         Err(payload) => Err(ApiError::InternalIo {
             message: format!(
                 "rebuild-all task panicked: {}",
-                crate::util::panic_payload_message(payload.as_ref())
+                crate::util::panic_payload_message(payload.as_ref(), &state.config.diagnostics)
             ),
         }),
     };
@@ -140,7 +140,7 @@ pub(crate) fn run(state: &AppState, operation_id: &str) {
 /// A storage fault can precede the pending Operation's start; preserve the existing
 /// status-guarded transition contract when recording that terminal failure.
 fn record_failure(state: &AppState, operation_id: &str, detail: &str) -> Result<(), ApiError> {
-    let root = &state.config.storage.index_root;
+    let root = &state.storage;
     if let Some(operation) = operations::get(root, operation_id)?
         && operation.status == crate::model::OperationStatus::Pending
     {
@@ -152,8 +152,8 @@ fn record_failure(state: &AppState, operation_id: &str, detail: &str) -> Result<
 /// Clear rows before removing blobs, retaining the Operation that detects a
 /// crash between these non-atomic boundaries. No storage user runs until resume.
 fn clear_storage(state: &AppState, operation_id: &str) -> Result<(), ApiError> {
-    operations::mark_running(&state.config.storage.index_root, operation_id)?;
-    let root = &state.config.storage.index_root;
+    operations::mark_running(&state.storage, operation_id)?;
+    let root = &state.storage;
     let targets = deletion_targets(root, &state.config.storage.corpus_root)?;
     let mut connection = hot_plane::open_write(root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, "rebuild_all", "clear_rows")?;

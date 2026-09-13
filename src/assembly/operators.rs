@@ -3,9 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::{Connection, Row, params};
-
-use crate::assembly::model::{MAX_PASSAGE_UNITS, MAX_QUERY_RESULTS};
+use crate::sqlite::Connection;
+use rusqlite::{Row, params};
 
 use crate::error::ApiError;
 use crate::model::provenance::Provenance;
@@ -28,7 +27,12 @@ pub(crate) fn selected_relationships(
     for &(parse_id, unit_id) in selected {
         by_parse.entry(parse_id).or_default().push(unit_id);
     }
-    let limit = MAX_QUERY_RESULTS * MAX_PASSAGE_UNITS;
+    // The existing relationship ceiling follows the configured maximum passage membership.
+    let limit = (conn.limits().retrieval.max_results as usize)
+        .checked_mul(conn.limits().retrieval.max_passage_units)
+        .ok_or_else(|| ApiError::StorageOperation {
+            message: "raw evidence relationship limit overflows usize".to_owned(),
+        })?;
     let sql = format!(
         "SELECT {EDGE_COLUMNS} FROM unit_relationships \
          WHERE parse_id = ?1 AND from_unit_id = ?2 \
@@ -52,8 +56,15 @@ pub(crate) fn selected_relationships(
             // One extra row makes overflow observable. Never truncate raw links
             // and return success, because consumers would treat them as complete.
             let remaining = limit.saturating_sub(edges.len());
+            let read_limit = remaining
+                .checked_add(1)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| ApiError::StorageOperation {
+                    message: "raw evidence relationship limit exceeds SQLite's row-count capacity"
+                        .to_owned(),
+                })?;
             let rows = statement.query_map(
-                params![parse_id, unit_id, targets, (remaining + 1) as i64],
+                params![parse_id, unit_id, targets, read_limit],
                 row_to_edge,
             ).map_err(|source| ApiError::StorageOperation {
                 message: format!("failed to read selected relationships for unit {unit_id} of parse {parse_id}: {source}"),

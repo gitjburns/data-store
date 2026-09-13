@@ -1,7 +1,8 @@
 // data-store web UI (SPEC-web-ui.md §3-§4).
 //
 // Vanilla ES2020, no framework and no build step: this file is embedded in the
-// client binary with include_str! and served verbatim at /app.js.
+// client binary with include_str! and served at /app.js after validated numeric
+// CLIENT_SETTINGS from config.toml. Missing configuration has no browser fallback.
 //
 // Structure, in order: escaping, API access, shared renderers, the hash router
 // and its view registry, then one registration per view. The hard rule for every
@@ -820,14 +821,15 @@ function retrievalProvenanceMarkup(provenance) {
       matchMarkup ? `<ul class="retrieval-matches">${matchMarkup}</ul>` : escOr(null),
     ];
   });
-  const preview = Array.from(explanations).slice(0, 3)
+  const previewLimit = CLIENT_SETTINGS.provenance_preview_items;
+  const preview = Array.from(explanations).slice(0, previewLimit)
     .map((explanation) => `<li>${explanation}</li>`).join('');
-  const additional = explanations.size > 3
-    ? `<p>${esc(explanations.size - 3)} more annotation matches in retrieval details.</p>` : '';
-  const densePreview = Array.from(denseExplanations).slice(0, 3)
+  const additional = explanations.size > previewLimit
+    ? `<p>${esc(explanations.size - previewLimit)} more annotation matches in retrieval details.</p>` : '';
+  const densePreview = Array.from(denseExplanations).slice(0, previewLimit)
     .map((description) => `<li>${esc(description)}</li>`).join('');
-  const denseAdditional = denseExplanations.size > 3
-    ? `<p>${esc(denseExplanations.size - 3)} more dense match descriptions in retrieval details.</p>` : '';
+  const denseAdditional = denseExplanations.size > previewLimit
+    ? `<p>${esc(denseExplanations.size - previewLimit)} more dense match descriptions in retrieval details.</p>` : '';
   const contextNote = contextUnits.length > 0
     ? `<p>${esc(contextUnits.length)} passage units added as context; no retrieval match is attributed to them.</p>`
     : '';

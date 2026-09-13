@@ -110,7 +110,8 @@ pub enum ApiError {
 pub struct OperationErrorDetail {
     pub status: u16,
     pub kind: String,
-    message: String,
+    /// The transport may apply its configured presentation bound without altering the original error.
+    pub(crate) message: String,
 }
 
 impl ApiError {

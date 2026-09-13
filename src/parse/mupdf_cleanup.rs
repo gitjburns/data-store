@@ -83,8 +83,11 @@ pub(crate) struct CleanedDocument {
 
 /// Apply the supplied scripts' preparation and generic cleanup, without font rules,
 /// hierarchy inference, OCR, or book-specific replacements.
-pub(crate) fn clean_document(document: &ExtractedPdf) -> Result<CleanedDocument> {
-    let cleaner = TextCleaner::new()?;
+pub(crate) fn clean_document(
+    document: &ExtractedPdf,
+    regex_backtrack_limit: usize,
+) -> Result<CleanedDocument> {
+    let cleaner = TextCleaner::new(regex_backtrack_limit)?;
     let folio = Regex::new(r"^(?:\d+|[ivxlcdm]+)$").context("compile PDF folio matcher")?;
     let mut report = CleanupReport {
         version: CLEANUP_VERSION,

@@ -3,11 +3,11 @@
 //! caller's connection.
 //!
 //! Atomicity invariant: every mutating function takes the CALLER's
-//! `&rusqlite::Transaction` and appends its event on that same transaction
+//! `&crate::sqlite::Transaction` and appends its event on that same transaction
 //! (via `crate::events::append_event`), so the row change and the audit event
 //! commit or roll back together — the event trail can never claim a lifecycle
 //! transition that did not durably happen. Read functions take a
-//! `&rusqlite::Connection`; one bounded SELECT needs no transaction.
+//! `&crate::sqlite::Connection`; one bounded SELECT needs no transaction.
 //!
 //! Freshness lifecycle (spec §21): an annotation is inserted `building` with
 //! no body, then transitions `building → fresh` on success, `building →
@@ -16,7 +16,8 @@
 //! one row, so a transition whose precondition vanished fails loudly rather
 //! than silently no-opping.
 
-use rusqlite::{Connection, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -382,7 +383,7 @@ pub(crate) fn mark_failed(
     annotation_id: &str,
     bounded_detail: &str,
 ) -> Result<(), ApiError> {
-    let detail = truncate_persisted_detail(bounded_detail);
+    let detail = truncate_persisted_detail(bounded_detail, &tx.limits().diagnostics);
 
     let updated = tx
         .execute(MARK_FAILED_SQL, params![annotation_id])

@@ -21,7 +21,8 @@
 
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use tokenizers::Tokenizer;
 use tracing::{error, info};
 
@@ -50,28 +51,9 @@ const COLBERT_DOCUMENT_PRODUCER: &str = "colbert_document_embedder";
 /// must invalidate prior multi-vector rows on rebuild.
 const COLBERT_DOCUMENT_PRODUCER_VERSION: &str = "1";
 
-/// Number of documents embedded per batched ColBERT forward pass. Engineering
-/// fact, not an operator config knob: the dense-batch diagnostic (2026-07-18)
-/// measured the flattened batched layer-work at 2.43x the per-doc/per-head style
-/// at 16 docs x seq 128 F32, which fixes this window. Documents are length-sorted
-/// within the builder loop before packing so a window's padding waste is bounded
-/// by its own longest member rather than the parse's longest unit.
-const COLBERT_DOCUMENT_BATCH_WINDOW: usize = 16;
-
-/// Local routing threshold for the CPd length-threshold hybrid (user-ruled
-/// 2026-07-18): a unit whose raw-text token count (`count_document_tokens`)
-/// is at or below this embeds through the batched `embed_documents` windows;
-/// a longer unit takes the singular `embed_document` path. Engineering fact, not an operator config
-/// knob: the 2026-07-18 CPc interim length-bucketed measurements put batched
-/// at 4.4x singular near 16 tokens, break-even near 130, and 1.8x SLOWER at
-/// the 512-token cap — padded quadratic attention over the (B*heads, S, S)
-/// score tensor dominates long windows — fixing the crossover this constant
-/// encodes. Revisit against CPc full-corpus data.
-const COLBERT_BATCH_ROUTE_MAX_TOKENS: usize = 128;
-
 /// Ordered SELECT of a parse's content units in reading order. The multi-vector
-/// builder uses `COLBERT_DOCUMENT_BATCH_WINDOW`-sized windows, except that
-/// local long units embed singularly (`COLBERT_BATCH_ROUTE_MAX_TOKENS`). It
+/// builder uses configured batch sizes, except that local units above the
+/// configured batching token threshold embed singularly. It
 /// persists one row per unit, and reading order is preserved only so build/rebuild
 /// logs and any downstream iteration are deterministic; unlike the annotation
 /// producers, ColBERT matrices are per-unit and order-independent for storage.
@@ -96,9 +78,12 @@ DELETE FROM unit_multivector_projections WHERE parse_id = ?1";
 /// to the single active parse (§14) and keyed on the `UNIQUE(parse_id, unit_id)`
 /// index so each probe returns at most one row; the shape columns and the
 /// row-major matrix blob are read so the loader can decode without a separate
-/// shape record.
+/// shape record. SQL checks admission before copying a potentially oversized blob
+/// into Rust; a NULL result is a resource refusal, not a missing matrix.
 const SELECT_UNIT_MULTIVECTOR_SQL: &str = "
-SELECT token_count, dimension, matrix_blob
+SELECT token_count, dimension,
+ CASE WHEN token_count <= ?3 AND token_count * dimension <= ?4
+ AND length(matrix_blob) <= ?4 * 4 THEN matrix_blob END
 FROM unit_multivector_projections
 WHERE parse_id = ?1 AND unit_id = ?2";
 
@@ -138,6 +123,7 @@ pub(crate) fn build_multivectors(
     colbert_runtime: &ColbertBackend,
     expected_dimension: usize,
     gate: Option<&ModelCallPermit>,
+    model_identity: &str,
 ) -> Result<String, ApiError> {
     // Enforce caller-side admission before touching rows: local inference must
     // hold the accelerator permit, while HTTP must never hold it over a request.
@@ -180,7 +166,7 @@ pub(crate) fn build_multivectors(
             projection_type: ProjectionType::MultiVector,
             input_unit_ids: Some(embeddable.iter().map(|unit| unit.unit_id.clone()).collect()),
             input_annotation_ids: None,
-            producer: colbert_producer_provenance(&embeddable),
+            producer: colbert_producer_provenance(&embeddable, model_identity),
             index_name: None,
             index_partition: None,
         },
@@ -285,20 +271,17 @@ fn build_rows(
     let now = utc_now()?;
     let mut total_tokens = 0usize;
 
-    // Local hybrid routing (CPd length-threshold ruling, 2026-07-18): count each
-    // unit's ColBERT tokens once and split the parse into a batched pool
-    // (short units, embedded in windows) and a singular pool (long units,
-    // embedded one at a time) — batched embedding is measurably SLOWER past
-    // the ~130-token crossover (see COLBERT_BATCH_ROUTE_MAX_TOKENS). The
-    // routing tokenization is CPU-only and negligible beside the GPU embeds.
-    // Routing counts the RAW unit text; the embed paths tokenize the
-    // prompt-prefixed text ("search_document: [D] " + text, colbert.rs
-    // format_document), so the embedded sequence runs a fixed few tokens
-    // longer than the routing count — a boundary bias well inside the gentle
-    // ~130-token break-even, accepted rather than coupling this builder to
-    // the runtime's private prompt format. The embed-side 512-token
-    // truncation cannot flip a <=128 comparison.
-    let tokenizer = colbert_runtime.tokenizer();
+    // Local batching cost depends on sequence length. The configured routing
+    // threshold measures complete raw text, while inference adds its own prompt.
+    // Only packing changes; canonical unit ownership and persistence stay identical.
+    let mut counter = colbert_runtime.tokenizer().clone();
+    counter
+        .with_truncation(None)
+        .map_err(|source| ApiError::InferenceInit {
+            message: format!("disable ColBERT routing truncation for {parse_id}: {source}"),
+        })?;
+    counter.with_padding(None);
+    let tokenizer = &counter;
     let mut token_lengths: Vec<usize> = Vec::with_capacity(units.len());
     for unit in units {
         token_lengths.push(count_document_tokens(tokenizer, &unit.unit_id, &unit.text)?);
@@ -309,7 +292,7 @@ fn build_rows(
     // owns that execution cost, so batch every HTTP unit to avoid per-unit RTTs.
     let local_routing = colbert_runtime.uses_local_model_gate();
     for (index, &token_length) in token_lengths.iter().enumerate() {
-        if !local_routing || token_length <= COLBERT_BATCH_ROUTE_MAX_TOKENS {
+        if !local_routing || token_length <= colbert_runtime.local_batch_max_tokens() {
             batched_indices.push(index);
         } else {
             singular_indices.push(index);
@@ -335,7 +318,7 @@ fn build_rows(
     }
 
     // Batched pool: sort by the routing token counts before packing, so each
-    // COLBERT_DOCUMENT_BATCH_WINDOW-sized window groups similarly-long
+    // configured batch groups similarly-long
     // documents and its padding waste is bounded by its own longest member
     // (the counts are already in hand from routing, retiring the earlier
     // byte-length proxy sort; the embed paths' fixed prompt-prefix delta
@@ -349,7 +332,7 @@ fn build_rows(
             .then_with(|| left.cmp(&right))
     });
 
-    for window in batched_indices.chunks(COLBERT_DOCUMENT_BATCH_WINDOW) {
+    for window in batched_indices.chunks(colbert_runtime.document_batch_size()) {
         // One batch per window, holding the caller's gate only for local
         // inference. embed_documents self-logs ONE
         // model_call.* pair with batch-level fields (text_count, summed chars,
@@ -407,6 +390,11 @@ fn persist_unit_matrix(
     now: &str,
     embedding: ColbertDocumentEmbedding,
 ) -> Result<usize, ApiError> {
+    super::annotation_io::admitted_value_count(
+        embedding.token_count,
+        embedding.dimension,
+        &tx.limits().resources,
+    )?;
     // Validate BEFORE persisting: reject zero-token, wrong-dimension,
     // wrong-value-count, or non-finite matrices so only well-formed matrices
     // reach storage and MaxSim scoring (C7c) can trust the shape columns. Each
@@ -457,9 +445,8 @@ fn persist_unit_matrix(
 /// (`encode(text, true)`, full encoding length). The embed paths tokenize the
 /// prompt-PREFIXED text (colbert.rs `format_document`), so the embedded
 /// sequence is a fixed few tokens longer than this count — see the routing
-/// comment in `build_rows` for why that bias is accepted. The embed-side
-/// truncation cap is irrelevant to a `COLBERT_BATCH_ROUTE_MAX_TOKENS`
-/// comparison. Failures carry the unit id — narrower attribution than the
+/// comment in `build_rows` for the packing contract. Count complete raw text
+/// independently of inference truncation. Failures carry the unit id — narrower attribution than the
 /// batched embed path's window-local index — and use the same error variant
 /// the ColBERT runtime raises for its own tokenization failures.
 fn count_document_tokens(
@@ -488,7 +475,7 @@ struct BuildRowsTotals {
 /// Assemble §20 provenance for the ColBERT document embedder over the units it
 /// embeds. `producerType` is Model; the input refs are the ContentUnits whose
 /// text is embedded, preserving lineage from the matrices back to their units.
-fn colbert_producer_provenance(units: &[UnitText]) -> Provenance {
+fn colbert_producer_provenance(units: &[UnitText], model_identity: &str) -> Provenance {
     let input_refs = units
         .iter()
         .map(|unit| ProvenanceInputRef {
@@ -502,7 +489,8 @@ fn colbert_producer_provenance(units: &[UnitText]) -> Provenance {
         producer_type: ProducerType::Model,
         producer_name: COLBERT_DOCUMENT_PRODUCER.to_string(),
         producer_version: Some(COLBERT_DOCUMENT_PRODUCER_VERSION.to_string()),
-        config_hash: None,
+        // Capacity and tokenizer/provider identity survive snapshot and restore.
+        config_hash: Some(model_identity.to_owned()),
         model_name: None,
         model_version: None,
         prompt_hash: None,
@@ -695,11 +683,11 @@ pub(crate) fn load_multivectors_for_units(
     let mut embeddings = Vec::with_capacity(unit_ids.len());
     for unit_id in unit_ids {
         let row = statement
-            .query_row(params![parse_id, unit_id], |row| {
+            .query_row(params![parse_id, unit_id, conn.limits().resources.max_embedding_rows, conn.limits().resources.max_embedding_values], |row| {
                 Ok(MultivectorRow {
                     token_count: row.get::<_, i64>(0)?,
                     dimension: row.get::<_, i64>(1)?,
-                    matrix_blob: row.get::<_, Vec<u8>>(2)?,
+                    matrix_blob: row.get::<_, Option<Vec<u8>>>(2)?,
                 })
             })
             .optional()
@@ -716,12 +704,20 @@ pub(crate) fn load_multivectors_for_units(
 
         let token_count = row.token_count.max(0) as usize;
         let row_dimension = row.dimension.max(0) as usize;
+        super::annotation_io::admitted_value_count(
+            token_count,
+            row_dimension,
+            &conn.limits().resources,
+        )?;
+        let matrix_blob = row.matrix_blob.ok_or_else(|| ApiError::StorageOperation {
+            message: format!("resource limit: ColBERT matrix for {unit_id} exceeds configured shape or byte budget"),
+        })?;
         // Decode + validate the stored blob; the codec re-derives the expected
         // byte length from (token_count, dimension) and rejects drift. Decode
         // errors are Strings — re-wrap with the unit's identity (never generic).
         let vector = decode_colbert_document_vector_blob(
             unit_id,
-            &row.matrix_blob,
+            &matrix_blob,
             token_count,
             row_dimension,
             expected_dimension,
@@ -750,5 +746,5 @@ pub(crate) fn load_multivectors_for_units(
 struct MultivectorRow {
     token_count: i64,
     dimension: i64,
-    matrix_blob: Vec<u8>,
+    matrix_blob: Option<Vec<u8>>,
 }

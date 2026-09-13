@@ -1,12 +1,14 @@
 use std::{
     fs,
+    io::Read,
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-const SAMPLE_TIMEOUT_GRACE_SECONDS: u64 = 15;
+use crate::limits::{DiagnosticLimits, ParsingLimits};
 
 #[derive(Debug, Clone)]
 pub struct DoclingActivityReport {
@@ -56,10 +58,20 @@ pub fn inspect_docling_activity(
     output_dir: &Path,
     expected_artifact_path: &Path,
     sample_duration: Duration,
+    remaining_document_time: Duration,
+    parsing: &ParsingLimits,
+    diagnostics: &DiagnosticLimits,
 ) -> DoclingActivityReport {
-    let process = inspect_process_metrics(process_id);
-    let sample = sample_process_activity(process_id, sample_duration);
-    let artifacts = inspect_artifacts(output_dir, expected_artifact_path);
+    let inspection_started = Instant::now();
+    let process = inspect_process_metrics(process_id, diagnostics);
+    let sample = sample_process_activity(
+        process_id,
+        sample_duration,
+        remaining_document_time.saturating_sub(inspection_started.elapsed()),
+        parsing,
+        diagnostics,
+    );
+    let artifacts = inspect_artifacts(output_dir, expected_artifact_path, diagnostics);
     let activity_label = classify_activity(&process, &sample);
 
     DoclingActivityReport {
@@ -87,7 +99,7 @@ pub fn format_docling_activity_message(
 }
 
 /// Read cheap process metrics from the platform process table.
-fn inspect_process_metrics(process_id: u32) -> ProcessMetrics {
+fn inspect_process_metrics(process_id: u32, diagnostics: &DiagnosticLimits) -> ProcessMetrics {
     let output = Command::new("ps")
         .args([
             "-p",
@@ -105,7 +117,7 @@ fn inspect_process_metrics(process_id: u32) -> ProcessMetrics {
                 error: Some(format!(
                     "ps failed: status={}; stderr={}",
                     output.status,
-                    truncate_for_metric(&String::from_utf8_lossy(&output.stderr))
+                    truncate_for_metric(&String::from_utf8_lossy(&output.stderr), diagnostics)
                 )),
                 thread_count: inspect_process_thread_count(process_id),
                 ..ProcessMetrics::default()
@@ -182,12 +194,24 @@ fn inspect_process_thread_count(process_id: u32) -> Option<u64> {
 }
 
 /// Run a bounded macOS sample command and count diagnostic frame categories.
-fn sample_process_activity(process_id: u32, sample_duration: Duration) -> SampleCounters {
+fn sample_process_activity(
+    process_id: u32,
+    sample_duration: Duration,
+    remaining_document_time: Duration,
+    parsing: &ParsingLimits,
+    diagnostics: &DiagnosticLimits,
+) -> SampleCounters {
     if sample_duration.is_zero() {
         return SampleCounters::default();
     }
 
-    let report = match run_bounded_sample(process_id, sample_duration) {
+    let report = match run_bounded_sample(
+        process_id,
+        sample_duration,
+        remaining_document_time,
+        parsing,
+        diagnostics,
+    ) {
         Ok(report) => report,
         Err(error) => {
             return SampleCounters {
@@ -254,8 +278,86 @@ fn sample_process_activity(process_id: u32, sample_duration: Duration) -> Sample
     }
 }
 
-/// Execute sample with a timeout around the command itself, not the Docling process.
-fn run_bounded_sample(process_id: u32, sample_duration: Duration) -> Result<String, String> {
+/// Drain both sampler pipes while polling, without allowing telemetry to extend
+/// the document deadline. Every return confirms exit or reports failed cleanup.
+fn run_bounded_sample(
+    process_id: u32,
+    sample_duration: Duration,
+    remaining_document_time: Duration,
+    parsing: &ParsingLimits,
+    diagnostics: &DiagnosticLimits,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let mut facts = SampleProcessFacts::default();
+    tracing::info!(
+        event = "docling.sample.started",
+        executable = "sample",
+        target_process_id = process_id,
+        sample_seconds = sample_duration.as_secs(),
+        document_remaining_ms = remaining_document_time.as_millis() as u64,
+        output_limit_bytes = parsing.process_log_bytes,
+        "native Docling activity sampling started"
+    );
+    let result = run_bounded_sample_inner(
+        process_id,
+        sample_duration,
+        remaining_document_time.saturating_sub(started.elapsed()),
+        parsing,
+        &mut facts,
+    );
+    match &result {
+        Ok(_) => {
+            tracing::info!(event = "docling.sample.completed", target_process_id = process_id, process_id = ?facts.process_id,
+            stdout_observed_bytes = facts.stdout_observed, stdout_retained_bytes = facts.stdout_retained,
+            stderr_observed_bytes = facts.stderr_observed, stderr_retained_bytes = facts.stderr_retained,
+            truncated = facts.truncated, timed_out = facts.timed_out, cleanup = facts.cleanup,
+            elapsed_ms = started.elapsed().as_millis() as u64, "native activity sample completed")
+        }
+        Err(source) => {
+            tracing::warn!(event = "docling.sample.failed", target_process_id = process_id, process_id = ?facts.process_id,
+            stdout_observed_bytes = facts.stdout_observed, stdout_retained_bytes = facts.stdout_retained,
+            stderr_observed_bytes = facts.stderr_observed, stderr_retained_bytes = facts.stderr_retained,
+            truncated = facts.truncated, timed_out = facts.timed_out, cleanup = facts.cleanup, error = %crate::util::truncate_diagnostic_text(source, diagnostics),
+            elapsed_ms = started.elapsed().as_millis() as u64, "native activity sample failed")
+        }
+    }
+    result
+}
+
+/// Lifecycle facts survive early failures without retaining sampled process contents.
+#[derive(Default)]
+struct SampleProcessFacts {
+    process_id: Option<u32>,
+    stdout_observed: usize,
+    stdout_retained: usize,
+    stderr_observed: usize,
+    stderr_retained: usize,
+    truncated: bool,
+    timed_out: bool,
+    cleanup: &'static str,
+}
+
+/// The outer boundary logs every result; this body owns sockets, deadline, and reaping.
+fn run_bounded_sample_inner(
+    process_id: u32,
+    sample_duration: Duration,
+    remaining_document_time: Duration,
+    parsing: &ParsingLimits,
+    facts: &mut SampleProcessFacts,
+) -> Result<String, String> {
+    facts.cleanup = "not_started";
+    let budget = sample_duration
+        .saturating_add(Duration::from_millis(parsing.activity_sample_grace_ms))
+        .min(remaining_document_time);
+    if budget.is_zero() {
+        facts.timed_out = true;
+        return Err("sample unavailable: document deadline reached before collection".to_owned());
+    }
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| "sample timeout overflowed".to_owned())?;
+    let (mut stdout, child_stdout) = SamplePipe::new("stdout")?;
+    let (mut stderr, child_stderr) = SamplePipe::new("stderr")?;
     let mut child = Command::new("sample")
         .args([
             &process_id.to_string(),
@@ -263,45 +365,198 @@ fn run_bounded_sample(process_id: u32, sample_duration: Duration) -> Result<Stri
             "-file",
             "/dev/stdout",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(child_stdout)
+        .stderr(child_stderr)
         .spawn()
         .map_err(|error| format!("sample failed to start: {error}"))?;
-    let deadline = Instant::now()
-        .checked_add(sample_duration + Duration::from_secs(SAMPLE_TIMEOUT_GRACE_SECONDS))
-        .ok_or_else(|| "sample timeout overflowed".to_string())?;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| format!("sample output read failed: {error}"))?;
-                if !output.status.success() {
-                    return Err(format!(
-                        "sample exited with {}; stderr={}",
-                        output.status,
-                        truncate_for_metric(&String::from_utf8_lossy(&output.stderr))
+    facts.process_id = Some(child.id());
+    facts.cleanup = "pending";
+    tracing::info!(
+        event = "docling.sample.spawned",
+        executable = "sample",
+        target_process_id = process_id,
+        process_id = child.id(),
+        timeout_ms = budget.as_millis() as u64,
+        "native activity sampler spawned"
+    );
+    let mut result = (|| {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(parsing.process_read_chunk_bytes)
+            .map_err(|source| format!("allocate sampler output read buffer: {source}"))?;
+        buffer.resize(parsing.process_read_chunk_bytes, 0);
+        loop {
+            stdout.drain(&mut buffer, parsing.process_log_bytes, deadline)?;
+            stderr.drain(&mut buffer, parsing.process_log_bytes, deadline)?;
+            match child
+                .try_wait()
+                .map_err(|source| format!("sample wait failed: {source}"))?
+            {
+                Some(status) => {
+                    // Once the direct child exits, drain only until EOF or the
+                    // shared deadline; an inherited open writer is explicit failure.
+                    while !stdout.eof || !stderr.eof {
+                        stdout.drain(&mut buffer, parsing.process_log_bytes, deadline)?;
+                        stderr.drain(&mut buffer, parsing.process_log_bytes, deadline)?;
+                        if !stdout.eof || !stderr.eof {
+                            if Instant::now() >= deadline {
+                                facts.timed_out = true;
+                                return Err(
+                                    "sample output incomplete at document/collector deadline"
+                                        .to_owned(),
+                                );
+                            }
+                            thread::sleep(
+                                Duration::from_millis(parsing.activity_poll_ms)
+                                    .min(deadline.saturating_duration_since(Instant::now())),
+                            );
+                        }
+                    }
+                    if !status.success() {
+                        return Err(format!(
+                            "sample exited with {status}; retained stdout={} bytes stderr={} bytes",
+                            stdout.bytes.len(),
+                            stderr.bytes.len()
+                        ));
+                    }
+                    if stdout.observed > stdout.bytes.len() || stderr.observed > stderr.bytes.len()
+                    {
+                        return Err(format!(
+                            "sample capture truncated: stdout={} retained/{} observed bytes, stderr={} retained/{} observed bytes",
+                            stdout.bytes.len(),
+                            stdout.observed,
+                            stderr.bytes.len(),
+                            stderr.observed
+                        ));
+                    }
+                    return Ok(format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&stdout.bytes),
+                        String::from_utf8_lossy(&stderr.bytes)
                     ));
                 }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Ok(format!("{stdout}\n{stderr}"));
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("sample timed out".to_string());
+                None if Instant::now() >= deadline => {
+                    facts.timed_out = true;
+                    return Err(format!(
+                        "sample timed out; partial stdout={} bytes stderr={} bytes",
+                        stdout.bytes.len(),
+                        stderr.bytes.len()
+                    ));
                 }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("sample wait failed: {error}"));
+                None => thread::sleep(
+                    Duration::from_millis(parsing.activity_poll_ms)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
             }
         }
+    })();
+    facts.stdout_observed = stdout.observed;
+    facts.stdout_retained = stdout.bytes.len();
+    facts.stderr_observed = stderr.observed;
+    facts.stderr_retained = stderr.bytes.len();
+    facts.truncated = stdout.observed > stdout.bytes.len() || stderr.observed > stderr.bytes.len();
+    // No reader thread can outlive this function. Even a failed kill closes the
+    // parent sockets immediately and reports that process exit is unconfirmed.
+    let exited = match child.try_wait() {
+        Ok(status) => status.is_some(),
+        Err(source) => {
+            result = Err(format!(
+                "{}; sample cleanup poll failed: {source}",
+                result
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("sample collection finished")
+            ));
+            false
+        }
+    };
+    if !exited {
+        facts.cleanup = "termination_requested";
+        if let Err(source) = child.kill() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                observed => {
+                    facts.cleanup = "exit_unconfirmed";
+                    return Err(format!(
+                        "{}; sample termination failed, exit unconfirmed: {source}; final poll={observed:?}",
+                        result
+                            .as_ref()
+                            .err()
+                            .map(String::as_str)
+                            .unwrap_or("sample cleanup")
+                    ));
+                }
+            }
+        }
+        child.wait().map_err(|source| {
+            facts.cleanup = "reap_failed";
+            format!(
+                "{}; sample reap failed: {source}",
+                result
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("sample collection finished")
+            )
+        })?;
+        facts.cleanup = "reaped_after_termination";
+    } else {
+        facts.cleanup = "exit_confirmed";
+    }
+    result
+}
+
+/// Parent-owned nonblocking streams keep bounded capture independent of child writes.
+struct SamplePipe {
+    stream: UnixStream,
+    label: &'static str,
+    bytes: Vec<u8>,
+    observed: usize,
+    eof: bool,
+}
+
+impl SamplePipe {
+    /// Configure the reader before spawn while leaving child writes blocking.
+    fn new(label: &'static str) -> Result<(Self, Stdio), String> {
+        let (read, write) = UnixStream::pair()
+            .map_err(|source| format!("create sample {label} socket: {source}"))?;
+        read.set_nonblocking(true)
+            .map_err(|source| format!("configure sample {label} socket: {source}"))?;
+        Ok((
+            Self {
+                stream: read,
+                label,
+                bytes: Vec::new(),
+                observed: 0,
+                eof: false,
+            },
+            Stdio::from(OwnedFd::from(write)),
+        ))
+    }
+
+    /// Bound work per turn and keep draining discarded bytes so output cannot stall sampling.
+    fn drain(&mut self, buffer: &mut [u8], cap: usize, deadline: Instant) -> Result<(), String> {
+        for _ in 0..cap.div_ceil(buffer.len()) {
+            if self.eof || Instant::now() >= deadline {
+                break;
+            }
+            match self.stream.read(buffer) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    self.observed = self.observed.saturating_add(count);
+                    let retain = count.min(cap.saturating_sub(self.bytes.len()));
+                    self.bytes.extend_from_slice(&buffer[..retain]);
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) => return Err(format!("read sample {}: {source}", self.label)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -326,12 +581,16 @@ fn count_any(value: &str, markers: &[&str]) -> usize {
 }
 
 /// Inspect output artifacts without reading produced file contents.
-fn inspect_artifacts(output_dir: &Path, expected_artifact_path: &Path) -> ArtifactMetrics {
+fn inspect_artifacts(
+    output_dir: &Path,
+    expected_artifact_path: &Path,
+    diagnostics: &DiagnosticLimits,
+) -> ArtifactMetrics {
     let mut metrics = ArtifactMetrics {
         expected_artifact_exists: expected_artifact_path.is_file(),
         ..ArtifactMetrics::default()
     };
-    if let Err(error) = visit_artifact_dir(output_dir, &mut metrics) {
+    if let Err(error) = visit_artifact_dir(output_dir, &mut metrics, diagnostics) {
         metrics.error = Some(error);
     }
 
@@ -339,7 +598,11 @@ fn inspect_artifacts(output_dir: &Path, expected_artifact_path: &Path) -> Artifa
 }
 
 /// Recursively visit artifact files and aggregate only metadata.
-fn visit_artifact_dir(dir: &Path, metrics: &mut ArtifactMetrics) -> Result<(), String> {
+fn visit_artifact_dir(
+    dir: &Path,
+    metrics: &mut ArtifactMetrics,
+    diagnostics: &DiagnosticLimits,
+) -> Result<(), String> {
     let entries = fs::read_dir(dir)
         .map_err(|error| format!("failed to read artifact dir {}: {error}", dir.display()))?;
     for entry in entries {
@@ -352,7 +615,7 @@ fn visit_artifact_dir(dir: &Path, metrics: &mut ArtifactMetrics) -> Result<(), S
             )
         })?;
         if metadata.is_dir() {
-            visit_artifact_dir(&path, metrics)?;
+            visit_artifact_dir(&path, metrics, diagnostics)?;
             continue;
         }
         if !metadata.is_file() {
@@ -375,9 +638,10 @@ fn visit_artifact_dir(dir: &Path, metrics: &mut ArtifactMetrics) -> Result<(), S
                 path.file_name()
                     .and_then(|value| value.to_str())
                     .map(|file_name| {
-                        let mut value = file_name.to_string();
-                        value.truncate(80);
-                        value
+                        file_name
+                            .chars()
+                            .take(diagnostics.activity_process_name_chars)
+                            .collect()
                     });
         }
     }
@@ -456,14 +720,13 @@ fn format_duration(duration: Duration) -> String {
 }
 
 /// Bound diagnostic command errors included in metrics.
-fn truncate_for_metric(value: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 240;
+fn truncate_for_metric(value: &str, diagnostics: &DiagnosticLimits) -> String {
     let mut truncated = value
         .trim()
         .chars()
-        .take(MAX_ERROR_CHARS)
+        .take(diagnostics.activity_error_chars)
         .collect::<String>();
-    if value.chars().count() > MAX_ERROR_CHARS {
+    if value.chars().count() > diagnostics.activity_error_chars {
         truncated.push_str("...");
     }
     truncated

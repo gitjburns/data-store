@@ -112,13 +112,25 @@ outcomes for real work at INFO after commit, including post-commit publication
 when applicable. Transaction failures and visible rollback/abort retain the
 operation, phase, local identifiers, and source error at WARN/ERROR.
 
+`sql.execution_timed_out` records operation, statement fingerprint, and configured
+budget without SQL parameter values. Its budget includes open row iteration and
+caller work between rows. Rollback cleanup has an independent budget;
+`sql.drop_rollback.*` records completion, failure, or unconfirmed transaction state.
+
 Every model call and startup smoke check must log model role, call purpose,
 start, success, normal error, elapsed milliseconds, compact input shape facts,
 and configured limits. Keep model payloads out of the service log.
 
+`model_capacity.*` records configured and advertised HTTP capacity, model identity,
+and metadata failures before readiness. Distinguish serving capacity from window
+limits and existing application prefix handling; server-side truncation is disabled.
+
 Every external process call must log executable identity, purpose, start,
 configured timeout, process ID when available, completion status or timeout,
 elapsed milliseconds, and bounded stdout/stderr diagnostics on failure.
+`docling.sample.started`, `.spawned`, and `.completed`/`.failed` record optional
+sampling PIDs, elapsed time, capture counts, timeout/truncation flags, and cleanup
+outcome. Partial telemetry is not a complete sample; raw sample text is not logged.
 
 Every spawned task must have durable visibility for start or acceptance, normal
 completion, normal error, panic when detectable, and cancellation or join
@@ -133,6 +145,8 @@ Query stages remain distinct: `query.channels.*` collects source/graph candidate
 `query.annotation.*` scans annotation representations, `query.fusion.*` records
 grouped fusion, and `query.annotation_maxsim.*` scores annotation/source windows.
 Retain candidate counts, invalid-input exclusions, source errors, and elapsed time.
+Resource admission failures name the configured guard and retained artifact/work
+identity; lowering a read budget must not be reported as historical corruption.
 
 ### Annotation Cancellation
 

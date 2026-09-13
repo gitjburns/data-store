@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[path = "data-store/serve.rs"]
 mod serve;
 
+// Client configuration uses the same required fields and validation as the service.
+#[path = "../client_limits.rs"]
+mod client_limits;
+use client_limits::ClientLimits;
+
 // Share only the wire contract with the service; attribution remains server-owned.
 #[path = "../query/provenance.rs"]
 mod provenance;
@@ -43,17 +48,6 @@ const PROMPT: &str = "data-store> ";
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const HISTORY_FILE_NAME: &str = ".data-store.history";
 const HEALTH_PATH: &str = "/v1/health";
-
-// Poll cadence for `GET /operations/{operationId}` (the §34.6 async-admin poll
-// loop). This is an INTERNAL client behavior, not an operator tuning knob, so it
-// is a code constant with a stated rationale (config records external facts
-// only; an internal poll cadence is not an operator tuning knob). One second
-// balances responsiveness against not hammering the operations store while an
-// admin operation runs; the reqwest client's `[client].operation_timeout_seconds`
-// (below) bounds each individual poll/transport request only. It does NOT bound
-// total wait time: the poll loop runs unbounded on this interval until the
-// Operation reaches a terminal status.
-const OPERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Correlate local client diagnostics without changing the service protocol.
 /// IDs are unique within this client process; they are not server request IDs.
@@ -95,8 +89,7 @@ impl ClientRequestDiagnostic {
 struct ClientConfig {
     server: ServerConfig,
     admin: AdminConfig,
-    #[serde(default)]
-    client: ClientRuntimeConfig,
+    client: ClientLimits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,17 +102,12 @@ struct AdminConfig {
     token_file_path: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClientRuntimeConfig {
-    #[serde(default = "default_operation_timeout_seconds")]
-    operation_timeout_seconds: u64,
-}
-
 #[derive(Debug)]
 struct ClientContext {
     base_url: String,
     token_file_path: PathBuf,
     http: Client,
+    settings: ClientLimits,
 }
 
 // The typed command surface targets the finalized §34 REST admin routes. Every
@@ -842,6 +830,7 @@ fn build_client_context(config_path: &Path) -> Result<(ClientContext, PathBuf)> 
         base_url: base_url_for_bind_address(config.server.bind_address),
         token_file_path: resolve_config_relative_path(&config_dir, &config.admin.token_file_path),
         http: build_http_client(&config.client)?,
+        settings: config.client,
     };
     Ok((context, config_dir))
 }
@@ -1231,31 +1220,15 @@ fn load_config(path: &Path) -> Result<ClientConfig> {
     if config.admin.token_file_path.as_os_str().is_empty() {
         bail!("admin.token_file_path must be a non-empty path");
     }
-    if config.client.operation_timeout_seconds == 0 {
-        bail!("client.operation_timeout_seconds must be greater than zero");
-    }
+    config.client.validate().map_err(anyhow::Error::msg)?;
 
     Ok(config)
-}
-
-impl Default for ClientRuntimeConfig {
-    /// Keep existing local configs usable while matching the documented one-hour operation cap.
-    fn default() -> Self {
-        Self {
-            operation_timeout_seconds: default_operation_timeout_seconds(),
-        }
-    }
-}
-
-/// Return the default CLI operation timeout in seconds.
-fn default_operation_timeout_seconds() -> u64 {
-    3_600
 }
 
 /// Build the blocking HTTP client with the configured operation timeout. This
 /// timeout bounds every request AND every individual poll of the operation loop
 /// (`[client].operation_timeout_seconds`), consumed exactly as before the rework.
-fn build_http_client(config: &ClientRuntimeConfig) -> Result<Client> {
+fn build_http_client(config: &ClientLimits) -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(config.operation_timeout_seconds))
         .build()
@@ -1754,7 +1727,7 @@ fn run_admin_operation(
     Ok(())
 }
 
-/// Poll `GET /operations/{operationId}` on the code-constant interval until the
+/// Poll `GET /operations/{operationId}` on the configured interval until the
 /// Operation reaches a terminal state (`succeeded`/`failed`), then return the
 /// terminal record. Each poll reads the admin token fresh (`/operations` is
 /// protected). The reqwest client's `[client].operation_timeout_seconds` bounds
@@ -1765,7 +1738,9 @@ fn poll_operation(context: &ClientContext, operation_id: &str) -> Result<Operati
         if record.status.is_terminal() {
             return Ok(record);
         }
-        thread::sleep(OPERATION_POLL_INTERVAL);
+        thread::sleep(Duration::from_millis(
+            context.settings.operation_poll_interval_ms,
+        ));
     }
 }
 

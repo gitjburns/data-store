@@ -124,6 +124,13 @@ impl DenseEmbeddingRuntime {
         progress("dense_tokenizer_ready")?;
         progress("dense_config_loading")?;
         let qwen_config = load_qwen3_config("dense", &artifacts.config_path)?;
+        // A configurable input ceiling must never extend the checkpoint's positional capacity.
+        if max_tokens > qwen_config.max_position_embeddings {
+            return Err(inference_error(format!(
+                "models.dense.max_tokens {max_tokens} exceeds dense max_position_embeddings {}",
+                qwen_config.max_position_embeddings
+            )));
+        }
         progress("dense_config_ready")?;
         progress("dense_model_loading")?;
         let model = Qwen3Model::load_with_progress(
@@ -526,6 +533,8 @@ fn dense_output_validation_error(
 }
 
 /// Tokenize one string and apply explicit service-owned truncation.
+/// This local-only prefix policy is distinct from HTTP rejection of oversized input.
+/// Complete annotation and section representations validate their full input before this call.
 fn tokenize_truncated(
     tokenizer: &Tokenizer,
     text: &str,

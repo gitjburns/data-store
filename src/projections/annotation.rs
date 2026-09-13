@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::sqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,15 +19,12 @@ use crate::{
     query::provenance::{AnnotationRepresentation, SourceExcerpt},
 };
 
-use super::annotation_io::{EmbeddingRef, MAX_MANIFEST_BYTES, validate_ref};
+use super::annotation_io::{EmbeddingRef, validate_ref};
 
 pub(crate) const INDEX_NAME: &str = "annotation_retrieval_v1";
 pub(crate) const PAYLOAD_TYPE: &str = "annotation_retrieval_manifest";
 pub(crate) const VECTOR_PAYLOAD_TYPE: &str = "annotation_embedding_blob";
-const FORMAT_VERSION: u32 = 1;
-const MAX_SOURCE_BYTES: usize = 1_048_576;
-const MAX_INPUTS: usize = 4096;
-const MAX_COHORTS: usize = 100_000;
+const FORMAT_VERSION: u32 = 2;
 const FORMAT_POLICY: &str = "annotation_retrieval_v1;entity_name_type;relation_triple;summary_text;combined_by_excerpt;complete_colbert_windows;unicode_scalar_ranges;canonical_source_separate";
 const PUBLICATIONS_SQL: &str = "WITH scoped AS (
  SELECT *, length(CAST(producer_json AS BLOB))
@@ -89,6 +87,17 @@ pub(crate) struct CohortPlan {
     pub(crate) model_identity: String,
     pub(crate) target: InputTarget,
     pub(crate) inputs: Vec<InputSignature>,
+    /// Absent only for the frozen v1 format; new publications seal their window budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) construction: Option<AnnotationConstruction>,
+}
+
+/// Construction policy is archived so configuration changes cannot reinterpret old windows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AnnotationConstruction {
+    pub(crate) version: u32,
+    pub(crate) window_max_tokens: u32,
 }
 
 /// A complete bounded model input, with source coordinates only for canonical source text.
@@ -136,72 +145,90 @@ pub(crate) fn plan_for_parse(
     parse_id: &str,
     model_identity: &str,
 ) -> Result<Vec<CohortPlan>, ApiError> {
+    let limits = &conn.limits().resources;
     let mut cohorts: BTreeMap<String, CohortPlan> = BTreeMap::new();
-    store::visit_fresh_for_active_parse(conn, source_id, Some(MAX_MANIFEST_BYTES), |annotation| {
-        if annotation.parse_id != parse_id {
-            return Err(failure("active parse changed during annotation discovery"));
-        }
-        let Some(representation) = representation_kind(annotation.annotation_type) else {
-            return Ok(());
-        };
-        let fingerprint = input_fingerprint(&annotation)?;
-        for unit_id in annotation.target_unit_ids.iter().collect::<BTreeSet<_>>() {
-            let ranges: Vec<Option<ProvenanceTextRange>> = annotation
-                .provenance
-                .input_refs
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .filter(|input| input.id == *unit_id)
-                .map(|input| input.text_range.clone())
-                .collect();
-            // Old producers did not record extraction offsets. Keep their declared
-            // whole-unit target instead of pretending the annotation names a precise slice.
-            let ranges = if ranges.is_empty() {
-                vec![None]
-            } else {
-                ranges
+    store::visit_fresh_for_active_parse(
+        conn,
+        source_id,
+        Some(limits.max_json_cell_bytes as u64),
+        |annotation| {
+            if annotation.parse_id != parse_id {
+                return Err(failure("active parse changed during annotation discovery"));
+            }
+            let Some(representation) = representation_kind(annotation.annotation_type) else {
+                return Ok(());
             };
-            for range in ranges {
-                let target = InputTarget {
-                    unit_id: unit_id.clone(),
-                    range,
-                };
-                let cohort_id = cohort_id(source_id, parse_id, &target)?;
-                if !cohorts.contains_key(&cohort_id) && cohorts.len() >= MAX_COHORTS {
-                    return Err(failure(format!(
-                        "parse {parse_id} exceeds {MAX_COHORTS} annotation cohorts"
-                    )));
-                }
-                let cohort = cohorts
-                    .entry(cohort_id.clone())
-                    .or_insert_with(|| CohortPlan {
-                        source_id: source_id.to_owned(),
-                        parse_id: parse_id.to_owned(),
-                        cohort_id,
-                        input_hash: String::new(),
-                        model_identity: model_identity.to_owned(),
-                        target,
-                        inputs: Vec::new(),
-                    });
-                if !cohort
-                    .inputs
+            let fingerprint = input_fingerprint(&annotation)?;
+            for unit_id in annotation.target_unit_ids.iter().collect::<BTreeSet<_>>() {
+                let ranges: Vec<Option<ProvenanceTextRange>> = annotation
+                    .provenance
+                    .input_refs
+                    .as_deref()
+                    .unwrap_or(&[])
                     .iter()
-                    .any(|input| input.annotation_id == annotation.id)
-                {
-                    if cohort.inputs.len() >= MAX_INPUTS {
-                        return Err(failure("annotation cohort input ceiling exceeded"));
+                    .filter(|input| input.id == *unit_id)
+                    .map(|input| input.text_range.clone())
+                    .collect();
+                // Old producers did not record extraction offsets. Keep their declared
+                // whole-unit target instead of pretending the annotation names a precise slice.
+                let ranges = if ranges.is_empty() {
+                    vec![None]
+                } else {
+                    ranges
+                };
+                for range in ranges {
+                    let target = InputTarget {
+                        unit_id: unit_id.clone(),
+                        range,
+                    };
+                    let cohort_id = cohort_id(source_id, parse_id, &target)?;
+                    if !cohorts.contains_key(&cohort_id)
+                        && cohorts.len() >= limits.max_cohorts_per_parse
+                    {
+                        return Err(failure(format!(
+                            "resource limit: parse {parse_id} exceeds {} annotation cohorts",
+                            limits.max_cohorts_per_parse
+                        )));
                     }
-                    cohort.inputs.push(InputSignature {
-                        annotation_id: annotation.id.clone(),
-                        fingerprint: fingerprint.clone(),
-                        representation,
-                    });
+                    let cohort = cohorts
+                        .entry(cohort_id.clone())
+                        .or_insert_with(|| CohortPlan {
+                            source_id: source_id.to_owned(),
+                            parse_id: parse_id.to_owned(),
+                            cohort_id,
+                            input_hash: String::new(),
+                            model_identity: model_identity.to_owned(),
+                            target,
+                            inputs: Vec::new(),
+                            construction: Some(AnnotationConstruction {
+                                version: FORMAT_VERSION,
+                                window_max_tokens: conn
+                                    .limits()
+                                    .indexing
+                                    .annotation_window_max_tokens,
+                            }),
+                        });
+                    if !cohort
+                        .inputs
+                        .iter()
+                        .any(|input| input.annotation_id == annotation.id)
+                    {
+                        if cohort.inputs.len() >= limits.max_annotations_per_cohort {
+                            return Err(failure(
+                                "resource limit: annotation cohort input ceiling exceeded",
+                            ));
+                        }
+                        cohort.inputs.push(InputSignature {
+                            annotation_id: annotation.id.clone(),
+                            fingerprint: fingerprint.clone(),
+                            representation,
+                        });
+                    }
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     for cohort in cohorts.values_mut() {
         cohort
             .inputs
@@ -217,6 +244,7 @@ pub(crate) fn prepare(
     plan: &CohortPlan,
     colbert: &ColbertBackend,
 ) -> Result<Option<PreparedProjection>, ApiError> {
+    let max_manifest_bytes = conn.limits().resources.max_manifest_bytes;
     let Some(annotations) = current_inputs(conn, plan)? else {
         return Ok(None);
     };
@@ -242,6 +270,7 @@ pub(crate) fn prepare(
         &[],
         source_slice,
         Some(start_char),
+        max_manifest_bytes,
     )?;
     let mut combined = String::new();
     let mut nonempty_ids = Vec::new();
@@ -259,15 +288,16 @@ pub(crate) fn prepare(
             std::slice::from_ref(&annotation.id),
             &text,
             None,
+            max_manifest_bytes,
         )?;
         if !combined.is_empty() {
             combined.push_str("\n\n");
         }
         combined.push_str(&text);
         nonempty_ids.push(annotation.id.clone());
-        if combined.len() as u64 > MAX_MANIFEST_BYTES {
+        if combined.len() > max_manifest_bytes {
             return Err(failure(
-                "combined annotation text exceeds publication ceiling",
+                "resource limit: combined annotation text exceeds publication ceiling",
             ));
         }
     }
@@ -280,14 +310,15 @@ pub(crate) fn prepare(
             &nonempty_ids,
             &combined,
             None,
+            max_manifest_bytes,
         )?;
     }
     if texts.is_empty() {
         return Err(failure("annotation cohort has no canonical source text"));
     }
-    if canonical_json_bytes_of(&texts)?.len() as u64 > MAX_MANIFEST_BYTES {
+    if canonical_json_bytes_of(&texts)?.len() > max_manifest_bytes {
         return Err(failure(
-            "prepared annotation representations exceed publication ceiling",
+            "resource limit: prepared annotation representations exceed publication ceiling",
         ));
     }
     Ok(Some(PreparedProjection {
@@ -301,6 +332,13 @@ pub(crate) fn current_inputs(
     conn: &Connection,
     plan: &CohortPlan,
 ) -> Result<Option<Vec<SemanticAnnotation>>, ApiError> {
+    let max_input_bytes = conn.limits().resources.max_json_cell_bytes;
+    let max_manifest_bytes = conn.limits().resources.max_manifest_bytes as u64;
+    if plan.inputs.len() > conn.limits().resources.max_annotations_per_cohort {
+        return Err(failure(
+            "resource limit: declared annotation cohort exceeds configured membership limit",
+        ));
+    }
     let mut inputs = Vec::new();
     let mut retained_bytes = 0_u64;
     let mut statement = conn
@@ -313,7 +351,7 @@ pub(crate) fn current_inputs(
                     input.annotation_id,
                     plan.source_id,
                     plan.parse_id,
-                    MAX_MANIFEST_BYTES
+                    max_input_bytes
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -324,10 +362,12 @@ pub(crate) fn current_inputs(
         let Some((input_bytes, raw)) = row else {
             return Ok(None);
         };
-        let raw = raw.ok_or_else(|| failure(format!("annotation {} raw fields or encoded JSON exceed {MAX_MANIFEST_BYTES} bytes (raw fields: {input_bytes} bytes)", input.annotation_id)))?;
+        let raw = raw.ok_or_else(|| failure(format!("resource limit: annotation {} raw fields or encoded JSON exceed {max_input_bytes} bytes (raw fields: {input_bytes} bytes)", input.annotation_id)))?;
         retained_bytes = retained_bytes.saturating_add(raw.len() as u64);
-        if retained_bytes > MAX_MANIFEST_BYTES {
-            return Err(failure("annotation inputs exceed publication ceiling"));
+        if retained_bytes > max_manifest_bytes {
+            return Err(failure(
+                "resource limit: annotation inputs exceed publication ceiling",
+            ));
         }
         let annotation: SemanticAnnotation = serde_json::from_str(&raw).map_err(|source| {
             failure(format!(
@@ -359,8 +399,10 @@ pub(crate) fn archive(
     };
     validate_manifest(&projection)?;
     let bytes = canonical_json_bytes_of(&projection)?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(failure("annotation manifest exceeds publication ceiling"));
+    if bytes.len() > store.limits().resources.max_manifest_bytes {
+        return Err(failure(
+            "resource limit: annotation manifest exceeds publication ceiling",
+        ));
     }
     store.put_bytes(&bytes)
 }
@@ -370,12 +412,20 @@ pub(crate) fn read_manifest(
     store: &ArtifactStore,
     uri: &str,
 ) -> Result<AnnotationProjection, ApiError> {
-    let projection: AnnotationProjection =
-        store.with_verified_reader(uri, Some(MAX_MANIFEST_BYTES), |reader| {
+    let projection: AnnotationProjection = store.with_verified_reader(
+        uri,
+        Some(store.limits().resources.max_manifest_bytes as u64),
+        |reader| {
             serde_json::from_reader(reader)
                 .map_err(|source| failure(format!("decode annotation manifest {uri}: {source}")))
-        })?;
+        },
+    )?;
     validate_manifest(&projection)?;
+    if projection.plan.inputs.len() > store.limits().resources.max_annotations_per_cohort {
+        return Err(failure(
+            "resource limit: archived annotation cohort exceeds configured membership limit",
+        ));
+    }
     Ok(projection)
 }
 
@@ -384,7 +434,14 @@ pub(crate) fn producer(plan: &CohortPlan) -> Provenance {
     Provenance {
         producer_type: crate::model::ProducerType::System,
         producer_name: INDEX_NAME.to_owned(),
-        producer_version: Some(FORMAT_VERSION.to_string()),
+        producer_version: Some(
+            if plan.construction.is_some() {
+                FORMAT_VERSION
+            } else {
+                1
+            }
+            .to_string(),
+        ),
         config_hash: Some(plan.input_hash.clone()),
         model_name: None,
         model_version: None,
@@ -443,6 +500,7 @@ pub(crate) fn published_for_parse(
     source_id: &str,
     parse_id: &str,
 ) -> Result<Vec<PublishedCohort>, ApiError> {
+    let max_cohorts = conn.limits().resources.max_cohorts_per_parse;
     let mut statement = conn
         .prepare(PUBLICATIONS_SQL)
         .map_err(|source| failure(format!("prepare annotation publications: {source}")))?;
@@ -452,8 +510,8 @@ pub(crate) fn published_for_parse(
                 source_id,
                 parse_id,
                 INDEX_NAME,
-                MAX_COHORTS * 2 + 1,
-                MAX_MANIFEST_BYTES
+                max_cohorts * 2 + 1,
+                conn.limits().resources.max_json_cell_bytes
             ],
             |row| {
                 Ok(PublicationRow {
@@ -473,9 +531,9 @@ pub(crate) fn published_for_parse(
     for row in rows {
         let row =
             row.map_err(|source| failure(format!("decode annotation publication: {source}")))?;
-        if output.len() >= MAX_COHORTS {
+        if output.len() >= max_cohorts {
             return Err(failure(
-                "annotation publication inventory exceeds its cohort limit",
+                "resource limit: annotation publication inventory exceeds its cohort limit",
             ));
         }
         // Dense sorts before ColBERT within a cohort. A second dense row or a
@@ -541,7 +599,7 @@ fn validate_publication_pair(
         .ok_or_else(|| failure("annotation publication lacks a payload"))?;
     let raw_producer = dense.producer.ok_or_else(|| {
         failure(format!(
-            "annotation publication {} metadata exceeds {MAX_MANIFEST_BYTES} bytes",
+            "resource limit: annotation publication {} metadata exceeds configured JSON byte limit",
             dense.id
         ))
     })?;
@@ -614,12 +672,18 @@ pub(crate) fn validate_publication_lineage(
 /// Validate manifest identities without requiring the embedding provider to be available.
 pub(crate) fn validate_manifest(projection: &AnnotationProjection) -> Result<(), ApiError> {
     let plan = &projection.plan;
-    if projection.format_version != FORMAT_VERSION
+    let valid_policy = match (projection.format_version, &plan.construction) {
+        (1, None) => true,
+        (FORMAT_VERSION, Some(policy)) => {
+            policy.version == FORMAT_VERSION && policy.window_max_tokens > 0
+        }
+        _ => false,
+    };
+    if !valid_policy
         || plan.model_identity.is_empty()
         || plan.source_id.is_empty()
         || plan.parse_id.is_empty()
         || plan.inputs.is_empty()
-        || plan.inputs.len() > MAX_INPUTS
         || plan.cohort_id != cohort_id(&plan.source_id, &plan.parse_id, &plan.target)?
         || plan.input_hash != plan_hash(plan)?
         || projection.representations.is_empty()
@@ -723,10 +787,11 @@ pub(crate) fn source_text(
     parse_id: &str,
     unit_id: &str,
 ) -> Result<String, ApiError> {
+    let max_source_bytes = conn.limits().resources.max_source_body_bytes;
     let (kind, body): (String, Option<String>) = conn
         .query_row(
             SOURCE_SQL,
-            params![unit_id, source_id, parse_id, MAX_SOURCE_BYTES],
+            params![unit_id, source_id, parse_id, max_source_bytes],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|source| {
@@ -736,7 +801,7 @@ pub(crate) fn source_text(
         })?;
     let body = body.ok_or_else(|| {
         failure(format!(
-            "canonical source {unit_id} exceeds {MAX_SOURCE_BYTES} bytes"
+            "resource limit: canonical source {unit_id} exceeds {max_source_bytes} bytes"
         ))
     })?;
     let kind: ContentType = serde_json::from_value(Value::String(kind))
@@ -819,6 +884,9 @@ pub(crate) fn representation_kind(
 }
 
 /// Split model inputs independently of corpus units and preserve every source coordinate.
+// Explicit arguments keep canonical offsets, model framing, and current admission
+// separate from the immutable construction policy archived in the plan.
+#[allow(clippy::too_many_arguments)]
 fn append_windows(
     texts: &mut Vec<RepresentationText>,
     colbert: &ColbertBackend,
@@ -827,9 +895,16 @@ fn append_windows(
     annotation_ids: &[String],
     text: &str,
     source_start: Option<usize>,
+    max_manifest_bytes: usize,
 ) -> Result<(), ApiError> {
     let mut retained_bytes: usize = texts.iter().map(retained_text_bytes).sum();
-    for window in colbert.document_windows(text, super::MAX_UNIT_TOKENS as usize)? {
+    // Only the legacy format used the frozen 512-token window. New plans carry
+    // their own construction limit, so changed settings require new identities.
+    let window_tokens = plan
+        .construction
+        .as_ref()
+        .map_or(512, |policy| policy.window_max_tokens) as usize;
+    for window in colbert.document_windows(text, window_tokens)? {
         // Bound retained input records before cloning repeated combined-input IDs.
         let added = window
             .text
@@ -842,9 +917,9 @@ fn append_windows(
             )
             .saturating_add(512);
         retained_bytes = retained_bytes.saturating_add(added);
-        if retained_bytes as u64 > MAX_MANIFEST_BYTES {
+        if retained_bytes > max_manifest_bytes {
             return Err(failure(format!(
-                "{} window working set exceeds publication ceiling",
+                "resource limit: {} window working set exceeds publication ceiling",
                 representation.label()
             )));
         }
@@ -893,6 +968,16 @@ fn retained_text_bytes(input: &RepresentationText) -> usize {
 
 /// Model identity and rendering policy participate in freshness without changing annotations.
 fn plan_hash(plan: &CohortPlan) -> Result<String, ApiError> {
+    if let Some(policy) = &plan.construction {
+        return canonical_sha256_hex_of(&(
+            FORMAT_POLICY,
+            policy,
+            &plan.model_identity,
+            &plan.cohort_id,
+            &plan.inputs,
+        ));
+    }
+    // Preserve the exact v1 tuple, including its absence of construction fields.
     canonical_sha256_hex_of(&(
         FORMAT_POLICY,
         &plan.model_identity,
@@ -916,6 +1001,19 @@ fn representation_id(
     start: usize,
     end: usize,
 ) -> Result<String, ApiError> {
+    if let Some(policy) = &plan.construction {
+        return canonical_sha256_hex_of(&(
+            policy,
+            &plan.cohort_id,
+            &plan.model_identity,
+            kind,
+            ids,
+            sha256_hex_bytes(text.as_bytes()),
+            excerpt,
+            start,
+            end,
+        ));
+    }
     canonical_sha256_hex_of(&(
         &plan.cohort_id,
         &plan.model_identity,

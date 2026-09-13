@@ -373,8 +373,9 @@ verdict.
 
 ### Example: query the fabric
 
-`queryText` is the only required field. Queries return up to ten passages by
-default; `maxFinalEvidenceUnits` sets the passage limit from 1 to 100. Raw unit
+`queryText` is the only required field. `retrieval.default_results` and
+`retrieval.max_results` configure the default and maximum passage counts
+(shipped values: 10 and 100). `maxFinalEvidenceUnits` selects a count within that range. Raw unit
 locators default on; relationships, annotations, and `debug` default off.
 
 ```sh
@@ -415,14 +416,18 @@ annotation ranking with graph matches. Exact source excerpts remain identifiable
 through ColBERT scoring, passage construction, reranking, and citations.
 
 Query scoring streams persisted vectors with bounded buffers; operating-system
-file caching can use spare RAM without requiring resident vector planes. Existing
+file caching can use spare RAM without requiring resident vector planes. Chunk
+mappings and canonical metadata still scale with the captured corpus. Existing
 annotations are embedded during normal discovery. Parses lacking required section
 embeddings still need `data-store --config config.toml --rebuild-all` from the
 project root, which clears indexed state and reingests the corpus. Snapshots
 lacking the required passage/section representations are rejected before restore.
 
-Fine retrieval chunks are capped at 512 ColBERT tokens, measured from the
-normalized indexed text. Oversized words are split to fit this limit.
+`indexing.chunk_max_tokens` bounds normalized retrieval chunks; annotation and
+section windows have separate indexing limits. Displayed passages use
+`retrieval.passage_max_tokens`. Final reranking uses a configured candidate depth
+(shipped value: 100), raised for larger valid result requests. Matched graph
+context shares the reranker's total input capacity without a separate token cutoff.
 
 The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
 `query-raw`) with the same query text to print the complete response JSON. Raw
@@ -461,23 +466,45 @@ the client's admin token file, and the UI itself carries no authentication.
 ## Configuration
 
 Configuration is a single TOML file (`config.toml`, from `config.example.toml`).
-Unknown keys anywhere in the file are fatal startup errors. The sections:
+Missing required settings and unknown keys are fatal startup errors. Configuration
+comments specify units, enforcement scope, and excess-input behavior. The sections:
 
 | Section | Purpose |
 | --- | --- |
 | `[server]` | HTTP bind address, required nonnegative integer `startup_delay_seconds` (`0` disables the wait), and request-shape limits. |
 | `[logging]` | File-backed service logging. |
 | `[admin]` | Admin token file location. |
-| `[client]` | Bundled CLI settings (server validates, never reads at runtime). |
+| `[client]` | Client deadlines, polling cadence, and provenance previews. |
+| `[retrieval]`, `[retrieval.entity_matching]` | Result counts, candidate depths, graph matching, passage/evidence budgets, and query admission. |
+| `[indexing]` | Independent chunk, annotation-window, and section construction limits. |
+| `[resources]` | Read, allocation, and inventory admission guards. |
+| `[workers]` | Annotation/projection batching, concurrency, polling, and publication allowances. |
+| `[sqlite]` | Lock-wait timeout, cooperative SQL execution timeout, and progress-callback cadence. |
+| `[parsing]` | Candidate acceptance, process capture/polling, optional sampling, and regex execution budgets. |
+| `[scheduling]` | Sync cadence, backoff, and maintenance polling. |
+| `[diagnostics]` | Operational error, identifier, and progress-summary bounds. |
 | `[inference]` | Accelerator selection for local retrieval models. Required but unused when dense, ColBERT, and the reranker all use HTTP; no local accelerator is initialized in that mode. |
 | `[storage]` | Corpus root and service-owned index root. |
 | `[connectors.filesystem]` | Governance domain stamped on acquired sources. |
 | `[pdf]` | Required `engine` (`docling` or `mupdf`) and positive `document_timeout_seconds`; no automatic fallback. |
 | `[docling]` | Docling executable and conversion controls. Required for `engine = "docling"`; validated whenever supplied. |
 | `[models]` | Dense, ColBERT, and reranker each select an exclusive `local` or `http` backend. Remote ColBERT uses vLLM `/pooling` token inference, a matching local tokenizer, persisted document matrices, and CPU MaxSim; no local ColBERT weights are loaded. The annotator uses an external chat-completions endpoint. See **INSTALL.md** for backend fields. |
-| `[policies]` | Paths to the two operator-editable policy documents (entity-match ruleset, annotator naming rules); config holds paths only, and edits require a restart. |
+| `[policies]` | Paths to entity-match enable flags and annotator naming rules. Numeric entity-matching limits live in `config.toml`. |
 
 See **INSTALL.md** for the annotated example and the required absolute paths.
+
+Model serving capacity is separate from retrieval window size. The configured
+HTTP capacities are 32,768 for `Qwen/Qwen3-Embedding-8B` and
+`Qwen/Qwen3-Reranker-0.6B`, and 518 for `lightonai/ColBERT-Zero`; ColBERT query
+and document inputs remain 512. Startup requires `/v1/models` to advertise the
+configured capacity. Server-side truncation is disabled; oversized HTTP inputs
+fail visibly. Existing application-side ColBERT token-ID and local-model prefix
+handling remains in place; annotation windows preserve complete input through splitting.
+
+Construction settings are recorded with new projections. Restore validates their
+recorded settings or explicit legacy formats without inference. Current resource
+guards may refuse large historical artifacts without declaring them corrupt.
+`[parsing]` resource and observation limits do not change successful parser identities.
 
 MuPDF extracts embedded text into cleaned paragraphs with source locators,
 physical pages, and image bounds. Cleanup removes margin text, folios, and junk
@@ -495,6 +522,7 @@ These `[models.annotator]` settings are required; the shipped values are:
 | --- | ---: | --- |
 | `max_input_chars` | 2000 | Source text per excerpt, in Unicode characters; prompts and prior-stage output are additional. |
 | `timeout_seconds` | 120 | Deadline for each model call, including thinking. |
+| `max_completion_tokens` | 150000 | Completion-token allowance per call, including reasoning. |
 | `annotation_max_retries` | 10 | Malformed-output retries after the initial attempt. |
 | `annotation_retry_interval_seconds` | 5 | Fixed malformed-output retry interval, with no backoff ceiling. |
 | `execution_max_retries` | 10 | Execution-failure retries after the initial attempt. |
@@ -504,7 +532,7 @@ These `[models.annotator]` settings are required; the shipped values are:
 The two failure counters are independent. Execution failures include timeouts,
 HTTP/protocol errors, token-limit termination, and internal producer failures.
 Their delay doubles up to the configured ceiling; it is independent of the
-shared 60-second limit used elsewhere. Malformed outputs use their fixed interval.
+configured scheduler waits and dense HTTP retry backoff. Malformed outputs use their fixed interval.
 Both limits allow `0` to disable that category's retries. Delays must be positive,
 and the execution ceiling must be at least the initial delay.
 

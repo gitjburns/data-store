@@ -7,18 +7,21 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[path = "../parse/mupdf_cleanup.rs"]
 mod mupdf_cleanup;
 #[path = "../parse/native_pdf.rs"]
 mod native_pdf;
+#[path = "../parsing_limits.rs"]
+mod parsing_limits;
 
 use native_pdf::{BlockKind, EXTRACTION_FLAGS, ExtractedPdf};
 
 const USAGE: &str = "pdf-extract-diagnostic <input.pdf> <new-output-directory>\n\
 Both paths must be inside this repository. The output parent must already exist.\n\
+Reads the cleanup budget from this repository's config.toml.\n\
 Writes raw.json, extracted.md, cleaned.md, mupdf_cleanup.json, and report.json.\n\
 No OCR, heading inference, font heuristics, database writes, or production routing.\n\
 The cleaned preview uses the production text cleaner; raw.json retains all native blocks.";
@@ -28,6 +31,13 @@ const DEPENDENCY_LOCK: &str = include_str!("../../Cargo.lock");
 struct Options {
     input: PathBuf,
     output: PathBuf,
+    cleanup_regex_backtrack_limit: usize,
+}
+
+/// Reuse the strict production parsing shape without loading model runtimes or unrelated settings.
+#[derive(Deserialize)]
+struct DiagnosticConfiguration {
+    parsing: parsing_limits::ParsingLimits,
 }
 
 /// A running report survives an interrupted evaluation without claiming success.
@@ -73,6 +83,7 @@ struct Report<'a> {
     backend: &'static str,
     extraction_flags: String,
     dependency_lock_sha256: String,
+    cleanup_regex_backtrack_limit: usize,
     input: &'a Path,
     output: &'a Path,
     started_unix_ms: u128,
@@ -99,6 +110,7 @@ fn main() -> Result<()> {
         backend: "mupdf",
         extraction_flags: format!("{EXTRACTION_FLAGS:?}"),
         dependency_lock_sha256: format!("{:x}", Sha256::digest(DEPENDENCY_LOCK.as_bytes())),
+        cleanup_regex_backtrack_limit: options.cleanup_regex_backtrack_limit,
         input: &options.input,
         output: &options.output,
         started_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
@@ -184,7 +196,22 @@ fn parse_options() -> Result<Option<Options>> {
         bail!("output must be inside {}", root.display());
     }
     let output = parent.join(name);
-    Ok(Some(Options { input, output }))
+    // Read before creating scratch output: a missing or invalid setting must not
+    // leave a partial diagnostic run or silently reinstate a code default.
+    let config_path = root.join("config.toml");
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let config: DiagnosticConfiguration = toml::from_str(&raw)
+        .with_context(|| format!("decode parsing settings in {}", config_path.display()))?;
+    let cleanup_regex_backtrack_limit = config.parsing.cleanup_regex_backtrack_limit;
+    if cleanup_regex_backtrack_limit == 0 {
+        bail!("parsing.cleanup_regex_backtrack_limit must be greater than zero");
+    }
+    Ok(Some(Options {
+        input,
+        output,
+        cleanup_regex_backtrack_limit,
+    }))
 }
 
 /// Separate native extraction time from Markdown cleanup and artifact I/O. Input
@@ -210,7 +237,8 @@ fn evaluate(options: &Options, report: &mut Report<'_>, started: Instant) -> Res
     report.stage = Stage::Render;
     checkpoint(options, report, started)?;
     let rendering_started = Instant::now();
-    let cleaned_document = mupdf_cleanup::clean_document(&document)?;
+    let cleaned_document =
+        mupdf_cleanup::clean_document(&document, options.cleanup_regex_backtrack_limit)?;
     let (extracted, cleaned, metrics) = render_markdown(&document, &cleaned_document);
     report.rendering_ms = Some(rendering_started.elapsed().as_millis());
     report.metrics = Some(metrics);

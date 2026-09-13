@@ -30,7 +30,8 @@
 
 use std::time::Instant;
 
-use rusqlite::{Connection, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use tracing::{error, info};
 
 use super::StoredChunk;

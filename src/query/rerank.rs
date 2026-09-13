@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::Connection;
+use crate::sqlite::Connection;
 use serde::Serialize;
 use tracing::{error, info};
 
@@ -146,7 +146,7 @@ pub(crate) fn run_maxsim_stage(
         .inspect_err(|source| {
             error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
                 parse_id, stage = "matrix_loading", candidate_count = unit_ids.len(),
-                error = %source, error_chain = %crate::util::error_chain(source),
+                error = %source, error_chain = %crate::util::error_chain(source, &ctx.conn.limits().diagnostics),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "ColBERT candidate matrices could not be loaded");
         })?;
@@ -167,7 +167,7 @@ pub(crate) fn run_maxsim_stage(
                 .inspect_err(|source| {
                     error!(event = "rerank.maxsim.failed", query_id = ctx.query_id,
                     stage = "model_gate", error = %source,
-                    error_chain = %crate::util::error_chain(source),
+                    error_chain = %crate::util::error_chain(source, &ctx.conn.limits().diagnostics),
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "ColBERT scoring could not acquire the model gate");
                 })?,
@@ -195,7 +195,7 @@ pub(crate) fn run_maxsim_stage(
                         backend = ?colbert.backend_kind(),
                         stage = "scoring", candidate_count = candidates.len(),
                         unit_id = %candidate.unit_id,
-                        error = %source, error_chain = %crate::util::error_chain(source),
+                        error = %source, error_chain = %crate::util::error_chain(source, &ctx.conn.limits().diagnostics),
                         gate_wait_ms, scoring_ms = scoring_started.elapsed().as_millis() as u64,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
                         "ColBERT MaxSim scoring failed");
@@ -342,7 +342,7 @@ pub(crate) fn run_reranker_stage(
                 input_char_count,
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 error = %source,
-                error_chain = %crate::util::error_chain(&source),
+                error_chain = %crate::util::error_chain(&source, &ctx.conn.limits().diagnostics),
                 "passage reranking failed"
             );
             return Err(source);

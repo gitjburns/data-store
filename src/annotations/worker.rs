@@ -21,7 +21,7 @@
 //! CONCURRENCY (producer dispatch only). The producer HTTP calls fan out: for
 //! each source the worker prepares memo-miss builds serially through their
 //! PRE-PAID `build_open` boundary, buffers them into a wave of up to
-//! `ANNOTATOR_CONCURRENT_CALLS`, then dispatches the wave's PURE producer calls
+//! the configured concurrent-call allowance, then dispatches PURE producer calls
 //! on scoped OS threads (`std::thread::scope`), joins, and commits each result
 //! serially. NOTHING else moves off this thread: discovery, memo lookups/writes,
 //! freshness transitions, annotation INSERTs, and every other SQLite write stay
@@ -81,13 +81,14 @@
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, params};
+use crate::sqlite::Connection;
+use rusqlite::params;
 use tracing::{debug, error, info, warn};
 
 use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
@@ -101,26 +102,13 @@ use crate::annotations::store::{self, NewAnnotation};
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
+use crate::limits::DiagnosticLimits;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::model::{Provenance, SemanticAnnotationType};
 use crate::primitives::utc_now;
 use crate::state::{AnnotationCycleCounts, AnnotationHealth, ShutdownSignal};
 use crate::types::{AnnotationActivity, AnnotationProgressCount};
 use crate::util::{panic_payload_message, truncate_persisted_detail};
-
-/// Idle interval between discovery cycles. A code constant, never config
-/// (§35): the cadence is internal pacing for a non-critical background build,
-/// not an operator tuning knob. Shutdown interrupts the wait promptly, so this
-/// is an upper bound on idle latency, not a hard delay.
-const CYCLE_IDLE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Number of producer HTTP calls dispatched concurrently per wave on scoped OS
-/// threads. A code constant, never config (§35): the commercial endpoint handles
-/// high concurrency, and annotation call failures park the affected target
-/// `failed` and retry next cycle, so this bound tolerates provider 429 bursts.
-/// Only the producer HTTP invocation fans out; every SQLite write (discovery,
-/// memo, freshness, INSERT, park-failed) stays serial on the worker thread.
-const ANNOTATOR_CONCURRENT_CALLS: usize = 32;
 
 /// Monotonic eligibility without adding arbitrarily large configured durations
 /// to an Instant. Copies retain the same start time while a cycle does other work.
@@ -245,10 +233,9 @@ impl RetryState {
     }
 
     /// Wake for a short retry while retaining ordinary discovery scans during long waits.
-    fn next_cycle_delay(&self) -> Duration {
-        self.next_retry.map_or(CYCLE_IDLE_INTERVAL, |delay| {
-            CYCLE_IDLE_INTERVAL.min(delay.remaining())
-        })
+    fn next_cycle_delay(&self, idle: Duration) -> Duration {
+        self.next_retry
+            .map_or(idle, |delay| idle.min(delay.remaining()))
     }
 }
 
@@ -276,7 +263,7 @@ WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL";
 /// Producer prompts contain only their single annotation goal; operator naming
 /// rules are not appended to requests or incorporated into producer memo identity.
 pub(crate) fn start(
-    index_root: PathBuf,
+    index_root: crate::runtime::StorageContext,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
     shutdown: Arc<ShutdownSignal>,
@@ -287,6 +274,8 @@ pub(crate) fn start(
     health_slot: Arc<Mutex<AnnotationHealth>>,
 ) -> thread::JoinHandle<()> {
     let context = crate::util::LogContext::new("worker", "annotation");
+    // The thread's panic boundary outlives run_worker's ownership of the storage root.
+    let diagnostics = index_root.limits().diagnostics;
     thread::Builder::new()
         .name("annotation-worker".to_string())
         .spawn(move || {
@@ -308,7 +297,7 @@ pub(crate) fn start(
                 )
             }));
             if let Err(payload) = body {
-                let message = panic_payload_message(payload.as_ref());
+                let message = panic_payload_message(payload.as_ref(), &diagnostics);
                 error!(
                     event = "annotation_worker.thread_panicked",
                     is_panic = true,
@@ -348,7 +337,7 @@ pub(crate) fn start(
 /// worker logs the error and parks in the shutdown-wait loop, leaving the
 /// process running. C10b surfaces this parked state.
 fn run_worker(
-    index_root: PathBuf,
+    index_root: crate::runtime::StorageContext,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
     shutdown: Arc<ShutdownSignal>,
@@ -364,6 +353,7 @@ fn run_worker(
     let client = match AnnotatorClient::load(
         &annotator_config,
         &config_root,
+        index_root.limits().diagnostics,
         maintenance.annotation_cancellation(),
     ) {
         Ok(client) => client,
@@ -380,7 +370,10 @@ fn run_worker(
                 &health_slot,
                 &AnnotationHealth {
                     parked: true,
-                    parked_detail: Some(truncate_persisted_detail(&source.to_string())),
+                    parked_detail: Some(truncate_persisted_detail(
+                        &source.to_string(),
+                        &index_root.limits().diagnostics,
+                    )),
                     last_cycle: None,
                     measured_at: None,
                     documents: None,
@@ -421,9 +414,10 @@ fn run_worker(
                     &health_slot,
                     &AnnotationHealth {
                         parked: true,
-                        parked_detail: Some(truncate_persisted_detail(&format!(
-                            "maintenance admission failed: {source}"
-                        ))),
+                        parked_detail: Some(truncate_persisted_detail(
+                            &format!("maintenance admission failed: {source}"),
+                            &index_root.limits().diagnostics,
+                        )),
                         last_cycle: None,
                         measured_at: None,
                         documents: None,
@@ -484,7 +478,9 @@ fn run_worker(
         drop(permit);
         // Retry eligibility is per annotation. A five-second retry wakes this
         // loop early; a long backoff does not stop ordinary discovery scans.
-        delay = output_retries.next_cycle_delay();
+        delay = output_retries.next_cycle_delay(Duration::from_millis(
+            index_root.limits().workers.annotation_idle_interval_ms,
+        ));
     }
 
     stop_document_activity(&health_slot, "shutdown");
@@ -526,7 +522,7 @@ fn stop_document_activity(slot: &Mutex<AnnotationHealth>, reason: &str) {
 /// `output_retries` tracks observed failures, not failed-row reopens;
 /// call failures end scheduling after the current wave finishes committing.
 fn run_cycle(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
@@ -577,7 +573,13 @@ fn run_cycle(
                     .map(drop)
             })
         {
-            record_source_failure(source, &source_error, false, health_slot);
+            record_source_failure(
+                source,
+                &source_error,
+                false,
+                health_slot,
+                &index_root.limits().diagnostics,
+            );
             unavailable.insert(source.source_id.clone());
         }
     }
@@ -658,6 +660,7 @@ fn run_cycle(
                     &source_error,
                     output_retries.call_failed_in_cycle,
                     health_slot,
+                    &index_root.limits().diagnostics,
                 );
                 if output_retries.call_failed_in_cycle {
                     break;
@@ -733,6 +736,7 @@ fn record_source_failure(
     source_error: &ApiError,
     call_failure_cycle_ended: bool,
     health_slot: &Mutex<AnnotationHealth>,
+    diagnostics: &DiagnosticLimits,
 ) {
     let mut annotation_progress = AnnotationProgressCount::default();
     update_annotation_health(health_slot, |health| {
@@ -744,7 +748,10 @@ fn record_source_failure(
         }) {
             annotation_progress = document.progress;
             document.activity = AnnotationActivity::Unavailable;
-            document.detail = Some(truncate_persisted_detail(&source_error.to_string()));
+            document.detail = Some(truncate_persisted_detail(
+                &source_error.to_string(),
+                diagnostics,
+            ));
             // Keep the last actual accounting timestamp when measurement fails.
         }
     });
@@ -951,7 +958,7 @@ enum PostPaidOutcome<T> {
 /// probe shutdown and maintenance before retrying; the wait is bounded by
 /// their cancellation signals (paid producer output must not be
 /// discarded on ordinary contention while the process lives). A periodic INFO
-/// every `WAIT_LOG_EVERY` consecutive busy attempts (~5 min) makes a long stall
+/// after the configured number of consecutive busy attempts makes a long stall
 /// visible in the durable log. On a successful begin the `body` runs on the
 /// transaction; `Ok` commits unless cancellation arrived during the body,
 /// in which case it rolls back and yields `Cancelled`. `Err` aborts and
@@ -966,16 +973,20 @@ enum PostPaidOutcome<T> {
 /// same poison-recovery semantics as the worker's other shutdown checks, so no
 /// new probe method is needed.
 fn run_post_paid_transaction<T>(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     operation: &'static str,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
     cancellation: &AnnotationCancellation,
     counts: &mut SourceCounts,
-    mut body: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, ApiError>,
+    mut body: impl FnMut(&crate::sqlite::Transaction<'_>) -> Result<T, ApiError>,
 ) -> Result<PostPaidOutcome<T>, ApiError> {
-    // ~60 busy attempts × ~5 s busy_timeout ≈ 5 min between stall logs.
-    const WAIT_LOG_EVERY: u64 = 60;
+    // Each attempt already waits under SQLite's configured lock timeout; the
+    // separate log cadence must not release or discard completed paid work.
+    let wait_log_every = index_root
+        .limits()
+        .workers
+        .annotation_commit_wait_log_attempts as u64;
     if let Some(reason) = cancellation.reason() {
         return Ok(PostPaidOutcome::Cancelled(reason));
     }
@@ -1039,7 +1050,7 @@ fn run_post_paid_transaction<T>(
                         Some("Waiting for SQLite to persist annotation results.".to_string()),
                     );
                 }
-                if busy_attempts.is_multiple_of(WAIT_LOG_EVERY) {
+                if busy_attempts.is_multiple_of(wait_log_every) {
                     info!(
                         event = "annotation_worker.completion_waiting",
                         annotation_progress = %counts.progress_count(),
@@ -1058,7 +1069,7 @@ fn run_post_paid_transaction<T>(
 /// Roll back cancelled work explicitly so logs distinguish confirmed cleanup
 /// from an actual rollback failure. Cancellation itself is never a storage error.
 fn rollback_cancelled(
-    tx: rusqlite::Transaction<'_>,
+    tx: crate::sqlite::Transaction<'_>,
     operation: &'static str,
     reason: AnnotationCancelReason,
 ) -> Result<(), ApiError> {
@@ -1113,7 +1124,7 @@ struct SourcePlan {
 
 /// Read a plan without holding SQLite across model work or health publication.
 fn read_source_plan(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     source: &ActiveSource,
     inventory_only: bool,
@@ -1214,7 +1225,7 @@ impl SourcePlan {
 /// the worker thread (no producer call), exactly as before. Memo MISSes are
 /// prepared serially — each passes its PRE-PAID `build_open` boundary on the
 /// worker thread (which durably inserts/reopens the `building` row) and is then
-/// BUFFERED into a `PendingBuild` wave of up to `ANNOTATOR_CONCURRENT_CALLS`.
+/// BUFFERED into a `PendingBuild` wave bounded by workers.annotation_concurrent_calls.
 /// When the wave fills (or the items run out), `dispatch_and_commit_wave` fans
 /// out ONLY the producer HTTP calls on scoped threads, joins, then commits each
 /// POST-PAID result serially on the worker thread. Every SQLite write — memo
@@ -1232,7 +1243,7 @@ impl SourcePlan {
 /// Each failure category has its own configured retry allowance. Reopening a
 /// row, waiting for eligibility, or deferring on contention spends neither budget.
 fn build_source<'slot>(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     source: &ActiveSource,
@@ -1258,7 +1269,8 @@ fn build_source<'slot>(
     counts.expected = work_items.len() as u64;
 
     // The current dispatch wave: producer builds past `build_open`, awaiting a
-    // concurrent HTTP dispatch. Kept small (<= ANNOTATOR_CONCURRENT_CALLS).
+    // concurrent HTTP dispatch. The configured wave cap bounds paid calls only;
+    // database discovery and every completion write stay serial on this worker.
     let mut pending: Vec<PendingBuild> = Vec::new();
 
     for item in work_items {
@@ -1406,9 +1418,9 @@ fn build_source<'slot>(
             PreparedItem::Cancelled(reason) => return Ok((counts, BuildFlow::Cancelled(reason))),
             PreparedItem::Pending(prepared) => {
                 pending.push(*prepared);
-                if pending.len() >= ANNOTATOR_CONCURRENT_CALLS {
+                if pending.len() >= index_root.limits().workers.annotation_concurrent_calls {
                     // Wave full: dispatch + commit before buffering more, so at
-                    // most ANNOTATOR_CONCURRENT_CALLS HTTP calls are ever in flight.
+                    // most the configured concurrent-call allowance is in flight.
                     let flow = dispatch_and_commit_wave(
                         index_root,
                         config,
@@ -1482,7 +1494,7 @@ fn build_source<'slot>(
 // existing explicit boundary rather than introduce a pass-through context.
 #[allow(clippy::too_many_arguments)]
 fn flush_pending_wave(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     source: &ActiveSource,
@@ -1532,7 +1544,7 @@ enum PreparedItem {
 // Keep the established source/item preparation inputs and cancellation explicit.
 #[allow(clippy::too_many_arguments)]
 fn prepare_work_item(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     source: &ActiveSource,
     item: &WorkItem,
@@ -1669,7 +1681,7 @@ fn enumerate_work_items(
 /// row as-is since it already holds the in-flight status and flipping it
 /// would fabricate a transition that never happened — or insert a new one.
 fn reopen_or_insert_building(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &crate::sqlite::Transaction<'_>,
     reopened: Option<&store::ReopenableRow>,
     request: &store::NewAnnotation,
 ) -> Result<String, ApiError> {
@@ -1694,7 +1706,7 @@ fn reopen_or_insert_building(
 // Keep cancellation explicit at this existing source/item transaction boundary.
 #[allow(clippy::too_many_arguments)]
 fn remint_from_memo(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     source: &ActiveSource,
     item: &WorkItem,
@@ -1802,7 +1814,7 @@ fn remint_from_memo(
 /// this pre-paid boundary, so a full busy_timeout is never burned before any
 /// paid work.
 fn open_producer_build(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     source: &ActiveSource,
     item: &WorkItem,
@@ -1847,7 +1859,7 @@ fn open_producer_build(
 }
 
 /// Dispatch one wave of `PendingBuild`s: fan the pure producer HTTP calls out on
-/// scoped OS threads (up to `ANNOTATOR_CONCURRENT_CALLS`, the buffer cap), join,
+/// scoped OS threads (bounded by the configured wave allowance), join,
 /// then commit each POST-PAID result SERIALLY on the worker thread. Drains
 /// `pending`; on return the wave is empty and its builds are committed (or the
 /// cycle is ending on cancellation).
@@ -1874,7 +1886,7 @@ fn open_producer_build(
 // existing explicit boundary rather than introduce a pass-through context.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_and_commit_wave(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     source: &ActiveSource,
@@ -1952,7 +1964,10 @@ fn dispatch_and_commit_wave(
                         Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
                             message: format!(
                                 "annotation producer thread panicked: {}",
-                                panic_payload_message(payload.as_ref())
+                                panic_payload_message(
+                                    payload.as_ref(),
+                                    &index_root.limits().diagnostics
+                                )
                             ),
                         }))
                     }
@@ -2144,7 +2159,7 @@ fn dispatch_and_commit_wave(
 // temperature explicitly so paid output follows the worker's serial write boundary.
 #[allow(clippy::too_many_arguments)]
 fn complete_build(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     source: &ActiveSource,
     item: &WorkItem,
@@ -2287,7 +2302,7 @@ fn complete_build(
 // The existing failure boundary also carries maintenance cancellation explicitly.
 #[allow(clippy::too_many_arguments)]
 fn fail_build(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source: &ActiveSource,
     item: &WorkItem,
     building_id: &str,
@@ -2301,7 +2316,10 @@ fn fail_build(
     if let InvocationFailure::Cancelled(reason) = producer_error {
         return Ok(CompletionOutcome::Cancelled(*reason));
     }
-    let detail = truncate_persisted_detail(&producer_error.to_string());
+    let detail = truncate_persisted_detail(
+        &producer_error.to_string(),
+        &index_root.limits().diagnostics,
+    );
 
     // POST-PAID: the producer failure evidence exists and must be recorded, so
     // wait out writer contention (bounded by shutdown); a shutdown-abandon leaves

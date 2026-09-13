@@ -23,20 +23,21 @@ use tracing::{debug, error, info, warn};
 use crate::{
     canonical,
     error::ApiError,
+    limits::ParsingLimits,
     model::{
         ContentType, CoordinateSystem, FigureBody, FigureType, Locator, PageBboxLocator, PageBody,
         ParseMetrics, ParseWarningSeverity, ParserCapabilityProfile, TextBlockBody,
         UnitRelationshipType,
     },
     primitives::utc_now,
+    runtime::StorageContext,
     util::{LogContext, truncate_diagnostic_text, truncate_persisted_detail},
 };
 
 use super::{
     bundle::{
-        BUNDLE_STREAM_LOG_CAP_BYTES, BundleIdentity, BundleWriter, CandidateContentUnit,
-        CandidateUnitRelationship, CandidateWarning, ParserExecutionStatus, ParserResult,
-        parse_staging_root,
+        BundleIdentity, BundleWriter, CandidateContentUnit, CandidateUnitRelationship,
+        CandidateWarning, ParserExecutionStatus, ParserResult, parse_staging_root,
     },
     mupdf_cleanup::{self, CleanedDocument, CleanupReport},
     native_pdf::{self, BlockKind, EXTRACTION_FLAGS, ExtractedPdf},
@@ -48,7 +49,6 @@ const PARSER_NAME: &str = "mupdf_pdf";
 const PARSER_VERSION: &str = "2";
 const RAW_FILE_NAME: &str = "mupdf.json";
 const DEPENDENCY_LOCK: &str = include_str!("../../Cargo.lock");
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Dispatch the private two-path child protocol before config, HTTP, or model startup.
 /// The scheduler supplies an exclusive output path inside its owned bundle workspace.
@@ -93,6 +93,8 @@ fn run_child(input: &Path, output: &Path) -> Result<()> {
 pub(crate) fn capability_profile(
     document_timeout_seconds: u64,
 ) -> Result<ParserCapabilityProfile, ApiError> {
+    // Admission and regex execution budgets affect whether work completes, not
+    // the successful mapping; their settings must not reparse accepted sources.
     let parser_config_hash = canonical::canonical_sha256_hex(&serde_json::json!({
         "documentTimeoutSeconds": document_timeout_seconds,
         "extractionFlags": format!("{EXTRACTION_FLAGS:?}"),
@@ -144,6 +146,7 @@ impl OwnedChild {
         timeout: Duration,
         stdout: &mut OutputCapture,
         stderr: &mut OutputCapture,
+        poll_interval: Duration,
     ) -> Result<(ExitStatus, bool)> {
         let started = Instant::now();
         loop {
@@ -163,7 +166,7 @@ impl OwnedChild {
                     );
                     return self.stop().map(|status| (status, true));
                 }
-                None => thread::sleep(PROCESS_POLL_INTERVAL),
+                None => thread::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed()))),
             }
         }
     }
@@ -214,6 +217,7 @@ impl Drop for OwnedChild {
 /// Parent-owned, nonblocking capture requires no reader thread that could outlive
 /// child termination. Only the parent's socket endpoint is made nonblocking.
 struct OutputCapture {
+    parsing: ParsingLimits,
     stream: UnixStream,
     label: &'static str,
     captured: Vec<u8>,
@@ -223,7 +227,7 @@ struct OutputCapture {
 
 impl OutputCapture {
     /// Prepare both endpoints before spawning native work, preserving blocking child writes.
-    fn new(label: &'static str) -> Result<(Self, Stdio)> {
+    fn new(label: &'static str, parsing: ParsingLimits) -> Result<(Self, Stdio)> {
         let (reader, writer) =
             UnixStream::pair().with_context(|| format!("create MuPDF {label} capture socket"))?;
         reader
@@ -231,6 +235,7 @@ impl OutputCapture {
             .with_context(|| format!("make MuPDF {label} capture nonblocking"))?;
         Ok((
             Self {
+                parsing,
                 stream: reader,
                 label,
                 captured: Vec::new(),
@@ -244,8 +249,14 @@ impl OutputCapture {
     /// Limit each drain turn so even continuous output cannot starve the document deadline.
     /// Bytes beyond the retained allowance are consumed, keeping the child unblocked.
     fn drain_available(&mut self) -> Result<()> {
-        let mut buffer = [0_u8; 8192];
-        for _ in 0..(BUNDLE_STREAM_LOG_CAP_BYTES / buffer.len()) {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(self.parsing.process_read_chunk_bytes)
+            .context("allocate MuPDF output read buffer")?;
+        buffer.resize(self.parsing.process_read_chunk_bytes, 0);
+        // One drain turn remains finite even when read chunks exceed the retained
+        // capture budget; zero iterations would leave the child pipe undrained.
+        for _ in 0..self.parsing.process_log_bytes.div_ceil(buffer.len()) {
             if self.eof {
                 break;
             }
@@ -262,8 +273,11 @@ impl OutputCapture {
                 }
             };
             self.observed_bytes += count;
-            let retained =
-                count.min(BUNDLE_STREAM_LOG_CAP_BYTES.saturating_sub(self.captured.len()));
+            let retained = count.min(
+                self.parsing
+                    .process_log_bytes
+                    .saturating_sub(self.captured.len()),
+            );
             self.captured.extend_from_slice(&buffer[..retained]);
         }
         Ok(())
@@ -299,14 +313,19 @@ impl OutputCapture {
 
 /// Run the same executable in extraction-only mode and poll its output synchronously.
 /// Parent-owned nonblocking reads remain bounded even if process cleanup fails.
-fn extract_in_child(input: &Path, output: &Path, timeout_seconds: u64) -> Result<ProcessOutput> {
+fn extract_in_child(
+    input: &Path,
+    output: &Path,
+    timeout_seconds: u64,
+    parsing: &ParsingLimits,
+) -> Result<ProcessOutput> {
     let started = Instant::now();
     let executable = env::current_exe().context("resolve MuPDF worker executable")?;
     info!(event = "mupdf.process.starting", executable_path = %executable.display(),
         source_path = %input.display(), output_path = %output.display(), timeout_seconds,
         "MuPDF extraction child starting");
-    let (mut stdout, child_stdout) = OutputCapture::new("stdout")?;
-    let (mut stderr, child_stderr) = OutputCapture::new("stderr")?;
+    let (mut stdout, child_stdout) = OutputCapture::new("stdout", *parsing)?;
+    let (mut stderr, child_stderr) = OutputCapture::new("stderr", *parsing)?;
     let child = Command::new(&executable)
         .arg(WORKER_FLAG)
         .arg(input)
@@ -329,6 +348,7 @@ fn extract_in_child(input: &Path, output: &Path, timeout_seconds: u64) -> Result
         Duration::from_secs(timeout_seconds),
         &mut stdout,
         &mut stderr,
+        Duration::from_millis(parsing.mupdf_poll_ms),
     )?;
     info!(event = "mupdf.process.wait_completed", process_id, status = %status, timed_out,
         elapsed_ms = started.elapsed().as_millis() as u64, "MuPDF child exit confirmed");
@@ -348,7 +368,7 @@ fn extract_in_child(input: &Path, output: &Path, timeout_seconds: u64) -> Result
 /// Stage producer successes and failures alike; only staging-infrastructure errors escape.
 pub(crate) fn run_pdf_parse(
     timeout_seconds: u64,
-    index_root: &Path,
+    index_root: &StorageContext,
     source: &Path,
     source_id: &str,
     source_hash: &str,
@@ -374,7 +394,7 @@ pub(crate) fn run_pdf_parse(
 /// Own the bundle separately from producer work so failed extraction/mapping remains inspectable.
 fn stage_parse(
     timeout_seconds: u64,
-    index_root: &Path,
+    index_root: &StorageContext,
     source: &Path,
     source_id: &str,
     source_hash: &str,
@@ -392,13 +412,19 @@ fn stage_parse(
             source_id: source_id.to_owned(),
             source_hash: source_hash.to_owned(),
         },
+        *index_root.limits(),
     )?;
     let raw_dir = writer.parser_raw_dir()?;
     let raw_path = raw_dir.join(RAW_FILE_NAME);
     let mut process = None;
     let mut cleanup_report = None;
     let mapped = (|| -> Result<MappedDocument> {
-        process = Some(extract_in_child(source, &raw_path, timeout_seconds)?);
+        process = Some(extract_in_child(
+            source,
+            &raw_path,
+            timeout_seconds,
+            &index_root.limits().parsing,
+        )?);
         let output = process.as_ref().context("MuPDF process outcome missing")?;
         if output.timed_out || !output.status.success() {
             bail!(
@@ -406,8 +432,14 @@ fn stage_parse(
                 output.status,
                 output.timed_out,
                 timeout_seconds,
-                truncate_diagnostic_text(&String::from_utf8_lossy(&output.stdout)),
-                truncate_diagnostic_text(&String::from_utf8_lossy(&output.stderr))
+                truncate_diagnostic_text(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &index_root.limits().diagnostics
+                ),
+                truncate_diagnostic_text(
+                    &String::from_utf8_lossy(&output.stderr),
+                    &index_root.limits().diagnostics
+                )
             );
         }
         info!(event = "parse.mupdf_worker.raw_read_started", raw_path = %raw_path.display(),
@@ -423,7 +455,11 @@ fn stage_parse(
             cleanup_version = mupdf_cleanup::CLEANUP_VERSION,
             "MuPDF text cleanup starting"
         );
-        let cleaned = mupdf_cleanup::clean_document(&document).context("clean MuPDF text")?;
+        let cleaned = mupdf_cleanup::clean_document(
+            &document,
+            index_root.limits().parsing.cleanup_regex_backtrack_limit,
+        )
+        .context("clean MuPDF text")?;
         info!(
             event = "parse.mupdf_worker.cleanup_completed",
             source_id,
@@ -486,7 +522,10 @@ fn stage_parse(
                 elapsed_ms = started.elapsed().as_millis() as u64, "MuPDF producer failed");
             (
                 ParserExecutionStatus::Failed,
-                Some(truncate_persisted_detail(&detail)),
+                Some(truncate_persisted_detail(
+                    &detail,
+                    &index_root.limits().diagnostics,
+                )),
                 empty_metrics(),
             )
         }

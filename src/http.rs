@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::maintenance::MaintenancePermit;
 use crate::util::LogContext;
+use crate::{limits::DiagnosticLimits, runtime::StorageContext};
 
 use crate::assembly::model::EvidencePack;
 use crate::inference::ColbertCandidateScore;
@@ -29,7 +30,7 @@ use crate::query::annotation::ScoredExcerpt;
 use crate::query::execute::{QueryPipelineOutcome, QueryRequestContext, execute_query};
 use crate::query::model::RetrievalHit;
 use crate::query::passages::{PassageCandidate, SearchResult};
-use crate::query::profile::{ScopeInput, active_profile, resolve_scope};
+use crate::query::profile::{ScopeInput, resolve_scope};
 use crate::query::request::{QueryRequest, ValidatedQuery};
 use crate::query::rerank::PassageScore;
 
@@ -50,20 +51,27 @@ const BEARER_PREFIX: &str = "Bearer ";
 /// Preserve Axum's path response contract while recording pre-handler failures.
 struct DiagnosticPath<T>(T);
 
-impl<S, T> FromRequestParts<S> for DiagnosticPath<T>
+impl<T> FromRequestParts<Arc<AppState>> for DiagnosticPath<T>
 where
-    S: Send + Sync,
     T: DeserializeOwned + Send,
 {
     type Rejection = PathRejection;
 
     /// Forward Axum's original rejection so its status and body remain unchanged.
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
         Path::<T>::from_request_parts(parts, state)
             .await
             .map(|Path(value)| Self(value))
             .inspect_err(|rejection| {
-                log_extraction_failed("path_extraction", rejection, rejection.status())
+                log_extraction_failed(
+                    "path_extraction",
+                    rejection,
+                    rejection.status(),
+                    &state.config.diagnostics,
+                )
             })
     }
 }
@@ -71,20 +79,27 @@ where
 /// Preserve direct query extraction while attributing failures to the request.
 struct DiagnosticQuery<T>(T);
 
-impl<S, T> FromRequestParts<S> for DiagnosticQuery<T>
+impl<T> FromRequestParts<Arc<AppState>> for DiagnosticQuery<T>
 where
-    S: Send + Sync,
     T: DeserializeOwned + Send,
 {
     type Rejection = QueryRejection;
 
     /// Log the cause without consuming, rewriting, or replacing Axum's rejection.
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
         Query::<T>::from_request_parts(parts, state)
             .await
             .map(|Query(value)| Self(value))
             .inspect_err(|rejection| {
-                log_extraction_failed("query_extraction", rejection, rejection.status())
+                log_extraction_failed(
+                    "query_extraction",
+                    rejection,
+                    rejection.status(),
+                    &state.config.diagnostics,
+                )
             })
     }
 }
@@ -94,14 +109,28 @@ fn log_extraction_failed(
     stage: &'static str,
     rejection: &dyn std::error::Error,
     status: StatusCode,
+    diagnostics: &DiagnosticLimits,
 ) {
-    let error_chain = crate::util::error_chain(rejection);
+    let error_chain = crate::util::error_chain(rejection, diagnostics);
+    let reason = crate::util::truncate_diagnostic_text(&rejection.to_string(), diagnostics);
     if status.is_server_error() {
-        error!(event = "http.extraction.failed", stage, status = status.as_u16(),
-            reason = %rejection, error_chain, "HTTP request extraction failed");
+        error!(
+            event = "http.extraction.failed",
+            stage,
+            status = status.as_u16(),
+            reason,
+            error_chain,
+            "HTTP request extraction failed"
+        );
     } else {
-        warn!(event = "http.extraction.failed", stage, status = status.as_u16(),
-            reason = %rejection, error_chain, "HTTP request extraction rejected");
+        warn!(
+            event = "http.extraction.failed",
+            stage,
+            status = status.as_u16(),
+            reason,
+            error_chain,
+            "HTTP request extraction rejected"
+        );
     }
 }
 
@@ -158,7 +187,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             storage_admission,
         ))
-        .layer(middleware::from_fn(request_diagnostics))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            request_diagnostics,
+        ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
@@ -196,14 +228,21 @@ pub fn build_dry_run_router(state: Arc<AppState>) -> Router {
         .route("/annotations/vocabulary", get(get_annotation_vocabulary))
         .route("/shutdown", post(post_shutdown))
         .route("/operations/{operationId}", get(get_operation))
-        .layer(middleware::from_fn(request_diagnostics))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            request_diagnostics,
+        ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
 
 /// Correlate admission, extractor rejection, blocking work, and response rendering.
 /// Instrument the future instead of entering a span across an async suspension.
-async fn request_diagnostics(request: Request, next: Next) -> Response {
+async fn request_diagnostics(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let request_id = crate::ids::new_request_id();
     let context = LogContext::new("request", &request_id);
     context.record("trigger", "http_request");
@@ -220,7 +259,17 @@ async fn request_diagnostics(request: Request, next: Next) -> Response {
     context
         .instrument(async move {
             let started = Instant::now();
-            let response = next.run(request).await;
+            let mut response = next.run(request).await;
+            // Only our typed errors are rendered again. Foreign responses retain
+            // their original status/body; no JSON probing or inferred error cause.
+            if let Some(cause) = response.extensions_mut().remove::<Arc<ApiError>>() {
+                let bounded = render_configured_api_error(&cause, &state.config.diagnostics);
+                // A bounded body has its own length; unrelated response headers remain intact.
+                response
+                    .headers_mut()
+                    .remove(axum::http::header::CONTENT_LENGTH);
+                *response.body_mut() = bounded.into_body();
+            }
             // This records response construction, not successful delivery to a client.
             // Extractor failures can bypass handlers, so this boundary covers them too.
             if response.status().is_server_error() {
@@ -344,7 +393,7 @@ async fn post_rebuild_all(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/rebuild-all";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
     let reserve_state = Arc::clone(&state);
     let operation_id = spawn_blocking_with_context(move || crate::reset::reserve(&reserve_state))
@@ -366,7 +415,7 @@ async fn post_rebuild_all(
 
 /// Return service readiness and startup diagnostics.
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let started = log_route_started("/v1/health", "health_reading");
+    let started = log_route_started("/v1/health", "health_reading", state.config.diagnostics);
     let response = state.health();
     debug!(
         event = "http.route.result_ready",
@@ -382,9 +431,34 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(response)
 }
 
+/// Timing and configured diagnostics follow a request or detached operation across its boundaries.
+struct RouteContext {
+    started: Instant,
+    diagnostics: DiagnosticLimits,
+}
+
+impl RouteContext {
+    /// Copy immutable diagnostic settings before ownership moves into blocking work.
+    fn new(diagnostics: DiagnosticLimits) -> Self {
+        Self {
+            started: Instant::now(),
+            diagnostics,
+        }
+    }
+
+    /// Keep elapsed measurements rooted at the original operation boundary.
+    fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
 /// Log the accepted boundary for one route-specific HTTP request.
-fn log_route_started(route: &'static str, stage: &'static str) -> Instant {
-    let started = Instant::now();
+fn log_route_started(
+    route: &'static str,
+    stage: &'static str,
+    diagnostics: DiagnosticLimits,
+) -> RouteContext {
+    let started = RouteContext::new(diagnostics);
     // Polling traces belong at DEBUG; query and admin lifecycle starts remain INFO.
     if matches!(
         route,
@@ -417,63 +491,89 @@ struct ErrorBody {
 }
 
 impl IntoResponse for ApiError {
-    /// Render service errors as explicit JSON API responses.
+    /// Preserve a typed cause until outer middleware applies the request's configured diagnostics.
     fn into_response(self) -> Response {
-        let error_kind = self.error_kind();
-        let message = self.to_string();
-        let error_chain = crate::util::error_chain(&self);
-        let mut detail = self.operation_error_detail();
-        // status_u16 only emits valid HTTP status codes; a conversion failure is
-        // a programming error surfaced as a logged 500 instead of a panic.
+        let error = Arc::new(self);
+        let mut detail = error.operation_error_detail();
         let status = match StatusCode::from_u16(detail.status) {
             Ok(status) => status,
             Err(source) => {
-                error!(
-                    event = "api.error_status_invalid",
-                    status = detail.status,
-                    error = %source,
-                    "API error status conversion failed"
-                );
-                // Keep the JSON body consistent with the HTTP status actually sent.
+                error!(event = "api.error_status_invalid", status = detail.status, error = %source,
+                    "API error status conversion failed");
                 detail.status = 500;
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-        // Central response logging guarantees every failed HTTP request is
-        // visible even when the failing stage returned before its completion log.
-        if status.is_server_error() {
-            error!(
-                event = "api.error_response",
-                status = status.as_u16(),
-                error_kind,
-                error = %message,
-                error_chain,
-                stage = "error_response_rendering",
-                "API error response constructed; work outcome is recorded at its owning boundary"
-            );
-        } else {
-            warn!(
-                event = "api.error_response",
-                status = status.as_u16(),
-                error_kind,
-                error = %message,
-                error_chain,
-                stage = "error_response_rendering",
-                "API error response constructed"
-            );
-        }
-        let body = ErrorBody { error: detail };
-
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(ErrorBody { error: detail })).into_response();
+        // Extensions are internal transport state and never part of the wire body.
+        response.extensions_mut().insert(error);
+        response
     }
 }
 
+/// Apply configured response and diagnostic bounds where request state is available.
+fn render_configured_api_error(error: &ApiError, diagnostics: &DiagnosticLimits) -> Response {
+    let error_kind = error.error_kind();
+    let message = crate::util::truncate_diagnostic_text(&error.to_string(), diagnostics);
+    let error_chain = crate::util::error_chain(error, diagnostics);
+    let mut detail = error.operation_error_detail();
+    detail.message = message.clone();
+    // status_u16 only emits valid HTTP status codes; a conversion failure is
+    // a programming error surfaced as a logged 500 instead of a panic.
+    let status = match StatusCode::from_u16(detail.status) {
+        Ok(status) => status,
+        Err(source) => {
+            error!(
+                event = "api.error_status_invalid",
+                status = detail.status,
+                error = %source,
+                "API error status conversion failed"
+            );
+            // Keep the JSON body consistent with the HTTP status actually sent.
+            detail.status = 500;
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    // Central response logging guarantees every failed HTTP request is
+    // visible even when the failing stage returned before its completion log.
+    if status.is_server_error() {
+        error!(
+            event = "api.error_response",
+            status = status.as_u16(),
+            error_kind,
+            error = %message,
+            error_chain,
+            stage = "error_response_rendering",
+            "API error response constructed; work outcome is recorded at its owning boundary"
+        );
+    } else {
+        warn!(
+            event = "api.error_response",
+            status = status.as_u16(),
+            error_kind,
+            error = %message,
+            error_chain,
+            stage = "error_response_rendering",
+            "API error response constructed"
+        );
+    }
+    let body = ErrorBody { error: detail };
+
+    (status, Json(body)).into_response()
+}
+
 /// Log a route-local failure before the shared API error renderer loses route context.
-fn log_route_failed(route: &'static str, stage: &'static str, error: &ApiError, started: &Instant) {
+fn log_route_failed(
+    route: &'static str,
+    stage: &'static str,
+    error: &ApiError,
+    started: &RouteContext,
+) {
     let status = error.status_u16();
     let error_kind = error.error_kind();
-    let error_message = error.to_string();
-    let error_chain = crate::util::error_chain(error);
+    let error_message =
+        crate::util::truncate_diagnostic_text(&error.to_string(), &started.diagnostics);
+    let error_chain = crate::util::error_chain(error, &started.diagnostics);
     if status >= 500 {
         error!(
             event = "http.route.failed",
@@ -662,7 +762,7 @@ async fn post_query(
     payload: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let route = "/query";
-    let started = log_route_started(route, "request_decoding");
+    let started = log_route_started(route, "request_decoding", state.config.diagnostics);
 
     // Decode: normalize the axum JSON rejection into this service's error shape
     // (413 for body-too-large, 400 otherwise) exactly like the control route.
@@ -682,17 +782,8 @@ async fn post_query(
         "query request decoded"
     );
 
-    // Validate against the sealed retrieval profile and the server query-length
-    // cap. `active_profile()` is the FIRST functional profile read on this path;
-    // `max_search_query_chars` is this request layer's first functional reader of
-    // that config key. A validation failure is a client boundary (field + cap).
-    let profile = match active_profile() {
-        Ok(profile) => profile,
-        Err(error) => {
-            log_route_failed(route, "profile_sealing", &error, &started);
-            return Err(error);
-        }
-    };
+    // Validation and execution borrow the same immutable profile sealed at startup.
+    let profile = &state.storage.settings().retrieval_profile;
     let max_search_query_chars = state.config.server.max_search_query_chars;
     let validated = match request.validate(profile, max_search_query_chars) {
         Ok(validated) => validated,
@@ -796,11 +887,11 @@ fn run_query_pipeline(
 
     let inference = state.inference()?;
     let gate = state.model_call_gate_handle();
-    let index_root = state.config.storage.index_root.as_path();
+    let index_root = &state.storage;
     // The runtime ColBERT projection width the multivector decoder validates
     // against, threaded from config exactly as the build path does (§scheduler).
     let colbert_expected_dimension = state.config.models.colbert.dimension as usize;
-    let profile = active_profile()?;
+    let profile = &state.storage.settings().retrieval_profile;
 
     let request_ctx = QueryRequestContext {
         max_final_evidence_units: validated.max_final_evidence_units,
@@ -862,7 +953,7 @@ fn authorize_request(
     state: &AppState,
     headers: &HeaderMap,
     route: &'static str,
-    started: &Instant,
+    started: &RouteContext,
 ) -> Result<(), ApiError> {
     let token = match bearer_token_from_headers(headers) {
         Ok(token) => token,
@@ -894,12 +985,12 @@ struct OperationAcceptedBody {
 /// is awaited here, unlike the detached work task. `insert_pending` opens its own
 /// write connection (operations-store contract).
 async fn insert_pending_operation(
-    index_root: std::path::PathBuf,
+    index_root: StorageContext,
     operation_type: OperationType,
     target_object_type: &'static str,
     target_object_id: String,
 ) -> Result<String, ApiError> {
-    let started = Instant::now();
+    let started = RouteContext::new(index_root.limits().diagnostics);
     let context = LogContext::current();
     context.record("target_object_type", target_object_type);
     context.record("target_object_id", target_object_id.as_str());
@@ -922,7 +1013,7 @@ async fn insert_pending_operation(
         Ok(operation_id) => context.record("operation_id", operation_id.as_str()),
         Err(source) => error!(event = "http.operation_insert.failed",
             stage = "insert_pending_operation", error = %source,
-            error_chain = %crate::util::error_chain(source),
+            error_chain = %crate::util::error_chain(source, &started.diagnostics),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "operation acceptance failed; no operation ID returned"),
     }
@@ -945,7 +1036,7 @@ async fn insert_pending_operation(
 /// state plus this log line are the record.
 fn spawn_admin_operation<F>(
     permit: MaintenancePermit,
-    index_root: std::path::PathBuf,
+    index_root: StorageContext,
     operation_id: String,
     operation_type: &'static str,
     work: F,
@@ -956,7 +1047,7 @@ fn spawn_admin_operation<F>(
         // The HTTP response may already be gone; retain admission through the
         // terminal Operation write so rebuild-all cannot erase this task's data.
         let _permit = permit;
-        let started = Instant::now();
+        let started = RouteContext::new(index_root.limits().diagnostics);
         // pending → running. A failure here means the row vanished or was already
         // advanced; there is nowhere to surface it (detached task), so log and stop
         // — running the work without a running row would break the audit contract.
@@ -1016,7 +1107,7 @@ fn spawn_admin_operation<F>(
                     status = error.status_u16(),
                     error_kind = error.error_kind(),
                     error = %error,
-                    error_chain = %crate::util::error_chain(&error),
+                    error_chain = %crate::util::error_chain(&error, &started.diagnostics),
                     last_confirmed_operation_status = "running",
                     work_effects = "see_domain_boundary_logs",
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1031,7 +1122,8 @@ fn spawn_admin_operation<F>(
                 );
             }
             Err(panic) => {
-                let panic_message = panic_message(panic.as_ref());
+                let panic_message =
+                    crate::util::panic_payload_message(panic.as_ref(), &started.diagnostics);
                 error!(
                     event = "operation.task.panicked",
                     operation_type,
@@ -1057,10 +1149,10 @@ fn spawn_admin_operation<F>(
 /// double-fault if the mark itself fails (there is nowhere else to surface it).
 fn mark_operation_failed(
     operation_type: &'static str,
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     operation_id: &str,
     detail: &str,
-    started: &Instant,
+    started: &RouteContext,
 ) {
     if let Err(error) = crate::operations::mark_failed(index_root, operation_id, detail) {
         log_terminal_mark_failure(operation_type, operation_id, "mark_failed", &error, started);
@@ -1074,7 +1166,7 @@ fn log_terminal_mark_failure(
     operation_id: &str,
     stage: &'static str,
     error: &ApiError,
-    started: &Instant,
+    started: &RouteContext,
 ) {
     error!(
         event = "operation.task.terminal_mark_failed",
@@ -1084,26 +1176,13 @@ fn log_terminal_mark_failure(
         status = error.status_u16(),
         error_kind = error.error_kind(),
         error = %error,
-        error_chain = %crate::util::error_chain(error),
+        error_chain = %crate::util::error_chain(error, &started.diagnostics),
         last_confirmed_operation_status = "running",
         terminal_operation_status = "unknown",
         next_action = "inspect_operation_and_domain_boundary_logs",
         elapsed_ms = started.elapsed().as_millis() as u64,
         "detached admin operation terminal transition failed"
     );
-}
-
-/// Extract a bounded, human-readable message from a caught panic payload. Only
-/// the panic's own string is surfaced (never captured local state), and it is
-/// bounded before persistence by `mark_failed`.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
-    }
 }
 
 /// Read one parse run's owning source id on a fresh read connection, for the
@@ -1115,7 +1194,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 const SELECT_PARSE_RUN_SOURCE_SQL: &str = "SELECT source_id FROM parse_runs WHERE id = ?1";
 
 fn lookup_source_id_for_parse(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     parse_run_id: &str,
 ) -> Result<String, ApiError> {
     let connection = crate::hot_plane::open_read(index_root)?;
@@ -1145,6 +1224,21 @@ struct IngestRequest {
     native_uri: String,
 }
 
+impl IngestRequest {
+    /// Reject oversized source coordinates before recording paths, opening SQLite, or accepting work.
+    fn validate_reference_length(&self, max_chars: u32) -> Result<(), ApiError> {
+        let chars = self.native_uri.chars().count();
+        if chars > max_chars as usize {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "nativeUri contains {chars} characters, exceeding server.max_ingest_source_chars {max_chars}"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Handle `POST /sources` (§34, `source_ingest`): QUEUE-COUPLED. Writes a
 /// `pending` Operation, enqueues the ingest coordinate with the operation id
 /// threaded into `sync_queue.operation_id`, and returns the id. The DRAIN owns
@@ -1156,10 +1250,13 @@ async fn post_sources(
     payload: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/sources";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
+    request
+        .validate_reference_length(state.config.server.max_ingest_source_chars)
+        .inspect_err(|error| log_route_failed(route, "coordinate_validating", error, &started))?;
     LogContext::current().record("source_paths", request.native_uri.as_str());
 
     // Lexical containment prescreen (ruled 2026-07-17): a nativeUri that is
@@ -1177,7 +1274,7 @@ async fn post_sources(
         return Err(error);
     }
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let native_uri = request.native_uri.clone();
 
     // pending row first (target = the source coordinate), then enqueue with the
@@ -1237,7 +1334,7 @@ LIMIT 1";
 ///
 /// Discloses only ids/URIs the caller already supplied.
 fn validate_parse_coordinate(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     source_id: &str,
     source_system: &str,
     native_uri: &str,
@@ -1296,12 +1393,15 @@ async fn post_source_parses(
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/sources/{sourceId}/parses";
     LogContext::current().record("source_id", source_id.as_str());
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
+    request
+        .validate_reference_length(state.config.server.max_ingest_source_chars)
+        .inspect_err(|error| log_route_failed(route, "coordinate_validating", error, &started))?;
     LogContext::current().record("source_paths", request.native_uri.as_str());
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
 
     // Operation targetObjectId integrity (Option 1 ruling 2026-07-16): the path
     // source id becomes the Operation target below, so the body coordinate must
@@ -1372,13 +1472,13 @@ async fn post_source_parses(
 /// advanced through `running` first). Only after that does the request error
 /// return to the client.
 async fn enqueue_ingest(
-    index_root: std::path::PathBuf,
+    index_root: StorageContext,
     source_system: String,
     native_uri: String,
     reason: &'static str,
     operation_id: &str,
     route: &'static str,
-    started: &Instant,
+    started: &RouteContext,
 ) -> Result<(), ApiError> {
     let enqueue_index_root = index_root.clone();
     let enqueue_operation_id = operation_id.to_owned();
@@ -1410,7 +1510,7 @@ async fn enqueue_ingest(
 /// on its own blocking boundary: a store fault here is logged and dropped — the
 /// enqueue error is already the client's response, and the durable record is the
 /// Operation row's last state plus this log.
-async fn fail_orphaned_operation(index_root: std::path::PathBuf, operation_id: &str, detail: &str) {
+async fn fail_orphaned_operation(index_root: StorageContext, operation_id: &str, detail: &str) {
     let operation_id = operation_id.to_owned();
     let detail = detail.to_owned();
     // Await within the cancellation-shielded HTTP task so its storage lease
@@ -1456,10 +1556,10 @@ async fn post_activate(
     let route = "/sources/{sourceId}/parses/{parseId}/activate";
     LogContext::current().record("source_id", source_id.as_str());
     LogContext::current().record("parse_id", parse_id.as_str());
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let operation_id = insert_pending_operation(
         index_root.clone(),
         OperationType::ParseActivation,
@@ -1510,10 +1610,10 @@ async fn post_accept(
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/parses/{parseId}/accept";
     LogContext::current().record("parse_id", parse_id.as_str());
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let operation_id = insert_pending_operation(
         index_root.clone(),
         OperationType::ParseActivation,
@@ -1567,10 +1667,10 @@ async fn post_discard(
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/parses/{parseId}/discard";
     LogContext::current().record("parse_id", parse_id.as_str());
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let operation_id = insert_pending_operation(
         index_root.clone(),
         OperationType::ParseDiscard,
@@ -1635,11 +1735,11 @@ async fn post_snapshots(
     payload: Result<Json<SnapshotRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/snapshots";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let snapshot_type = if request.incident {
         SnapshotType::Incident
     } else {
@@ -1707,11 +1807,11 @@ async fn post_restore(
     payload: Result<Json<RestoreRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
     let route = "/restore";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     let Json(request) = decode_body(route, payload, &started)?;
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let source_id = request.source_id.clone();
     let parse_id = request.parse_id.clone();
     let operation_id = insert_pending_operation(
@@ -1766,7 +1866,7 @@ async fn post_shutdown(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let route = "/shutdown";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     if let Err(error) = state.request_shutdown() {
@@ -1794,7 +1894,7 @@ async fn post_shutdown(
 /// propagates so the task records the operation `failed` (§31.2 halt/retain, no
 /// auto-retry).
 fn drive_activation_cleanup(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     source_id: &str,
     activated_parse_id: &str,
     decision: &crate::activation::ActivationDecision,
@@ -1830,7 +1930,7 @@ fn drive_activation_cleanup(
 /// (Ruling 1), gating over each candidate's own pre_activation snapshot. Mirrors
 /// the scheduler's post-barrier held cleanup. Normally empty or one id.
 fn clean_superseded_held(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     source_id: &str,
     superseded_held_ids: &[String],
 ) -> Result<(), ApiError> {
@@ -1850,7 +1950,7 @@ fn log_operation_accepted(
     route: &'static str,
     operation_type: &'static str,
     operation_id: &str,
-    started: &Instant,
+    started: &RouteContext,
 ) {
     info!(
         event = "operation.accepted",
@@ -1869,7 +1969,7 @@ fn log_operation_accepted(
 fn decode_body<T>(
     route: &'static str,
     payload: Result<Json<T>, JsonRejection>,
-    started: &Instant,
+    started: &RouteContext,
 ) -> Result<Json<T>, ApiError> {
     payload.map_err(|rejection| {
         let error = json_rejection_to_api_error(rejection);
@@ -1920,7 +2020,7 @@ async fn get_parses(
     headers: HeaderMap,
 ) -> Result<Json<HeldParsesResponse>, ApiError> {
     let route = "/parses";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     // Only after successful auth do we examine the query extractor result, so a
@@ -1945,7 +2045,7 @@ async fn get_parses(
         return Err(error);
     }
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let parses = spawn_blocking_with_context(move || read_held_parses(&index_root))
         .await
         .map_err(|join_error| ApiError::InternalIo {
@@ -1970,7 +2070,7 @@ async fn get_parses(
 /// column-string fields (status, held_reason, and the JSON payload columns) are
 /// re-typed through their model shapes in `parse_run_from_row`, so a corrupt
 /// persisted value fails loudly rather than being served wrong.
-fn read_held_parses(index_root: &std::path::Path) -> Result<Vec<ParseRun>, ApiError> {
+fn read_held_parses(index_root: &StorageContext) -> Result<Vec<ParseRun>, ApiError> {
     let connection = crate::hot_plane::open_read(index_root)?;
     let mut statement = connection
         .prepare(SELECT_HELD_PARSES_SQL)
@@ -2214,7 +2314,7 @@ async fn get_annotation_vocabulary(
     headers: HeaderMap,
 ) -> Result<Json<VocabularyResponse>, ApiError> {
     let route = "/annotations/vocabulary";
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
     // Only after auth do we examine the query extractor result (auth-first).
@@ -2256,7 +2356,7 @@ async fn get_annotation_vocabulary(
         }
     };
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let response =
         spawn_blocking_with_context(move || read_vocabulary(&index_root, annotation_type, scope))
             .await
@@ -2317,7 +2417,7 @@ async fn get_annotation_vocabulary(
 /// the handler runs it in `spawn_blocking`). Maps the aggregation module's typed
 /// result into the camelCase wire DTOs.
 fn read_vocabulary(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     annotation_type: crate::model::SemanticAnnotationType,
     scope: crate::annotations::vocabulary::VocabularyScope,
 ) -> Result<VocabularyResponse, ApiError> {
@@ -2435,7 +2535,7 @@ WHERE id = ?1
 /// Read one active-parse-gated ContentUnit into the model shape; `None` when no
 /// such active unit exists (absent, or its parse is not active — §14).
 fn read_active_unit(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     unit_id: &str,
 ) -> Result<Option<ContentUnit>, ApiError> {
     let connection = crate::hot_plane::open_read(index_root)?;
@@ -2553,7 +2653,7 @@ ORDER BY r.sequence_index, r.id";
 /// Returns `None` when the anchor unit is not served under §14 (absent or its
 /// parse is not active), so the handler maps that to 404 — matching the unit read.
 fn read_active_unit_relationships(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     unit_id: &str,
     direction: RelationshipDirection,
     relationship_type: Option<&str>,
@@ -2670,7 +2770,7 @@ ORDER BY source_system, native_uri";
 /// source id is absent. Locations carry freshness (last_seen_at) and status, so
 /// the assembled SourceObject is the §10 inspection view.
 fn read_source(
-    index_root: &std::path::Path,
+    index_root: &StorageContext,
     source_id: &str,
 ) -> Result<Option<SourceObject>, ApiError> {
     let connection = crate::hot_plane::open_read(index_root)?;
@@ -2839,10 +2939,10 @@ async fn get_operation(
 ) -> Result<Json<Operation>, ApiError> {
     let route = "/operations/{operationId}";
     LogContext::current().record("operation_id", operation_id.as_str());
-    let started = log_route_started(route, "authorizing");
+    let started = log_route_started(route, "authorizing", state.config.diagnostics);
     authorize_request(&state, &headers, route, &started)?;
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let lookup_id = operation_id.clone();
     let operation =
         spawn_blocking_with_context(move || crate::operations::get(&index_root, &lookup_id))
@@ -2885,9 +2985,9 @@ async fn get_unit(
     let route = "/units/{unitId}";
     LogContext::current().record("target_object_type", "unit");
     LogContext::current().record("target_object_id", unit_id.as_str());
-    let started = log_route_started(route, "reading");
+    let started = log_route_started(route, "reading", state.config.diagnostics);
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let lookup_id = unit_id.clone();
     let unit = spawn_blocking_with_context(move || read_active_unit(&index_root, &lookup_id))
         .await
@@ -2948,7 +3048,7 @@ async fn get_unit_relationships(
     let route = "/units/{unitId}/relationships";
     LogContext::current().record("target_object_type", "unit");
     LogContext::current().record("target_object_id", unit_id.as_str());
-    let started = log_route_started(route, "reading");
+    let started = log_route_started(route, "reading", state.config.diagnostics);
 
     let direction = match parse_direction(params.direction.as_deref()) {
         Ok(direction) => direction,
@@ -2957,7 +3057,7 @@ async fn get_unit_relationships(
             return Err(error);
         }
     };
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let lookup_id = unit_id.clone();
     let relationship_type = params.relationship_type.clone();
     let relationships = spawn_blocking_with_context(move || {
@@ -3004,9 +3104,9 @@ async fn get_source(
 ) -> Result<Json<SourceObject>, ApiError> {
     let route = "/sources/{sourceId}";
     LogContext::current().record("source_id", source_id.as_str());
-    let started = log_route_started(route, "reading");
+    let started = log_route_started(route, "reading", state.config.diagnostics);
 
-    let index_root = state.config.storage.index_root.clone();
+    let index_root = state.storage.clone();
     let lookup_id = source_id.clone();
     let source = spawn_blocking_with_context(move || read_source(&index_root, &lookup_id))
         .await
@@ -3074,7 +3174,7 @@ impl From<SyncHealth> for SyncStatusResponse {
 /// Handle `GET /sync/status` (§9.5–§9.6, public): the last-published sync
 /// scheduler health snapshot.
 async fn get_sync_status(State(state): State<Arc<AppState>>) -> Json<SyncStatusResponse> {
-    let started = log_route_started("/sync/status", "reading");
+    let started = log_route_started("/sync/status", "reading", state.config.diagnostics);
     let response = SyncStatusResponse::from(state.sync_health_snapshot());
     debug!(
         event = "http.route.result_ready",
@@ -3093,7 +3193,7 @@ fn not_found_logged(
     route: &'static str,
     stage: &'static str,
     message: String,
-    started: &Instant,
+    started: &RouteContext,
 ) -> ApiError {
     let error = ApiError::NotFound { message };
     log_route_failed(route, stage, &error, started);

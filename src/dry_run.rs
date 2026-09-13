@@ -39,7 +39,7 @@
 //! The worker's dedicated discovery loop is NOT reused (its
 //! item enumeration is private); this driver mirrors the call sequence directly.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tracing::{info, warn};
 
@@ -74,7 +74,7 @@ const SAMPLED_KINDS: [ProducerKind; 2] = [ProducerKind::Entity, ProducerKind::Re
 /// `InferenceRuntime` — which this mode never initializes by design.
 pub(crate) struct DryRunInputs {
     pub(crate) corpus_root: PathBuf,
-    pub(crate) index_root: PathBuf,
+    pub(crate) index_root: crate::runtime::StorageContext,
     pub(crate) governance_domain: String,
     /// The same startup-selected PDF producer used by ordinary ingestion.
     pub(crate) pdf: crate::parse::pdf::PdfParser,
@@ -159,7 +159,12 @@ pub(crate) fn run(
     // or an unbuildable client fails the mode loudly, because sampling IS the
     // mode's purpose (unlike the normal worker, where annotations are
     // non-critical and a client load failure only parks the worker).
-    let client = AnnotatorClient::load(&inputs.annotator, &inputs.config_root, cancellation)?;
+    let client = AnnotatorClient::load(
+        &inputs.annotator,
+        &inputs.config_root,
+        inputs.index_root.limits().diagnostics,
+        cancellation,
+    )?;
 
     // Phase 2: sample the first N section groups per source per type. Serial —
     // sampling is small (bounded by groups_per_source), so no wave machinery.
@@ -229,7 +234,7 @@ pub(crate) fn run(
 /// against the parse's existing annotation rows (content-scoped, CA2), exactly as
 /// the worker does, so a re-run of the mode does not duplicate work already done.
 fn sample_source(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     ready: &DryRunReadyParse,
@@ -311,7 +316,7 @@ fn sample_source(
 /// pass — a later run (this mode or the normal worker) retries the failed row.
 #[allow(clippy::too_many_arguments)]
 fn sample_item(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     client: &AnnotatorClient,
     ready: &DryRunReadyParse,
@@ -556,7 +561,7 @@ fn new_annotation_request(
 /// guarded transition, adopting a crash-orphaned `building` row as-is) or insert
 /// a new one. Mirrors `worker::reopen_or_insert_building`.
 fn reopen_or_insert_building(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &crate::sqlite::Transaction<'_>,
     reopened: Option<&ReopenableRow>,
     request: &NewAnnotation,
 ) -> Result<String, ApiError> {
@@ -578,7 +583,7 @@ fn reopen_or_insert_building(
 /// single-threaded, so a plain committed begin is correct).
 /// Returns false when cancellation discards the re-mint without a durable memo hit.
 fn remint_from_memo(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     request: &NewAnnotation,
     reopened: Option<&ReopenableRow>,
     entry: &memo::MemoEntry,
@@ -645,7 +650,7 @@ fn remint_from_memo(
 /// Returns false when cancellation discards output before its completion commits.
 #[allow(clippy::too_many_arguments)]
 fn complete_build(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
     kind: ProducerKind,
     request: &NewAnnotation,
@@ -729,7 +734,7 @@ fn complete_build(
 /// `worker::fail_build`.
 /// Returns false when cancellation prevents the failure from being persisted.
 fn fail_build(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     building_id: &str,
     producer_error: &ApiError,
     cancellation: &AnnotationCancellation,
@@ -737,7 +742,10 @@ fn fail_build(
     if sampling_cancelled(cancellation, "build_fail") {
         return Ok(false);
     }
-    let detail = crate::util::truncate_persisted_detail(&producer_error.to_string());
+    let detail = crate::util::truncate_persisted_detail(
+        &producer_error.to_string(),
+        &index_root.limits().diagnostics,
+    );
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "build_fail")?;
     let result = store::mark_failed(&tx, building_id, &detail);
@@ -769,7 +777,7 @@ fn sampling_cancelled(cancellation: &AnnotationCancellation, phase: &'static str
 /// Only a committed transaction may contribute to sampling success counters.
 /// Cancellation rolls back explicitly so the operator sees a confirmed outcome.
 fn commit_unless_cancelled(
-    tx: rusqlite::Transaction<'_>,
+    tx: crate::sqlite::Transaction<'_>,
     phase: &'static str,
     cancellation: &AnnotationCancellation,
 ) -> Result<bool, ApiError> {

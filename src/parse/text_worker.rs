@@ -47,14 +47,6 @@ pub(crate) const PLAIN_TEXT_PARSER_NAME: &str = "plain_text";
 /// creates net-new canonical graphs, spec §12 rule 3).
 pub(crate) const PLAIN_TEXT_PARSER_VERSION: &str = "2";
 
-/// Structural ceiling on candidate text blocks from one source (spec §12.1
-/// rule 5: parser execution has explicit resource bounds; §13.1: exceeded
-/// limits are a hard fault). A source splitting into more paragraphs than
-/// this fails the parse as a recorded outcome instead of staging an
-/// unbounded bundle. Same ceiling family the importer enforces at §13.1
-/// validation.
-pub(crate) const MAX_CANDIDATE_TEXT_BLOCKS: u64 = 999_999;
-
 /// Wire name of the char-range locator kind (spec §17), as declared in the
 /// capability profile's `emitsLocatorKinds`. Must stay in sync with the
 /// serde `kind` tag of `Locator::CharRange`.
@@ -63,6 +55,8 @@ const LOCATOR_KIND_CHAR_RANGE: &str = "char_range";
 /// Bind splitting and cleanup rules to parse identity so changed text cannot
 /// silently reuse a parse produced under an older cleanup version.
 fn plain_text_config_hash() -> Result<String, ApiError> {
+    // Resource admission changes do not alter successful parsed content and
+    // must not invalidate accepted sources or trigger automatic reannotation.
     canonical::canonical_sha256_hex(&serde_json::json!({
         "paragraphSplit": "blank_line", "cleanupVersion": cleanup::CLEANUP_VERSION
     }))
@@ -126,7 +120,7 @@ struct TextParseOutcome {
 /// terminal success with counts, recorded parse failure, and workspace
 /// fault, each with elapsed time.
 pub(crate) fn run_text_parse(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_absolute_path: &Path,
     source_id: &str,
     source_hash: &str,
@@ -192,7 +186,7 @@ pub(crate) fn run_text_parse(
 /// read and decode the source, split paragraphs, stream candidate units and
 /// precedes relationships, and seal the bundle with outcome and metrics.
 fn run_text_parse_inner(
-    index_root: &Path,
+    index_root: &crate::runtime::StorageContext,
     source_absolute_path: &Path,
     source_id: &str,
     source_hash: &str,
@@ -211,7 +205,11 @@ fn run_text_parse_inner(
         source_id: source_id.to_string(),
         source_hash: source_hash.to_string(),
     };
-    let mut writer = BundleWriter::create(&parse_staging_root(index_root), identity)?;
+    let mut writer = BundleWriter::create(
+        &parse_staging_root(index_root),
+        identity,
+        *index_root.limits(),
+    )?;
 
     // Source read/decode failures are parse outcomes, not worker faults:
     // seal a failure bundle and return Ok.
@@ -249,15 +247,16 @@ fn run_text_parse_inner(
     // ceiling check is bounded by a small multiple of the source size; the
     // ceiling bounds the candidate record count, not transient memory.
     let paragraphs = split_paragraphs(&text);
-    if paragraphs.len() as u64 > MAX_CANDIDATE_TEXT_BLOCKS {
+    if paragraphs.len() > index_root.limits().parsing.max_candidate_units {
         return finish_failed(
             writer,
             started_at,
             started,
             format!(
                 "source splits into {} paragraphs, exceeding the ceiling of \
-                 {MAX_CANDIDATE_TEXT_BLOCKS} candidate text blocks",
-                paragraphs.len()
+                 {} candidate text blocks",
+                paragraphs.len(),
+                index_root.limits().parsing.max_candidate_units
             ),
             byte_count,
         );
@@ -368,7 +367,7 @@ fn finish_failed(
 ) -> Result<TextParseOutcome, ApiError> {
     // Bound once here so the identical detail is safe both to persist in
     // the bundle and to emit in the boundary log.
-    let detail = truncate_persisted_detail(&detail);
+    let detail = truncate_persisted_detail(&detail, &writer.limits().diagnostics);
     let parser_result = ParserResult {
         status: ParserExecutionStatus::Failed,
         error: Some(detail.clone()),

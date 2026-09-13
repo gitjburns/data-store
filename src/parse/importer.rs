@@ -36,9 +36,12 @@
 //! belongs to the dispatch pipeline (C5); failure bundles stay inspectable
 //! per spec §12.2.
 
-use std::{collections::BTreeMap, fs, io, path::Path, time::Instant};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use crate::limits::{DiagnosticLimits, RuntimeLimits};
+use crate::runtime::StorageContext;
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{error, info, warn};
@@ -56,38 +59,11 @@ use crate::model::{
 };
 use crate::parse::bundle::{
     BUNDLE_MANIFEST_FILE_NAME, BundleReadError, CandidateWarning, ParserExecutionStatus,
-    ParserOutputBundle, ParserOutputManifest, read_bundle,
+    ParserOutputBundle, ParserOutputManifest, read_bundle, read_capped_bytes,
 };
 use crate::parse::conformance;
 use crate::primitives::utc_now;
 use crate::util::truncate_persisted_detail;
-
-/// Spec §13.1 resource limit: maximum candidate ContentUnits per parse.
-/// This is a COUNT, not an index: 999,999 units occupy sequence indices
-/// 0..=999,998. It is coupled to the persisted canonical-ID contract:
-/// `crate::ids` zero-pads the parse-scoped sequence component to six digits
-/// (its private `SEQUENCE_DIGITS`), so 999,999 is the largest sequence
-/// index that still orders lexicographically — and unitId-ascending order
-/// is a meaningful persisted property (spec §16.4). The limit must not grow
-/// past 1,000,000 (index 999,999) without widening the six-digit contract.
-const MAX_CANDIDATE_UNITS: usize = 999_999;
-
-/// Spec §13.1 resource limit: maximum candidate UnitRelationships per parse.
-/// Relationship IDs share the six-digit zero-padding but carry no ordering
-/// contract (only unit IDs do, §16.4), so the limit is a plain resource
-/// bound above the ID-width boundary; beyond 999,999 the formatting widens
-/// naturally and IDs stay unique and deterministic.
-const MAX_CANDIDATE_RELATIONSHIPS: usize = 4_000_000;
-
-/// Spec §13.1 resource limit: maximum candidate warnings per parse; bounds
-/// the persisted warnings_json column and the warnings artifact.
-const MAX_CANDIDATE_WARNINGS: usize = 10_000;
-
-/// Spec §13.1 resource limit: maximum serialized size of one candidate unit
-/// body (4 MiB). Measured over the compact plain-serde serialization of the
-/// staged claim; the canonical bytes persisted later may differ slightly
-/// (NFC, key order), but this is a resource bound, not an exact contract.
-const MAX_UNIT_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Schema version written into the canonical parse bundle manifest (spec
 /// §12.3). Bump only with a coordinated change to every bundle consumer
@@ -256,7 +232,7 @@ struct ReadyState<'a> {
 /// Producer breaches become recorded failed parses; `Err` means the
 /// canonical side itself failed (see the module docs for the split).
 pub(crate) fn import_parser_bundle(
-    index_root: &Path,
+    index_root: &StorageContext,
     bundle_dir: &Path,
     capability_profile: &ParserCapabilityProfile,
 ) -> Result<ImportedParse, ApiError> {
@@ -271,7 +247,7 @@ pub(crate) fn import_parser_bundle(
     // durable record for every failed attempt, and the record needs parser
     // identity plus source linkage from the manifest. This lenient read is
     // for claims only; read_bundle below performs the real verification.
-    let claims = match load_manifest_claims(bundle_dir) {
+    let claims = match load_manifest_claims(bundle_dir, index_root.limits()) {
         Ok(claims) => claims,
         Err(source) => {
             error!(
@@ -336,7 +312,7 @@ pub(crate) fn import_parser_bundle(
 /// `Copy` and the attempt body binds them like locals.
 #[derive(Clone, Copy)]
 struct AttributedImport<'a> {
-    index_root: &'a Path,
+    index_root: &'a StorageContext,
     bundle_dir: &'a Path,
     capability_profile: &'a ParserCapabilityProfile,
     parse_run_id: &'a str,
@@ -368,7 +344,7 @@ fn run_attributed_import(
     // Verified read (C4a): manifest schema + two-way digest coverage +
     // deny_unknown_fields record deserialization. read_bundle owns its own
     // read/verify boundary logs.
-    let bundle = match read_bundle(bundle_dir) {
+    let bundle = match read_bundle(bundle_dir, index_root.limits()) {
         Ok(bundle) => bundle,
         Err(BundleReadError::ContractViolation { detail }) => {
             // Producer breach: a meaningful parse outcome, recorded durably.
@@ -378,6 +354,37 @@ fn run_attributed_import(
                 &claims.source_id,
                 &detail,
                 None,
+                started,
+            );
+        }
+        Err(BundleReadError::ResourceLimit {
+            detail,
+            verified_parser_raw_files,
+        }) => {
+            let raw_uri = if let Some(raw) = verified_parser_raw_files {
+                // A second manifest read may race the claims read. Do not
+                // attribute verified raw bytes to a different source/parser identity.
+                if raw.manifest_hash != crate::canonical::canonical_sha256_hex_of(claims)? {
+                    return fail_parse_run(
+                        connection,
+                        parse_run_id,
+                        &claims.source_id,
+                        "staged bundle manifest changed between the claims read and the verified read",
+                        None,
+                        started,
+                    );
+                }
+                let store = ArtifactStore::open(index_root)?;
+                archive_parser_raw(&store, parse_run_id, &raw.files)?
+            } else {
+                None
+            };
+            return fail_parse_run(
+                connection,
+                parse_run_id,
+                &claims.source_id,
+                &detail,
+                raw_uri.as_ref().map(|raw| raw.manifest.uri.as_str()),
                 started,
             );
         }
@@ -475,7 +482,7 @@ fn run_attributed_import(
     );
 
     let rows = assign_canonical_rows(parse_run_id, &bundle)?;
-    let warnings = canonical_warnings(&bundle.warnings);
+    let warnings = canonical_warnings(&bundle.warnings, &index_root.limits().diagnostics);
 
     // Build the parse_run.json snapshot for the canonical bundle. It
     // captures the run's identity and its `building` status as of bundle
@@ -569,26 +576,22 @@ fn run_attributed_import(
 /// `building` run row its identity before verification. A missing manifest
 /// is a producer breach (`BadRequest` — no run row can represent it, see the
 /// module docs); any other read fault is a canonical-side `InternalIo`.
-fn load_manifest_claims(bundle_dir: &Path) -> Result<ParserOutputManifest, ApiError> {
+fn load_manifest_claims(
+    bundle_dir: &Path,
+    limits: &RuntimeLimits,
+) -> Result<ParserOutputManifest, ApiError> {
     let manifest_path = bundle_dir.join(BUNDLE_MANIFEST_FILE_NAME);
-    let bytes = fs::read(&manifest_path).map_err(|source| {
-        if source.kind() == io::ErrorKind::NotFound {
-            ApiError::BadRequest {
+    let bytes = read_capped_bytes(&manifest_path, limits.resources.max_manifest_bytes).map_err(
+        |source| match source {
+            BundleReadError::Internal(source) => source,
+            BundleReadError::ContractViolation { detail }
+            | BundleReadError::ResourceLimit { detail, .. } => ApiError::BadRequest {
                 message: format!(
-                    "staged parse bundle has no {BUNDLE_MANIFEST_FILE_NAME} at {}: {source}; \
-                     a parse run cannot be recorded without identity claims",
-                    manifest_path.display()
+                    "{detail}; a parse run cannot be recorded without identity claims"
                 ),
-            }
-        } else {
-            ApiError::InternalIo {
-                message: format!(
-                    "failed to read staged bundle manifest at {}: {source}",
-                    manifest_path.display()
-                ),
-            }
-        }
-    })?;
+            },
+        },
+    )?;
     serde_json::from_slice(&bytes).map_err(|source| ApiError::BadRequest {
         message: format!(
             "staged parse bundle manifest at {} is unparseable: {source}; \
@@ -690,7 +693,7 @@ fn fail_parse_run(
     parser_raw_output_uri: Option<&str>,
     started: Instant,
 ) -> Result<ImportedParse, ApiError> {
-    let detail = truncate_persisted_detail(detail);
+    let detail = truncate_persisted_detail(detail, &connection.limits().diagnostics);
     let completed_at = utc_now()?;
 
     let tx = hot_plane::begin_write_transaction(connection, TX_LOG_NAMESPACE, "fail_parse_run")?;
@@ -793,28 +796,8 @@ fn validate_hard_gates(
         ));
     }
 
-    // Gate (d): resource limits, as documented code constants.
-    if bundle.candidate_units.len() > MAX_CANDIDATE_UNITS {
-        return Err(format!(
-            "§13.1 gate resource_limits: {} candidate units exceed the maximum of \
-             {MAX_CANDIDATE_UNITS}",
-            bundle.candidate_units.len()
-        ));
-    }
-    if bundle.candidate_relationships.len() > MAX_CANDIDATE_RELATIONSHIPS {
-        return Err(format!(
-            "§13.1 gate resource_limits: {} candidate relationships exceed the maximum of \
-             {MAX_CANDIDATE_RELATIONSHIPS}",
-            bundle.candidate_relationships.len()
-        ));
-    }
-    if bundle.warnings.len() > MAX_CANDIDATE_WARNINGS {
-        return Err(format!(
-            "§13.1 gate resource_limits: {} candidate warnings exceed the maximum of \
-             {MAX_CANDIDATE_WARNINGS}",
-            bundle.warnings.len()
-        ));
-    }
+    // Resource admission already counted/validated rows while decoding them.
+    // A resource-rejected plane cannot reach this structural-only boundary.
 
     let mut local_ids: BTreeMap<&str, ContentType> = BTreeMap::new();
     for (index, unit) in bundle.candidate_units.iter().enumerate() {
@@ -838,21 +821,6 @@ fn validate_hard_gates(
             return Err(format!(
                 "§13.1 gate local_ref_integrity: duplicate unit localId {}",
                 unit.local_id
-            ));
-        }
-        // Gate (d): single-body size bound over the staged serialization.
-        let body_bytes = serde_json::to_vec(&unit.body).map_err(|source| {
-            format!(
-                "§13.1 gate resource_limits: unit {} body is not serializable: {source}",
-                unit.local_id
-            )
-        })?;
-        if body_bytes.len() > MAX_UNIT_BODY_BYTES {
-            return Err(format!(
-                "§13.1 gate resource_limits: unit {} body serializes to {} bytes, exceeding \
-                 the maximum of {MAX_UNIT_BODY_BYTES}",
-                unit.local_id,
-                body_bytes.len()
             ));
         }
         // Gate (a): the §15.2 contentType-to-body mapping.
@@ -1110,12 +1078,15 @@ fn validated_body<T: serde::de::DeserializeOwned>(
 /// bundle: messages are bounded before persistence, and the parser-local
 /// `unit_local_id` is dropped because the canonical ParseWarning defines no
 /// unit reference field.
-fn canonical_warnings(candidates: &[CandidateWarning]) -> Vec<ParseWarning> {
+fn canonical_warnings(
+    candidates: &[CandidateWarning],
+    diagnostics: &DiagnosticLimits,
+) -> Vec<ParseWarning> {
     candidates
         .iter()
         .map(|warning| ParseWarning {
             code: warning.code.clone(),
-            message: truncate_persisted_detail(&warning.message),
+            message: truncate_persisted_detail(&warning.message, diagnostics),
             severity: warning.severity,
             locator: warning.locator.clone(),
         })

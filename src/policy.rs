@@ -11,11 +11,9 @@
 //! `crate::config` (every field required, `deny_unknown_fields`), because a
 //! policy that silently loses an operator's intent is worse than a hard failure.
 //!
-//! Each loaded document carries a `content_hash`: the SHA-256 (via
-//! `crate::canonical`) over the PARSED document's canonical serialization, NOT
-//! over the raw file bytes. Hashing the parsed shape means whitespace-only and
-//! comment-only edits do not change a policy's identity or bump its version;
-//! only a change that alters the deserialized document is a real change.
+//! Each loaded policy carries a SHA-256 over its effective canonical document.
+//! Entity matching composes file enable flags with config numeric limits in the
+//! historical shape before hashing. Whitespace and comment edits preserve identity.
 //!
 //! Versions are SYSTEM-ASSIGNED change-event counters tracked in the append-only
 //! `policy_versions` hot-plane table (see `sql/fabric/schema.sql`). Registration
@@ -33,7 +31,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::sqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -58,11 +57,9 @@ pub(crate) const POLICY_ID_ANNOTATOR_NAMING: &str = "annotator_naming";
 /// the policy id, so an audit reader can trace a policy's whole version history.
 const OBJECT_TYPE_POLICY: &str = "policy";
 
-/// The entity-match policy document (CA2): how a query is matched against stored
-/// entity names. Every field is REQUIRED with no serde default — an operator
-/// omitting a field is a fatal parse error, not a silent default, matching the
-/// config principle. Unknown keys are rejected so a typo fails loudly rather
-/// than being silently ignored.
+/// Effective entity-match policy: file enable flags plus configured numeric
+/// limits. Its serialized shape stays stable so relocating unchanged settings
+/// does not manufacture a policy version or invalidate historical hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EntityMatchPolicy {
@@ -78,6 +75,21 @@ pub(crate) struct EntityMatchPolicy {
     /// Must be > 0: a zero cap would disable fuzzy matching silently, which the
     /// operator should express by disabling the classes, not by a zero here.
     pub(crate) max_fuzzy_candidates: u32,
+}
+
+/// On-disk entity policy contains behavior switches; numeric work lives in config.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityMatchDocument {
+    acronym: MatchClassSwitch,
+    token_prefix: MatchClassSwitch,
+}
+
+/// A required enable switch prevents missing values from silently disabling a class.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatchClassSwitch {
+    enabled: bool,
 }
 
 /// The `[acronym]` match class of the entity-match policy.
@@ -117,10 +129,8 @@ pub(crate) struct AnnotatorNamingPolicy {
     pub(crate) rules: Vec<String>,
 }
 
-/// A parsed policy document paired with its content hash. The hash is the
-/// SHA-256 over the PARSED document's canonical serialization (see the module
-/// doc): it is the policy's identity for version tracking, invariant under
-/// whitespace and comment edits.
+/// An effective policy paired with its canonical content hash; file formatting
+/// cannot change identity, and entity matching includes configured numeric limits.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedPolicy<T> {
     /// The strictly-validated policy document.
@@ -144,14 +154,27 @@ pub(crate) struct RegisteredVersion {
     pub(crate) advanced: bool,
 }
 
-/// Load and strictly validate the entity-match policy from `path`. A missing
-/// file, unparseable TOML, an unknown key, or an out-of-range value is a fatal
-/// error. Returns the parsed document plus its parsed-shape content hash.
+/// Compose file switches and validated config limits into the historical
+/// effective-policy shape before hashing and version registration.
 pub(crate) fn load_entity_match_policy(
     path: &Path,
+    limits: &crate::limits::FuzzyLimits,
 ) -> Result<LoadedPolicy<EntityMatchPolicy>, ApiError> {
-    let document: EntityMatchPolicy = parse_policy_file(path)?;
-    validate_entity_match_policy(&document, path)?;
+    limits
+        .validate()
+        .map_err(|message| ApiError::InvalidConfig { message })?;
+    let switches: EntityMatchDocument = parse_policy_file(path)?;
+    let document = EntityMatchPolicy {
+        acronym: AcronymClass {
+            enabled: switches.acronym.enabled,
+            min_name_tokens: limits.acronym_min_name_tokens,
+        },
+        token_prefix: TokenPrefixClass {
+            enabled: switches.token_prefix.enabled,
+            min_token_len: limits.prefix_min_token_chars,
+        },
+        max_fuzzy_candidates: limits.max_fuzzy_candidates,
+    };
     let content_hash = crate::canonical::canonical_sha256_hex_of(&document)?;
 
     // Log the load boundary with bounded metadata only: never rule text or any
@@ -335,36 +358,4 @@ where
         path: PathBuf::from(path),
         source,
     })
-}
-
-/// Validate the entity-match policy's cross-field ranges that TOML
-/// deserialization cannot express. Range violations map to `InvalidConfig`,
-/// matching `ServiceConfig::validate`.
-fn validate_entity_match_policy(policy: &EntityMatchPolicy, path: &Path) -> Result<(), ApiError> {
-    // min_name_tokens >= 2: a single-token name has no multi-token acronym.
-    if policy.acronym.min_name_tokens < 2 {
-        return Err(invalid_policy(path, "acronym.min_name_tokens must be >= 2"));
-    }
-    // min_token_len >= 1: a zero-length query token would match vacuously.
-    // Written as `== 0` (not `< 1`) so clippy does not flag an unsigned
-    // comparison, matching the max_fuzzy_candidates guard below.
-    if policy.token_prefix.min_token_len == 0 {
-        return Err(invalid_policy(
-            path,
-            "token_prefix.min_token_len must be >= 1",
-        ));
-    }
-    // max_fuzzy_candidates > 0: a zero cap silently disables fuzzy matching.
-    if policy.max_fuzzy_candidates == 0 {
-        return Err(invalid_policy(path, "max_fuzzy_candidates must be > 0"));
-    }
-    Ok(())
-}
-
-/// Build an `InvalidConfig` error naming the offending policy file and rule, so
-/// the fatal startup message points the operator at the exact document.
-fn invalid_policy(path: &Path, message: &str) -> ApiError {
-    ApiError::InvalidConfig {
-        message: format!("invalid policy at {}: {message}", path.display()),
-    }
 }

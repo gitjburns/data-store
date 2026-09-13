@@ -7,12 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     artifact_store::{ArtifactRef, ArtifactStore},
     error::ApiError,
+    limits::ResourceLimits,
 };
-
-// These are corruption/allocation ceilings, not retrieval truncation policies.
-const MAX_VALUES: usize = 1_048_576;
-const MAX_ROWS: usize = 518;
-pub(crate) const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Shape and norm are verified against the immutable little-endian f32 payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +27,7 @@ pub(crate) fn store_embedding(
     rows: usize,
     dimension: usize,
 ) -> Result<EmbeddingRef, ApiError> {
-    let count = value_count(rows, dimension)?;
+    let count = admitted_value_count(rows, dimension, &store.limits().resources)?;
     if values.len() != count {
         return Err(failure("embedding value count disagrees with its shape"));
     }
@@ -57,7 +53,11 @@ pub(crate) fn load_embedding(
     reference: &EmbeddingRef,
 ) -> Result<Vec<f32>, ApiError> {
     validate_ref(reference)?;
-    let count = value_count(reference.rows, reference.dimension)?;
+    let count = admitted_value_count(
+        reference.rows,
+        reference.dimension,
+        &store.limits().resources,
+    )?;
     store.with_verified_reader(
         &reference.artifact.uri,
         Some(reference.artifact.size_bytes),
@@ -66,10 +66,15 @@ pub(crate) fn load_embedding(
             values
                 .try_reserve_exact(count)
                 .map_err(|source| failure(format!("allocate embedding read buffer: {source}")))?;
-            visit_values(reader, count, |value| {
-                values.push(value);
-                Ok(())
-            })?;
+            visit_values(
+                reader,
+                count,
+                store.limits().resources.embedding_read_buffer_bytes,
+                |value| {
+                    values.push(value);
+                    Ok(())
+                },
+            )?;
             let norm = checked_norm(&values, reference.dimension)?;
             if norm.to_bits() != reference.norm.to_bits() {
                 return Err(failure(format!(
@@ -89,6 +94,11 @@ pub(crate) fn cosine(
     query: &[f32],
 ) -> Result<f32, ApiError> {
     validate_ref(reference)?;
+    admitted_value_count(
+        reference.rows,
+        reference.dimension,
+        &store.limits().resources,
+    )?;
     if reference.rows != 1 || reference.dimension != query.len() {
         return Err(failure("dense query and stored embedding shapes differ"));
     }
@@ -100,12 +110,17 @@ pub(crate) fn cosine(
             let mut index = 0;
             let mut dot = 0.0_f32;
             let mut norm_squared = 0.0_f32;
-            visit_values(reader, query.len(), |value| {
-                dot += value * query[index];
-                norm_squared += value * value;
-                index += 1;
-                Ok(())
-            })?;
+            visit_values(
+                reader,
+                query.len(),
+                store.limits().resources.embedding_read_buffer_bytes,
+                |value| {
+                    dot += value * query[index];
+                    norm_squared += value * value;
+                    index += 1;
+                    Ok(())
+                },
+            )?;
             let norm = norm_squared.sqrt();
             if norm.to_bits() != reference.norm.to_bits() || !norm.is_finite() || norm <= 0.0 {
                 return Err(failure(format!(
@@ -143,11 +158,27 @@ pub(crate) fn validate_ref(reference: &EmbeddingRef) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Reject malformed dimensions before they become a working-memory requirement.
+/// Validate format arithmetic independently of the current operator's admission budget.
 fn value_count(rows: usize, dimension: usize) -> Result<usize, ApiError> {
     rows.checked_mul(dimension)
-        .filter(|count| rows > 0 && rows <= MAX_ROWS && dimension > 0 && *count <= MAX_VALUES)
+        .filter(|count| rows > 0 && dimension > 0 && count.checked_mul(4).is_some())
         .ok_or_else(|| failure(format!("invalid embedding shape {rows} x {dimension}")))
+}
+
+/// A reduced memory budget may refuse historical data without declaring it corrupt.
+pub(crate) fn admitted_value_count(
+    rows: usize,
+    dimension: usize,
+    limits: &ResourceLimits,
+) -> Result<usize, ApiError> {
+    let count = value_count(rows, dimension)?;
+    if rows > limits.max_embedding_rows || count > limits.max_embedding_values {
+        return Err(failure(format!(
+            "resource limit: embedding shape {rows} x {dimension} exceeds configured {} rows or {} values",
+            limits.max_embedding_rows, limits.max_embedding_values
+        )));
+    }
+    Ok(count)
 }
 
 /// Validate nonzero finite rows and retain the deterministic flattened L2 norm.
@@ -172,9 +203,14 @@ fn checked_norm(values: &[f32], dimension: usize) -> Result<f32, ApiError> {
 fn visit_values(
     reader: &mut dyn Read,
     count: usize,
+    buffer_bytes: usize,
     mut visit: impl FnMut(f32) -> Result<(), ApiError>,
 ) -> Result<(), ApiError> {
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(buffer_bytes)
+        .map_err(|source| failure(format!("allocate embedding streaming buffer: {source}")))?;
+    buffer.resize(buffer_bytes, 0);
     let mut remaining = count;
     while remaining > 0 {
         let values = remaining.min(buffer.len() / 4);

@@ -76,8 +76,8 @@ pub(crate) struct QueryConstraints {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RetrievalPolicyRequest {
     /// Requested final evidence-unit count (§24.3 `maxFinalEvidenceUnits?`).
-    /// When present must be `1..=profile.max_top_k`; absent ⇒
-    /// `profile.default_top_k`.
+    /// When present must be `1..=profile.limits.max_results`; absent uses
+    /// `profile.limits.default_results`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_final_evidence_units: Option<u32>,
 }
@@ -185,25 +185,24 @@ impl QueryRequest {
             });
         }
 
-        // max_final_evidence_units: when present, must fall in
-        // `1..=profile.max_top_k`; absent defaults to `profile.default_top_k`.
+        // The captured profile supplies the authoritative configured result range and default.
         let max_final_evidence_units = match self
             .retrieval_policy
             .as_ref()
             .and_then(|policy| policy.max_final_evidence_units)
         {
             Some(requested) => {
-                if requested < 1 || requested > profile.max_top_k {
+                if requested < 1 || requested > profile.limits.max_results {
                     return Err(ApiError::BadRequest {
                         message: format!(
                             "maxFinalEvidenceUnits must be between 1 and {}",
-                            profile.max_top_k
+                            profile.limits.max_results
                         ),
                     });
                 }
                 requested
             }
-            None => profile.default_top_k,
+            None => profile.limits.default_results,
         };
 
         // Evidence-policy defaults (R6): locators on, relationships/annotations

@@ -7,15 +7,15 @@
 //! DECOUPLING INVARIANT (mirrors `query/`-vs-`projections/`): nothing under
 //! `src/assembly/` imports axum/tokio/http types, and no function here opens
 //! its own database connection. Every assembly function takes
-//! `&rusqlite::Connection` (the caller's query read transaction) plus explicit
+//! `&crate::sqlite::Connection` (the caller's bounded query read transaction) plus explicit
 //! inputs. The transport shell (`http.rs`) and the pipeline stage that owns the
 //! transaction (`query/execute.rs`) live outside this boundary and thread the
 //! connection in; assembly stays a pure, synchronous graph-and-unit reader.
 //!
 //! Submodule ownership (declared here in full so later packages never contend
 //! on this file): `model` — the §25–§27 wire types (C8s); `policy` — the sealed
-//! MVP `AssemblyPolicy` and the graph operators' policy surface (C8a);
-//! `operators` — the seven §25 graph operators (C8a); `evidence` — the
+//! configured `AssemblyPolicy` and captured parse contract;
+//! `operators` — canonical links within selected evidence; `evidence` — the
 //! `build_evidence_pack` entry point (C8b).
 
 pub(crate) mod evidence;

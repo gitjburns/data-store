@@ -5,11 +5,11 @@
 //! envelope discipline cannot diverge per builder.
 //!
 //! Atomicity invariant (mirror of `crate::annotations::store`): every mutating
-//! function takes the CALLER's `&rusqlite::Transaction` and appends its event
+//! function takes the CALLER's `&crate::sqlite::Transaction` and appends its event
 //! on that same transaction (via `crate::events::append_event`), so the row
 //! change and the audit event commit or roll back together — the event trail
 //! can never claim a lifecycle transition that did not durably happen. Read
-//! functions take a `&rusqlite::Connection`; one bounded SELECT needs no
+//! functions take a `&crate::sqlite::Connection`; one bounded SELECT needs no
 //! transaction.
 //!
 //! Freshness lifecycle (spec §22): an envelope is inserted `building`, then
@@ -24,7 +24,8 @@
 // wire it.
 #![allow(dead_code)]
 
-use rusqlite::{Connection, Transaction, params};
+use crate::sqlite::{Connection, Transaction};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -128,7 +129,6 @@ DELETE FROM retrieval_projections
 WHERE parse_id = ?1 AND projection_type = ?2
   AND index_name IS ?3 AND index_partition IS ?4";
 
-const MAX_ANNOTATION_DEPENDENTS: usize = 1_000_000;
 const ANNOTATION_DEPENDENTS_SQL: &str = "
 SELECT p.id FROM retrieval_projections AS p
 WHERE p.freshness_status = 'fresh' AND p.deleted_at IS NULL
@@ -324,7 +324,7 @@ pub(crate) fn mark_failed(
     projection_id: &str,
     bounded_detail: &str,
 ) -> Result<(), ApiError> {
-    let detail = truncate_persisted_detail(bounded_detail);
+    let detail = truncate_persisted_detail(bounded_detail, &tx.limits().diagnostics);
 
     let updated = tx
         .execute(MARK_FAILED_SQL, params![projection_id])
@@ -387,7 +387,10 @@ pub(crate) fn mark_annotation_dependents_stale(
             })?;
     let rows = statement
         .query_map(
-            params![annotation_id, MAX_ANNOTATION_DEPENDENTS + 1],
+            params![
+                annotation_id,
+                tx.limits().resources.max_annotation_dependents + 1
+            ],
             |row| row.get::<_, String>(0),
         )
         .map_err(|source| ApiError::StorageOperation {
@@ -395,7 +398,7 @@ pub(crate) fn mark_annotation_dependents_stale(
         })?;
     let mut ids = Vec::new();
     for row in rows {
-        if ids.len() == MAX_ANNOTATION_DEPENDENTS {
+        if ids.len() == tx.limits().resources.max_annotation_dependents {
             return Err(ApiError::StorageOperation {
                 message: format!(
                     "annotation {annotation_id} exceeds the dependent projection limit"

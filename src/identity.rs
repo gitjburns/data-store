@@ -20,6 +20,10 @@ use serde::Serialize;
 use crate::canonical;
 use crate::config::{PdfEngine, ServiceConfig};
 use crate::error::ApiError;
+use crate::limits::{
+    DiagnosticLimits, IndexingLimits, ParsingLimits, ResourceLimits, RetrievalLimits,
+    SchedulingLimits, SqliteLimits, WorkerLimits,
+};
 
 /// Spec version this build implements, stamped into every `ForensicSnapshot`
 /// as `specVersion` (§30.3). A constant, not derived from the spec file: the
@@ -54,11 +58,8 @@ pub(crate) struct ApplicationIdentity {
     /// §30.7 aggregate `configurationHash` — lowercase-hex SHA-256 over the
     /// audit-relevant configuration (secret PATHS only; see `configuration_hash`).
     pub(crate) configuration_hash: String,
-    /// Content hash of the loaded entity-match policy document (D3 amendment,
-    /// CA2). The configuration hash covers only the document's PATH; the
-    /// document itself is operator-mutable, so its content identity is pinned
-    /// here — a replay environment must reconstruct the same ruleset, not just
-    /// the same path.
+    /// Effective entity-match hash combines file enable flags and configured
+    /// numeric limits. Replay must reconstruct the same rules, not only a path.
     pub(crate) entity_match_policy_hash: String,
     /// Content hash of the loaded annotator naming-rules policy document
     /// (same rationale as `entity_match_policy_hash`; this one is also
@@ -153,6 +154,16 @@ struct ConfigurationIdentity {
     max_ingest_source_chars: u32,
     max_search_query_chars: u32,
 
+    // Persist all operational groups; client presentation cannot affect replay.
+    retrieval: RetrievalLimits,
+    indexing: IndexingLimits,
+    resources: ResourceLimits,
+    workers: WorkerLimits,
+    sqlite: SqliteLimits,
+    parsing: ParsingLimits,
+    scheduling: SchedulingLimits,
+    diagnostics: DiagnosticLimits,
+
     logging_level: String,
 
     inference_device: String,
@@ -212,8 +223,12 @@ struct ModelIdentity {
     /// Local-backend facts: present only when `dense_backend` is local.
     #[serde(skip_serializing_if = "Option::is_none")]
     dense_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dense_max_tokens: Option<u32>,
+    dense_max_tokens: u32,
+    dense_http_batch_size: usize,
+    dense_http_concurrent_requests: usize,
+    dense_http_max_retries: usize,
+    dense_http_retry_initial_delay_ms: u64,
+    dense_http_retry_max_delay_ms: u64,
     /// HTTP-backend facts: present only when `dense_backend` is http.
     #[serde(skip_serializing_if = "Option::is_none")]
     dense_endpoint: Option<String>,
@@ -229,8 +244,11 @@ struct ModelIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     colbert_path: Option<String>,
     colbert_dimension: u32,
+    colbert_max_tokens: u32,
     colbert_query_max_tokens: u32,
     colbert_document_max_tokens: u32,
+    colbert_document_batch_size: usize,
+    colbert_local_batch_max_tokens: usize,
     /// HTTP facts identify the remote model and its matching local tokenizer.
     #[serde(skip_serializing_if = "Option::is_none")]
     colbert_endpoint: Option<String>,
@@ -247,8 +265,7 @@ struct ModelIdentity {
     reranker_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reranker_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reranker_max_tokens: Option<u32>,
+    reranker_max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     reranker_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +279,8 @@ struct ModelIdentity {
     /// Resolved PATH of the annotator API-key file, never its contents.
     #[serde(skip_serializing_if = "Option::is_none")]
     annotator_api_key_file_path: Option<String>,
+    annotator_max_input_chars: usize,
+    annotator_max_completion_tokens: u64,
     // Operational retry policy belongs to the audit identity, not producer
     // memo identity. Each call's actual retry temperature is recorded in provenance.
     annotator_annotation_max_retries: u32,
@@ -281,6 +300,14 @@ impl ConfigurationIdentity {
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_ingest_source_chars: config.server.max_ingest_source_chars,
             max_search_query_chars: config.server.max_search_query_chars,
+            retrieval: config.retrieval,
+            indexing: config.indexing,
+            resources: config.resources,
+            workers: config.workers,
+            sqlite: config.sqlite,
+            parsing: config.parsing,
+            scheduling: config.scheduling,
+            diagnostics: config.diagnostics,
             logging_level: format!("{:?}", config.logging.level),
             inference_device: format!("{:?}", config.inference.device),
             inference_device_index: config.inference.device_index,
@@ -301,15 +328,18 @@ impl ConfigurationIdentity {
                 page_batch_size: docling.page_batch_size,
             }),
             models: ModelIdentity {
-                // Per-backend dense facts: config validation guarantees exactly
-                // one backend's fields are set, so these Options are captured
-                // honestly — the local backend carries path/max_tokens, the HTTP
-                // backend endpoint/model/timeout/key-path, never invented values.
+                // Input capacity is shared; optional connection/model paths
+                // identify only the selected backend. No secret values enter here.
                 dense_backend: format!("{:?}", config.models.dense.backend),
                 dense_dimension: config.models.dense.dimension,
                 dense_pooling: config.models.dense.pooling.clone(),
                 dense_path: config.models.dense.path.as_deref().map(path_string),
                 dense_max_tokens: config.models.dense.max_tokens,
+                dense_http_batch_size: config.models.dense.http_batch_size,
+                dense_http_concurrent_requests: config.models.dense.http_concurrent_requests,
+                dense_http_max_retries: config.models.dense.http_max_retries,
+                dense_http_retry_initial_delay_ms: config.models.dense.http_retry_initial_delay_ms,
+                dense_http_retry_max_delay_ms: config.models.dense.http_retry_max_delay_ms,
                 dense_endpoint: config.models.dense.endpoint.clone(),
                 dense_model: config.models.dense.model.clone(),
                 dense_timeout_seconds: config.models.dense.timeout_seconds,
@@ -325,8 +355,11 @@ impl ConfigurationIdentity {
                 colbert_backend: format!("{:?}", config.models.colbert.backend),
                 colbert_path: config.models.colbert.path.as_deref().map(path_string),
                 colbert_dimension: config.models.colbert.dimension,
+                colbert_max_tokens: config.models.colbert.max_tokens,
                 colbert_query_max_tokens: config.models.colbert.query_max_tokens,
                 colbert_document_max_tokens: config.models.colbert.document_max_tokens,
+                colbert_document_batch_size: config.models.colbert.document_batch_size,
+                colbert_local_batch_max_tokens: config.models.colbert.local_batch_max_tokens,
                 colbert_endpoint: config.models.colbert.endpoint.clone(),
                 colbert_model: config.models.colbert.model.clone(),
                 colbert_tokenizer_file_path: config
@@ -363,6 +396,8 @@ impl ConfigurationIdentity {
                     .as_deref()
                     .map(path_string),
                 annotator_annotation_max_retries: config.models.annotator.annotation_max_retries,
+                annotator_max_input_chars: config.models.annotator.max_input_chars,
+                annotator_max_completion_tokens: config.models.annotator.max_completion_tokens,
                 annotator_annotation_retry_interval_seconds: config
                     .models
                     .annotator

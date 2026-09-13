@@ -47,12 +47,13 @@
 // entry is reached through the snapshot HTTP route (`http::post_snapshots`), so
 // no dead-code allow is needed anywhere in this module.
 
+use crate::runtime::StorageContext;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
+use crate::sqlite::{Connection, Transaction};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value};
 use tracing::{error, info};
 
@@ -112,7 +113,7 @@ SELECT source_id FROM parse_runs WHERE id = ?1";
 /// full artifact set. Returns the header carrying the `manifestHash` that
 /// mechanical verification (§30.5) checks.
 pub(crate) fn pre_activation_snapshot(
-    index_root: &Path,
+    index_root: &StorageContext,
     identity: &ApplicationIdentity,
     parse_run_id: &str,
 ) -> Result<ForensicSnapshot, ApiError> {
@@ -140,7 +141,7 @@ pub(crate) fn pre_activation_snapshot(
 /// source's active parse, so the captured active set already reflects the
 /// cutover.
 pub(crate) fn post_activation_snapshot(
-    index_root: &Path,
+    index_root: &StorageContext,
     identity: &ApplicationIdentity,
     parse_run_id: &str,
 ) -> Result<ForensicSnapshot, ApiError> {
@@ -168,7 +169,7 @@ pub(crate) fn post_activation_snapshot(
 /// with no active parse is a caller-contract error: there is nothing to
 /// snapshot before deactivating.
 pub(crate) fn pre_deactivation_snapshot(
-    index_root: &Path,
+    index_root: &StorageContext,
     identity: &ApplicationIdentity,
     source_id: &str,
 ) -> Result<ForensicSnapshot, ApiError> {
@@ -203,7 +204,7 @@ pub(crate) fn pre_deactivation_snapshot(
 /// attribution and free-text context from the request. Exposed through the
 /// manual/incident snapshot HTTP route in `crate::http` (`post_snapshots`).
 pub(crate) fn request_snapshot(
-    index_root: &Path,
+    index_root: &StorageContext,
     identity: &ApplicationIdentity,
     snapshot_type: SnapshotType,
     created_by: Option<&str>,
@@ -272,7 +273,7 @@ struct SnapshotScope {
 /// write transactions retain started/failed audit events and atomically publish
 /// the final metadata row with its completed event after all artifacts exist.
 fn mint(
-    index_root: &Path,
+    index_root: &StorageContext,
     identity: &ApplicationIdentity,
     snapshot_type: SnapshotType,
     resolve_scope: impl FnOnce(&Connection) -> Result<SnapshotScope, ApiError>,
@@ -525,7 +526,7 @@ fn jsonl_record_count(artifact: &SnapshotArtifactRef) -> usize {
 /// archived counts for the `snapshot.completed` log. The caller-owned read
 /// transaction also resolved scope, preventing mixed annotation/projection states.
 fn build_and_archive_manifest(
-    connection: &rusqlite::Transaction<'_>,
+    connection: &Transaction<'_>,
     store: &ArtifactStore,
     identity: &ApplicationIdentity,
     snapshot_id: &str,
@@ -560,6 +561,7 @@ fn build_and_archive_manifest(
         ORDER_BY_ID,
         "chunk_projections",
     )?);
+    retrieval_projections.extend(reference_chunk_policies(connection, store)?);
 
     // --- Dense/multivector blobs archived as raw bytes so restore RE-IMPORTS
     // them (§31.3) rather than re-embedding: they are byte-reproducible ONLY
@@ -595,18 +597,18 @@ fn build_and_archive_manifest(
 
     // --- Sealed policies/profiles serialized at snapshot time (§30.4
     // assemblyPolicies/retrievalProfiles/capabilityProfiles). These are
-    // OnceLock constants never otherwise archived; their resolved values
+    // validated runtime settings; their resolved values
     // (self-hash-sealed documents) are put_json'd here so the snapshot pins the
     // exact policy/profile identity that governed the captured state.
     let assembly_policies = vec![put_json_ref(
         store,
-        &json_value_of(crate::assembly::policy::active_policy()?)?,
+        &json_value_of(&store.settings().assembly_policy)?,
         "assembly_policy",
         created_at,
     )?];
     let retrieval_profiles = vec![put_json_ref(
         store,
-        &json_value_of(crate::query::profile::active_profile()?)?,
+        &json_value_of(&store.settings().retrieval_profile)?,
         "retrieval_profile",
         created_at,
     )?];
@@ -732,6 +734,50 @@ fn build_and_archive_manifest(
     let manifest_value = json_value_of(&manifest)?;
     let manifest_ref = store.put_json(&manifest_value)?;
     Ok((manifest_ref, counts))
+}
+
+/// Pin construction descriptors separately so restore can authenticate the original
+/// chunk semantics after operators change indexing limits.
+fn reference_chunk_policies(
+    connection: &Connection,
+    store: &ArtifactStore,
+) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
+    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
+    let mut refs = Vec::new();
+    for record in records {
+        if record.get("projection_type").and_then(Value::as_str) != Some("chunk") {
+            continue;
+        }
+        let Some(uri) = record.get("payload_uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let policy: crate::projections::ChunkerConfig = store.with_verified_reader(
+            uri,
+            Some(store.limits().resources.max_json_cell_bytes as u64),
+            |reader| {
+                serde_json::from_reader(reader).map_err(|source| ApiError::StorageOperation {
+                    message: format!("decode chunk construction descriptor {uri}: {source}"),
+                })
+            },
+        )?;
+        policy.validate()?;
+        let stored = store.reference_for_uri(uri)?;
+        refs.push(SnapshotArtifactRef {
+            artifact_type: crate::projections::CHUNK_CONFIG_PAYLOAD_TYPE.to_owned(),
+            uri: stored.uri,
+            hash: stored.hash,
+            format: Some("json".to_owned()),
+            created_at: record
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            metadata: Some(BTreeMap::from([(
+                "projectionId".to_owned(),
+                record["id"].clone(),
+            )])),
+        });
+    }
+    Ok(refs)
 }
 
 /// Pin immutable section payloads explicitly: envelope URIs alone are not a
@@ -1443,7 +1489,7 @@ fn commit_snapshot_row(
 /// the completed event carries the manifest hash so an audit can jump from the
 /// event to the archived manifest.
 fn snapshot_row_body(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     header: &ForensicSnapshot,
     subject_source_id: Option<&str>,
     subject_parse_id: Option<&str>,

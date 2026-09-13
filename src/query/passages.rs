@@ -5,19 +5,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::sqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 use tracing::{error, info};
 
 use crate::assembly::evidence::evidence_text;
-use crate::assembly::model::MAX_PASSAGE_UNITS;
 use crate::canonical::{canonical_sha256_hex_of, sha256_hex_bytes};
 use crate::error::ApiError;
 use crate::inference::ColbertCandidateScore;
+use crate::limits::RetrievalLimits;
 use crate::model::{ContentType, Locator, SourceLocationStatus};
-use crate::projections::{MAX_UNIT_TOKENS, annotation::slice_chars};
+use crate::projections::annotation::slice_chars;
 use crate::query::annotation::ScoredExcerpt;
 use crate::query::model::RetrievalHit;
 use crate::query::provenance::{
@@ -28,12 +29,10 @@ use crate::sections::read_section;
 
 // Bound cells before bringing them into Rust. Oversized authoritative data is
 // an explicit error, never a silently shortened raw evidence record.
-const MAX_CELL_BYTES: usize = 1_048_576;
-const MAX_SOURCE_LOCATIONS: usize = 256;
 const UNIT_SQL: &str = "
 SELECT source_id, content_type,
        CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END,
-       CASE WHEN length(CAST(COALESCE(locators_json, '[]') AS BLOB)) <= ?3
+       CASE WHEN length(CAST(COALESCE(locators_json, '[]') AS BLOB)) <= ?4
             THEN COALESCE(locators_json, '[]') END
 FROM content_units WHERE parse_id = ?1 AND id = ?2";
 const PREVIOUS_SQL: &str = "
@@ -160,7 +159,7 @@ impl PassageCandidate {
             text.push_str(&annotations.into_iter().collect::<Vec<_>>().join("\n\n"));
         }
         if !self.graph_context.is_empty() {
-            text.push_str("\n\nMatched graph context (bounded; whole-unit targeting):\n");
+            text.push_str("\n\nMatched graph context (whole-unit targeting):\n");
             text.push_str(&self.graph_context.join("\n"));
         }
         text
@@ -171,13 +170,8 @@ impl PassageCandidate {
         self.parts.iter().map(PassagePart::source_excerpt).collect()
     }
 
-    /// Include retained graph paths within the existing passage token budget, preserving full provenance separately.
-    pub(crate) fn attach_graph_context(
-        &mut self,
-        channel_hits: &[RetrievalHit],
-        tokenizer: &Tokenizer,
-    ) -> Result<(), ApiError> {
-        let counter = untruncated_tokenizer(tokenizer)?;
+    /// Include every retained graph path supporting the passage; the reranker enforces its total input capacity.
+    pub(crate) fn attach_graph_context(&mut self, channel_hits: &[RetrievalHit]) {
         let mut context = Vec::new();
         for hit in channel_hits {
             if !self
@@ -204,18 +198,11 @@ impl PassageCandidate {
                 if context.contains(&text) {
                     continue;
                 }
-                let proposed = if context.is_empty() {
-                    text.clone()
-                } else {
-                    format!("{}\n{text}", context.join("\n"))
-                };
-                if token_count(&counter, &proposed)? <= MAX_UNIT_TOKENS as usize {
-                    context.push(text);
-                }
+                // A component-specific cutoff would hide expensive annotations from final scoring.
+                context.push(text);
             }
         }
         self.graph_context = context;
-        Ok(())
     }
 
     /// Coordinate containment prevents a later match in the same unit from attaching to its prefix.
@@ -501,8 +488,8 @@ pub(crate) fn build_passages(
         query_id,
         seeds = ranked.len() + excerpts.len(),
         candidate_limit,
-        max_tokens = MAX_UNIT_TOKENS,
-        max_units = MAX_PASSAGE_UNITS,
+        max_tokens = conn.limits().retrieval.passage_max_tokens,
+        max_units = conn.limits().retrieval.max_passage_units,
         "constructing passage candidates"
     );
     let mut counts = PassageBuildCounts::default();
@@ -534,7 +521,7 @@ pub(crate) fn build_passages(
         ),
         Err(failure) => error!(event = "query.passages.failed", query_id,
             error = %failure, elapsed_ms = started.elapsed().as_millis() as u64,
-            error_chain = %crate::util::error_chain(failure),
+            error_chain = %crate::util::error_chain(failure, &conn.limits().diagnostics),
             stage = "passage_construction", seeds = ranked.len() + excerpts.len(), candidate_limit,
             "passage construction failed"),
     }
@@ -600,10 +587,15 @@ fn build_passages_body(
         // Work on an owned trial so a cap failure leaves stronger candidates intact.
         let first = overlapping[0];
         let mut merged = passages[first].clone();
-        let mut fits = merge_passage(&mut merged, &candidate, tokenizer)?;
+        let mut fits = merge_passage(&mut merged, &candidate, tokenizer, &conn.limits().retrieval)?;
         for &index in overlapping.iter().skip(1) {
             if fits {
-                fits = merge_passage(&mut merged, &passages[index], tokenizer)?;
+                fits = merge_passage(
+                    &mut merged,
+                    &passages[index],
+                    tokenizer,
+                    &conn.limits().retrieval,
+                )?;
             }
         }
         if fits {
@@ -701,10 +693,11 @@ fn build_excerpt_passage(
     if text.trim().is_empty() {
         return Ok(None);
     }
-    if token_count(tokenizer, text)? > MAX_UNIT_TOKENS as usize {
-        return Err(failure(
-            "exact source window exceeds the passage token budget",
-        ));
+    if token_count(tokenizer, text)? > conn.limits().retrieval.passage_max_tokens as usize {
+        return Err(failure(format!(
+            "resource limit: exact source window exceeds retrieval.passage_max_tokens {}",
+            conn.limits().retrieval.passage_max_tokens
+        )));
     }
     if seed
         .annotation_matches
@@ -775,7 +768,9 @@ fn build_passage(
         return Ok(None);
     };
     let (section_id, section_path) = read_section(conn, parse_id, anchor)?;
-    let (text, truncated) = bounded_text(&part.text, tokenizer)?;
+    let limits = &conn.limits().retrieval;
+    let (text, truncated) =
+        bounded_text(&part.text, tokenizer, limits.passage_max_tokens as usize)?;
     part.end_char = part.start_char + text.chars().count();
     part.text = text;
     let legacy_seed_range = part.source_excerpt();
@@ -783,7 +778,7 @@ fn build_passage(
     if unit.is_prose() && !truncated {
         let mut cursors = [Some(anchor.to_string()), Some(anchor.to_string())];
         let mut visited = BTreeSet::from([anchor.to_string()]);
-        for step in 0..MAX_PASSAGE_UNITS - 1 {
+        for step in 0..limits.max_passage_units - 1 {
             let direction = step % 2;
             let Some(current) = cursors[direction].as_deref() else {
                 if cursors.iter().all(Option::is_none) {
@@ -827,7 +822,7 @@ fn build_passage(
             } else {
                 format!("{}\n\n{}", join_parts(&parts), part.text)
             };
-            if token_count(tokenizer, &joined)? > MAX_UNIT_TOKENS as usize {
+            if token_count(tokenizer, &joined)? > limits.passage_max_tokens as usize {
                 cursors[direction] = None;
             } else if direction == 0 {
                 parts.insert(0, part);
@@ -860,6 +855,7 @@ fn merge_passage(
     destination: &mut PassageCandidate,
     other: &PassageCandidate,
     tokenizer: &Tokenizer,
+    limits: &RetrievalLimits,
 ) -> Result<bool, ApiError> {
     if destination.source_id != other.source_id
         || destination.parse_id != other.parse_id
@@ -899,8 +895,8 @@ fn merge_passage(
         }
     }
     let text = join_parts(&combined);
-    if combined.len() > MAX_PASSAGE_UNITS
-        || token_count(tokenizer, &text)? > MAX_UNIT_TOKENS as usize
+    if combined.len() > limits.max_passage_units
+        || token_count(tokenizer, &text)? > limits.passage_max_tokens as usize
     {
         return Ok(false);
     }
@@ -992,24 +988,27 @@ fn token_count(tokenizer: &Tokenizer, text: &str) -> Result<usize, ApiError> {
 
 /// Excerpt only an oversized single unit, retaining original UTF-8 bytes and
 /// exposing truncation. Its complete canonical body still appears in evidencePack.
-fn bounded_text(text: &str, tokenizer: &Tokenizer) -> Result<(String, bool), ApiError> {
+fn bounded_text(
+    text: &str,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+) -> Result<(String, bool), ApiError> {
     let encoded = tokenizer
         .encode(text, true)
         .map_err(|source| failure(format!("passage tokenization failed: {source}")))?;
-    if encoded.len() <= MAX_UNIT_TOKENS as usize {
+    if encoded.len() <= max_tokens {
         return Ok((text.to_string(), false));
     }
     let mut end = encoded
         .get_offsets()
         .iter()
-        .take(MAX_UNIT_TOKENS as usize)
+        .take(max_tokens)
         .map(|(_, end)| *end)
         .max()
         .unwrap_or(0)
         .min(text.len());
     while end > 0
-        && (!text.is_char_boundary(end)
-            || token_count(tokenizer, &text[..end])? > MAX_UNIT_TOKENS as usize)
+        && (!text.is_char_boundary(end) || token_count(tokenizer, &text[..end])? > max_tokens)
     {
         end -= 1;
     }
@@ -1023,10 +1022,12 @@ fn bounded_text(text: &str, tokenizer: &Tokenizer) -> Result<(String, bool), Api
 
 /// Read a bounded canonical unit, failing on missing or oversized authoritative data.
 fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, ApiError> {
+    let body_limit = conn.limits().resources.max_source_body_bytes;
+    let cell_limit = conn.limits().resources.max_json_cell_bytes;
     let row = conn
         .query_row(
             UNIT_SQL,
-            params![parse_id, unit_id, MAX_CELL_BYTES],
+            params![parse_id, unit_id, body_limit, cell_limit],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1043,12 +1044,14 @@ fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, A
             ))
         })?
         .ok_or_else(|| failure(format!("missing passage unit {unit_id} in {parse_id}")))?;
-    let body = row
-        .2
-        .ok_or_else(|| failure(format!("body of {unit_id} exceeds {MAX_CELL_BYTES} bytes")))?;
+    let body = row.2.ok_or_else(|| {
+        failure(format!(
+            "resource limit: body of {unit_id} exceeds {body_limit} bytes"
+        ))
+    })?;
     let locators = row.3.ok_or_else(|| {
         failure(format!(
-            "locators of {unit_id} exceed {MAX_CELL_BYTES} bytes"
+            "resource limit: locators of {unit_id} exceed {cell_limit} bytes"
         ))
     })?;
     Ok(Unit {
@@ -1091,16 +1094,17 @@ fn unique_link(
 /// Preserve recorded locations and their states; an absent location is reported
 /// as absent by clients rather than replaced with an invented title or path.
 fn read_locations(conn: &Connection, source_id: &str) -> Result<Vec<SourceCitation>, ApiError> {
+    let cell_limit = conn.limits().resources.max_json_cell_bytes;
+    let location_limit = conn.limits().retrieval.max_source_locations;
     let mut statement = conn.prepare(LOCATIONS_SQL).map_err(|source| {
         failure(format!(
             "prepare source citations for {source_id}: {source}"
         ))
     })?;
     let rows = statement
-        .query_map(
-            params![source_id, MAX_CELL_BYTES, MAX_SOURCE_LOCATIONS + 1],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
-        )
+        .query_map(params![source_id, cell_limit, location_limit + 1], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|source| failure(format!("read source citations for {source_id}: {source}")))?;
     let mut locations = Vec::new();
     for row in rows {
@@ -1108,7 +1112,7 @@ fn read_locations(conn: &Connection, source_id: &str) -> Result<Vec<SourceCitati
             row.map_err(|source| failure(format!("source citation for {source_id}: {source}")))?;
         let native_uri = uri.ok_or_else(|| {
             failure(format!(
-                "source URI for {source_id} exceeds {MAX_CELL_BYTES} bytes"
+                "resource limit: source URI for {source_id} exceeds {cell_limit} bytes"
             ))
         })?;
         locations.push(SourceCitation {
@@ -1116,9 +1120,9 @@ fn read_locations(conn: &Connection, source_id: &str) -> Result<Vec<SourceCitati
             status: serde_json::from_value(Value::String(status))
                 .map_err(|source| failure(format!("source status for {source_id}: {source}")))?,
         });
-        if locations.len() > MAX_SOURCE_LOCATIONS {
+        if locations.len() > location_limit {
             return Err(failure(format!(
-                "source {source_id} exceeds {MAX_SOURCE_LOCATIONS} citation locations"
+                "resource limit: source {source_id} exceeds {location_limit} citation locations"
             )));
         }
     }

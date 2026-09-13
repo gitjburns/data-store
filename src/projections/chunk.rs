@@ -36,7 +36,9 @@
 
 use std::time::Instant;
 
-use rusqlite::{Transaction, params};
+use crate::artifact_store::ArtifactStore;
+use crate::sqlite::Transaction;
+use rusqlite::params;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 use tracing::{error, info};
@@ -47,7 +49,7 @@ use crate::model::{ContentType, ProducerType, Provenance};
 use crate::primitives::utc_now;
 
 use super::envelope::{self, NewProjection, ProjectionType};
-use super::{CHUNKER_NAME, CHUNKER_VERSION, ChunkerConfig, MAX_UNIT_TOKENS, MIN_SEARCH_UNIT_CHARS};
+use super::{CHUNKER_NAME, CHUNKER_VERSION, ChunkerConfig};
 
 /// Ordered SELECT of a parse's content units in reading order, mirroring
 /// `crate::annotations::producer::SELECT_PARSE_UNITS_SQL`. Chunking depends on
@@ -97,8 +99,8 @@ INSERT INTO chunk_projections (
 /// Atomicity and lifecycle: everything runs on the CALLER's transaction. We
 /// open a `building` Chunk envelope, delete prior chunk rows, extract and split
 /// each unit's targeting text, INSERT the surviving chunks, and complete the
-/// envelope `fresh` (payload_uri = None — the chunk payload lives entirely in
-/// the hot-plane `chunk_projections` table, not an archived blob). Any failure
+/// envelope `fresh` with an immutable construction descriptor. Chunk rows stay
+/// in the hot plane; the descriptor preserves historical settings. Any failure
 /// marks the envelope `failed` on the SAME transaction so the envelope's
 /// lifecycle and the audit event commit or roll back together.
 pub(crate) fn build_chunks(
@@ -106,6 +108,7 @@ pub(crate) fn build_chunks(
     source_id: &str,
     parse_id: &str,
     tokenizer: &Tokenizer,
+    store: &ArtifactStore,
 ) -> Result<usize, ApiError> {
     let started = Instant::now();
     info!(
@@ -113,16 +116,26 @@ pub(crate) fn build_chunks(
         source_id, parse_id, "building chunk projections for parse"
     );
 
-    let projection_id = envelope::insert_building(tx, &new_chunk_projection(source_id, parse_id))?;
+    let config = ChunkerConfig::active(&tx.limits().indexing, tokenizer)?;
+    let config_hash = config.config_hash()?;
+    let descriptor_bytes = crate::canonical::canonical_json_bytes_of(&config)?;
+    if descriptor_bytes.len() > store.limits().resources.max_json_cell_bytes {
+        return Err(ApiError::StorageOperation {
+            message: "resource limit: chunk construction descriptor exceeds configured JSON bytes"
+                .to_owned(),
+        });
+    }
+    let descriptor = store.put_bytes(&descriptor_bytes)?;
+    let projection_id =
+        envelope::insert_building(tx, &new_chunk_projection(source_id, parse_id, &config_hash))?;
 
     // Everything from here is fallible; on any error mark the envelope failed on
     // the same transaction, then propagate. `run_build` owns the actual work so
     // this one site handles the failure lifecycle for every failure path.
-    match run_build(tx, source_id, parse_id, &projection_id, tokenizer) {
+    match run_build(tx, source_id, parse_id, &projection_id, tokenizer, &config) {
         Ok(chunk_count) => {
-            // The chunk payload lives in `chunk_projections`, so there is no
-            // archived payload URI to record (payload_uri = None).
-            envelope::complete_fresh(tx, &projection_id, None)?;
+            // Publish descriptor ownership with the rows in the same transaction.
+            envelope::complete_fresh(tx, &projection_id, Some(&descriptor.uri))?;
             info!(
                 event = "chunk_build.success",
                 // The enclosing owner reports durability after its commit.
@@ -166,6 +179,7 @@ fn run_build(
     parse_id: &str,
     projection_id: &str,
     tokenizer: &Tokenizer,
+    config: &ChunkerConfig,
 ) -> Result<usize, ApiError> {
     // Rebuild idempotence: replace this parse's chunk set wholesale. Must
     // precede the inserts below (see DELETE_PARSE_CHUNKS_SQL invariant).
@@ -175,13 +189,10 @@ fn run_build(
         })?;
 
     let units = read_parse_units(tx, parse_id)?;
-    let chunks = split_units_into_chunks(&units, tokenizer)?;
+    let chunks = split_units_into_chunks(&units, tokenizer, config)?;
 
-    // Chunker identity/config hash are stamped from the ACTIVE ChunkerConfig
-    // (super::ChunkerConfig) — the single source of the §22 chunker identity.
-    // This builder never invents chunker constants; changing a boundary-
-    // affecting parameter there changes this hash for every chunk.
-    let config = ChunkerConfig::active();
+    // The same construction descriptor governs splitting, the envelope, and
+    // every chunk row; changing a boundary parameter changes all their hashes.
     let chunker_config_hash = config.config_hash()?;
     let now = utc_now()?;
 
@@ -202,42 +213,36 @@ fn run_build(
 
 /// Assemble the `NewProjection` request that opens this build's Chunk envelope.
 /// The producer is a Rule (the deterministic chunker, not a model): its name
-/// and version are the banked chunker identity, and its `config_hash` is the
+/// and version are the recorded chunker identity, and its `config_hash` is the
 /// active `ChunkerConfig` hash, so the envelope's provenance answers "which
 /// chunker produced this" without reading a payload row. `input_unit_ids` is
 /// left None on the envelope: the per-chunk `input_unit_ids` are the meaningful
 /// §23 rule-2 links and live on each `chunk_projections` row, whereas a single
 /// envelope-level union would flatten which chunk targets which unit.
-fn new_chunk_projection(source_id: &str, parse_id: &str) -> NewProjection {
+fn new_chunk_projection(source_id: &str, parse_id: &str, config_hash: &str) -> NewProjection {
     NewProjection {
         source_id: source_id.to_string(),
         parse_id: parse_id.to_string(),
         projection_type: ProjectionType::Chunk,
         input_unit_ids: None,
         input_annotation_ids: None,
-        producer: chunker_provenance(),
+        producer: chunker_provenance(config_hash),
         index_name: None,
         index_partition: None,
     }
 }
 
 /// §20 provenance for the chunk producer: a deterministic Rule producer stamped
-/// with the banked chunker name/version and the active config hash. No model,
+/// with the recorded chunker name/version and the active config hash. No model,
 /// prompt, or input refs — the chunker is not a model and its per-chunk input
 /// lineage lives on the chunk rows, not the envelope provenance.
-fn chunker_provenance() -> Provenance {
+fn chunker_provenance(config_hash: &str) -> Provenance {
     Provenance {
         producer_type: ProducerType::Rule,
         producer_name: CHUNKER_NAME.to_string(),
         producer_version: Some(CHUNKER_VERSION.to_string()),
-        // config_hash is intentionally left None here rather than recomputed:
-        // the hash is fallible (it may fail canonical serialization) and the
-        // authoritative per-chunk hash is stamped on each row from
-        // ChunkerConfig::active().config_hash() in run_build. Duplicating a
-        // fallible hash into the infallible envelope-provenance assembly would
-        // force this function to return Result for no added lineage — the row
-        // hash is the answer to "which chunker config produced this chunk".
-        config_hash: None,
+        // Envelope and rows share the exact hash computed once for this build.
+        config_hash: Some(config_hash.to_owned()),
         model_name: None,
         model_version: None,
         prompt_hash: None,
@@ -395,7 +400,7 @@ fn string_field(body: &Value, field: &str) -> Option<String> {
 }
 
 /// Greedily accumulate consecutive units' targeting text into chunks that honor
-/// `MAX_UNIT_TOKENS`, dropping chunks under `MIN_SEARCH_UNIT_CHARS`. Harvested
+/// the recorded token ceiling, dropping chunks under its character floor. Harvested
 /// from `units.rs::split_conversion_into_units`, repurposed so each "block" is a
 /// canonical ContentUnit's text and each produced chunk records the source unit
 /// ids that fed it.
@@ -411,6 +416,7 @@ fn string_field(body: &Value, field: &str) -> Option<String> {
 fn split_units_into_chunks(
     units: &[ChunkableUnit],
     tokenizer: &Tokenizer,
+    config: &ChunkerConfig,
 ) -> Result<Vec<BuiltChunk>, ApiError> {
     // Length accounting must see the complete input, independently of inference
     // truncation/padding settings. Keep the shared model tokenizer unchanged.
@@ -422,8 +428,8 @@ fn split_units_into_chunks(
         })?;
     counter.with_padding(None);
     let tokenizer = &counter;
-    let max_tokens = MAX_UNIT_TOKENS as usize;
-    let min_chars = MIN_SEARCH_UNIT_CHARS as usize;
+    let max_tokens = config.max_unit_tokens as usize;
+    let min_chars = config.min_search_unit_chars;
     let mut chunks = Vec::new();
     let mut current: Option<ChunkAccumulator> = None;
 
@@ -753,7 +759,7 @@ fn flush_chunk(
 }
 
 /// Normalize and record one accumulated chunk, dropping it when it is under the
-/// `MIN_SEARCH_UNIT_CHARS` search-target floor (harvested from
+/// configured search-target character floor (harvested from
 /// `units.rs::push_unit`). The min-char test is on the NORMALIZED text so
 /// whitespace runs cannot inflate a chunk past the floor.
 fn push_chunk(chunks: &mut Vec<BuiltChunk>, accumulator: ChunkAccumulator, min_chars: usize) {

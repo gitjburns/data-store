@@ -68,6 +68,8 @@ pub(crate) enum InferenceSlot {
 #[derive(Debug)]
 pub struct AppState {
     pub config: ServiceConfig,
+    /// Database/artifact callers share validated limits and sealed policy identities.
+    pub(crate) storage: crate::runtime::StorageContext,
     inference: InferenceSlot,
     model_call_gate: Arc<ExclusiveGate>,
     admin_shutdown_token: String,
@@ -102,7 +104,7 @@ pub struct AppState {
     // registry the scheduler acquires barriers on, so activation and query
     // rejection serialize on one set of per-source barriers.
     cutover_registry: Arc<CutoverRegistry>,
-    // Fail-fast search admission gate (D3): a single in-flight-search window
+    // Fail-fast search admission gate: a configured in-flight-search window
     // the `/query` handler acquires a permit on before running the pipeline.
     // Saturation surfaces the existing `ServiceUnavailable` path (R7) — no new
     // error variant.
@@ -455,6 +457,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ServiceConfig,
+        storage: crate::runtime::StorageContext,
         inference: InferenceSlot,
         admin_shutdown_token: String,
         shutdown_signal: Arc<ShutdownSignal>,
@@ -470,20 +473,19 @@ impl AppState {
         let model_call_gate =
             Arc::new(ExclusiveGate::new("model_gate.lock_poisoned", "model gate"));
 
-        // D3: the search admission window is exactly one in-flight search. The
-        // gate primitive counts a `u32` capacity, so the intent-carrying
-        // constant is declared as `u32` to feed `AdmissionGate::new` without a
-        // cast while keeping "one in-flight search" explicit at the call site.
-        const MAX_IN_FLIGHT_SEARCH: u32 = 1;
-        let search_admission = AdmissionGate::new(MAX_IN_FLIGHT_SEARCH);
+        // Admission and worker wakeups use the same validated startup values
+        // that the profile and operational configuration identity record.
+        let search_admission = AdmissionGate::new(config.retrieval.max_concurrent_queries);
+        let maintenance = Arc::new(MaintenanceGate::new(config.scheduling.maintenance_poll_ms));
 
         Self {
             config,
+            storage,
             inference,
             model_call_gate,
             admin_shutdown_token,
             shutdown_signal,
-            maintenance: Arc::new(MaintenanceGate::default()),
+            maintenance,
             sync_health,
             fabric_health,
             annotation_health,

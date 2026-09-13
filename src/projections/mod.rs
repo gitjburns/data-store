@@ -18,7 +18,7 @@
 //! - `graph` (C6f): entity-mention and entity-edge projections (D9).
 //!
 //! This module owns the SHARED contract the packages consume: the banked
-//! chunker constants, the chunker identity and its config-hash derivation
+//! archived chunker configuration, its identity and config-hash derivation
 //! (routed through `crate::canonical` so the hash follows the one §16.2
 //! canonical-serialization rule), and the stored-chunk row shape the lexical
 //! and dense builders read chunks back through.
@@ -40,21 +40,9 @@ pub(crate) mod section_dense;
 pub(crate) mod view;
 pub(crate) mod worker;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-
-/// Minimum character length a chunk must reach to be indexed as a search
-/// target (spec §23 / D3). Banked at CRc from the retired
-/// `[search].min_search_unit_chars` config key so C6b no longer reads it from
-/// config; it is now identity-bearing, folded into `chunkerConfigHash`.
-pub(crate) const MIN_SEARCH_UNIT_CHARS: u32 = 400;
-
-/// Maximum token count a chunk may hold before it is split (spec §23 / D3),
-/// the ColBERT token cap. Banked at CRc from the retired
-/// `[search].max_unit_tokens` config key; like `MIN_SEARCH_UNIT_CHARS` it is
-/// now part of the hashed chunker configuration, not runtime config.
-pub(crate) const MAX_UNIT_TOKENS: u32 = 512;
 
 /// Chunker producer name recorded on every `chunk_projections` row and in the
 /// projection's Provenance (spec §22 ChunkPayload.chunkerName). Stable across
@@ -65,7 +53,8 @@ pub(crate) const CHUNKER_NAME: &str = "fabric-chunker";
 /// when the splitting algorithm changes in a way that alters chunk boundaries,
 /// so a version change is a visible rebuild trigger rather than a silent
 /// change in what got indexed.
-pub(crate) const CHUNKER_VERSION: &str = "1";
+pub(crate) const CHUNKER_VERSION: &str = "2";
+pub(crate) const CHUNK_CONFIG_PAYLOAD_TYPE: &str = "chunk_construction_policy";
 
 /// The identity-bearing chunker configuration whose canonical hash is the
 /// `chunkerConfigHash` stamped on every chunk (spec §22). Serializing the real
@@ -73,26 +62,67 @@ pub(crate) const CHUNKER_VERSION: &str = "1";
 /// the §16.2 wire convention used across the model. Two chunkers that would
 /// produce different chunk boundaries must never share this hash, so every
 /// boundary-affecting parameter belongs here.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ChunkerConfig {
-    pub(crate) chunker_name: &'static str,
-    pub(crate) chunker_version: &'static str,
-    pub(crate) min_search_unit_chars: u32,
+    pub(crate) chunker_name: String,
+    pub(crate) chunker_version: String,
+    pub(crate) min_search_unit_chars: usize,
     pub(crate) max_unit_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tokenizer_hash: Option<String>,
 }
 
 impl ChunkerConfig {
-    /// The active chunker configuration: the banked constants under the
-    /// current chunker identity. This is the one configuration C6b builds
-    /// chunks with, so its hash is the `chunkerConfigHash` every chunk carries.
-    pub(crate) fn active() -> Self {
+    /// Seal current construction limits and tokenizer bytes before producing any chunks.
+    pub(crate) fn active(
+        limits: &crate::limits::IndexingLimits,
+        tokenizer: &tokenizers::Tokenizer,
+    ) -> Result<Self, ApiError> {
+        let tokenizer =
+            tokenizer
+                .to_string(false)
+                .map_err(|source| ApiError::StorageOperation {
+                    message: format!("serialize chunk tokenizer identity: {source}"),
+                })?;
+        Ok(Self {
+            chunker_name: CHUNKER_NAME.to_owned(),
+            chunker_version: CHUNKER_VERSION.to_owned(),
+            min_search_unit_chars: limits.min_search_unit_chars,
+            max_unit_tokens: limits.chunk_max_tokens,
+            tokenizer_hash: Some(crate::canonical::sha256_hex_bytes(tokenizer.as_bytes())),
+        })
+    }
+
+    /// Legacy artifacts have no descriptor and must match this exact frozen v1 shape.
+    pub(crate) fn legacy() -> Self {
         ChunkerConfig {
-            chunker_name: CHUNKER_NAME,
-            chunker_version: CHUNKER_VERSION,
-            min_search_unit_chars: MIN_SEARCH_UNIT_CHARS,
-            max_unit_tokens: MAX_UNIT_TOKENS,
+            chunker_name: CHUNKER_NAME.to_owned(),
+            chunker_version: "1".to_owned(),
+            min_search_unit_chars: 400,
+            max_unit_tokens: 512,
+            tokenizer_hash: None,
         }
+    }
+
+    /// Reject unknown construction versions without comparing history to today's settings.
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        let valid = self.chunker_name == CHUNKER_NAME
+            && self.chunker_version == CHUNKER_VERSION
+            && self.min_search_unit_chars > 0
+            && self.max_unit_tokens > 0
+            && self.tokenizer_hash.as_ref().is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !valid {
+            return Err(ApiError::StorageOperation {
+                message: "invalid or unsupported chunk construction policy".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Derive this configuration's `chunkerConfigHash` (spec §22): lowercase

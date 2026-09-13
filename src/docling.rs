@@ -21,16 +21,13 @@ use crate::{
         DoclingActivityReport, format_docling_activity_message, inspect_docling_activity,
     },
     error::ApiError,
+    limits::{DiagnosticLimits, ParsingLimits},
+    runtime::StorageContext,
     source::ResolvedSource,
-    util::{MAX_DIAGNOSTIC_CHARS, panic_payload_message, truncate_diagnostic_text},
+    util::{panic_payload_message, truncate_diagnostic_text},
 };
 
 static CONVERSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const CHILD_OUTPUT_READ_CHUNK_BYTES: usize = 8_192;
-const DOCLING_WAIT_POLL_MILLIS: u64 = 250;
-const POST_100_FIRST_FEEDBACK_SECONDS: u64 = 1;
-const POST_100_FEEDBACK_CADENCE_SECONDS: u64 = 1;
-const POST_100_SAMPLE_SECONDS: u64 = 0;
 
 /// Effective Docling CLI options for one conversion, resolved from
 /// `[docling]` config and the shared `[pdf]` timeout. These are identity-bearing
@@ -108,7 +105,7 @@ struct DoclingLaunch<'a> {
     config: &'a DoclingConfig,
     document_timeout_seconds: u64,
     args: &'a [String],
-    index_root: &'a Path,
+    index_root: &'a StorageContext,
     output_dir: &'a Path,
     source: &'a ResolvedSource,
     output_format: &'a str,
@@ -117,6 +114,8 @@ struct DoclingLaunch<'a> {
 // Keep stable Docling process facts together so wait-time logs and feedback use
 // the same lifecycle identity without changing operation handles.
 struct DoclingProcessContext<'a> {
+    parsing: ParsingLimits,
+    diagnostics: DiagnosticLimits,
     config: &'a DoclingConfig,
     document_timeout_seconds: u64,
     output_dir: &'a Path,
@@ -131,6 +130,8 @@ struct DoclingProcessContext<'a> {
 // Reader threads need owned copies of diagnostic identity because their closures
 // outlive the stack frame that spawned the Docling process.
 struct DoclingChildOutputContext {
+    parsing: ParsingLimits,
+    diagnostics: DiagnosticLimits,
     label: &'static str,
     process_id: u32,
     source_requested: String,
@@ -148,7 +149,7 @@ struct DoclingChildOutputContext {
 pub fn convert_source_to_document_json(
     config: &DoclingConfig,
     document_timeout_seconds: u64,
-    index_root: &Path,
+    index_root: &StorageContext,
     source: ResolvedSource,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     output_dir_override: Option<&Path>,
@@ -200,7 +201,7 @@ pub fn convert_source_to_document_json(
 /// `json`).
 fn execute_docling_conversion(
     config: &DoclingConfig,
-    index_root: &Path,
+    index_root: &StorageContext,
     source: &ResolvedSource,
     progress_sender: Option<SyncSender<DoclingProgressUpdate>>,
     output_dir: &Path,
@@ -223,8 +224,8 @@ fn execute_docling_conversion(
         progress_sender,
         expected_artifact,
     )?;
-    let stdout = truncate_diagnostic_text(&output.stdout);
-    let stderr = truncate_diagnostic_text(&output.stderr);
+    let stdout = truncate_diagnostic_text(&output.stdout, &index_root.limits().diagnostics);
+    let stderr = truncate_diagnostic_text(&output.stderr, &index_root.limits().diagnostics);
 
     if output.timed_out || !output.status.success() {
         let timeout_context = if output.timed_out {
@@ -470,6 +471,8 @@ fn run_docling(
     let output_dir_for_log = output_dir.display().to_string();
     let progress_state = Arc::new(Mutex::new(DoclingProgressState::default()));
     let stdout_context = DoclingChildOutputContext {
+        parsing: index_root.limits().parsing,
+        diagnostics: index_root.limits().diagnostics,
         label: "stdout",
         process_id,
         source_requested: source_requested.clone(),
@@ -491,6 +494,8 @@ fn run_docling(
             .wrap(move || read_child_output(stdout, stdout_context, None, None)),
     );
     let stderr_context = DoclingChildOutputContext {
+        parsing: index_root.limits().parsing,
+        diagnostics: index_root.limits().diagnostics,
         label: "stderr",
         process_id,
         source_requested,
@@ -518,6 +523,8 @@ fn run_docling(
         )
     }));
     let process_context = DoclingProcessContext {
+        parsing: index_root.limits().parsing,
+        diagnostics: index_root.limits().diagnostics,
         config,
         document_timeout_seconds,
         output_dir,
@@ -548,12 +555,24 @@ fn run_docling(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Docling process wait completed"
     );
-    let stdout = join_child_output(stdout_reader, "stdout", process_id, started);
-    let stderr = join_child_output(stderr_reader, "stderr", process_id, started);
+    let stdout = join_child_output(
+        stdout_reader,
+        "stdout",
+        process_id,
+        started,
+        &index_root.limits().diagnostics,
+    );
+    let stderr = join_child_output(
+        stderr_reader,
+        "stderr",
+        process_id,
+        started,
+        &index_root.limits().diagnostics,
+    );
     let stdout = stdout?;
     let stderr = stderr?;
-    let stdout_diagnostic = truncate_diagnostic_text(&stdout);
-    let stderr_diagnostic = truncate_diagnostic_text(&stderr);
+    let stdout_diagnostic = truncate_diagnostic_text(&stdout, &index_root.limits().diagnostics);
+    let stderr_diagnostic = truncate_diagnostic_text(&stderr, &index_root.limits().diagnostics);
     if timed_out || !status.success() {
         error!(
             event = "docling.process.failed",
@@ -649,7 +668,7 @@ fn wait_for_docling_process(
 
         let now = Instant::now();
         let snapshot = snapshot_docling_progress(&progress_state, now);
-        if should_emit_post_100_feedback(&snapshot, last_feedback_at, now) {
+        if should_emit_post_100_feedback(&snapshot, last_feedback_at, now, &context.parsing) {
             last_feedback_at = Some(now);
             let consumer_disconnected = emit_post_100_docling_feedback(
                 context,
@@ -666,7 +685,7 @@ fn wait_for_docling_process(
             }
         }
 
-        let poll_duration = Duration::from_millis(DOCLING_WAIT_POLL_MILLIS)
+        let poll_duration = Duration::from_millis(context.parsing.docling_poll_ms)
             .min(timeout_duration.saturating_sub(started.elapsed()));
         thread::sleep(poll_duration);
     }
@@ -761,7 +780,7 @@ fn emit_post_100_docling_feedback(
     let latest_progress_message = progress_snapshot
         .latest_message
         .as_deref()
-        .map(truncate_progress_message_for_log)
+        .map(|message| truncate_progress_message_for_log(message, &context.diagnostics))
         .unwrap_or_else(|| "none".to_string());
     info!(
         event = "docling.post_100_feedback.started",
@@ -778,12 +797,15 @@ fn emit_post_100_docling_feedback(
         "Docling post-100 feedback inspection started"
     );
 
-    let sample_duration = Duration::from_secs(POST_100_SAMPLE_SECONDS);
+    let sample_duration = Duration::from_secs(context.parsing.docling_sample_seconds);
     let report = inspect_docling_activity(
         process_id,
         output_dir,
         expected_artifact_path,
         sample_duration,
+        timeout_duration.saturating_sub(started.elapsed()),
+        &context.parsing,
+        &context.diagnostics,
     );
     log_post_100_report(&report, context, timeout_remaining);
     let message = format_docling_activity_message(&report, started.elapsed(), timeout_remaining);
@@ -891,28 +913,28 @@ fn should_emit_post_100_feedback(
     snapshot: &DoclingProgressSnapshot,
     last_feedback_at: Option<Instant>,
     now: Instant,
+    parsing: &ParsingLimits,
 ) -> bool {
     let Some(completed_reported_for) = snapshot.completed_reported_for else {
         return false;
     };
-    if completed_reported_for < Duration::from_secs(POST_100_FIRST_FEEDBACK_SECONDS) {
+    if completed_reported_for < Duration::from_millis(parsing.docling_feedback_initial_ms) {
         return false;
     }
 
     last_feedback_at
         .and_then(|last_feedback_at| now.checked_duration_since(last_feedback_at))
-        .map(|age| age >= Duration::from_secs(POST_100_FEEDBACK_CADENCE_SECONDS))
+        .map(|age| age >= Duration::from_millis(parsing.docling_feedback_interval_ms))
         .unwrap_or(true)
 }
 
 /// Bound the latest Docling progress line before writing it to the service log.
-fn truncate_progress_message_for_log(value: &str) -> String {
-    const MAX_PROGRESS_LOG_CHARS: usize = 240;
+fn truncate_progress_message_for_log(value: &str, diagnostics: &DiagnosticLimits) -> String {
     let mut truncated = value
         .chars()
-        .take(MAX_PROGRESS_LOG_CHARS)
+        .take(diagnostics.progress_log_chars)
         .collect::<String>();
-    if value.chars().count() > MAX_PROGRESS_LOG_CHARS {
+    if value.chars().count() > diagnostics.progress_log_chars {
         truncated.push_str("...");
     }
 
@@ -930,6 +952,8 @@ where
     R: Read,
 {
     let DoclingChildOutputContext {
+        parsing,
+        diagnostics,
         label,
         process_id,
         source_requested,
@@ -949,7 +973,13 @@ where
         "Docling child output reader started"
     );
     let mut output = String::new();
-    let mut buffer = [0_u8; CHILD_OUTPUT_READ_CHUNK_BYTES];
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(parsing.process_read_chunk_bytes)
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("allocate Docling output read buffer: {source}"),
+        })?;
+    buffer.resize(parsing.process_read_chunk_bytes, 0);
     loop {
         let bytes_read = match reader.read(&mut buffer) {
             Ok(bytes_read) => bytes_read,
@@ -990,7 +1020,7 @@ where
         }
 
         let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        output = append_bounded_diagnostic_text(&output, &chunk);
+        output = append_bounded_diagnostic_text(&output, &chunk, &parsing, &diagnostics);
         if progress_sender.is_some() || progress_state.is_some() {
             let consumer_disconnected = emit_docling_progress_from_chunk(
                 progress_sender.as_ref(),
@@ -1025,6 +1055,7 @@ fn join_child_output(
     label: &'static str,
     process_id: u32,
     process_started: Instant,
+    diagnostics: &DiagnosticLimits,
 ) -> Result<String, ApiError> {
     match handle.join() {
         Ok(Ok(output)) => Ok(output),
@@ -1043,7 +1074,7 @@ fn join_child_output(
         }
         // std thread joins fail only on panic; there is no cancellation state.
         Err(panic_payload) => {
-            let panic_message = panic_payload_message(panic_payload.as_ref());
+            let panic_message = panic_payload_message(panic_payload.as_ref(), diagnostics);
             error!(
                 event = "docling.child_output_reader.join_failed",
                 task_purpose = "read_docling_child_output",
@@ -1298,19 +1329,29 @@ fn read_raw_artifact(path: &Path) -> Result<String, ApiError> {
 }
 
 /// Append one diagnostic chunk while keeping the most recent bounded text.
-fn append_bounded_diagnostic_text(current: &str, chunk: &str) -> String {
+fn append_bounded_diagnostic_text(
+    current: &str,
+    chunk: &str,
+    parsing: &ParsingLimits,
+    diagnostics: &DiagnosticLimits,
+) -> String {
     let next = format!("{current}{chunk}");
-    if next.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+    if next.chars().count() <= diagnostics.max_error_chars
+        && next.len() <= parsing.process_log_bytes
+    {
         return next;
     }
 
-    next.chars()
-        .rev()
-        .take(MAX_DIAGNOSTIC_CHARS)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
+    // Preserve the latest complete UTF-8 characters under both independent
+    // capture-byte and display-character limits while continuing to drain pipes.
+    let mut start = next.len();
+    for (index, (byte, _)) in next.char_indices().rev().enumerate() {
+        if index == diagnostics.max_error_chars || next.len() - byte > parsing.process_log_bytes {
+            break;
+        }
+        start = byte;
+    }
+    next[start..].to_owned()
 }
 
 /// Format child-process exit status fields for diagnostics.

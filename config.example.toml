@@ -29,6 +29,10 @@ token_file_path = ".data-store-admin-token"
 # The server validates this section but never reads it at runtime; it is
 # owned by the bundled data-store CLI client sharing this file.
 operation_timeout_seconds = 3600
+# Milliseconds to wait between operation polls; terminal operation state ends polling.
+operation_poll_interval_ms = 1000
+# Number of attribution entries initially expanded; further entries remain inspectable.
+provenance_preview_items = 3
 
 [inference]
 # Accelerator backend to use for model inference. CPU fallback is not supported.
@@ -129,10 +133,10 @@ page_batch_size = 10
 # - local: In-process Candle Qwen3 embedding runtime on the [inference]
 #   accelerator. Requires path and max_tokens. The http-only fields
 #   (endpoint, model, timeout_seconds, api_key_file_path) must not be set.
-# - http: Remote endpoint speaking the OpenAI-compatible embeddings contract
-#   (vLLM, TEI, llama.cpp). Requires endpoint, model, and timeout_seconds;
-#   api_key_file_path is optional. The local-only fields (path, max_tokens)
-#   must not be set. The service sends the same instruction-prefixed text the
+# - http: Remote embeddings endpoint with vLLM model metadata and explicit
+#   truncation controls. Requires endpoint, model, max_tokens, and timeout_seconds;
+#   api_key_file_path is optional and path is forbidden. The service sends the
+#   same instruction-prefixed text the
 #   local runtime would embed and L2-normalizes returned vectors, so query and
 #   passage semantics do not fork by backend. Vectors from different backends
 #   are not interchangeable within one corpus; switch backends only alongside
@@ -147,16 +151,24 @@ dimension = 4096
 pooling = "last_token"
 # Local Qwen3 dense embedding model directory. Required when backend = "local".
 path = "/absolute/path/to/qwen3-embedding-8b"
-# Maximum token count accepted by the local dense runtime. Required when
-# backend = "local".
-max_tokens = 8192
-# HTTP backend example: replace the local fields above with these.
+# Encoded token capacity including instructions/special tokens. HTTP requires
+# exact equality with /v1/models; local validates checkpoint capacity. No truncation.
+max_tokens = 32768
+# HTTP inputs per batch and batches in flight; remaining work waits. Local ignores these.
+http_batch_size = 32
+http_concurrent_requests = 8
+# HTTP transient-failure retries beyond the first call; 0 disables retrying.
+http_max_retries = 3
+# Milliseconds for exponential HTTP retry backoff; initial delay must fit the ceiling.
+http_retry_initial_delay_ms = 2000
+http_retry_max_delay_ms = 8000
+# HTTP backend example: set backend = "http", remove path, and set these fields.
 #
 # OpenAI-compatible embeddings endpoint URL; must start with http:// or
 # https://. Full route URL, not a base URL.
 #endpoint = "http://embedding-host:8001/v1/embeddings"
 # Model name sent in HTTP embeddings requests.
-#model = "qwen3-embedding-8b"
+#model = "Qwen/Qwen3-Embedding-8B"
 # HTTP embeddings request timeout in seconds.
 #timeout_seconds = 60
 # Optional owner-only file containing the API key sent as a bearer token.
@@ -172,10 +184,16 @@ backend = "local"
 path = "/absolute/path/to/colbert-zero"
 # Expected ColBERT token-vector dimension.
 dimension = 128
+# Encoded checkpoint/engine capacity; HTTP must equal /v1/models. No truncation.
+max_tokens = 518
 # Maximum encoded query tokens for ColBERT query embedding.
 query_max_tokens = 512
 # Maximum encoded document/unit tokens for ColBERT document embedding.
 document_max_tokens = 512
+# Windows per document call; remaining windows use later batches.
+document_batch_size = 16
+# Local padded-batch token threshold; longer inputs are inferred individually.
+local_batch_max_tokens = 128
 
 # HTTP backend: set backend = "http", remove path above, and set all four fields.
 # Full /pooling route; no URL credentials, query parameters, or fragment.
@@ -197,22 +215,21 @@ document_max_tokens = 512
 # - local: In-process Candle ModernBERT sequence-classification runtime on the
 #   [inference] accelerator. Requires path and max_tokens. The http-only fields
 #   (endpoint, model, timeout_seconds, api_key_file_path) must not be set.
-# - http: Remote endpoint speaking the Cohere-compatible rerank contract
-#   (vLLM, Cohere, Jina). Requires endpoint, model, and timeout_seconds;
-#   api_key_file_path is optional. The local-only fields (path, max_tokens)
-#   must not be set.
+# - http: Remote rerank endpoint with vLLM model metadata and explicit truncation
+#   controls. Requires endpoint, model, max_tokens, and timeout_seconds;
+#   api_key_file_path is optional and path is forbidden.
 backend = "local"
 # Local reranker model directory. Required when backend = "local".
-path = "/absolute/path/to/qwen3-reranker-4b"
-# Maximum token count accepted by the local reranker runtime. Required when
-# backend = "local".
+path = "/absolute/path/to/modernbert-reranker"
+# Encoded query/source/annotation/template capacity; HTTP must match /v1/models.
+# Local must fit its checkpoint. Oversized inputs fail; no component is clipped.
 max_tokens = 32768
-# HTTP backend example: replace the local fields above with these.
+# HTTP backend example: set backend = "http", remove path, and set these fields.
 #
 # Cohere-compatible rerank endpoint URL; must start with http:// or https://.
 #endpoint = "https://api.example.com/v1/rerank"
 # Model name sent in HTTP rerank requests.
-#model = "rerank-model-name"
+#model = "Qwen/Qwen3-Reranker-0.6B"
 # HTTP rerank request timeout in seconds.
 #timeout_seconds = 60
 # Optional owner-only file containing the API key sent as a bearer token.
@@ -235,6 +252,9 @@ timeout_seconds = 120
 # Maximum source-excerpt length in Unicode characters. Oversized units are
 # split without dropping text; prompts and intermediate results are additional.
 max_input_chars = 2000
+# Maximum provider completion tokens, including reasoning; a length stop fails
+# the annotation call instead of publishing partial output.
+max_completion_tokens = 150000
 
 # Independent per-annotation retry allowances; zero disables that category.
 # Counters and retry timers reset on restart or rebuild.
@@ -247,18 +267,196 @@ execution_retry_initial_delay_seconds = 5
 execution_retry_max_delay_seconds = 300
 
 [policies]
-# Paths to the operator-editable external policy documents. Config holds the
-# PATH to a policy document, never its values; each document is loaded once at
-# startup, strictly validated (unknown keys and invalid values are fatal), and
-# content-hashed. Versions are SYSTEM-ASSIGNED: the service detects content
+# Paths to startup-loaded policy documents. Entity-match flags combine with
+# retrieval.entity_matching limits before hashing the effective policy.
+# Unknown keys and invalid values are fatal. Versions are SYSTEM-ASSIGNED: content
 # changes by hash and appends the next version to the policy_versions registry
 # at startup — do not put version fields in the documents. Editing a document
 # requires a service restart to take effect. Relative paths resolve from this
 # config file's directory.
 #
-# Graph-entry entity-match ruleset (fuzzy matching classes and caps).
+# Graph-entry entity-match enable flags; numeric limits live in retrieval.entity_matching.
 entity_match_file_path = "policies/entity-match.toml"
 # Annotator naming rules composed into the entity/relation producer prompts.
 # NOTE: editing that document changes producer identity (promptHash) and
 # invalidates memoized producer output — see the document's own comments.
 annotator_naming_file_path = "policies/annotator-naming.toml"
+
+# Operational limits: required at startup; no implicit defaults.
+[retrieval]
+# Result count when omitted; requests above max_results are rejected.
+default_results = 10
+max_results = 100
+# Searches executing concurrently; additional requests receive busy feedback.
+max_concurrent_queries = 1
+# Top candidates retained per discovery channel; lower-ranked candidates are dropped.
+max_candidates_per_channel = 100
+# Fused candidates scored by ColBERT; lower fusion ranks are dropped.
+colbert_candidate_pool_size = 100
+# Passage candidates sent to the final reranker, raised for larger valid result requests.
+reranker_candidate_pool_size = 100
+# Positive reciprocal-rank-fusion k in 1/(k + rank); larger values flatten rank differences.
+rrf_k = 60
+# Best section windows retained per query; each nominates up to the following unit count.
+section_candidate_limit = 20
+section_passages_per_window = 5
+# Graph traversal depth: 0 disables neighbors, 1 includes direct neighbors; others rejected.
+graph_hop_budget = 1
+# Maximum contiguous query-token span tested as an entity name; longer spans are not tried.
+max_entity_name_tokens = 6
+# Unicode-character minimum for normalized terms admitted to the strict lexical query.
+# Broad OR matching retains shorter terms and stopwords; every term is quoted.
+min_fts_term_chars = 3
+# ColBERT-token budget per displayed source passage; legacy whole-unit text may
+# use a prefix, while exact windows remain complete. Reranker context is separate.
+passage_max_tokens = 512
+# Maximum canonical units assembled into one source passage; further neighbors are omitted.
+max_passage_units = 64
+# Maximum source locations read for one result; excess fails citation assembly.
+max_source_locations = 256
+# Maximum parent-section traversal depth; excess fails ancestry resolution.
+max_section_ancestry = 64
+# Total units and complete-text ColBERT tokens allowed in a raw evidence pack.
+# Exceeding either budget fails raw evidence assembly with its limit named.
+raw_evidence_max_units = 6400
+raw_evidence_max_tokens = 3276800
+
+[retrieval.entity_matching]
+# Maximum fuzzy name candidates admitted per query; remaining candidates are not traversed.
+max_fuzzy_candidates = 20
+# Minimum stored-name token count for acronym matching; at least 2 is required.
+acronym_min_name_tokens = 2
+# Minimum Unicode characters in each prefix query token; shorter tokens cannot prefix-match.
+prefix_min_token_chars = 3
+
+[indexing]
+# Minimum Unicode characters in a searchable merged source chunk; shorter units are combined.
+min_search_unit_chars = 400
+# Complete-text ColBERT-token budget for source chunks; larger text is split into windows.
+chunk_max_tokens = 512
+# Complete-text ColBERT-token budget for annotation views; all windows are embedded.
+annotation_window_max_tokens = 512
+# Complete-text ColBERT-token budget for dense section windows; larger sections are split.
+section_max_tokens = 2048
+
+[resources]
+# Bytes per canonical body used by annotation/section readers and builders; excess fails that work.
+max_source_body_bytes = 1048576
+# Bytes in one inspected JSON cell/document or JSONL read segment; excess refuses decoding.
+max_json_cell_bytes = 16777216
+# Bytes in an annotation retrieval manifest/plan or parser bundle manifest; excess refuses admission.
+# Section planes use per-record JSON/vector guards instead of a whole-file cap.
+max_manifest_bytes = 16777216
+# Bytes of one /v1/models response, bounded before JSON decoding; excess fails initialization.
+model_metadata_max_bytes = 1048576
+# f32 values and token rows in one embedding blob; excess fails publication/read.
+max_embedding_values = 1048576
+max_embedding_rows = 518
+# Annotation inputs in one cohort and cohorts in one parse; excess fails discovery/publication.
+max_annotations_per_cohort = 4096
+max_cohorts_per_parse = 100000
+# Source IDs held by one inventory operation; excess fails that operation.
+max_sources = 100000
+# Input IDs or dependent projection IDs inspected together; excess fails the bounded operation.
+max_annotation_inputs = 1000000
+max_annotation_dependents = 1000000
+# Unit IDs held for one parse and parse IDs held at startup; excess fails the operation.
+max_parse_units = 100000
+max_startup_parses = 100000
+# Vocabulary rows scanned and groups returned; inspection reports when its bound is reached.
+vocabulary_scan_rows = 200000
+vocabulary_groups = 50000
+# Bytes per streamed embedding read, a positive multiple of 4; larger blobs use more reads.
+embedding_read_buffer_bytes = 16384
+
+[workers]
+# Milliseconds before an idle annotation worker checks for new committed work.
+annotation_idle_interval_ms = 30000
+# Annotation producer calls in flight; additional ready annotations wait.
+annotation_concurrent_calls = 32
+# Commit-lock attempts between progress logs; retries preserve completed model output.
+annotation_commit_wait_log_attempts = 60
+# Milliseconds between projection discovery cycles.
+projection_interval_ms = 5000
+# Milliseconds between publication commit-lock attempts; completed embeddings are retained.
+projection_commit_wait_ms = 100
+# Representations per embedding batch; remaining representations use later batches.
+projection_batch_size = 8
+# Cohorts attempted per discovery cycle and per source; remaining work rotates into later cycles.
+projection_cohorts_per_cycle = 16
+projection_cohorts_per_source = 4
+
+[sqlite]
+# Milliseconds spent waiting for another connection's lock; expiry returns a SQLite error.
+busy_timeout_ms = 5000
+# Milliseconds of wall time per SQL execution boundary; expiry cooperatively interrupts SQL.
+# SQL calls and open row iteration consume this budget, including iterator caller
+# work. Model calls made outside SQL execution scopes do not consume it.
+execution_timeout_ms = 5000
+# SQLite VM operations between deadline checks; smaller values detect expiry sooner.
+progress_operations = 1000
+
+[parsing]
+# Candidate object counts accepted before activation; excess fails the parse with no partial publish.
+# Units cannot exceed 1000000 because canonical IDs retain six-digit ordering.
+# These acceptance limits do not cap complete forensic parser_raw payloads.
+max_candidate_units = 999999
+max_candidate_relationships = 4000000
+max_candidate_warnings = 10000
+# UTF-8 bytes in one candidate unit body; excess fails parse acceptance.
+max_unit_body_bytes = 4194304
+# Captured bytes per child stdout/stderr stream; extra bytes are drained without retention.
+process_log_bytes = 65536
+# Bytes per subprocess pipe read; larger output is handled with repeated bounded reads.
+process_read_chunk_bytes = 8192
+# Milliseconds between process completion/deadline checks for each PDF engine.
+mupdf_poll_ms = 25
+docling_poll_ms = 250
+# Milliseconds until the first Docling progress update and between later updates.
+docling_feedback_initial_ms = 1000
+docling_feedback_interval_ms = 1000
+# Seconds of native Docling process sampling; 0 disables sampling, not document processing.
+docling_sample_seconds = 0
+# Milliseconds allowed beyond sampling duration before stopping the sample collector.
+activity_sample_grace_ms = 15000
+# Milliseconds between sample-process completion checks.
+activity_poll_ms = 100
+# Regex backtracking steps per PDF cleanup match; exhaustion fails cleanup explicitly.
+cleanup_regex_backtrack_limit = 1000000
+
+[scheduling]
+# Minimum filesystem sweep delay in milliseconds; faster suggestions are clamped here.
+min_interval_ms = 1
+# Maximum adaptive/backoff delay in milliseconds; larger suggestions are clamped here.
+max_backoff_ms = 60000
+# Millisecond base for failed-sweep backoff; the first delay is base * error_growth.
+error_retry_base_ms = 1000
+# Multipliers applied after quiet, backpressured, and failed sweeps, capped by max_backoff_ms.
+quiet_growth = 1.5
+backpressure_growth = 2.0
+error_growth = 2.0
+# Weight of the latest observed inter-change interval in the cadence estimate: 0 < weight <= 1.
+inter_change_ema_weight = 0.3
+# Milliseconds between maintenance/shutdown observations while workers wait.
+maintenance_poll_ms = 100
+
+[diagnostics]
+# Unicode characters retained in rendered error details; excess is abbreviated.
+max_error_chars = 16000
+# Unicode characters persisted in bounded operation/worker failure summaries.
+persisted_detail_chars = 500
+# Error-source links traversed for diagnostics; deeper chains are not expanded.
+error_chain_depth = 16
+# Unicode characters from provider error bodies included in model failure context.
+model_error_excerpt_chars = 2048
+# Unicode characters of subprocess progress retained per log update.
+progress_log_chars = 240
+# Unicode characters retained for sampled process names and sampling error text.
+activity_process_name_chars = 80
+activity_error_chars = 240
+# Unicode characters in diagnostic key/name previews; longer identifiers are abbreviated.
+identifier_preview_chars = 64
+# Hash characters shown in diagnostic prefixes; the complete stored hash remains unchanged.
+hash_prefix_chars = 12
+# Example paths included in a filesystem sweep summary; counts still cover all paths.
+sweep_example_paths = 3

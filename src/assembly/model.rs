@@ -19,12 +19,6 @@ use crate::model::relationship::{UnitRelationship, UnitRelationshipType};
 use crate::model::unit::ContentType;
 use crate::model::{Locator, SemanticAnnotation};
 
-/// Maximum ranked passages accepted by the query and retained by assembly.
-pub(crate) const MAX_QUERY_RESULTS: usize = 100;
-
-/// Bound canonical membership independently of a passage's displayed token count.
-pub(crate) const MAX_PASSAGE_UNITS: usize = 64;
-
 /// Versioned, self-hashed contract for retaining canonical passage evidence.
 /// The sealed policy records inclusion behavior and raw evidence safety bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,12 +66,6 @@ pub(crate) struct AssemblyBudget {
     /// Maximum total token budget across the pack's text projections
     /// (spec `maxTokens`).
     pub(crate) max_tokens: u32,
-    /// Graph-expansion depth; zero for final-passage retention.
-    pub(crate) max_expansion_depth: u32,
-    /// Optional cap on explicitly-referenced units pulled in by the
-    /// `include_explicit_references` operator (spec `maxReferencedUnits?`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) max_referenced_units: Option<u32>,
 }
 
 /// Spec §25 `AssemblyPolicy.rules[]`. One inclusion rule: when its `when`

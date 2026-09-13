@@ -4,6 +4,7 @@ mod colbert_backend;
 mod dense;
 mod dense_backend;
 mod device;
+mod http_models;
 mod qwen3;
 mod reranker;
 mod reranker_backend;
@@ -133,6 +134,7 @@ impl InferenceRuntime {
         progress("artifacts_validating")?;
         let artifacts = ModelArtifactSet::load(&config.models)?;
         progress("artifacts_ready")?;
+        let limits = config.runtime_limits();
         // Dense backend selection (approved design): the local backend loads the
         // validated 8B artifacts and the Candle runtime (bit-identical to the
         // pre-split path); the HTTP backend skips local artifact validation and
@@ -158,6 +160,7 @@ impl InferenceRuntime {
             DenseBackendKind::Http => DenseEmbeddingBackend::load_http_with_progress(
                 &config.models.dense,
                 config.config_root(),
+                &limits,
                 progress,
             )?,
         };
@@ -182,6 +185,7 @@ impl InferenceRuntime {
             ColbertBackendKind::Http => ColbertBackend::load_http_with_progress(
                 &config.models.colbert,
                 config.config_root(),
+                &limits,
                 progress,
             )?,
         };
@@ -207,6 +211,7 @@ impl InferenceRuntime {
             RerankerBackendKind::Http => RerankerBackend::load_http_with_progress(
                 &config.models.reranker,
                 config.config_root(),
+                &limits,
                 progress,
             )?,
         };
@@ -259,12 +264,13 @@ fn embedding_identity(
     let colbert = &config.models.colbert;
     // Formatter outputs bind the identity to their authoritative prefixes/markers instead of copies.
     let identity = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "dense": {
             "backend": dense_backend.backend_kind(),
             "path": dense.path,
             "endpoint": dense.endpoint,
             "model": dense.model,
+            "servedModel": dense_backend.served_model(),
             "dimension": dense.dimension,
             "pooling": dense.pooling,
             "maxTokens": dense.max_tokens,
@@ -276,6 +282,8 @@ fn embedding_identity(
             "path": colbert.path,
             "endpoint": colbert.endpoint,
             "model": colbert.model,
+            "servedModel": colbert_backend.served_model(),
+            "maxTokens": colbert.max_tokens,
             "dimension": colbert.dimension,
             "queryMaxTokens": colbert.query_max_tokens,
             "documentMaxTokens": colbert.document_max_tokens,

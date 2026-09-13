@@ -14,7 +14,6 @@ pub(crate) struct Bm25Queries {
     pub(crate) broad_query: Option<String>,
 }
 
-const MIN_FTS_TERM_CHARS: usize = 3;
 const FTS_STOPWORDS: &[&str] = &[
     "about",
     "above",
@@ -108,8 +107,9 @@ const FTS_STOPWORDS: &[&str] = &[
     "yourselves",
 ];
 
-/// Build strict and broad BM25 query strings from user text while preserving the plain-text boundary.
-pub(crate) fn build_bm25_queries(query: &str) -> Option<Bm25Queries> {
+/// Build quoted BM25 queries with a configured strict-term floor; broad queries
+/// retain shorter terms and stopwords so narrow eligibility does not erase them.
+pub(crate) fn build_bm25_queries(query: &str, min_term_chars: usize) -> Option<Bm25Queries> {
     let mut broad_terms = Vec::<String>::new();
     let mut strict_terms = Vec::<String>::new();
     for value in query.split(|value: char| !value.is_alphanumeric()) {
@@ -117,7 +117,7 @@ pub(crate) fn build_bm25_queries(query: &str) -> Option<Bm25Queries> {
         if term.is_empty() || broad_terms.iter().any(|existing| existing == &term) {
             continue;
         }
-        if term.chars().count() >= MIN_FTS_TERM_CHARS && !is_fts_stopword(&term) {
+        if term.chars().count() >= min_term_chars && !is_fts_stopword(&term) {
             strict_terms.push(term.clone());
         }
         broad_terms.push(term);

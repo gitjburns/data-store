@@ -1714,6 +1714,8 @@ fn encode_without_special_tokens(
 }
 
 /// Build the explicit ModernBERT pair input `[CLS] query [SEP] document [SEP]`.
+/// Preserve the local backend's query-first prefix allocation. The HTTP backend
+/// sends complete pairs and surfaces an oversized-input rejection from the engine.
 fn build_pair_input_ids(
     cls_token_id: u32,
     sep_token_id: u32,
