@@ -39,7 +39,7 @@ identifiers, and elapsed time when measurable.
 
 - INFO records startup/shutdown, queries and admin operations, actual ingestion
   and state changes, and meaningful stage completions with counts and elapsed time.
-- DEBUG records routine scans, empty successful cycles, health/Operation polling,
+- DEBUG records routine scans, empty successful cycles, health/monitor/Operation polling,
   successful internal transaction mechanics, expected contention, individual
   diagnostic details, and task completion already covered by an operation outcome.
 - WARN/ERROR retain failures and their specific source and boundary context.
@@ -147,6 +147,23 @@ grouped fusion, and `query.annotation_maxsim.*` scores annotation/source windows
 Retain candidate counts, invalid-input exclusions, source errors, and elapsed time.
 Resource admission failures name the configured guard and retained artifact/work
 identity; lowering a read budget must not be reported as historical corruption.
+
+### Monitoring observations
+
+`GET /v1/monitor` and the TUI supplement the service log; bounded recent outcomes
+are not an authoritative event record. Preserve existing stage, model-call,
+commit, publication, cancellation, and failure logs. Monitoring failures retain
+source errors; interrupted observers retain worker/stage identity and available
+timing. Reset records identify the generation and discarded observations. Successful
+polling remains DEBUG. Snapshot fields contain compact operational metadata,
+never source content, prompts, model output, or credentials.
+
+`clear_failures.*` records drain, acceptance, committed retry permissions and
+requeued counts, worker notification, and terminal outcome. Distinguish storage
+commit from successful resume; a later failure must state whether permission
+already committed. Preserve original failures and exact `parse.failure_cleared`
+events. Monitoring restores persisted failure explanations after restart;
+routine no-op scans are not document completion events.
 
 ### Annotation Cancellation
 

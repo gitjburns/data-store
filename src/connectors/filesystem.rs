@@ -13,6 +13,7 @@ use std::{
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Instant, UNIX_EPOCH},
 };
 
@@ -22,6 +23,8 @@ use crate::{
     canonical,
     error::ApiError,
     model::{AcquisitionFailureClass, ConnectorCapabilityProfile, DetectionMode},
+    monitoring::Monitoring,
+    monitoring_types::{MonitorState, REFRESH_INTERVAL_MS, WorkIdentity},
     primitives::{current_time_ms, format_utc_timestamp_ms},
 };
 
@@ -204,8 +207,16 @@ impl FilesystemConnector {
     pub(crate) fn full_scan(
         &self,
         known: &BTreeMap<String, KnownLocationState>,
+        monitoring: Option<&Arc<Monitoring>>,
     ) -> Result<FullScanOutcome, ScanError> {
         let scan_started = Instant::now();
+        if let Some(monitoring) = monitoring {
+            // Keep the last measured inventory during cheap unchanged-file
+            // checks; only actual staging belongs in current work and history.
+            monitoring.update_ingestion(|snapshot| {
+                snapshot.next_scan_wait_ms = None;
+            });
+        }
         debug!(
             event = "connector.filesystem.scan_started",
             corpus_root = %self.corpus_root.display(),
@@ -213,8 +224,68 @@ impl FilesystemConnector {
             "filesystem full scan starting"
         );
 
-        match self.run_full_scan(known, scan_started) {
+        match self.run_full_scan(known, scan_started, monitoring) {
             Ok(outcome) => {
+                if let Some(monitoring) = monitoring {
+                    let measured_at = monitoring.observed_at();
+                    monitoring.update_ingestion(|snapshot| {
+                        snapshot.enumerated_files =
+                            Some(outcome.enumerated_native_uris.len() as u64);
+                        snapshot.enumeration_complete = outcome.enumeration_complete;
+                        snapshot.staged_files = outcome.staged_bundle_dirs.len() as u64;
+                        snapshot.skipped_files = outcome.skipped_unchanged;
+                        snapshot.scan_failures = outcome.failures.len() as u64;
+                        snapshot.last_scan_ms = Some(outcome.elapsed_ms);
+                        snapshot.scan_measured_at = measured_at;
+                    });
+                    monitoring.clear_issue("scan-scope");
+                    // Only a complete enumeration may retire errors for absent
+                    // paths. The durable failure records remain untouched.
+                    if outcome.enumeration_complete {
+                        let failed_paths: BTreeSet<&str> = outcome
+                            .failures
+                            .iter()
+                            .map(|failure| failure.native_uri.as_str())
+                            .collect();
+                        monitoring.retain_issues("scan:", |key| {
+                            key.strip_prefix("scan:")
+                                .is_some_and(|path| failed_paths.contains(path))
+                        });
+                        monitoring.retain_issues("scan-directory:", |_| false);
+                        monitoring.retain_issues("ingestion:", |key| {
+                            key.strip_prefix("ingestion:")
+                                .is_some_and(|path| outcome.enumerated_native_uris.contains(path))
+                        });
+                        monitoring.retain_issues("acquisition:", |key| {
+                            key.strip_prefix("acquisition:")
+                                .is_some_and(|path| outcome.enumerated_native_uris.contains(path))
+                        });
+                    }
+                    // Non-UTF-8 file failures also arrive through this outcome;
+                    // directory failures publish directly without changing acquisition policy.
+                    for failure in &outcome.failures {
+                        monitoring.set_issue(
+                            format!("scan:{}", failure.native_uri),
+                            crate::monitoring_types::MonitorIssue {
+                                identity: WorkIdentity::new(
+                                    "scanner",
+                                    &failure.native_uri,
+                                    None,
+                                    None,
+                                ),
+                                stage: "scan and acquisition".to_string(),
+                                state: MonitorState::Failed,
+                                message: failure.detail.clone(),
+                                affected: 1,
+                                retry_in_ms: None,
+                                attempt: None,
+                                retry_limit: None,
+                                observed_since: None,
+                                elapsed_ms: 0,
+                            },
+                        );
+                    }
+                }
                 debug!(
                     event = "connector.filesystem.scan_completed",
                     corpus_root = %self.corpus_root.display(),
@@ -235,6 +306,28 @@ impl FilesystemConnector {
                     ScanError::SourceSide { detail, .. } => ("source", detail.clone()),
                     ScanError::Internal(error) => ("internal", error.to_string()),
                 };
+                if let Some(monitoring) = monitoring {
+                    monitoring.set_issue(
+                        "scan-scope".to_string(),
+                        crate::monitoring_types::MonitorIssue {
+                            identity: WorkIdentity::new(
+                                "scanner",
+                                &self.corpus_root.to_string_lossy(),
+                                None,
+                                None,
+                            ),
+                            stage: "filesystem scan".to_string(),
+                            state: MonitorState::Failed,
+                            message: message.clone(),
+                            affected: 1,
+                            retry_in_ms: None,
+                            attempt: None,
+                            retry_limit: None,
+                            observed_since: None,
+                            elapsed_ms: 0,
+                        },
+                    );
+                }
                 error!(
                     event = "connector.filesystem.scan_failed",
                     corpus_root = %self.corpus_root.display(),
@@ -255,6 +348,7 @@ impl FilesystemConnector {
         &self,
         known: &BTreeMap<String, KnownLocationState>,
         scan_started: Instant,
+        monitoring: Option<&Arc<Monitoring>>,
     ) -> Result<FullScanOutcome, ScanError> {
         // Corpus-root precondition failures are SOURCE-side: the scope
         // itself could not be read, which is a recordable acquisition
@@ -294,6 +388,8 @@ impl FilesystemConnector {
 
         let mut state = ScanState {
             known,
+            monitoring,
+            last_monitor_publish: scan_started,
             pending_dirs: Vec::new(),
             staged_bundle_dirs: Vec::new(),
             enumerated_native_uris: BTreeSet::new(),
@@ -325,6 +421,7 @@ impl FilesystemConnector {
             match fs::read_dir(&dir) {
                 Ok(reader) => self.scan_directory(&dir, reader, &mut state),
                 Err(source) => {
+                    state.monitor_problem(&dir, "reading directory", &source.to_string());
                     warn!(
                         event = "connector.filesystem.dir_unreadable",
                         path = %dir.display(),
@@ -375,6 +472,7 @@ impl FilesystemConnector {
                 Err(source) => {
                     // An entry we could not even name may hide an entire
                     // subtree, so completeness is lost.
+                    state.monitor_problem(dir, "enumerating directory", &source.to_string());
                     warn!(
                         event = "connector.filesystem.dir_entry_unreadable",
                         dir = %dir.display(),
@@ -478,17 +576,46 @@ impl FilesystemConnector {
         };
         let native_uri = native_uri.to_string();
 
-        match self.process_regular_file(entry, path, &native_uri, state.known, &mut state.temp_seq)
-        {
+        match self.process_regular_file(
+            entry,
+            path,
+            &native_uri,
+            state.known,
+            &mut state.temp_seq,
+            state.monitoring,
+        ) {
             Ok(FileScanAction::Unchanged) => {
+                if let Some(monitoring) = state.monitoring {
+                    monitoring.clear_issue(&format!("scan:{native_uri}"));
+                }
                 state.skipped_unchanged += 1;
                 state.enumerated_native_uris.insert(native_uri);
             }
             Ok(FileScanAction::Staged(bundle_dir)) => {
+                if let Some(monitoring) = state.monitoring {
+                    monitoring.clear_issue(&format!("scan:{native_uri}"));
+                }
                 state.staged_bundle_dirs.push(bundle_dir);
                 state.enumerated_native_uris.insert(native_uri);
             }
             Err(item_error) => {
+                if let Some(monitoring) = state.monitoring {
+                    monitoring.set_issue(
+                        format!("scan:{native_uri}"),
+                        crate::monitoring_types::MonitorIssue {
+                            identity: WorkIdentity::new("scanner", &native_uri, None, None),
+                            stage: "acquisition".to_string(),
+                            state: MonitorState::Failed,
+                            message: item_error.detail.clone(),
+                            affected: 1,
+                            retry_in_ms: None,
+                            attempt: None,
+                            retry_limit: None,
+                            observed_since: None,
+                            elapsed_ms: 0,
+                        },
+                    );
+                }
                 warn!(
                     event = "connector.filesystem.item_failed",
                     native_uri = %native_uri,
@@ -505,6 +632,7 @@ impl FilesystemConnector {
                 });
             }
         }
+        state.publish_monitor();
     }
 
     /// Decide one regular file's fate: skip it when its (mtime, size)
@@ -518,6 +646,7 @@ impl FilesystemConnector {
         native_uri: &str,
         known: &BTreeMap<String, KnownLocationState>,
         temp_seq: &mut u64,
+        monitoring: Option<&Arc<Monitoring>>,
     ) -> Result<FileScanAction, ItemError> {
         // DirEntry::metadata never traverses symlinks, and the entry was
         // already classified as a regular file.
@@ -549,8 +678,24 @@ impl FilesystemConnector {
             return Ok(FileScanAction::Unchanged);
         }
 
-        let bundle_dir = self.stage_bundle(path, native_uri, mtime_ms, temp_seq)?;
-        Ok(FileScanAction::Staged(bundle_dir))
+        // Only changed files create activity. A completed staging step does not
+        // imply that parsing or enrichment of this document has completed.
+        let work = monitoring.map(|monitoring| {
+            monitoring.work(
+                WorkIdentity::new("scanner", native_uri, None, None),
+                "staging source",
+                None,
+                "files",
+            )
+        });
+        let outcome = self.stage_bundle(path, native_uri, mtime_ms, temp_seq);
+        if let Some(work) = work {
+            match &outcome {
+                Ok(_) => work.finish(MonitorState::Complete, "Source staged for ingestion"),
+                Err(error) => work.finish(MonitorState::Failed, &error.detail),
+            }
+        }
+        outcome.map(FileScanAction::Staged)
     }
 
     /// Stage one acquisition bundle: read the file, build its manifest
@@ -731,6 +876,8 @@ fn capability_profile_hash_of(profile: &ConnectorCapabilityProfile) -> Result<St
 struct ScanState<'a> {
     /// Last-known per-location claims used for the unchanged prescreen.
     known: &'a BTreeMap<String, KnownLocationState>,
+    monitoring: Option<&'a Arc<Monitoring>>,
+    last_monitor_publish: Instant,
     /// Directories discovered but not yet read (LIFO walk order).
     pending_dirs: Vec<PathBuf>,
     staged_bundle_dirs: Vec<PathBuf>,
@@ -747,6 +894,50 @@ struct ScanState<'a> {
     /// Monotonic suffix making temp bundle directory names unique within
     /// this scan.
     temp_seq: u64,
+}
+
+impl ScanState<'_> {
+    /// Preserve directory failure details without manufacturing acquisition rows
+    /// or changing the connector's existing deletion-inference contract.
+    fn monitor_problem(&self, path: &Path, stage: &str, message: &str) {
+        if let Some(monitoring) = self.monitoring {
+            monitoring.set_issue(
+                format!("scan-directory:{}:{stage}", path.display()),
+                crate::monitoring_types::MonitorIssue {
+                    identity: WorkIdentity::new("scanner", &path.to_string_lossy(), None, None),
+                    stage: stage.to_string(),
+                    state: MonitorState::Failed,
+                    message: message.to_string(),
+                    affected: 1,
+                    retry_in_ms: None,
+                    attempt: None,
+                    retry_limit: None,
+                    observed_since: None,
+                    elapsed_ms: 0,
+                },
+            );
+        }
+    }
+
+    /// Coalesce fast per-file observations; the parent always publishes the final
+    /// counts, and partial discovery never pretends to have a final denominator.
+    fn publish_monitor(&mut self) {
+        if self.last_monitor_publish.elapsed().as_millis() < u128::from(REFRESH_INTERVAL_MS) {
+            return;
+        }
+        self.last_monitor_publish = Instant::now();
+        if let Some(monitoring) = self.monitoring {
+            let measured_at = monitoring.observed_at();
+            monitoring.update_ingestion(|snapshot| {
+                snapshot.enumerated_files = Some(self.enumerated_native_uris.len() as u64);
+                snapshot.enumeration_complete = false;
+                snapshot.staged_files = self.staged_bundle_dirs.len() as u64;
+                snapshot.skipped_files = self.skipped_unchanged;
+                snapshot.scan_failures = self.failures.len() as u64;
+                snapshot.scan_measured_at = measured_at;
+            });
+        }
+    }
 }
 
 /// What happened to one regular file that was successfully processed.

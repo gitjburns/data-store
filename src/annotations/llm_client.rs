@@ -28,6 +28,8 @@ use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::limits::DiagnosticLimits;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
+use crate::monitoring::{CallGuard, WorkHandle};
+use crate::monitoring_types::TokenUsage;
 use crate::types::AnnotationProgressCount;
 use crate::util::{LogContext, truncate_diagnostic_text};
 
@@ -70,6 +72,9 @@ pub(crate) struct AnnotatorClient {
     api_key_file_path: Option<PathBuf>,
     // Producer clones must share one writer lock for indivisible transcript blocks.
     transcript: Arc<Transcript>,
+    // The owning source supplies identity; pooled client clones never infer it
+    // from thread-local tracing or retain identities across unrelated documents.
+    monitor: Option<WorkHandle>,
 }
 
 /// Cancellation must reach the worker without being counted as a provider failure.
@@ -391,6 +396,28 @@ impl AnnotatorClient {
             api_key,
             api_key_file_path,
             transcript: Arc::new(Transcript::open(config_root)),
+            monitor: None,
+        })
+    }
+
+    /// Scope shared HTTP resources to one source's observer without changing the
+    /// producer configuration or the memo identity derived from that configuration.
+    pub(crate) fn with_monitor(&self, monitor: WorkHandle) -> Self {
+        let mut client = self.clone();
+        client.monitor = Some(monitor);
+        client
+    }
+
+    /// Observe actual submission through the stage's terminal validation result;
+    /// the stage owns the guard so response receipt cannot count twice.
+    pub(crate) fn monitor_call(&self, stage: &str) -> Option<CallGuard> {
+        self.monitor.as_ref().map(|monitor| {
+            monitor.call(
+                "annotator",
+                &self.model,
+                stage,
+                Some(self.timeout_seconds.saturating_mul(1_000)),
+            )
         })
     }
 
@@ -426,6 +453,8 @@ impl AnnotatorClient {
     /// endpoint/model/status and protocol-boundary context. Selected payloads go only
     /// to the annotator transcript. Maintenance cancellation drops the HTTP future
     /// and returns a distinct outcome so the worker does not count a failed attempt.
+    /// Reported usage accompanies both success and failure, independently of the
+    /// result, so subsequent structural validation cannot discard that measurement.
     pub(crate) fn complete(
         &self,
         call: &mut TranscriptCall<'_>,
@@ -434,7 +463,7 @@ impl AnnotatorClient {
         user_content: &str,
         output_schema: &serde_json::Value,
         temperature: f64,
-    ) -> Result<String, CompletionFailure> {
+    ) -> (Result<String, CompletionFailure>, TokenUsage) {
         let request_purpose = call.stage;
         let entered = context.enter();
         let started_at = Instant::now();
@@ -498,6 +527,20 @@ impl AnnotatorClient {
         // This measurement record survives cancellation and decoding/transport
         // failures; unavailable usage stays absent rather than being estimated.
         response.log_measurements(started_at);
+        // Metadata survives request failure and cancellation when a response was
+        // received. Reasoning remains a subset of completion, never extra tokens.
+        let monitor_usage = response
+            .usage
+            .as_ref()
+            .map_or_else(TokenUsage::default, |usage| TokenUsage {
+                prompt: usage.prompt_tokens,
+                completion: usage.completion_tokens,
+                reasoning: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens),
+                total: usage.total_tokens,
+            });
         // Transcript field selection is presentation-only. Protocol validation and
         // the terminal failure reason remain authoritative in the caller's RESULT.
         call.response(response.body_received.then_some(response.body.as_slice()));
@@ -554,7 +597,7 @@ impl AnnotatorClient {
             }
         }
 
-        result.map(|()| response.content)
+        (result.map(|()| response.content), monitor_usage)
     }
 
     /// Build the request body, send it, and map every failure mode into a

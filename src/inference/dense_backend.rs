@@ -64,6 +64,21 @@ impl DenseEmbeddingBackend {
         }
     }
 
+    /// Attribute calls to the selected endpoint or local runtime without exposing
+    /// credentials; local inference has no HTTP request timeout.
+    pub(crate) fn monitor_call(
+        &self,
+        monitor: Option<&crate::monitoring::WorkHandle>,
+        stage: &str,
+    ) -> Option<crate::monitoring::CallGuard> {
+        match self {
+            Self::Local(_) => {
+                monitor.map(|monitor| monitor.call("dense", "local dense", stage, None))
+            }
+            Self::Http(client) => client.monitor_call(monitor, stage),
+        }
+    }
+
     /// Return whether embedding uses the local accelerator model-call gate. The
     /// caller-side gate sites acquire ONLY when this is true; the HTTP backend
     /// is network I/O and must never hold the exclusive gate across a request.
@@ -305,6 +320,23 @@ impl HttpDenseClient {
         self.concurrent_requests
     }
 
+    /// Scoped batch threads publish submission and terminal outcomes, never
+    /// intermediate token activity or endpoint credentials.
+    pub(crate) fn monitor_call(
+        &self,
+        monitor: Option<&crate::monitoring::WorkHandle>,
+        stage: &str,
+    ) -> Option<crate::monitoring::CallGuard> {
+        monitor.map(|monitor| {
+            monitor.call(
+                "dense",
+                &self.model,
+                stage,
+                Some(self.timeout_seconds.saturating_mul(1_000)),
+            )
+        })
+    }
+
     /// Keep builder-thread failures under the same diagnostic bounds as their model client.
     pub(crate) fn diagnostics(&self) -> &DiagnosticLimits {
         &self.diagnostics
@@ -321,6 +353,7 @@ impl HttpDenseClient {
                 call_purpose: "startup_smoke_embedding",
                 input_kind: "smoke",
             },
+            None,
         )?;
         let first = vectors.first().ok_or_else(|| ApiError::InferenceInit {
             message: "HTTP dense smoke round-trip produced no vectors".to_string(),
@@ -345,6 +378,7 @@ impl HttpDenseClient {
                 call_purpose: "query_embedding",
                 input_kind: "query",
             },
+            None,
         )?;
         single_vector(vectors.drain(..), "query_embedding")
     }
@@ -356,7 +390,12 @@ impl HttpDenseClient {
     /// boundary; the returned vectors align 1:1 with `texts`. The builder packs
     /// its own configured `batch_size()` windows, so this method embeds
     /// exactly the window it is handed.
-    pub fn embed_passage_vectors(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ApiError> {
+    pub(crate) fn embed_passage_vectors(
+        &self,
+        texts: &[&str],
+        monitor: Option<&crate::monitoring::WorkHandle>,
+        stage: &str,
+    ) -> Result<Vec<Vec<f32>>, ApiError> {
         let formatted: Vec<&str> = texts
             .iter()
             .map(|text| format_dense_passage_text(text))
@@ -367,6 +406,7 @@ impl HttpDenseClient {
                 call_purpose: "batched_passage_embedding",
                 input_kind: "passage",
             },
+            self.monitor_call(monitor, stage),
         )
     }
 
@@ -382,6 +422,7 @@ impl HttpDenseClient {
         &self,
         texts: &[&str],
         shape: DenseCallShape,
+        monitor_call: Option<crate::monitoring::CallGuard>,
     ) -> Result<Vec<Vec<f32>>, ApiError> {
         let context = crate::util::model_call_context("dense", shape.call_purpose);
         let _entered = context.enter();
@@ -412,7 +453,8 @@ impl HttpDenseClient {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
-            let response = self.send_request(texts, shape, &mut retried_attempts)?;
+            let response =
+                self.send_request(texts, shape, &mut retried_attempts, monitor_call.as_ref())?;
             self.map_response(texts.len(), response, shape)
         })();
 
@@ -455,6 +497,9 @@ impl HttpDenseClient {
             }
         }
 
+        if let Some(call) = monitor_call {
+            call.finish_result(&result);
+        }
         result
     }
 
@@ -471,6 +516,7 @@ impl HttpDenseClient {
         texts: &[&str],
         shape: DenseCallShape,
         retried_attempts: &mut usize,
+        monitor_call: Option<&crate::monitoring::CallGuard>,
     ) -> Result<EmbeddingsResponse, ApiError> {
         // Retry accounting excludes the initial attempt. Delay growth saturates
         // before applying the configured ceiling, even for large retry budgets.
@@ -478,13 +524,46 @@ impl HttpDenseClient {
         let mut retry_delay = self.retry_initial_delay.min(self.retry_max_delay);
         loop {
             *retried_attempts = attempt - 1;
+            if let Some(call) = monitor_call {
+                call.retry_started();
+            }
             let context = crate::util::LogContext::new("http_attempt", &attempt.to_string());
             let _entered = context.enter();
             match self.send_request_once(texts, shape)? {
-                AttemptOutcome::Parsed(response) => return Ok(response),
+                AttemptOutcome::Parsed(response) => {
+                    // Preserve the provider's measured usage even when the later
+                    // vector contract rejects this otherwise decoded response.
+                    if let Some(call) = monitor_call {
+                        call.response_usage(crate::monitoring_types::TokenUsage {
+                            prompt: response
+                                .usage
+                                .as_ref()
+                                .and_then(|usage| usage.get("prompt_tokens"))
+                                .and_then(serde_json::Value::as_u64),
+                            total: response
+                                .usage
+                                .as_ref()
+                                .and_then(|usage| usage.get("total_tokens"))
+                                .and_then(serde_json::Value::as_u64),
+                            completion: None,
+                            reasoning: None,
+                        });
+                    }
+                    return Ok(response);
+                }
                 AttemptOutcome::Overloaded { body_excerpt } => {
                     if attempt <= self.max_retries {
                         let delay = retry_delay;
+                        // Backoff belongs to this logical request, not the whole
+                        // document: sibling embedding batches may still be running.
+                        if let Some(call) = monitor_call {
+                            call.retry_wait(
+                                "Dense endpoint returned HTTP 429; backing off before retry",
+                                attempt as u64,
+                                self.max_retries as u64,
+                                delay.as_millis() as u64,
+                            );
+                        }
                         warn!(
                             event = "model_call.http_retry",
                             model_role = "dense",

@@ -150,6 +150,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // GET /operations/{operationId}. See §34 protection split (plan resolution 4).
     Router::new()
         .route("/v1/health", get(get_health))
+        .route("/v1/monitor", get(get_monitor))
         // §34.1 spec-literal query path. The synchronous retrieval + assembly
         // pipeline runs on a blocking thread inside `post_query` (R12).
         .route("/query", post(post_query))
@@ -167,6 +168,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/snapshots", post(post_snapshots))
         .route("/restore", post(post_restore))
         .route("/rebuild-all", post(post_rebuild_all))
+        .route("/clear-failures", post(post_clear_failures))
         // Control action (§34): immediate confirmation then signal; NOT an
         // Operation row (it is not async work). Protected.
         .route("/shutdown", post(post_shutdown))
@@ -315,8 +317,13 @@ async fn storage_admission(
         .to_owned();
     let control = matches!(
         (request.method(), route.as_str()),
-        (&Method::GET, "/v1/health" | "/operations/{operationId}")
-            | (&Method::POST, "/shutdown" | "/rebuild-all")
+        (
+            &Method::GET,
+            "/v1/health" | "/v1/monitor" | "/operations/{operationId}"
+        ) | (
+            &Method::POST,
+            "/shutdown" | "/rebuild-all" | "/clear-failures"
+        )
     );
     let permit = if control {
         None
@@ -413,6 +420,35 @@ async fn post_rebuild_all(
     ))
 }
 
+/// Authorize failure recovery before reserving its non-destructive maintenance
+/// hold. The blocking task owns draining; HTTP polling and monitor reads stay live.
+async fn post_clear_failures(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<OperationAcceptedBody>), ApiError> {
+    let route = "/clear-failures";
+    let diagnostic = log_route_started(route, "authorizing", state.config.diagnostics);
+    authorize_request(&state, &headers, route, &diagnostic)?;
+    let owner = Arc::clone(&state);
+    let operation_id = spawn_blocking_with_context(move || crate::clear_failures::reserve(&owner))
+        .await
+        .map_err(|source| ApiError::InternalIo {
+            message: format!("clear-failures acceptance task failed to join: {source}"),
+        })
+        .inspect_err(|source| log_route_failed(route, "acceptance_join", source, &diagnostic))?
+        .inspect_err(|source| {
+            log_route_failed(route, "reserving_failure_reset", source, &diagnostic)
+        })?;
+    LogContext::current().record("operation_id", operation_id.as_str());
+    let accepted_id = operation_id.clone();
+    spawn_blocking_with_context(move || crate::clear_failures::run(&state, &accepted_id));
+    log_operation_accepted(route, "clear_failures", &operation_id, &diagnostic);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(OperationAcceptedBody { operation_id }),
+    ))
+}
+
 /// Return service readiness and startup diagnostics.
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let started = log_route_started("/v1/health", "health_reading", state.config.diagnostics);
@@ -428,6 +464,25 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         "HTTP route result ready"
     );
 
+    Json(response)
+}
+
+/// Serve worker observations during ingestion and maintenance without entering
+/// storage admission or opening SQLite. Frequent successful polls stay at DEBUG.
+async fn get_monitor(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::monitoring_types::MonitorSnapshot> {
+    let started = log_route_started("/v1/monitor", "monitor_reading", state.config.diagnostics);
+    let response = state.monitor_snapshot();
+    debug!(
+        event = "http.route.result_ready",
+        route = "/v1/monitor",
+        stage = "monitor_reading",
+        status = 200_u16,
+        generation = response.generation,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "monitor observations ready"
+    );
     Json(response)
 }
 
@@ -462,7 +517,7 @@ fn log_route_started(
     // Polling traces belong at DEBUG; query and admin lifecycle starts remain INFO.
     if matches!(
         route,
-        "/v1/health" | "/operations/{operationId}" | "/sync/status"
+        "/v1/health" | "/v1/monitor" | "/operations/{operationId}" | "/sync/status"
     ) {
         debug!(
             event = "http.route.started",
@@ -1078,8 +1133,12 @@ fn spawn_admin_operation<F>(
         // state. Terminal persistence may itself fail; its failure log preserves
         // that unresolved outcome. `AssertUnwindSafe` is sound
         // here because a panic ends the task — no caught-across state is observed
-        // after unwinding; the only post-panic action is the durable mark_failed.
+        // after unwinding; subsequent diagnostics open fresh read handles and
+        // the operation still follows its existing durable mark_failed path.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        // Admin activation/restore can change source coverage outside the scan
+        // loop. Reconcile after domain work releases its cutover and SQL guards.
+        crate::monitoring_storage::refresh_sources(&index_root);
         match outcome {
             Ok(Ok(())) => match crate::operations::mark_succeeded(&index_root, &operation_id) {
                 Ok(()) => info!(

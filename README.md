@@ -176,6 +176,7 @@ PROTOCOL.md is the contract of record. This is the map.
 | --- | --- |
 | `POST /query` | Synchronous retrieval; returns ranked passages and their canonical EvidencePack. |
 | `GET /v1/health` | Readiness and per-component diagnostics. |
+| `GET /v1/monitor` | Current ingestion, annotation, publication, and model-call observations. |
 | `GET /units/{unitId}` | One canonical unit (served only if its parse is active). |
 | `GET /units/{unitId}/relationships` | Unit relationships (direction/type filters). |
 | `GET /sources/{sourceId}` | Source locations and freshness. |
@@ -193,6 +194,7 @@ PROTOCOL.md is the contract of record. This is the map.
 | `POST /snapshots` | Create a forensic snapshot (async Operation). |
 | `POST /restore` | Restore a source from a snapshot (async Operation). |
 | `POST /rebuild-all` | Clear indexed corpus state and schedule automatic rebuilding (async Operation). |
+| `POST /clear-failures` | Unblock failed background work while preserving successful work and failure history (async Operation). |
 | `POST /shutdown` | Graceful shutdown (immediate confirmation, then signal). |
 | `GET /parses?status=held` | List parses awaiting disposition. |
 | `GET /operations/{operationId}` | Poll an async Operation's status. |
@@ -252,7 +254,7 @@ directly or list held candidates with `GET /parses?status=held`.
 Each component carries typed `details` and a typed `counts` array. Every count
 carries its own `as_of` label — a count is never presented as current without
 saying when it was measured — and fabric counts are keyed by `source_system`.
-`/v1/health` is the one plain-named (non-camelCase) response on the surface.
+`/v1/health` and `/v1/monitor` use `snake_case` response fields.
 Components that publish no counters serialize an empty array.
 
 - Readiness-gating components: `inference`, `sync`. Their combined readiness is
@@ -358,6 +360,7 @@ Operator verbs (CLI flag / REPL name):
 | `--snapshot` | `[requestJson]` | Create a snapshot. |
 | `--restore` | `<sourceId> <parseId>` | Restore from a snapshot. |
 | `--rebuild-all` | — | Clear indexed state and artifacts, then automatically reingest the corpus. Available during the startup delay. |
+| `--clear-failures` | — | Requeue failed work and reset annotation retry budgets without rebuilding successful work. |
 | `--held-parses` | — | List held parses awaiting disposition. |
 | `--operation` | `<operationId>` | Read an Operation once. |
 | `--vocabulary` (`--vocab`) | `<entity\|relation> [active\|all]` | Inspect the annotation vocabulary (scope defaults to `active`). |
@@ -442,6 +445,37 @@ curl -s http://127.0.0.1:8091/v1/health
 ```sh
 data-store --config config.toml --health
 ```
+
+### Ingestion monitor
+
+```sh
+data-store --config config.toml --monitor
+```
+
+The read-only terminal dashboard refreshes every 200 ms on one screen: ingestion
+stages and queues, committed annotation coverage, retrieval publication, grouped
+model calls, timings, reported token usage, waits, failures, and recent outcomes.
+Progress bars use measured totals; files and deduplicated active known sources
+remain separate. Blue, amber, and magenta accompany text state labels. Stale
+connections and display overflow are explicit; resize for more space. Q, Esc,
+or Ctrl-C exits. There are no monitor configuration settings or submenus.
+See `SPEC-CLIENT.md` §1.7 for polling and terminal behavior.
+
+The headline distinguishes service readiness from ingestion completion and
+explains blocked work. Annotation and publication percentages cover active
+documents only. Persisted parse and queue failures remain visible after restart;
+routine checks leave idle panels unchanged.
+
+To unblock failed work after addressing its cause:
+
+```sh
+data-store --config config.toml --clear-failures
+```
+
+This preserves successful work and failure history, resets retry eligibility,
+and resumes background processing. Command success does not mean ingestion is
+complete. Held parses and validation checks remain in force; workers terminated
+by panic or failed startup still require a restart.
 
 ### Web UI
 

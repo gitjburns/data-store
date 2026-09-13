@@ -116,6 +116,9 @@ INSERT INTO unit_multivector_projections (
 /// trips on a re-run. The whole call runs on the caller's transaction, so the
 /// delete, the inserts, and the envelope lifecycle commit or roll back as one
 /// unit.
+// The caller owns transaction, target identity, model permit, producer identity,
+// validation dimension, and observer; the builder must not reconstruct them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_multivectors(
     tx: &Transaction<'_>,
     source_id: &str,
@@ -124,6 +127,7 @@ pub(crate) fn build_multivectors(
     expected_dimension: usize,
     gate: Option<&ModelCallPermit>,
     model_identity: &str,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<String, ApiError> {
     // Enforce caller-side admission before touching rows: local inference must
     // hold the accelerator permit, while HTTP must never hold it over a request.
@@ -147,6 +151,13 @@ pub(crate) fn build_multivectors(
         })
         .filter(|unit| !unit.text.trim().is_empty())
         .collect();
+    if let Some(monitor) = monitor {
+        monitor.stage(
+            "ColBERT content embeddings",
+            Some(embeddable.len() as u64),
+            "units embedded",
+        );
+    }
 
     info!(
         event = "multivector_build.started",
@@ -184,6 +195,7 @@ pub(crate) fn build_multivectors(
         colbert_runtime,
         expected_dimension,
         &embeddable,
+        monitor,
     ) {
         Ok(totals) => {
             // Payload lives entirely in the hot-plane table, so no archived
@@ -250,6 +262,9 @@ pub(crate) fn build_multivectors(
 /// completion log (safe aggregates — never matrix values, which are forbidden
 /// in logs). Split out so `build_multivectors` can wrap the whole payload write
 /// in a single success/failure envelope transition.
+// Explicit transaction, source/parse/envelope targets, backend, validation
+// dimension, prepared units, and observer preserve the outer builder's ownership.
+#[allow(clippy::too_many_arguments)]
 fn build_rows(
     tx: &Transaction<'_>,
     source_id: &str,
@@ -258,6 +273,7 @@ fn build_rows(
     colbert_runtime: &ColbertBackend,
     expected_dimension: usize,
     units: &[UnitText],
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<BuildRowsTotals, ApiError> {
     // Delete-first rebuild: clear the parse's prior rows before inserting so the
     // UNIQUE(parse_id, unit_id) index cannot conflict on a re-run.
@@ -270,6 +286,7 @@ fn build_rows(
 
     let now = utc_now()?;
     let mut total_tokens = 0usize;
+    let mut completed_units = 0u64;
 
     // Local batching cost depends on sequence length. The configured routing
     // threshold measures complete raw text, while inference adds its own prompt.
@@ -304,7 +321,16 @@ fn build_rows(
     // returns for exactly the units this path serves.
     for &index in &singular_indices {
         let unit = &units[index];
-        let embedding = colbert_runtime.embed_document(&unit.unit_id, &unit.text)?;
+        let call = colbert_runtime.monitor_call(monitor, "content unit embedding");
+        let result = colbert_runtime.embed_document(&unit.unit_id, &unit.text, call.as_ref());
+        if let Some(call) = call {
+            call.finish_result(&result);
+        }
+        let embedding = result?;
+        completed_units += 1;
+        if let Some(monitor) = monitor {
+            monitor.progress(completed_units, Some(units.len() as u64));
+        }
         let token_count = persist_unit_matrix(
             tx,
             source_id,
@@ -341,7 +367,16 @@ fn build_rows(
             .iter()
             .map(|&index| (units[index].unit_id.as_str(), units[index].text.as_str()))
             .collect();
-        let embeddings = colbert_runtime.embed_documents(&batch)?;
+        let call = colbert_runtime.monitor_call(monitor, "content unit embedding");
+        let result = colbert_runtime.embed_documents(&batch, call.as_ref());
+        if let Some(call) = call {
+            call.finish_result(&result);
+        }
+        let embeddings = result?;
+        completed_units += batch.len() as u64;
+        if let Some(monitor) = monitor {
+            monitor.progress(completed_units, Some(units.len() as u64));
+        }
         if embeddings.len() != batch.len() {
             return Err(ApiError::StorageOperation {
                 message: format!(

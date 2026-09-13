@@ -17,6 +17,7 @@ pub(crate) struct MaintenanceGate {
     /// Shutdown uses a separate latch, so waits periodically observe it.
     poll_interval: Duration,
     annotation_cancellation: watch::Sender<Option<AnnotationCancelReason>>,
+    dispatch_pause: watch::Sender<bool>,
 }
 
 /// Cancellation is control flow, distinct from provider failures and retry debt.
@@ -45,9 +46,16 @@ impl AnnotationCancelReason {
 #[derive(Debug, Clone)]
 pub(crate) struct AnnotationCancellation {
     receiver: watch::Receiver<Option<AnnotationCancelReason>>,
+    dispatch_pause: watch::Receiver<bool>,
 }
 
 impl AnnotationCancellation {
+    /// Failure clearing stops the next dispatch, while existing calls and their
+    /// commits continue under the separate cancellation signal.
+    pub(crate) fn dispatch_paused(&self) -> bool {
+        *self.dispatch_pause.borrow()
+    }
+
     /// Check without blocking; a lost owner fails closed instead of leaving a request running.
     pub(crate) fn reason(&self) -> Option<AnnotationCancelReason> {
         if self.receiver.has_changed().is_err() {
@@ -73,11 +81,13 @@ impl MaintenanceGate {
     /// Capture validated polling cadence; cancellation retains state before subscription.
     pub(crate) fn new(poll_interval_ms: u64) -> Self {
         let (annotation_cancellation, _) = watch::channel(None);
+        let (dispatch_pause, _) = watch::channel(false);
         Self {
             state: Mutex::new(GateState::default()),
             changed: Condvar::new(),
             poll_interval: Duration::from_millis(poll_interval_ms),
             annotation_cancellation,
+            dispatch_pause,
         }
     }
 }
@@ -86,12 +96,15 @@ impl MaintenanceGate {
 struct GateState {
     active: usize,
     rebuilding: bool,
+    clearing_failures: bool,
     stopped: bool,
     detail: Option<String>,
     // Startup and rebuild have independent owners. Completing either hold must
     // never reopen admission while the other still protects corpus state.
     startup_detail: Option<String>,
     generation: u64,
+    // Recovery wakes workers without invalidating successful corpus observations.
+    corpus_generation: u64,
 }
 
 /// Clones share one counted admission; the final descendant releases it.
@@ -102,6 +115,7 @@ pub(crate) struct MaintenancePermit(Arc<Lease>);
 struct Lease {
     gate: Arc<MaintenanceGate>,
     generation: u64,
+    corpus_generation: u64,
 }
 
 impl MaintenanceGate {
@@ -195,6 +209,7 @@ impl MaintenanceGate {
     pub(crate) fn annotation_cancellation(&self) -> AnnotationCancellation {
         AnnotationCancellation {
             receiver: self.annotation_cancellation.subscribe(),
+            dispatch_pause: self.dispatch_pause.subscribe(),
         }
     }
 
@@ -226,6 +241,7 @@ impl MaintenanceGate {
         MaintenancePermit(Arc::new(Lease {
             gate: Arc::clone(self),
             generation: state.generation,
+            corpus_generation: state.corpus_generation,
         }))
     }
 
@@ -291,9 +307,9 @@ impl MaintenanceGate {
     /// Reserve the only rebuild owner and close admission before its durable marker is written.
     pub(crate) fn begin(&self) -> Result<(), ApiError> {
         let mut state = self.lock()?;
-        if state.rebuilding || state.stopped {
+        if state.rebuilding || state.clearing_failures || state.stopped {
             return Err(ApiError::ServiceUnavailable {
-                message: "rebuild-all is already running or shutdown has started".into(),
+                message: "maintenance is already running or shutdown has started".into(),
             });
         }
         state.rebuilding = true;
@@ -350,11 +366,116 @@ impl MaintenanceGate {
             })?;
         record_success()?;
         state.generation = generation;
+        state.corpus_generation = generation;
         state.detail = None;
         state.rebuilding = false;
         // Drain proved every old lease was released. Only the new storage
         // generation may dispatch again after this reset of cancellation state.
         self.annotation_cancellation.send_replace(None);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Hold new admission without cancelling paid work; workers finish their
+    /// current source, wave, or batch before releasing the leases we drain.
+    pub(crate) fn begin_failure_clear(&self) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        if state.stopped
+            || state.rebuilding
+            || state.clearing_failures
+            || state.detail.is_some()
+            || state.startup_detail.is_some()
+        {
+            return Err(ApiError::ServiceUnavailable {
+                message:
+                    "clear-failures requires operational storage with no other maintenance running"
+                        .into(),
+            });
+        }
+        state.clearing_failures = true;
+        self.dispatch_pause.send_replace(true);
+        state.detail =
+            Some("clear-failures: finishing current work before resetting failures".into());
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Check only at dispatch boundaries, never while committing an existing result.
+    pub(crate) fn failure_clear_requested(&self) -> bool {
+        match self.lock() {
+            Ok(state) => state.clearing_failures,
+            // Uncertain admission must stop dispatch; draining reports the poison.
+            Err(_) => true,
+        }
+    }
+
+    /// Wait for every admitted descendant to finish before changing failure state.
+    pub(crate) fn drain_failure_clear(&self) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        while state.active != 0 && !state.stopped && state.clearing_failures {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|source| ApiError::InternalIo {
+                    message: format!("clear-failures drain wait poisoned: {source}"),
+                })?;
+        }
+        if state.stopped || !state.clearing_failures {
+            return Err(ApiError::ServiceUnavailable {
+                message: "clear-failures interrupted before resetting failures".into(),
+            });
+        }
+        state.detail = Some("clear-failures: resetting failure eligibility".into());
+        Ok(())
+    }
+
+    /// Publish already-committed recovery under one admission lock. The caller
+    /// must have committed failure eligibility first. Retain this retry reset if
+    /// recording terminal success fails; abort then releases the same generation.
+    pub(crate) fn complete_failure_clear(
+        &self,
+        record_success: impl FnOnce() -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        if state.stopped || !state.clearing_failures || state.active != 0 {
+            return Err(ApiError::ServiceUnavailable {
+                message: "clear-failures cannot complete without exclusive drained admission"
+                    .into(),
+            });
+        }
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| ApiError::InternalIo {
+                message: "maintenance generation exhausted".into(),
+            })?;
+        state.generation = generation;
+        // The outer operation owner records panics and releases this hold. Keep
+        // a terminal-record panic from poisoning admission before that cleanup.
+        let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record_success));
+        match recorded {
+            Ok(result) => result?,
+            Err(payload) => {
+                drop(state);
+                std::panic::resume_unwind(payload);
+            }
+        }
+        state.clearing_failures = false;
+        state.detail = None;
+        self.dispatch_pause.send_replace(false);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Release this non-destructive hold after failure; shutdown and any other
+    /// owner's admission hold remain intact, so recovery cannot reopen them.
+    pub(crate) fn abort_failure_clear(&self) -> Result<(), ApiError> {
+        let mut state = self.lock()?;
+        if state.clearing_failures {
+            state.clearing_failures = false;
+            state.detail = None;
+            self.dispatch_pause.send_replace(false);
+        }
         self.changed.notify_all();
         Ok(())
     }
@@ -423,7 +544,7 @@ impl MaintenanceGate {
     /// Keep main alive until an accepted destructive action has reached a terminal boundary.
     pub(crate) fn wait_for_rebuild(&self) -> Result<(), ApiError> {
         let mut state = self.lock()?;
-        while state.rebuilding {
+        while state.rebuilding || state.clearing_failures {
             state = self
                 .changed
                 .wait(state)
@@ -436,9 +557,19 @@ impl MaintenanceGate {
 }
 
 impl MaintenancePermit {
-    /// Workers discard local bookkeeping when the storage generation changes.
+    /// A source owner finishes its current commit before releasing this lease.
+    pub(crate) fn failure_clear_requested(&self) -> bool {
+        self.0.gate.failure_clear_requested()
+    }
+
+    /// Any successful maintenance wakes workers and resets their failure budgets.
     pub(crate) fn generation(&self) -> u64 {
         self.0.generation
+    }
+
+    /// Only destructive maintenance invalidates successful corpus observations.
+    pub(crate) fn corpus_generation(&self) -> u64 {
+        self.0.corpus_generation
     }
 }
 

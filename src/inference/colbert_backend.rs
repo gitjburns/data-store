@@ -78,6 +78,24 @@ impl ColbertBackend {
         }
     }
 
+    /// Preserve selected model attribution and the actual HTTP deadline; a local
+    /// runtime has no request deadline and never claims remote usage metadata.
+    pub(crate) fn monitor_call(
+        &self,
+        monitor: Option<&crate::monitoring::WorkHandle>,
+        stage: &str,
+    ) -> Option<crate::monitoring::CallGuard> {
+        monitor.map(|monitor| match self {
+            Self::Local(_) => monitor.call("colbert", "local ColBERT", stage, None),
+            Self::Http(client) => monitor.call(
+                "colbert",
+                &client.model,
+                stage,
+                Some(client.timeout_seconds.saturating_mul(1_000)),
+            ),
+        })
+    }
+
     /// Share the inference tokenizer with chunking and evidence token accounting.
     pub fn tokenizer(&self) -> &Tokenizer {
         match self {
@@ -177,11 +195,12 @@ impl ColbertBackend {
         &self,
         unit_id: &str,
         text: &str,
+        monitor_call: Option<&crate::monitoring::CallGuard>,
     ) -> Result<ColbertDocumentEmbedding, ApiError> {
         match self {
             Self::Local(runtime) => runtime.embed_document(unit_id, text),
             Self::Http(client) => client
-                .embed_documents(&[(unit_id, text)])?
+                .embed_documents(&[(unit_id, text)], monitor_call)?
                 .pop()
                 .ok_or_else(|| inference_error("HTTP ColBERT returned no document matrix")),
         }
@@ -191,10 +210,11 @@ impl ColbertBackend {
     pub fn embed_documents(
         &self,
         documents: &[(&str, &str)],
+        monitor_call: Option<&crate::monitoring::CallGuard>,
     ) -> Result<Vec<ColbertDocumentEmbedding>, ApiError> {
         match self {
             Self::Local(runtime) => runtime.embed_documents(documents),
-            Self::Http(client) => client.embed_documents(documents),
+            Self::Http(client) => client.embed_documents(documents, monitor_call),
         }
     }
 
@@ -440,10 +460,13 @@ impl HttpColbertClient {
             smoke_score: None,
         };
         progress("colbert_http_smoke_document_batch")?;
-        let documents = backend.embed_documents(&[
-            ("colbert-smoke-document", SMOKE_DOCUMENT),
-            ("colbert-smoke-short", SMOKE_BATCH_SHORT),
-        ])?;
+        let documents = backend.embed_documents(
+            &[
+                ("colbert-smoke-document", SMOKE_DOCUMENT),
+                ("colbert-smoke-short", SMOKE_BATCH_SHORT),
+            ],
+            None,
+        )?;
         progress("colbert_http_smoke_query_and_cpu_maxsim")?;
         let scores = backend.score_persisted_candidates(SMOKE_QUERY, &documents)?;
         let first = scores
@@ -473,6 +496,7 @@ impl HttpColbertClient {
     fn embed_documents(
         &self,
         documents: &[(&str, &str)],
+        monitor_call: Option<&crate::monitoring::CallGuard>,
     ) -> Result<Vec<ColbertDocumentEmbedding>, ApiError> {
         if documents.is_empty() {
             return Ok(Vec::new());
@@ -493,7 +517,7 @@ impl HttpColbertClient {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let matrices = self.embed_token_batch(&input, "document_embedding")?;
+        let matrices = self.embed_token_batch(&input, "document_embedding", monitor_call)?;
         Ok(documents
             .iter()
             .zip(matrices)
@@ -517,7 +541,7 @@ impl HttpColbertClient {
         )?;
         let query_tokens = ids.len();
         let vector = self
-            .embed_token_batch(&[ids], "query_embedding")?
+            .embed_token_batch(&[ids], "query_embedding", None)?
             .pop()
             .ok_or_else(|| inference_error("HTTP ColBERT returned no query matrix"))?;
         let matrix = cpu_matrix(&vector, query_tokens, self.dimension, "query")?;
@@ -547,7 +571,7 @@ impl HttpColbertClient {
             )?;
             let query_tokens = ids.len();
             let vector = self
-                .embed_token_batch(&[ids], "query_embedding")?
+                .embed_token_batch(&[ids], "query_embedding", None)?
                 .pop()
                 .ok_or_else(|| inference_error("HTTP ColBERT returned no query matrix"))?;
             let query_matrix = cpu_matrix(&vector, query_tokens, self.dimension, "query")?;
@@ -602,6 +626,7 @@ impl HttpColbertClient {
         &self,
         input: &[Vec<u32>],
         purpose: &'static str,
+        monitor_call: Option<&crate::monitoring::CallGuard>,
     ) -> Result<Vec<Vec<f32>>, ApiError> {
         if input.is_empty() {
             return Ok(Vec::new());
@@ -618,14 +643,16 @@ impl HttpColbertClient {
             batch_size = input.len(), tokens, expected_dimension = self.dimension,
             query_max_tokens = self.query_max_tokens, document_max_tokens = self.document_max_tokens,
             timeout_seconds = self.timeout_seconds, "HTTP ColBERT token embedding started");
-        let result = self.send_token_batch(input).map_err(|source| {
-            inference_error(format!(
-                "HTTP ColBERT request to {} model {} purpose {purpose} failed: {}",
-                self.endpoint,
-                self.model,
-                self.redact(&error_chain(&source, &self.diagnostics))
-            ))
-        });
+        let result = self
+            .send_token_batch(input, monitor_call)
+            .map_err(|source| {
+                inference_error(format!(
+                    "HTTP ColBERT request to {} model {} purpose {purpose} failed: {}",
+                    self.endpoint,
+                    self.model,
+                    self.redact(&error_chain(&source, &self.diagnostics))
+                ))
+            });
         match &result {
             Ok(matrices) => info!(event = "model_call.completed", model_role = "colbert",
                 call_purpose = purpose, adapter_mode = HTTP_COLBERT_MODE,
@@ -642,7 +669,11 @@ impl HttpColbertClient {
     }
 
     /// Make exactly one request: transport, status, schema, and matrix failures never retry implicitly.
-    fn send_token_batch(&self, input: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, ApiError> {
+    fn send_token_batch(
+        &self,
+        input: &[Vec<u32>],
+        monitor_call: Option<&crate::monitoring::CallGuard>,
+    ) -> Result<Vec<Vec<f32>>, ApiError> {
         if input.iter().any(Vec::is_empty) {
             return Err(inference_error(
                 "HTTP ColBERT input contains an empty token sequence",
@@ -683,6 +714,16 @@ impl HttpColbertClient {
             .as_ref()
             .ok()
             .and_then(|response| response.usage.as_ref());
+        // Capture the same provider measurements as the response log; terminal
+        // accounting waits for status/schema/matrix validation by the caller.
+        if let Some(call) = monitor_call {
+            call.response_usage(crate::monitoring_types::TokenUsage {
+                prompt: usage.and_then(|usage| usage.prompt_tokens),
+                total: usage.and_then(|usage| usage.total_tokens),
+                completion: None,
+                reasoning: None,
+            });
+        }
         // Receiving a response is not successful inference: schema and matrix validation still follow.
         info!(event = "model_call.http_request.completed", model_role = "colbert",
             adapter_mode = HTTP_COLBERT_MODE, endpoint = %self.endpoint, model = %self.model,

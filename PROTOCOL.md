@@ -25,6 +25,7 @@ an asynchronous **Operation** you poll (see [Operations](#operations)).
 - [Route summary](#route-summary)
 - [Public routes](#public-routes)
   - [`GET /v1/health`](#get-v1health)
+  - [`GET /v1/monitor`](#get-v1monitor)
   - [`POST /query`](#post-query)
   - [`GET /units/{unitId}`](#get-unitsunitid)
   - [`GET /units/{unitId}/relationships`](#get-unitsunitidrelationships)
@@ -39,6 +40,7 @@ an asynchronous **Operation** you poll (see [Operations](#operations)).
   - [`POST /snapshots`](#post-snapshots)
   - [`POST /restore`](#post-restore)
   - [`POST /rebuild-all`](#post-rebuild-all)
+  - [`POST /clear-failures`](#post-clear-failures)
   - [`POST /shutdown`](#post-shutdown)
   - [`GET /parses`](#get-parses)
   - [`GET /operations/{operationId}`](#get-operationsoperationid)
@@ -160,6 +162,7 @@ failures and are reported as `500`, not `503`. Only `cutover_barrier_active`
 | Method | Path | Auth | Body → Response |
 |--------|------|------|-----------------|
 | GET  | `/v1/health`                                    | public    | — → `HealthResponse` |
+| GET  | `/v1/monitor`                                   | public    | — → `MonitorSnapshot` |
 | POST | `/query`                                         | public    | `QueryRequest` → `{ results, evidencePack, diagnostics? }` |
 | GET  | `/units/{unitId}`                                | public    | — → `ContentUnit` |
 | GET  | `/units/{unitId}/relationships`                  | public    | — → `{ relationships }` |
@@ -173,6 +176,7 @@ failures and are reported as `500`, not `503`. Only `cutover_barrier_active`
 | POST | `/snapshots`                                     | protected | `SnapshotRequest` → `202 { operationId }` |
 | POST | `/restore`                                       | protected | `RestoreRequest` → `202 { operationId }` |
 | POST | `/rebuild-all`                                   | protected | — → `202 { operationId }` |
+| POST | `/clear-failures`                                | protected | — → `202 { operationId }` |
 | POST | `/shutdown`                                       | protected | — → `202` (no body) |
 | GET  | `/parses?status=held`                            | protected | — → `{ parses }` |
 | GET  | `/operations/{operationId}`                      | protected | — → `Operation` |
@@ -301,11 +305,11 @@ measured empty inventory. Projection publication is disabled in annotation dry r
 
 Readiness (`ready`) is determined by the `inference` and `sync` components. The
 other components (`logging`, `fabric`, `annotation`, `projections`, `search_admission`) are
-diagnostic-only and do not gate top-level readiness. `GET /v1/health` is the single aggregation
-surface for corpus/fabric counts.
+diagnostic-only and do not gate top-level readiness. `GET /v1/health` aggregates
+corpus/fabric counts; `/v1/monitor` includes the same measured corpus exceptions.
 
 During the configured `server.startup_delay_seconds` window, `ready` is false
-and health reports the startup delay. `GET /v1/health`,
+and health reports the startup delay. `GET /v1/health`, `GET /v1/monitor`,
 `GET /operations/{operationId}`, `POST /rebuild-all`, and `POST /shutdown`
 remain available; other storage-dependent requests return `503`
 `service_unavailable`. Rebuild-all ends the countdown immediately. After
@@ -315,6 +319,60 @@ remaining delay; failed rebuilds keep storage paused. Shutdown cancels the wait.
 ```bash
 curl -s http://localhost:PORT/v1/health
 ```
+
+---
+
+### `GET /v1/monitor`
+
+Public, read-only monitoring snapshot; no request body or query parameters.
+Available on the normal router during startup delay and rebuild maintenance;
+absent from the annotation dry-run router. The handler reads memory, never SQLite.
+
+**Response `200`** — `MonitorSnapshot`, with `snake_case` fields. The server and
+bundled CLI share the types in `src/monitoring_types.rs`.
+
+| Fields | Contract |
+| --- | --- |
+| `run_id`, `generation` | String process identity and integer observation generation. Restart changes the run; rebuild or reporting-state recovery advances the generation, resetting coverage observations, active work, recent events, rates, and model totals. |
+| `started_at`, `sampled_at`, `uptime_ms`, `generation_elapsed_ms` | Nullable UTC timestamp strings and integer monotonic elapsed milliseconds. Sampling time does not make worker measurements current. |
+| `ready`, `status`, `queries_in_flight`, `query_limit` | Boolean readiness, service/maintenance explanation, and integer query admission counts. |
+| `headline`, `activity` | Server-owned ingestion summary and current work/idle explanation, distinct from service readiness. |
+| `ingestion` | Nullable `enumerated_files`, `pending`, `in_flight`, `failed`, `blocked_sources` (sources blocked by uncleared parse failure); boolean `enumeration_complete`; integer `skipped_files`, `staged_files`, `scan_failures`; nullable `last_scan_ms`, `next_scan_wait_ms`; `active_sources` progress; nullable `source_measured_at`, `queue_measured_at`, `scan_measured_at`, `measured_at`. |
+| `annotations` | Nullable integer `documents`; integer `unmeasured_documents`, `memoized`; committed `progress`, unfinished `work`, and `by_type` using the health count shapes above; nullable `parked_reason`, `measured_at`. |
+| `publication` | Nullable integer `documents`; `graph`, `summary`, nullable `embeddings` publication counts; `graph_progress`, `summary_progress`, nullable `embeddings_progress`; integer `unmeasured_embedding_documents`; nullable `measured_at`. |
+| `work[]` | `identity`, string `stage`, `state`, nullable `progress: { counts, unit }`, nullable `started_at`, integer `elapsed_ms`, nullable `detail`. |
+| `calls[]` | Groups of `identity`, string `role`, `model`, `stage`, integer `running`, nullable `oldest_started_at`, nullable `timeout_ms`. |
+| `call_log[]` | All running calls, newest starts first, followed by up to 32 newest finished calls in completion order. Each record has integer `id` (stable within run/generation), `identity`, string `role`, `model`, `stage`, `state`, nullable UTC `started_at`, `ended_at`, integer `elapsed_ms`, nullable `timeout_ms`, nullable string `detail`, and `usage: { prompt, completion, reasoning, total }` with nullable integer counts. Usage is published at terminal reporting. History is in memory and resets with the observation generation; calls completed between polls remain available until evicted by later completions. |
+| `model_stats[]` | String `role`, `model`; integer `succeeded`, `failed`, `cancelled`, `usage_unavailable`; nullable `mean_duration_ms`, `max_duration_ms`; `usage: { prompt, completion, reasoning, total }` with nullable integer token counts. |
+| `rates[]` | String `label`, integer `completed`, `window_ms`, and numeric `per_minute` for the observed trailing window, at most 60 seconds. |
+| `issues[]` | `identity`, string `stage`, `state`, string `message`, integer `affected`, nullable UTC `observed_since`, integer `elapsed_ms`, nullable integer `retry_in_ms`, `attempt`, `retry_limit`. Age starts at the first unresolved observation, independently of retry scheduling. `attempt` is an observed attempt; `retry_limit` is an additional-retry allowance, not its denominator. Outstanding issues are independent of recent-event retention. |
+| `recent[]` | Newest first, at most 32 `{ at, identity, stage, state, message }` outcomes; `at` is nullable. |
+| `corpus[]` | `{ source_system, label, value, measured_at }`: strings, integer count, and nullable measurement string from the scheduler's corpus observations. |
+
+`identity` is `{ worker, document, source_id, parse_id }`; canonical IDs are
+nullable until known. `state` is `running`, `waiting`, `complete`, `failed`,
+`cancelled`, `unavailable`, or `idle`. Progress uses the server-calculated
+`{ completed, total, percentage }` shape above. Unknown totals/percentages are
+null; zero required work has no percentage. File enumeration and deduplicated
+known-source coverage are separate populations. Partial annotation or embedding
+inventory cannot establish corpus completion.
+
+Annotation and publication percentages cover active documents only. Persisted
+parse/queue failures and source counts are measured from one WAL snapshot and
+restored after restart. Routine discovery is not active work or a recent DONE
+event; publication retains valid counts during unchanged checks.
+
+Workers publish stage boundaries, completed batches, commits, waits, and outcomes;
+frequent stage progress is coalesced at 200 ms. Model calls expose start and
+terminal outcome only. Completed calls do not imply committed annotations or
+published retrieval inputs. Token totals sum only provider-reported fields;
+`usage_unavailable` counts missing/partial prompt and total usage for embeddings,
+and prompt, completion, and total usage for annotations. Reasoning is included
+in completion, never added again.
+
+The snapshot supplements authoritative service logs. It is neither a durable
+event stream nor a scheduling input; restart reconstructs coverage through the
+existing worker inventories.
 
 ---
 
@@ -778,8 +836,8 @@ curl -s http://localhost:PORT/sources/SOURCE_ID
 The last-published sync-scheduler health snapshot (§9.5–§9.6). Public.
 
 This route serves the published `SyncHealth` snapshot **only**. It does not carry
-a fabric-counts projection — corpus/fabric counts live on `GET /v1/health`, the
-single aggregation surface.
+a fabric-counts projection — corpus/fabric counts appear on `GET /v1/health`
+and in `/v1/monitor`'s measured corpus observations.
 
 **Response `200`** — `SyncStatusResponse` (`camelCase`):
 
@@ -815,15 +873,15 @@ curl -s http://localhost:PORT/sync/status
 ## Protected routes
 
 All routes in this section require the bearer token (see
-[Authentication](#authentication)). The eight asynchronous admin routes below
-return `202 Accepted` with `{ "operationId": "..." }`. `POST /rebuild-all`
-drains current storage work before recording acceptance; clearing then runs
+[Authentication](#authentication)). The asynchronous admin routes below
+return `202 Accepted` with `{ "operationId": "..." }`. `POST /rebuild-all` and `POST /clear-failures`
+drain current storage work before recording acceptance; clearing then runs
 asynchronously. Poll the returned id at
 [`GET /operations/{operationId}`](#get-operationsoperationid); see
 [Operations](#operations) for the polling model and the important
 `succeeded`-is-not-a-verdict caveat.
 
-The `202` acceptance body is the same for all eight (`camelCase`):
+The `202` acceptance body is the same for these routes (`camelCase`):
 
 ```json
 { "operationId": "op_..." }
@@ -1066,6 +1124,29 @@ start against that state.
 
 ---
 
+### `POST /clear-failures`
+
+Unblock failed background work without deleting successful work or failure
+history. Protected; normal router only. **Request body** — none.
+**Response `202`** — `{ operationId }`, `operationType: clear_failures`, target `corpus`.
+
+Before acceptance, storage admission closes and admitted work drains at source,
+annotation-wave, and publication-cohort boundaries. In-flight model calls finish
+without cancellation. An overlapping maintenance operation is rejected.
+
+The operation appends `parse.failure_cleared` events for exact failed parse IDs
+and requeues failed current/access-lost sources and failed queue entries with
+fresh Operations. A new failed attempt blocks again. It resets annotation retry
+budgets/timers and wakes background workers, including retrying parked annotation
+client loading. Held parses and ordinary validation gates remain unchanged.
+
+`succeeded` means retry eligibility was reset and workers notified, not that
+ingestion completed. Durable retry permission can commit before a later resume
+failure; errors and logs identify that boundary. Worker threads terminated by
+panic/spawn failure and invalid inference startup still require restart.
+
+---
+
 ### `POST /shutdown`
 
 Signal the service to shut down. Protected. This is a **control action, not an
@@ -1190,12 +1271,12 @@ Read one Operation row by id (§34.6). Protected.
 ```
 acquisition, parser_execution, parse_build, parse_import_validation,
 parse_activation, projection_build, snapshot_creation, restore,
-drill, source_ingest, parse_discard, rebuild_all
+drill, source_ingest, parse_discard, rebuild_all, clear_failures
 ```
 
-`parse_discard` and `rebuild_all` extend the spec's closed set (see
-[`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard) and
-[`POST /rebuild-all`](#post-rebuild-all)).
+`parse_discard`, `rebuild_all`, and `clear_failures` extend the spec's closed set (see
+[`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard),
+[`POST /rebuild-all`](#post-rebuild-all), and [`POST /clear-failures`](#post-clear-failures)).
 
 `status` values (wire names, `snake_case`): `pending`, `running`, `succeeded`,
 `failed`.
@@ -1295,9 +1376,10 @@ Every mutating admin route ([`POST /sources`](#post-sources),
 [`POST /parses/{parseId}/discard`](#post-parsesparseiddiscard),
 [`POST /snapshots`](#post-snapshots),
 [`POST /restore`](#post-restore),
-[`POST /rebuild-all`](#post-rebuild-all)) returns `202 { "operationId": "op_..." }`
-**before** the work completes. `POST /rebuild-all` first drains current storage
-work, then records acceptance and starts asynchronous clearing.
+[`POST /rebuild-all`](#post-rebuild-all),
+[`POST /clear-failures`](#post-clear-failures)) returns `202 { "operationId": "op_..." }`
+**before** the work completes. `POST /rebuild-all` and `POST /clear-failures` first drain current storage
+work, then record acceptance and start asynchronous clearing.
 
 To observe progress and outcome, poll
 [`GET /operations/{operationId}`](#get-operationsoperationid). The `status` walks

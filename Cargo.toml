@@ -19,9 +19,13 @@ axum = "0.8.9"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
+crossterm = "0.29.0"
 fancy-regex = "0.17.0"
 getrandom = "0.3.4"
 mupdf = "0.8.0"
+ratatui-core = { version = "0.1.2", default-features = false, features = ["std", "layout-cache"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Progress callbacks support configurable SQL execution deadlines.
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }

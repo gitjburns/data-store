@@ -422,7 +422,7 @@ activity_sample_grace_ms = 15000
 # Milliseconds between sample-process completion checks.
 activity_poll_ms = 100
 # Regex backtracking steps per PDF cleanup match; exhaustion fails cleanup explicitly.
-cleanup_regex_backtrack_limit = 1000000
+cleanup_regex_backtrack_limit = 5000000
 
 [scheduling]
 # Minimum filesystem sweep delay in milliseconds; faster suggestions are clamped here.

@@ -18,6 +18,7 @@ use crate::annotations::{
     summary,
 };
 use crate::error::ApiError;
+use crate::monitoring_types::{MonitorState, TokenUsage};
 use crate::types::AnnotationProgressCount;
 
 #[derive(Deserialize)]
@@ -355,19 +356,38 @@ fn run_stage<T>(
     // Context and payload buffer have distinct owners: HTTP can fill the buffer
     // while the stage retains its tracing scope through validation and one flush.
     let _entered = context.enter();
+    let mut monitor_call = None;
+    let mut usage = TokenUsage::default();
     let result = (|| {
         check_cancellation(client)?;
         let schema = stage.schema().map_err(InvocationFailure::Internal)?;
         let prompt = stage.prompt();
-        let raw = client
-            .complete(&mut call, &context, &prompt, input, &schema, temperature)
-            .map_err(|failure| match failure {
-                CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
-                CompletionFailure::Request(error) => InvocationFailure::Call(error),
-            })?;
+        // Submission starts after local preparation; one terminal observation
+        // includes structural validation without claiming annotation persistence.
+        monitor_call = client.monitor_call(stage.name());
+        let (completion, received_usage) =
+            client.complete(&mut call, &context, &prompt, input, &schema, temperature);
+        // Usage belongs to the received exchange even when HTTP or subsequent
+        // validation fails; preserve it before propagating either result.
+        usage = received_usage;
+        let raw = completion.map_err(|failure| match failure {
+            CompletionFailure::Cancelled(reason) => InvocationFailure::Cancelled(reason),
+            CompletionFailure::Request(error) => InvocationFailure::Call(error),
+        })?;
         check_cancellation(client)?;
         parse(&raw).map_err(InvocationFailure::InvalidOutput)
     })();
+    if let Some(monitor_call) = monitor_call {
+        match &result {
+            Ok(_) => monitor_call.finish(MonitorState::Complete, usage, None),
+            Err(InvocationFailure::Cancelled(reason)) => {
+                monitor_call.finish(MonitorState::Cancelled, usage, Some(reason.label()));
+            }
+            Err(failure) => {
+                monitor_call.finish(MonitorState::Failed, usage, Some(&failure.to_string()));
+            }
+        }
+    }
     match &result {
         Ok(value) => {
             let output_items = item_count(value);

@@ -198,7 +198,7 @@ validates** this section (so `deny_unknown_fields` accepts the shared file) but
 
 | Key | Meaning |
 | --- | --- |
-| `operation_timeout_seconds` | Timeout for each CLI HTTP request, including each individual Operation poll. Must be > 0. |
+| `operation_timeout_seconds` | Timeout for CLI HTTP requests and individual Operation polls, except monitor polls use a fixed two-second deadline. Must be > 0. |
 
 The polling loop has no overall deadline; it continues until a terminal status
 or request failure. The client-facing API uses JSON responses and polling;
@@ -442,7 +442,7 @@ request handling begins after inference is ready. Ordering:
 5. Initialize inference. Failure is fatal (and cleans up the token file).
 6. Load and validate policy documents and capture application identity (§15.3).
    Construct shared state with ordinary storage admission held.
-7. Serve HTTP and wait `server.startup_delay_seconds`. Health, Operation polling,
+7. Serve HTTP and wait `server.startup_delay_seconds`. Health, monitoring, Operation polling,
    rebuild-all, and shutdown remain available; other storage-dependent requests
    return `503`. Readiness stays false and health reports the startup delay.
 8. When the delay expires, register policy versions and load caches through a
@@ -572,7 +572,8 @@ before inserting its Operation and returning acceptance (§5.1).
 The Operation `status` set is closed: **`pending`** (on insert) →
 **`running`** (once the worker starts it) → terminal **`succeeded`** or
 **`failed`**. The `operationType` set is the spec §34.6 closed enumeration plus
-**`parse_discard`** (held-parse discard, §16) and **`rebuild_all`** (§5.1).
+**`parse_discard`** (held-parse discard, §16), **`rebuild_all`** (§5.1), and
+**`clear_failures`** (retry eligibility reset).
 
 **No NDJSON anywhere** (D2 ruling): there is no streamed progress on
 administrative operations, and no streamed query transport. Administration is
@@ -634,6 +635,7 @@ The full wire contract is in **PROTOCOL.md**. Routes split into public
 **Public:**
 
 - `GET /v1/health` — readiness and diagnostics (§7).
+- `GET /v1/monitor` — current worker observations and measured progress (§7.1).
 - `POST /query` — JSON `QueryRequest` in, one JSON response carrying ranked
   passages and their canonical EvidencePack. The synchronous retrieval + assembly
   pipeline runs on a blocking thread.
@@ -654,6 +656,11 @@ The full wire contract is in **PROTOCOL.md**. Routes split into public
   completion path).
 - `POST /rebuild-all` — clear stored corpus state and resume automatic rebuilding
   (async Operation; §5.1).
+- `POST /clear-failures` — drain admitted work without cancelling model calls,
+  then reset failure eligibility through an Operation. Preserve successful work
+  and failure history; requeue failed sources/jobs, reset annotation retry budgets,
+  and notify workers. Held parses and validation gates remain. See PROTOCOL.md
+  for committed-permission and worker-resume boundaries.
 - `POST /shutdown` — immediate confirmation, then signals shutdown. **Not** an
   Operation row (not async work).
 - `GET /parses?status=held` — held-parse listing (spec §13.4 disposition surface).
@@ -724,6 +731,37 @@ Admission itself: the `/query` handler acquires a permit from a fail-fast
 in-flight search gate before running the pipeline. Saturation surfaces the
 existing `ServiceUnavailable` (503) path; the gate's capacity is a code constant,
 not operator-tunable.
+
+---
+
+### 7.1 Monitoring
+
+`GET /v1/monitor` reads worker-owned memory observations without database access.
+Workers measure queue/source counts through bounded read-only storage reads
+after committed transitions; source, queue, and scan timestamps remain separate.
+Annotation and publication totals reuse their existing inventory accounting.
+File discovery counts are distinct from deduplicated active known-source coverage.
+The server supplies percentages and rates; unknown denominators remain null.
+
+Server-owned `headline` and `activity` distinguish ingestion status from query
+readiness. Source coverage, blocked parse counts, and persisted parse/queue
+failure explanations share a WAL snapshot and are restored after restart.
+Annotation and publication percentages cover active documents only.
+
+Stage boundaries, completed batches, commits, waits, and outcomes update the
+snapshot; frequent progress is coalesced at 200 ms. Model calls expose start and
+terminal outcome only, grouped by document, role, model, and stage. Rates cover
+at most 60 seconds; recent outcomes retain 32 entries. Active work, outstanding
+issues, and completed-call totals do not age out with recent events. These are
+fixed implementation constants, with no monitor configuration fields.
+
+No-op discovery checks produce neither active-work rows nor recent completions.
+Publication retains valid coverage while checking unchanged inputs.
+
+Rebuild advances the monitoring generation and clears corpus observations and
+generation statistics. Restart creates a new run; existing discovery reconstructs
+coverage. Monitoring supplements durable diagnostics and never controls work.
+`PROTOCOL.md` defines the snapshot; `SPEC-CLIENT.md` §1.7 defines the TUI.
 
 ---
 

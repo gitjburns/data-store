@@ -19,13 +19,9 @@
 //! event-atomic append these functions' template (annotations/store.rs) makes
 //! must be told: there is deliberately none here.
 //!
-//! Transaction shape: unlike the annotations store (whose mutations take the
-//! CALLER's `&Transaction` so a row change and its event commit atomically),
-//! these functions open their OWN write connection per call (the scheduler
-//! `complete()` precedent). Operation rows are NOT event-atomic with any
-//! domain write — there is no paired event, and the C10a detached tasks and
-//! the scheduler drain call these from OUTSIDE any shared domain transaction —
-//! so the self-contained `open_write`-per-call form is the correct fit. Reads
+//! Transaction shape: lifecycle transitions open their own write connection.
+//! `insert_pending_on` lets failure clearing atomically enqueue a fresh attempt
+//! and its Operation in the caller's domain transaction. Reads
 //! take a fresh read-only connection. Boundary logging is deliberately left to
 //! the C10a/scheduler callers (mirroring annotations/store.rs, which logs at
 //! the worker boundary, not per store fn); those callers own the async-task
@@ -101,11 +97,27 @@ pub(crate) fn insert_pending(
     target_object_type: &str,
     target_object_id: &str,
 ) -> Result<String, ApiError> {
+    let connection = hot_plane::open_write(index_root)?;
+    insert_pending_on(
+        &connection,
+        operation_type,
+        target_object_type,
+        target_object_id,
+    )
+}
+
+/// Couple a new retry Operation to its queue row in the caller's transaction;
+/// terminal Operations from earlier attempts remain immutable history.
+pub(crate) fn insert_pending_on(
+    connection: &crate::sqlite::Connection,
+    operation_type: OperationType,
+    target_object_type: &str,
+    target_object_id: &str,
+) -> Result<String, ApiError> {
     let id = new_operation_id()?;
     let operation_type_wire = enum_wire_name(&operation_type, "operation type")?;
     let now = utc_now()?;
 
-    let connection = hot_plane::open_write(index_root)?;
     connection
         .execute(
             INSERT_PENDING_SQL,

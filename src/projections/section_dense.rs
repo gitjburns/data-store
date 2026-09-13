@@ -168,6 +168,7 @@ pub(crate) fn build_section_dense(
     tokenizer: &Tokenizer,
     permit: Option<&ModelCallPermit>,
     model_identity: &str,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<usize, ApiError> {
     let started = Instant::now();
     info!(
@@ -248,7 +249,15 @@ pub(crate) fn build_section_dense(
                 .iter()
                 .map(|window| window.targeting_text.as_str())
                 .collect();
-            let vectors = super::dense::embed_texts(backend, &texts, parse_id)?;
+            if let Some(monitor) = monitor {
+                monitor.stage(
+                    "dense section embeddings",
+                    Some(texts.len() as u64),
+                    "section inputs embedded",
+                );
+            }
+            let vectors =
+                super::dense::embed_texts(backend, &texts, parse_id, monitor, "section embedding")?;
             if vectors.len() != plane.windows.len() {
                 return Err(failure(format!(
                     "section embedding count for {parse_id}: {} returned for {} windows",

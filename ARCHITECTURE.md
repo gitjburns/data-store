@@ -146,11 +146,18 @@ and detached clearing run synchronously behind `spawn_blocking`. Client timeout
 or disconnect does not cancel the work. Health, Operation polling, and shutdown
 remain available.
 
+`POST /clear-failures` uses the same admission boundary but lets model calls and
+their commits finish. `src/clear_failures.rs` records exact failed-parse clear
+events and fresh queue Operations in a transaction, then resets in-memory retry
+budgets and notifies workers. Committed retry permission survives a later resume
+failure. It preserves successful data, failure history, held parses, and validation
+gates; it does not supervise dead worker threads.
+
 Cancellation is a control outcome, not a provider failure or retry-budget charge.
-The watch signal resets only after clearing succeeds and the storage generation
+The rebuild watch signal resets only after clearing succeeds and the storage generation
 advances. `DIAGNOSTICS.md` documents the cancellation fields and terminal events.
 
-With storage users drained, the operation clears application data while
+With storage users drained, rebuild-all clears application data while
 preserving schema and its own Operation, deletes the artifact and staging trees,
 re-registers loaded policies, and resets in-memory caches, worker bookkeeping,
 cadence, and health counts. Operation success marks clearing completion and
@@ -929,6 +936,34 @@ database connections. Slots are poison-recovered on read.
   (`entity_match_policy_hash`, `annotator_naming_policy_hash`, Section 3.2),
   captured once at startup alongside the config hash; the config-hash projection
   itself carries the two document **paths only**.
+
+### 7.1 Monitoring observations
+
+`src/monitoring.rs` owns transient observations carried by explicit worker/call
+handles. Existing workers remain authoritative for ingestion boundaries,
+annotation accounting, and committed publication. Bounded read-only queue/source
+measurements run on their synchronous owners after committed transitions;
+source, queue, and scan timestamps remain independent. `AppState::monitor_snapshot`
+reads memory and adds existing readiness, maintenance, corpus, and query admission
+observations. `GET /v1/monitor` performs no database access.
+
+`src/monitoring_storage.rs` measures source counts and persisted parse/queue
+failure explanations in one WAL snapshot. Cleared historical failures do not
+inflate current blocked/stale counts. `AppState` derives the ingestion headline
+and idle/work explanation; clients render these without inferring eligibility.
+
+Observers do not hold their lock across model, database, or filesystem work.
+Generation identities reject late reports after rebuild; restart creates a new
+run and inventories reconstruct coverage. Frequent progress is coalesced at
+200 ms; rates retain at most 60 seconds and recent outcomes at most 32 entries.
+Active work and outstanding issues do not expire with recent history. The shared
+wire contract is `src/monitoring_types.rs`; the single-screen client in
+`src/bin/data-store/monitor.rs` uses one joined blocking polling worker.
+Monitoring neither schedules work nor replaces durable diagnostics.
+
+Routine discovery is silent in active-work/recent panels. Publication retains
+valid coverage during unchanged checks. Annotation/publication percentages are
+scoped to active documents; durable failure explanations return after restart.
 
 ## 8. Model runtime
 

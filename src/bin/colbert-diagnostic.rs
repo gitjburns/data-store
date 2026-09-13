@@ -15,8 +15,15 @@ mod error;
 mod inference;
 #[path = "../limits.rs"]
 mod limits;
+// Included model adapters share the service's optional observation types.
+#[path = "../monitoring.rs"]
+mod monitoring;
+#[path = "../monitoring_types.rs"]
+mod monitoring_types;
 #[path = "../primitives/mod.rs"]
 mod primitives;
+#[path = "../types.rs"]
+mod types;
 // Required by the included inference sources: device.rs renders panic
 // payloads through crate::util, which this bin crate must therefore declare.
 #[path = "../util.rs"]

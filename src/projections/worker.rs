@@ -20,6 +20,8 @@ use crate::inference::InferenceRuntime;
 use crate::limits::DiagnosticLimits;
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation, MaintenanceGate};
 use crate::model::{ProducerType, Provenance};
+use crate::monitoring::WorkHandle;
+use crate::monitoring_types::{MonitorIssue, MonitorState, WorkIdentity};
 use crate::primitives::utc_now;
 use crate::state::{ExclusiveGate, ProjectionHealth, ShutdownSignal, acquire_model_call_gate_on};
 use crate::types::{ProjectionActivity, ProjectionDocumentProgress, ProjectionPublicationCounts};
@@ -89,6 +91,18 @@ struct ActiveSource {
     source_id: String,
     parse_id: String,
     source_paths: Vec<String>,
+}
+
+impl ActiveSource {
+    /// Keep canonical identity stable while locations remain presentation fields.
+    fn monitor_identity(&self) -> WorkIdentity {
+        WorkIdentity {
+            worker: crate::monitoring::PUBLICATION_WORKER.to_owned(),
+            document: self.source_paths.join(", "),
+            source_id: Some(self.source_id.clone()),
+            parse_id: Some(self.parse_id.clone()),
+        }
+    }
 }
 
 /// Ephemeral scheduling positions carry no durable work state; discovery remains
@@ -164,10 +178,39 @@ impl Materialization {
     }
 }
 
+/// Retain worker-level failures independently of document retirement and coverage.
+fn publication_worker_issue(
+    monitoring: &crate::monitoring::Monitoring,
+    stage: &str,
+    message: &str,
+) {
+    monitoring.set_issue(
+        "projection-worker".to_owned(),
+        MonitorIssue {
+            observed_since: None,
+            elapsed_ms: 0,
+            identity: WorkIdentity::new(
+                crate::monitoring::PUBLICATION_WORKER,
+                "worker",
+                None,
+                None,
+            ),
+            stage: stage.to_owned(),
+            state: MonitorState::Unavailable,
+            message: message.to_owned(),
+            affected: 1,
+            retry_in_ms: None,
+            attempt: None,
+            retry_limit: None,
+        },
+    );
+}
+
 /// Start a diagnostic-only publication owner with observable spawn/panic outcomes.
 /// The caller retains and joins the handle during common shutdown cleanup.
 pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
     let failed_health = Arc::clone(&inputs.health);
+    let failure_monitor = Arc::clone(inputs.index_root.monitoring());
     // Spawn failures occur after the closure has taken ownership of inputs.
     let diagnostics = inputs.index_root.limits().diagnostics;
     thread::Builder::new()
@@ -187,12 +230,22 @@ pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
                     "annotation projection worker stopped cleanly"
                 ),
                 Ok(Err(source)) => {
+                    publication_worker_issue(
+                        inputs.index_root.monitoring(),
+                        "worker lifecycle",
+                        &source.to_string(),
+                    );
                     error!(event = "projection_worker.thread_failed", error = %source,
                     "annotation projection worker stopped after a lifecycle failure");
                     unavailable(&inputs.health, &source.to_string(), &diagnostics);
                 }
                 Err(payload) => {
                     let detail = panic_payload_message(payload.as_ref(), &diagnostics);
+                    publication_worker_issue(
+                        inputs.index_root.monitoring(),
+                        "worker panic",
+                        &detail,
+                    );
                     error!(event = "projection_worker.thread_panicked", is_panic = true,
                     panic_message = %detail, "annotation projection worker panicked");
                     unavailable(&inputs.health, &detail, &diagnostics);
@@ -206,6 +259,7 @@ pub(crate) fn start(inputs: WorkerInputs) -> Result<JoinHandle<()>, ApiError> {
             error!(event = "projection_worker.spawn_failed", error = %error,
             "annotation projection publication unavailable");
             unavailable(&failed_health, &error.to_string(), &diagnostics);
+            publication_worker_issue(&failure_monitor, "worker spawn", &error.to_string());
             error
         })
 }
@@ -217,6 +271,7 @@ fn run_worker(inputs: &WorkerInputs) -> Result<(), ApiError> {
     // it between blocking calls instead of introducing an asynchronous model path.
     let cancellation = inputs.maintenance.annotation_cancellation();
     let mut generation = 0;
+    let mut corpus_generation = 0;
     let mut delay = Duration::ZERO;
     let mut cursor = PublicationCursor::default();
     loop {
@@ -230,14 +285,25 @@ fn run_worker(inputs: &WorkerInputs) -> Result<(), ApiError> {
         if permit.generation() != generation {
             generation = permit.generation();
             cursor = PublicationCursor::default();
+        }
+        if permit.corpus_generation() != corpus_generation {
+            corpus_generation = permit.corpus_generation();
             update_health(&inputs.health, |health| {
                 health.documents = None;
                 health.measured_at = None;
             });
         }
         match run_cycle(inputs, &cancellation, &mut cursor) {
-            Ok(()) => {}
+            Ok(()) => inputs
+                .index_root
+                .monitoring()
+                .clear_issue("projection-worker"),
             Err(source) => {
+                publication_worker_issue(
+                    inputs.index_root.monitoring(),
+                    "discovery",
+                    &source.to_string(),
+                );
                 error!(event = "projection_worker.cycle_failed", error = %source,
                     "projection discovery failed; previous document measurements retained");
                 worker_activity(
@@ -275,18 +341,18 @@ fn run_cycle(
     cursor
         .last_cohort
         .retain(|source_id, _| active_ids.contains(source_id.as_str()));
-    publish_inventory(&inputs.health, &sources)?;
-    let mut documents: Vec<_> = sources.iter().map(initial_document).collect();
+    // Preserve last valid publication counts during discovery; a routine check
+    // must not turn completed embeddings back into an unmeasured inventory.
+    let mut documents = publish_inventory(inputs, &sources)?;
     for (source, document) in sources.iter().zip(&mut documents) {
         for family in [Materialization::Graph, Materialization::Summary] {
-            if cancelled(inputs, cancellation).is_some() {
+            if cancelled(inputs, cancellation).is_some() || cancellation.dispatch_paused() {
                 return Ok(());
             }
-            document.activity = ProjectionActivity::Building;
             let result = publish_materialization(inputs, cancellation, source, family);
             apply_materialization_result(inputs, cancellation, source, document, family, result);
         }
-        publish_document(&inputs.health, document)?;
+        publish_document(inputs, document)?;
     }
     // Runtime absence is explicit while cheap materialization remains usable.
     if let Some(runtime) = &inputs.runtime {
@@ -308,7 +374,7 @@ fn run_cycle(
             let index = (start + offset) % sources.len();
             let source = &sources[index];
             let document = &mut documents[index];
-            if cancelled(inputs, cancellation).is_some() {
+            if cancelled(inputs, cancellation).is_some() || cancellation.dispatch_paused() {
                 return Ok(());
             }
             if let Err(source_error) = publish_document_embeddings(
@@ -319,6 +385,21 @@ fn run_cycle(
                 document,
                 &mut budget,
             ) {
+                inputs.index_root.monitoring().set_issue(
+                    format!("projection-source:{}", source.parse_id),
+                    MonitorIssue {
+                        observed_since: None,
+                        elapsed_ms: 0,
+                        identity: source.monitor_identity(),
+                        stage: "embedding discovery".to_owned(),
+                        state: MonitorState::Unavailable,
+                        message: source_error.to_string(),
+                        affected: 1,
+                        retry_in_ms: None,
+                        attempt: None,
+                        retry_limit: None,
+                    },
+                );
                 error!(event = "projection_worker.document_failed", source_id = %source.source_id,
                     parse_id = %source.parse_id, error = %source_error, error_kind = source_error.error_kind(),
                     "annotation embedding discovery failed for one source");
@@ -327,14 +408,26 @@ fn run_cycle(
                     &source_error.to_string(),
                     &inputs.index_root.limits().diagnostics,
                 ));
-                publish_document(&inputs.health, document)?;
+                publish_document(inputs, document)?;
+            } else {
+                inputs
+                    .index_root
+                    .monitoring()
+                    .clear_issue(&format!("projection-source:{}", source.parse_id));
             }
         }
     } else {
+        inputs.index_root.monitoring().set_issue("projection-runtime".to_owned(), MonitorIssue {
+            observed_since: None, elapsed_ms: 0,
+            identity: WorkIdentity::new(crate::monitoring::PUBLICATION_WORKER, "worker", None, None),
+            stage: "embedding runtime".to_owned(), state: MonitorState::Unavailable,
+            message: "Annotation embedding runtime unavailable; graph and summary publication remain independent.".to_owned(),
+            affected: sources.len() as u64, retry_in_ms: None, attempt: None, retry_limit: None,
+        });
         for document in &mut documents {
             document.activity = ProjectionActivity::Unavailable;
             document.detail = Some("Annotation embedding runtime is unavailable; graph and summary publication remain independent.".to_owned());
-            publish_document(&inputs.health, document)?;
+            publish_document(inputs, document)?;
         }
     }
     let failed: u64 = documents
@@ -568,6 +661,7 @@ fn publish_materialization(
         return Ok(PublicationOutcome::Cancelled(reason));
     }
     let started = Instant::now();
+    let mut work = None;
     let body = (|| {
         if !is_active(&tx, &source.source_id, &source.parse_id)? {
             return Ok(PublicationOutcome::Inactive);
@@ -575,6 +669,14 @@ fn publish_materialization(
         if materialization_current(&tx, source, family)? {
             return Ok(PublicationOutcome::Current);
         }
+        // Only real materialization owns an active-work row. Freshness checks
+        // remain quiet, including the second check under the writer lock.
+        work = Some(inputs.index_root.monitoring().work(
+            source.monitor_identity(),
+            family.name(),
+            Some(1),
+            "publication",
+        ));
         info!(event = "projection_worker.materialization_started", source_id = %source.source_id,
             parse_id = %source.parse_id, projection_type = family.name(), "annotation materialization started");
         envelope::delete_for_index_partition(
@@ -597,19 +699,31 @@ fn publish_materialization(
     let outcome = match body {
         Ok(outcome) => outcome,
         Err(error) => {
-            return Err(hot_plane::abort_transaction(
+            let result = Err(hot_plane::abort_transaction(
                 tx,
                 TX_NAMESPACE,
                 "materialize",
                 error,
             ));
+            if let Some(work) = work {
+                finish_publication_work(work, &result);
+            }
+            return result;
         }
     };
     if let Some(reason) = cancelled(inputs, cancellation) {
         rollback_cancelled(tx, family.name(), reason)?;
+        if let Some(work) = work {
+            finish_publication_work(work, &Ok(PublicationOutcome::Cancelled(reason)));
+        }
         return Ok(PublicationOutcome::Cancelled(reason));
     }
-    hot_plane::commit_transaction(tx, TX_NAMESPACE, "materialize")?;
+    let committed =
+        hot_plane::commit_transaction(tx, TX_NAMESPACE, "materialize").map(|()| outcome);
+    if let Some(work) = work {
+        finish_publication_work(work, &committed);
+    }
+    let outcome = committed?;
     if matches!(outcome, PublicationOutcome::Published) {
         info!(event = "projection_worker.materialization_published", source_id = %source.source_id,
             parse_id = %source.parse_id, projection_type = family.name(), committed = true,
@@ -830,7 +944,7 @@ fn publish_document_embeddings(
         if !is_active(&tx, &source.source_id, &source.parse_id)? {
             document.activity = ProjectionActivity::Stopped;
             document.detail = Some("Source no longer has this active parse.".to_owned());
-            return publish_document(&inputs.health, document);
+            return publish_document(inputs, document);
         }
         (
             annotation::plan_for_parse(
@@ -846,9 +960,18 @@ fn publish_document_embeddings(
     if let Some(reason) = inventory.cancelled {
         document.activity = ProjectionActivity::Stopped;
         document.detail = Some(format!("Publication cancelled: {}", reason.label()));
-        return publish_document(&inputs.health, document);
+        return publish_document(inputs, document);
     }
     let mut pending = Vec::new();
+    let issue_prefix = format!("projection-cohort:{}:", source.parse_id);
+    let current_issue_keys: BTreeSet<_> = plans
+        .iter()
+        .map(|plan| format!("{issue_prefix}{}", plan.cohort_id))
+        .collect();
+    inputs
+        .index_root
+        .monitoring()
+        .retain_issues(&issue_prefix, |key| current_issue_keys.contains(key));
     let mut retirement_only = inventory.pending_retirements;
     let mut counts = ProjectionPublicationCounts::default();
     for plan in plans {
@@ -861,6 +984,10 @@ fn publish_document_embeddings(
             // A matching input hash cannot hide different declared envelope
             // lineage. Validate against this plan without loading artifact bodies.
             annotation::validate_publication_lineage(publication, &plan)?;
+            inputs
+                .index_root
+                .monitoring()
+                .clear_issue(&format!("{issue_prefix}{}", plan.cohort_id));
             counts.published += 1;
         } else {
             counts.pending += 1;
@@ -874,7 +1001,7 @@ fn publish_document_embeddings(
     } else {
         document_activity(document)
     };
-    publish_document(&inputs.health, document)?;
+    publish_document(inputs, document)?;
     let store = ArtifactStore::open_existing(&inputs.index_root)?;
     if let Some(last) = budget.cursor.last_cohort.get(&source.source_id) {
         let start = pending.partition_point(|plan| plan.cohort_id.as_str() <= last.as_str());
@@ -888,10 +1015,15 @@ fn publish_document_embeddings(
             .projection_cohorts_per_source,
     );
     for plan in pending.into_iter().take(allowance) {
+        // Finish the previous cohort, including its publication commit, before
+        // yielding to non-destructive recovery. No new model call is dispatched.
+        if cancellation.dispatch_paused() {
+            break;
+        }
         if let Some(reason) = cancelled(inputs, cancellation) {
             document.activity = ProjectionActivity::Stopped;
             document.detail = Some(format!("Publication cancelled: {}", reason.label()));
-            publish_document(&inputs.health, document)?;
+            publish_document(inputs, document)?;
             break;
         }
         budget.remaining -= 1;
@@ -901,15 +1033,41 @@ fn publish_document_embeddings(
             .last_cohort
             .insert(source.source_id.clone(), plan.cohort_id.clone());
         document.activity = ProjectionActivity::Building;
-        publish_document(&inputs.health, document)?;
+        publish_document(inputs, document)?;
         let started = Instant::now();
         info!(event = "projection_worker.embedding_started", source_id = %plan.source_id,
             parse_id = %plan.parse_id, cohort_id = %plan.cohort_id, input_hash = %plan.input_hash,
             annotation_count = plan.inputs.len(), "annotation retrieval embedding started");
-        let result =
-            build_and_publish_cohort(inputs, cancellation, runtime, &store, &plan, document);
+        let work = inputs.index_root.monitoring().work(
+            source.monitor_identity(),
+            "annotation representations",
+            None,
+            "representations",
+        );
+        let monitor = work.handle();
+        let result = build_and_publish_cohort(
+            inputs,
+            cancellation,
+            runtime,
+            &store,
+            &plan,
+            document,
+            &monitor,
+        );
+        finish_publication_work(work, &result);
+        let issue_key = format!("{issue_prefix}{}", plan.cohort_id);
+        if matches!(result, Ok(PublicationOutcome::Published)) {
+            inputs.index_root.monitoring().record_completed(
+                source.monitor_identity(),
+                "annotation embeddings",
+                "Dense and ColBERT publication committed",
+                "embedding cohorts published",
+                1,
+            );
+        }
         match result {
             Ok(PublicationOutcome::Published | PublicationOutcome::Current) => {
+                inputs.index_root.monitoring().clear_issue(&issue_key);
                 counts.pending -= 1;
                 counts.published += 1;
             }
@@ -917,7 +1075,7 @@ fn publish_document_embeddings(
                 document.activity = ProjectionActivity::Stopped;
                 document.detail = Some(format!("Publication cancelled: {}", reason.label()));
                 document.embeddings = Some(counts);
-                publish_document(&inputs.health, document)?;
+                publish_document(inputs, document)?;
                 break;
             }
             Ok(PublicationOutcome::Inactive) => {
@@ -925,7 +1083,7 @@ fn publish_document_embeddings(
                 document.detail =
                     Some("Source changed active parse before publication.".to_owned());
                 document.embeddings = Some(counts);
-                publish_document(&inputs.health, document)?;
+                publish_document(inputs, document)?;
                 break;
             }
             Ok(PublicationOutcome::InputsChanged | PublicationOutcome::Deferred) => {
@@ -936,6 +1094,17 @@ fn publish_document_embeddings(
             Err(source_error) => {
                 counts.pending -= 1;
                 counts.failed += 1;
+                inputs.index_root.monitoring().set_issue(issue_key, MonitorIssue {
+                    observed_since: None, elapsed_ms: 0,
+                    identity: source.monitor_identity(),
+                    stage: "annotation embedding publication".to_owned(),
+                    state: MonitorState::Failed,
+                    message: format!("{source_error}; committed annotations and previous publication retained"),
+                    affected: 1,
+                    retry_in_ms: Some(inputs.index_root.limits().workers.projection_interval_ms),
+                    attempt: None,
+                    retry_limit: None,
+                });
                 document.detail = Some(truncate_persisted_detail(
                     &source_error.to_string(),
                     &inputs.index_root.limits().diagnostics,
@@ -955,13 +1124,13 @@ fn publish_document_embeddings(
                 // document's remaining cohorts. Other cheap families ran first.
                 document.embeddings = Some(counts);
                 document.activity = ProjectionActivity::RetryWait;
-                publish_document(&inputs.health, document)?;
+                publish_document(inputs, document)?;
                 break;
             }
         }
         document.embeddings = Some(counts);
         document.activity = document_activity(document);
-        publish_document(&inputs.health, document)?;
+        publish_document(inputs, document)?;
     }
     Ok(())
 }
@@ -975,6 +1144,7 @@ fn build_and_publish_cohort(
     store: &ArtifactStore,
     plan: &CohortPlan,
     document: &mut ProjectionDocumentProgress,
+    monitor: &WorkHandle,
 ) -> Result<PublicationOutcome, ApiError> {
     let prepared = {
         let mut connection = hot_plane::open_read(&inputs.index_root)?;
@@ -991,13 +1161,15 @@ fn build_and_publish_cohort(
     let Some(prepared) = prepared else {
         return Ok(PublicationOutcome::InputsChanged);
     };
-    let artifact = match embed_and_archive(inputs, cancellation, runtime, store, prepared)? {
+    let artifact = match embed_and_archive(inputs, cancellation, runtime, store, prepared, monitor)?
+    {
         EmbeddingOutcome::Archived(artifact) => artifact,
         EmbeddingOutcome::Cancelled(reason) => return Ok(PublicationOutcome::Cancelled(reason)),
     };
     document.activity = ProjectionActivity::AwaitingCommit;
-    publish_document(&inputs.health, document)?;
-    publish_cohort(inputs, cancellation, plan, &artifact)
+    monitor.waiting("embeddings archived; awaiting publication commit");
+    publish_document(inputs, document)?;
+    publish_cohort(inputs, cancellation, plan, &artifact, monitor)
 }
 
 /// Keep at most one small response batch of matrices/vectors resident. Inputs use
@@ -1008,8 +1180,10 @@ fn embed_and_archive(
     runtime: &InferenceRuntime,
     store: &ArtifactStore,
     prepared: PreparedProjection,
+    monitor: &WorkHandle,
 ) -> Result<EmbeddingOutcome, ApiError> {
     let PreparedProjection { plan, texts } = prepared;
+    let total_representations = texts.len() as u64;
     let mut representations = Vec::new();
     let mut texts = texts.into_iter();
     loop {
@@ -1028,8 +1202,14 @@ fn embed_and_archive(
             return Ok(EmbeddingOutcome::Cancelled(reason));
         }
         let passages: Vec<_> = batch.iter().map(|item| item.text.as_str()).collect();
+        monitor.stage(
+            "annotation dense embedding batch",
+            Some(batch.len() as u64),
+            "representations embedded",
+        );
         let dense_vectors = {
             let _permit = if runtime.dense.uses_local_model_gate() {
+                monitor.waiting("waiting for local dense model gate");
                 Some(acquire_model_call_gate_on(
                     &inputs.model_gate,
                     &plan.cohort_id,
@@ -1042,7 +1222,14 @@ fn embed_and_archive(
             if let Some(reason) = cancelled(inputs, cancellation) {
                 return Ok(EmbeddingOutcome::Cancelled(reason));
             }
-            dense::embed_texts(&runtime.dense, &passages, &plan.parse_id)?
+            monitor.running();
+            dense::embed_texts(
+                &runtime.dense,
+                &passages,
+                &plan.parse_id,
+                Some(monitor),
+                "annotation embedding",
+            )?
         };
         if let Some(reason) = cancelled(inputs, cancellation) {
             return Ok(EmbeddingOutcome::Cancelled(reason));
@@ -1052,7 +1239,13 @@ fn embed_and_archive(
             .map(|text| (plan.target.unit_id.as_str(), *text))
             .collect();
         let matrices = {
+            monitor.stage(
+                "annotation ColBERT embedding batch",
+                Some(documents.len() as u64),
+                "representations embedded",
+            );
             let _permit = if runtime.colbert.uses_local_model_gate() {
+                monitor.waiting("waiting for local ColBERT model gate");
                 Some(acquire_model_call_gate_on(
                     &inputs.model_gate,
                     &plan.cohort_id,
@@ -1065,7 +1258,17 @@ fn embed_and_archive(
             if let Some(reason) = cancelled(inputs, cancellation) {
                 return Ok(EmbeddingOutcome::Cancelled(reason));
             }
-            runtime.colbert.embed_documents(&documents)?
+            monitor.running();
+            let call = runtime
+                .colbert
+                .monitor_call(Some(monitor), "annotation embedding");
+            let result = runtime.colbert.embed_documents(&documents, call.as_ref());
+            if let Some(call) = call {
+                call.finish_result(&result);
+            }
+            let matrices = result?;
+            monitor.progress(documents.len() as u64, Some(documents.len() as u64));
+            matrices
         };
         if let Some(reason) = cancelled(inputs, cancellation) {
             return Ok(EmbeddingOutcome::Cancelled(reason));
@@ -1078,6 +1281,13 @@ fn embed_and_archive(
                 ),
             });
         }
+        // Archival measures prepared inputs only; the publication denominator
+        // advances later, after both envelopes commit together.
+        monitor.stage(
+            "archive annotation representations",
+            Some(total_representations),
+            "representations archived",
+        );
         for ((input, vector), matrix) in batch.into_iter().zip(dense_vectors).zip(matrices) {
             if matrix.unit_id != plan.target.unit_id || matrix.dimension != inputs.colbert_dimension
             {
@@ -1104,6 +1314,7 @@ fn embed_and_archive(
         debug!(event = "projection_worker.embedding_batch_completed", source_id = %plan.source_id,
             parse_id = %plan.parse_id, cohort_id = %plan.cohort_id,
             completed_representations = representations.len(), "annotation embedding batch archived");
+        monitor.progress(representations.len() as u64, Some(total_representations));
     }
     if let Some(reason) = cancelled(inputs, cancellation) {
         return Ok(EmbeddingOutcome::Cancelled(reason));
@@ -1118,6 +1329,7 @@ fn publish_cohort(
     cancellation: &AnnotationCancellation,
     plan: &CohortPlan,
     artifact: &ArtifactRef,
+    monitor: &WorkHandle,
 ) -> Result<PublicationOutcome, ApiError> {
     let started = Instant::now();
     let mut connection = hot_plane::open_write(&inputs.index_root)?;
@@ -1133,6 +1345,7 @@ fn publish_cohort(
         )? {
             WriteTransactionAttempt::Begun(tx) => tx,
             WriteTransactionAttempt::Busy => {
+                monitor.waiting("embeddings archived; waiting for publication writer lock");
                 if !waited {
                     info!(event = "projection_worker.publication_waiting", source_id = %plan.source_id,
                         parse_id = %plan.parse_id, cohort_id = %plan.cohort_id,
@@ -1194,6 +1407,34 @@ fn publish_cohort(
     }
 }
 
+/// Finish at the publication owner's boundary; model completion alone cannot
+/// imply a durable projection, and source changes are observed deferrals.
+fn finish_publication_work(
+    work: crate::monitoring::WorkGuard,
+    result: &Result<PublicationOutcome, ApiError>,
+) {
+    match result {
+        Ok(PublicationOutcome::Published) => {
+            work.finish(MonitorState::Complete, "Projection publication committed")
+        }
+        Ok(PublicationOutcome::Current) => {
+            work.finish(MonitorState::Idle, "Projection inputs already published")
+        }
+        Ok(PublicationOutcome::Deferred) => work.finish(
+            MonitorState::Waiting,
+            "Publication deferred by writer contention",
+        ),
+        Ok(PublicationOutcome::InputsChanged | PublicationOutcome::Inactive) => work.finish(
+            MonitorState::Cancelled,
+            "Captured inputs or active source changed before publication",
+        ),
+        Ok(PublicationOutcome::Cancelled(reason)) => {
+            work.finish(MonitorState::Cancelled, reason.label())
+        }
+        Err(error) => work.finish(MonitorState::Failed, &error.to_string()),
+    }
+}
+
 /// Both envelopes name canonical source evidence as well as their annotation inputs.
 fn embedding_request(plan: &CohortPlan, kind: ProjectionType) -> NewProjection {
     NewProjection {
@@ -1224,8 +1465,21 @@ fn apply_materialization_result(
     result: Result<PublicationOutcome, ApiError>,
 ) {
     let mut counts = ProjectionPublicationCounts::default();
+    let issue_key = format!("projection:{}:{}", source.parse_id, family.name());
+    if matches!(result, Ok(PublicationOutcome::Published)) {
+        inputs.index_root.monitoring().record_completed(
+            source.monitor_identity(),
+            family.name(),
+            "Materialization publication committed",
+            "materializations published",
+            1,
+        );
+    }
     match result {
-        Ok(PublicationOutcome::Current | PublicationOutcome::Published) => counts.published = 1,
+        Ok(PublicationOutcome::Current | PublicationOutcome::Published) => {
+            counts.published = 1;
+            inputs.index_root.monitoring().clear_issue(&issue_key);
+        }
         Ok(PublicationOutcome::Deferred | PublicationOutcome::InputsChanged) => counts.pending = 1,
         Ok(PublicationOutcome::Inactive) => {
             counts.pending = 1;
@@ -1240,6 +1494,21 @@ fn apply_materialization_result(
         }
         Err(source_error) => {
             counts.failed = 1;
+            inputs.index_root.monitoring().set_issue(
+                issue_key,
+                MonitorIssue {
+                    observed_since: None,
+                    elapsed_ms: 0,
+                    identity: source.monitor_identity(),
+                    stage: family.name().to_owned(),
+                    state: MonitorState::Failed,
+                    message: source_error.to_string(),
+                    affected: 1,
+                    retry_in_ms: None,
+                    attempt: None,
+                    retry_limit: None,
+                },
+            );
             document.detail = Some(truncate_persisted_detail(
                 &source_error.to_string(),
                 &inputs.index_root.limits().diagnostics,
@@ -1420,11 +1689,12 @@ fn initial_document(source: &ActiveSource) -> ProjectionDocumentProgress {
 /// Replace inventory by captured source/parse identity while retaining older
 /// measurements for still-active documents until their new pass completes.
 fn publish_inventory(
-    slot: &Mutex<ProjectionHealth>,
+    inputs: &WorkerInputs,
     sources: &[ActiveSource],
-) -> Result<(), ApiError> {
+) -> Result<Vec<ProjectionDocumentProgress>, ApiError> {
     let now = utc_now()?;
-    update_health(slot, |health| {
+    let mut monitored_documents = Vec::new();
+    update_health(&inputs.health, |health| {
         let previous: HashMap<_, _> = health
             .documents
             .take()
@@ -1448,11 +1718,15 @@ fn publish_inventory(
                 })
                 .collect(),
         );
-        health.activity = ProjectionActivity::Discovering;
-        health.detail = None;
         health.measured_at = Some(now);
+        monitored_documents = health.documents.clone().unwrap_or_default();
     });
-    Ok(())
+    // Publish outside the health lock so monitoring never creates nested lock ownership.
+    inputs
+        .index_root
+        .monitoring()
+        .replace_publications(&monitored_documents);
+    Ok(monitored_documents)
 }
 
 /// Classification follows measured publication work; missing embedding inventory
@@ -1480,11 +1754,15 @@ fn document_activity(document: &ProjectionDocumentProgress) -> ProjectionActivit
 /// Publish one source's observation atomically; clocks and compact progress facts
 /// belong to the owning worker, while health handlers only copy the last snapshot.
 fn publish_document(
-    slot: &Mutex<ProjectionHealth>,
+    inputs: &WorkerInputs,
     document: &mut ProjectionDocumentProgress,
 ) -> Result<(), ApiError> {
     document.measured_at = Some(utc_now()?);
-    update_health(slot, |health| {
+    inputs
+        .index_root
+        .monitoring()
+        .publication_document(document);
+    update_health(&inputs.health, |health| {
         if let Some(current) = health.documents.as_mut().and_then(|documents| {
             documents.iter_mut().find(|current| {
                 current.source_id == document.source_id && current.parse_id == document.parse_id

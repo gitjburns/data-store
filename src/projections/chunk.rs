@@ -109,6 +109,7 @@ pub(crate) fn build_chunks(
     parse_id: &str,
     tokenizer: &Tokenizer,
     store: &ArtifactStore,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<usize, ApiError> {
     let started = Instant::now();
     info!(
@@ -132,7 +133,15 @@ pub(crate) fn build_chunks(
     // Everything from here is fallible; on any error mark the envelope failed on
     // the same transaction, then propagate. `run_build` owns the actual work so
     // this one site handles the failure lifecycle for every failure path.
-    match run_build(tx, source_id, parse_id, &projection_id, tokenizer, &config) {
+    match run_build(
+        tx,
+        source_id,
+        parse_id,
+        &projection_id,
+        tokenizer,
+        &config,
+        monitor,
+    ) {
         Ok(chunk_count) => {
             // Publish descriptor ownership with the rows in the same transaction.
             envelope::complete_fresh(tx, &projection_id, Some(&descriptor.uri))?;
@@ -180,6 +189,7 @@ fn run_build(
     projection_id: &str,
     tokenizer: &Tokenizer,
     config: &ChunkerConfig,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<usize, ApiError> {
     // Rebuild idempotence: replace this parse's chunk set wholesale. Must
     // precede the inserts below (see DELETE_PARSE_CHUNKS_SQL invariant).
@@ -189,14 +199,28 @@ fn run_build(
         })?;
 
     let units = read_parse_units(tx, parse_id)?;
-    let chunks = split_units_into_chunks(&units, tokenizer, config)?;
+    if let Some(monitor) = monitor {
+        monitor.stage(
+            "split canonical units into chunks",
+            Some(units.len() as u64),
+            "units processed",
+        );
+    }
+    let chunks = split_units_into_chunks(&units, tokenizer, config, monitor)?;
 
     // The same construction descriptor governs splitting, the envelope, and
     // every chunk row; changing a boundary parameter changes all their hashes.
     let chunker_config_hash = config.config_hash()?;
     let now = utc_now()?;
 
-    for chunk in &chunks {
+    if let Some(monitor) = monitor {
+        monitor.stage(
+            "stage chunk rows",
+            Some(chunks.len() as u64),
+            "chunks staged",
+        );
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
         insert_chunk(
             tx,
             projection_id,
@@ -206,6 +230,9 @@ fn run_build(
             &chunker_config_hash,
             &now,
         )?;
+        if let Some(monitor) = monitor {
+            monitor.progress((index + 1) as u64, Some(chunks.len() as u64));
+        }
     }
 
     Ok(chunks.len())
@@ -417,6 +444,7 @@ fn split_units_into_chunks(
     units: &[ChunkableUnit],
     tokenizer: &Tokenizer,
     config: &ChunkerConfig,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<Vec<BuiltChunk>, ApiError> {
     // Length accounting must see the complete input, independently of inference
     // truncation/padding settings. Keep the shared model tokenizer unchanged.
@@ -433,7 +461,7 @@ fn split_units_into_chunks(
     let mut chunks = Vec::new();
     let mut current: Option<ChunkAccumulator> = None;
 
-    for unit in units {
+    for (index, unit) in units.iter().enumerate() {
         let unit_tokens = count_tokens(tokenizer, &unit.text)?;
 
         if unit_tokens > max_tokens {
@@ -448,6 +476,9 @@ fn split_units_into_chunks(
                 min_chars,
                 &mut chunks,
             )?;
+            if let Some(monitor) = monitor {
+                monitor.progress((index + 1) as u64, Some(units.len() as u64));
+            }
             continue;
         }
 
@@ -474,12 +505,23 @@ fn split_units_into_chunks(
                 ));
             }
         }
+        if let Some(monitor) = monitor {
+            monitor.progress((index + 1) as u64, Some(units.len() as u64));
+        }
     }
 
     flush_chunk(&mut current, &mut chunks, min_chars);
     // Both emission paths normalize text. Recount their exact output and enforce
     // the cap before any chunk rows are persisted by the caller's transaction.
-    for chunk in &mut chunks {
+    let total_chunks = chunks.len() as u64;
+    if let Some(monitor) = monitor {
+        monitor.stage(
+            "validate normalized chunk tokens",
+            Some(total_chunks),
+            "chunks validated",
+        );
+    }
+    for (index, chunk) in chunks.iter_mut().enumerate() {
         chunk.token_count = count_tokens(tokenizer, &chunk.targeting_text).map_err(|source| {
             ApiError::UnitSplitting {
                 message: format!(
@@ -496,6 +538,9 @@ fn split_units_into_chunks(
                     chunk.token_count
                 ),
             });
+        }
+        if let Some(monitor) = monitor {
+            monitor.progress((index + 1) as u64, Some(total_chunks));
         }
     }
     Ok(chunks)

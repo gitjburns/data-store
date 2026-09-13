@@ -238,15 +238,94 @@ pub(crate) fn import_staged_bundle(
     bundle_dir: &Path,
 ) -> Result<ImportOutcome, ApiError> {
     let started = Instant::now();
+    // Loading/hashing a staged source can be lengthy before canonical identity
+    // exists. Keep that work visible and attach validated identity only when known.
+    let monitoring = index_root.monitoring();
+    let work = monitoring.work(
+        crate::monitoring_types::WorkIdentity::new(
+            "ingestion",
+            &format!("staged bundle {}", bundle_dir.display()),
+            None,
+            None,
+        ),
+        "validating staged acquisition",
+        None,
+        "bytes",
+    );
+    let monitor = work.handle();
     info!(
         event = "acquisition.import_started",
         bundle_dir = %bundle_dir.display(),
         "staged bundle import starting"
     );
-    match load_staged_bundle(bundle_dir) {
-        Ok(bundle) => import_validated_bundle(index_root, bundle_dir, bundle, started),
-        Err(rejection) => reject_staged_bundle(index_root, bundle_dir, rejection, started),
+    // Issue keys retain the actual input identity; display sanitization must
+    // never prevent retirement when a later complete scan removes that source.
+    let bundle_issue_key = format!("acquisition-bundle:{}", bundle_dir.display());
+    let mut issue_key = bundle_issue_key.clone();
+    let outcome = match load_staged_bundle(bundle_dir) {
+        Ok(bundle) => {
+            issue_key = format!("acquisition:{}", bundle.manifest.native_uri);
+            monitor.document(&bundle.manifest.native_uri);
+            monitor.stage("archiving and committing acquisition", None, "acquisitions");
+            import_validated_bundle(index_root, bundle_dir, bundle, started)
+        }
+        Err(rejection) => {
+            if let Some(claims) = &rejection.claims {
+                issue_key = format!("acquisition:{}", claims.native_uri);
+                monitor.document(&claims.native_uri);
+            }
+            reject_staged_bundle(index_root, bundle_dir, rejection, started)
+        }
+    };
+    let (state, message) = match &outcome {
+        Ok(outcome) if outcome.imported => {
+            monitor.identify(outcome.source_object_id.as_deref(), None);
+            monitoring.record_completed(
+                monitor.identity(),
+                "acquisition",
+                "Acquisition committed",
+                "acquisitions committed",
+                1,
+            );
+            (
+                crate::monitoring_types::MonitorState::Complete,
+                "Acquisition committed".to_string(),
+            )
+        }
+        Ok(outcome) => (
+            crate::monitoring_types::MonitorState::Failed,
+            outcome
+                .rejection_detail
+                .clone()
+                .unwrap_or_else(|| "Acquisition rejected without a detail".to_string()),
+        ),
+        Err(source) => (
+            crate::monitoring_types::MonitorState::Failed,
+            source.to_string(),
+        ),
+    };
+    if state == crate::monitoring_types::MonitorState::Failed {
+        monitoring.set_issue(
+            issue_key,
+            crate::monitoring_types::MonitorIssue {
+                identity: monitor.identity(),
+                stage: "acquisition import".to_string(),
+                state,
+                message: message.clone(),
+                affected: 1,
+                retry_in_ms: None,
+                attempt: None,
+                retry_limit: None,
+                observed_since: None,
+                elapsed_ms: 0,
+            },
+        );
+    } else {
+        monitoring.clear_issue(&issue_key);
+        monitoring.clear_issue(&bundle_issue_key);
     }
+    work.finish(state, &message);
+    outcome
 }
 
 /// Read and validate one staged bundle: manifest present and well-formed,

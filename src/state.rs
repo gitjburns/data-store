@@ -538,6 +538,10 @@ impl AppState {
         annotations.measured_at = None;
         annotations.documents = None;
         annotations.inventory_measured_at = None;
+        let parked_reason = annotations
+            .parked_detail
+            .clone()
+            .filter(|_| annotations.parked);
         drop(annotations);
         let mut projections =
             self.projection_health
@@ -552,6 +556,11 @@ impl AppState {
             projections.activity = ProjectionActivity::Discovering;
             projections.detail = None;
         }
+        drop(projections);
+        // All storage users have drained. A new monitoring generation fences
+        // late observations while preserving a client-load failure that reset cannot fix.
+        self.storage.monitoring().reset();
+        self.storage.monitoring().annotation_parked(parked_reason);
         Ok(())
     }
 
@@ -730,6 +739,58 @@ impl AppState {
                 poisoned.into_inner().clone()
             }
         }
+    }
+
+    /// Recovery changes eligibility, not successful data or lifetime statistics.
+    /// Worker-owned coverage will be remeasured when the resumed workers run.
+    pub(crate) fn refresh_after_failure_clear(&self) {
+        self.storage.monitoring().clear_failure_observations();
+        crate::monitoring_storage::refresh_queue(&self.storage);
+        crate::monitoring_storage::refresh_sources(&self.storage);
+    }
+
+    /// Read compact observations without cloning the corpus-wide document health
+    /// inventories. Readiness and maintenance keep their existing authorities.
+    pub(crate) fn monitor_snapshot(&self) -> crate::monitoring_types::MonitorSnapshot {
+        let mut snapshot = self.storage.monitoring().snapshot();
+        let sync = self.sync_health_snapshot();
+        let maintenance = self.maintenance.detail();
+        snapshot.ready = matches!(self.inference, InferenceSlot::Ready(_))
+            && sync.fabric_ready
+            && maintenance.is_none();
+        let mut causes: Vec<String> = maintenance.into_iter().chain(sync.detail).collect();
+        match &self.inference {
+            InferenceSlot::Ready(_) => {}
+            InferenceSlot::Failed(source) => causes.push(source.to_string()),
+            InferenceSlot::NotInitialized => {
+                causes.push(DRY_RUN_INFERENCE_NOT_INITIALIZED.to_string())
+            }
+        }
+        snapshot.status = if causes.is_empty() {
+            if snapshot.ready {
+                "Operational".to_string()
+            } else {
+                "Waiting for service readiness".to_string()
+            }
+        } else {
+            causes.join(" | ")
+        };
+        let admission = self.admission_snapshot();
+        snapshot.queries_in_flight = admission.in_flight;
+        snapshot.query_limit = admission.max_in_flight;
+        snapshot.corpus = self
+            .fabric_component()
+            .counts
+            .into_iter()
+            .map(|count| crate::monitoring_types::CorpusCount {
+                source_system: count.source_system.unwrap_or_default(),
+                label: count.label,
+                value: count.value,
+                measured_at: Some(count.as_of),
+            })
+            .collect();
+        (snapshot.headline, snapshot.activity) = monitor_explanation(&snapshot);
+        snapshot
     }
 
     /// Return current service health and readiness diagnostics.
@@ -1500,6 +1561,98 @@ impl From<CutoverBarrierActive> for ApiError {
             message: rejection.to_string(),
         }
     }
+}
+
+/// Explain corpus availability independently of HTTP readiness. Completion of
+/// annotation/publication subsets must never imply that an inactive source succeeded.
+fn monitor_explanation(snapshot: &crate::monitoring_types::MonitorSnapshot) -> (String, String) {
+    if !snapshot.ready {
+        return ("INGESTION PAUSED".into(), snapshot.status.clone());
+    }
+    let coverage = snapshot.ingestion.active_sources;
+    let Some(total) = coverage.total else {
+        return (
+            "MEASURING INGESTION STATE".into(),
+            "Source inventory has not been measured yet.".into(),
+        );
+    };
+    let Some(blocked) = snapshot.ingestion.blocked_sources else {
+        return (
+            "MEASURING INGESTION STATE".into(),
+            "Persistent failure inventory has not been measured yet.".into(),
+        );
+    };
+    // Acquisition can fail before a source exists, or queue an update for an
+    // already active source. Source availability alone cannot prove completion.
+    let queue_unfinished = [
+        snapshot.ingestion.failed,
+        snapshot.ingestion.pending,
+        snapshot.ingestion.in_flight,
+    ]
+    .into_iter()
+    .any(|count| count.is_some_and(|count| count > 0));
+    let headline = if queue_unfinished {
+        format!(
+            "INGESTION INCOMPLETE — {} of {total} known sources available; source work remains",
+            coverage.completed
+        )
+    } else if total == 0 {
+        if snapshot.ingestion.enumeration_complete && snapshot.ingestion.enumerated_files == Some(0)
+        {
+            "CORPUS EMPTY".into()
+        } else {
+            "INGESTION STARTING — no known source is available yet".into()
+        }
+    } else if coverage.completed < total || blocked > 0 {
+        format!(
+            "INGESTION INCOMPLETE — {} of {total} known sources available",
+            coverage.completed
+        )
+    } else {
+        format!(
+            "INGESTION UP TO DATE — {} of {total} known sources available",
+            coverage.completed
+        )
+    };
+    let activity = if !snapshot.work.is_empty() || !snapshot.calls.is_empty() {
+        let requests: u64 = snapshot.calls.iter().map(|call| call.running).sum();
+        format!(
+            "Working: {} active stages, {requests} model requests. {blocked} source(s) blocked by a prior parse failure.",
+            snapshot.work.len()
+        )
+    } else if blocked > 0 || snapshot.ingestion.failed.is_some_and(|count| count > 0) {
+        "Idle — documents failed and are not being retried. See their reasons below; use --clear-failures to retry.".into()
+    } else if snapshot.ingestion.pending.is_some_and(|count| count > 0)
+        || snapshot.ingestion.in_flight.is_some_and(|count| count > 0)
+    {
+        "Waiting for the scheduler — source work is queued.".into()
+    } else if snapshot.annotations.work.exhausted > 0 {
+        format!(
+            "Idle — {} annotation work items exhausted their retries. Use --clear-failures to retry.",
+            snapshot.annotations.work.exhausted
+        )
+    } else if snapshot.annotations.parked_reason.is_some() || !snapshot.issues.is_empty() {
+        "Idle — unresolved conditions need attention; see the reasons below.".into()
+    } else if snapshot.annotations.work.retry_waiting > 0 {
+        "Waiting for scheduled annotation retries.".into()
+    } else if snapshot.annotations.work.pending > 0
+        || snapshot.annotations.work.failed > 0
+        || snapshot.publication.graph.pending > 0
+        || snapshot.publication.summary.pending > 0
+        || snapshot
+            .publication
+            .embeddings
+            .is_some_and(|counts| counts.pending > 0)
+    {
+        "Waiting for the next worker pass — unfinished annotation or publication work remains."
+            .into()
+    } else if coverage.completed < total {
+        "Idle — some sources have no active parse and no work is queued; source state needs investigation.".into()
+    } else {
+        "Idle — no work currently scheduled. Enrichment percentages cover the active sources only."
+            .into()
+    };
+    (headline, activity)
 }
 
 /// Prioritize observed ingestion faults without treating a historical queue

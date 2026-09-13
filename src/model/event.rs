@@ -61,6 +61,9 @@ pub(crate) enum SystemEventType {
     ParseActivated,
     #[serde(rename = "parse.failed")]
     ParseFailed,
+    /// Explicit operator retry permission for exactly one retained failed attempt.
+    #[serde(rename = "parse.failure_cleared")]
+    ParseFailureCleared,
     #[serde(rename = "parse.archived")]
     ParseArchived,
     #[serde(rename = "sync.backpressure_entered")]

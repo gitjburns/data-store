@@ -34,8 +34,8 @@ admin-token file path comes from `[admin].token_file_path`, and the
 request timeout from the `[client]` section:
 
 - `[client].operation_timeout_seconds` — the timeout on the underlying
-  `reqwest` HTTP client. It bounds **each individual HTTP request** the
-  client makes, including **each individual poll** of the operation
+  `reqwest` HTTP client. Except for monitor mode's fixed two-second deadline
+  (§1.7), it bounds **each individual HTTP request**, including each poll of the operation
   loop (§4) — and nothing more: the poll loop as a whole is
   **unbounded** and runs until a terminal status is observed (§4), so a
   never-terminal operation polls forever. It is **not** a stream
@@ -47,12 +47,12 @@ config file's directory, matching the server's resolution rule.
 
 Select the config with `--config <path>`; it defaults to `config.toml`.
 
-### 1.2 Three invocation modes
+### 1.2 Invocation modes
 
 - **One-shot** — invoke a single command via its `--flag` and exit.
   Example: `data-store --config config.toml --health`.
 - **Interactive REPL** — invoke `data-store` with no command flag and no
-  `--serve` to enter the read-eval-print loop (`--config <path>` is honored). The
+  `--serve` or `--monitor` to enter the read-eval-print loop (`--config <path>` is honored). The
   prompt is `data-store> `; type `help` for the command list, `exit`
   (or `quit`), or EOF (Ctrl-D), to leave; Ctrl-C interrupts the current
   line and reminds you to use `exit`. Line editing and history are
@@ -60,6 +60,9 @@ Select the config with `--config <path>`; it defaults to `config.toml`.
   (resolved against the config file's directory) across sessions.
 - **Serve** — invoke `data-store --serve <host>:<port>` (`--config <path>`
   is honored) to host the read-only web UI in the foreground (§1.6).
+- **Monitor** — invoke `data-store --monitor` (`--config <path>` is honored)
+  for the read-only terminal dashboard (§1.7). It has no REPL spelling and
+  cannot be combined with `--serve` or an operation flag.
 
 One-shot and REPL dispatch through the same command table and the same
 renderers; the only difference is how the command is entered. Serve is a
@@ -170,6 +173,42 @@ Passthrough rules:
 
 ---
 
+### 1.7 Monitor mode
+
+`data-store [--config <path>] --monitor` opens a Ratatui/Crossterm dashboard.
+It requires terminal stdin/stdout and presents one screen without menus or
+drilldowns. Panels show ingestion, committed annotation coverage, publication,
+grouped work/model calls, throughput, completed-call statistics, outstanding
+issues, and recent outcomes. Every measured percentage has a progress bar;
+unknown totals remain explicit. Color is paired with state labels. Long names
+and rows that exceed screen capacity carry visible truncation/overflow markers.
+The dashboard requires at least 120 columns × 42 rows; smaller terminals show a
+resize notice and aggregate coverage only.
+
+The server's ingestion headline and activity explanation lead the display;
+service readiness is separate. Annotation and publication percentages explicitly
+cover active documents only. Failure identities and reasons wrap inline. Empty
+work/call panels are compact; unchanged checks do not animate work or publication,
+and routine scan completions do not occupy recent history.
+
+One blocking worker polls public `GET /v1/monitor` every 200 ms with at most one
+request outstanding and a fixed two-second request timeout. Keyboard handling
+remains independent. A failed poll retains the last complete snapshot, marks it
+stale, displays the transport/service error, and retries. Run/generation changes
+replace the complete snapshot and announce the reset. Q, Esc, or Ctrl-C exits;
+normal/error/panic cleanup restores the terminal, and exit joins the poll worker.
+
+The monitor uses no configuration settings. Snapshot bodies over 8 MiB are
+rejected; HTTP error details retain an explicitly marked prefix up to 64 KiB.
+Progress, states, and rates come from the shared `src/monitoring_types.rs` wire
+contract. Model calls report only start and terminal outcome. Token columns
+show rounded thousands of provider-reported tokens; reasoning is included in
+completion, and partial/missing usage remains visible.
+
+Live refresh performance and terminal usability remain unverified.
+
+---
+
 ## 2. Command dispatch
 
 Every command has a REPL name (with optional aliases), an equivalent
@@ -219,6 +258,7 @@ are cross-checked against the router in `src/http.rs`.
 | `snapshot` | `--snapshot` | `[requestJson]` | `POST /snapshots` | protected | yes (operation) |
 | `restore` | `--restore` | `<sourceId> <parseId>` | `POST /restore` | protected | yes (operation) |
 | `rebuild-all` | `--rebuild-all` | — | `POST /rebuild-all` | protected | yes (operation) |
+| `clear-failures` | `--clear-failures` | — | `POST /clear-failures` | protected | yes (operation) |
 | `shutdown` | `--shutdown` | — | `POST /shutdown` | protected | no (control action) |
 | `held-parses` (`held`) | `--held-parses` | — | `GET /parses?status=held` | protected | no |
 | `operation` | `--operation` | `<operationId>` | `GET /operations/{operationId}` | protected | no (single read) |
@@ -246,6 +286,9 @@ Notes on individual commands:
   corpus data and resuming automatic ingestion, including fresh embeddings and
   annotations. Corpus files remain intact. See PROTOCOL.md for maintenance and
   failure behavior.
+- **`clear-failures`** — POSTs without a body, waits for safe draining and
+  acceptance, then polls. Success reports restored retry eligibility, not
+  ingestion completion. Successful work and failure history are preserved.
 - **`operation <operationId>`** — a **single** protected read of the
   operation record; it does **not** poll. (The async admin commands poll
   internally; this command is the standalone snapshot read.)
@@ -264,8 +307,8 @@ Notes on individual commands:
 
 ## 4. Polling model for async admin mutations
 
-The eight async admin commands (`ingest`, `reparse`, `activate`,
-`accept`, `discard`, `snapshot`, `restore`, `rebuild-all`) drive server-side work that
+The async admin commands (`ingest`, `reparse`, `activate`,
+`accept`, `discard`, `snapshot`, `restore`, `rebuild-all`, `clear-failures`) drive server-side work that
 runs asynchronously. The client:
 
 1. Prints a **progress line** `<METHOD> <url>` to stdout (visible as

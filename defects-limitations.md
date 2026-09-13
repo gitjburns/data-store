@@ -1,6 +1,6 @@
 # Defects and limitations
 
-Current state reviewed on 2026-09-11 against source and annotation logs. This
+Current state reviewed on 2026-09-12 against source and static verification. This
 register tracks defects, limitations, and proposed enhancements. Proposed remedies
 require design approval; their retrieval-quality and performance benefits have
 not been established.
@@ -9,10 +9,10 @@ not been established.
 | --- | --- | --- |
 | D04 | Annotation input sizing lacks a complete-request token budget | Open |
 | D05 | Annotation requests lacked structured-output schemas | Resolved; provider enforcement unverified |
-| D06 | Annotation selection is exhaustive rather than selective | Open |
+| D06 | Exhaustive annotation's marginal retrieval value is unmeasured | Open; selectivity deferred pending retrieval evaluation |
 | D07 | Graph traversal cannot follow connections across documents | Open |
 | D08 | Derived-data rebuilding is too coarse | Open |
-| D09 | Semantic entity retrieval, independent annotation publication, and document progress | Open; document progress implemented, live verification pending |
+| D09 | Semantic entity retrieval, independent annotation publication, and document progress | Implemented; live relevance and lifecycle verification pending |
 
 ## Implemented annotation behavior
 
@@ -59,7 +59,36 @@ rates and production matching performance remain unmeasured. Fuzzy acceptance
 can omit qualifications or admit changed names, numbers, or negation; it does not
 establish semantic correctness or persistence. Source-text corruption, long
 reasoning, and request timeouts remain observed issues.
-Independent publication remains pending under D09.
+Independent publication is implemented under D09; live lifecycle verification
+remains pending.
+
+## Implemented configuration and limit enforcement
+
+- **Configuration:** operational limits are required, validated settings in
+  [config.toml](config.toml) and [config.example.toml](config.example.toml), with
+  comments describing units and enforcement. Immutable settings flow through
+  service, worker, SQLite, and artifact owners. Numeric entity-matching limits
+  live under `retrieval.entity_matching`.
+- **Models and reranking:** dense and reranker capacity is 32,768 tokens;
+  ColBERT capacity is 518 with 512-token query/document budgets. HTTP initialization
+  verifies advertised model identity and capacity. Server truncation is disabled;
+  overlength requests fail visibly. Existing application prefix handling remains.
+  Reranker candidate depth is 100, and graph context has no separate token cutoff.
+- **Enforcement:** ingest-reference length, complete raw-evidence token counts,
+  parser record admission, and SQL execution deadlines are enforced. SQLite has
+  separate 5-second lock-wait and cooperative execution budgets; open row iteration
+  consumes the latter, and rollback cleanup receives its own attempt. Unused
+  assembly expansion controls and duplicated result defaults were removed.
+- **Artifacts:** new projections record construction settings; historical readers
+  use recorded settings or explicit legacy formats. Current resource refusals are
+  distinct from corruption. Restore performs no inference. These guards do not
+  impose a total process-memory ceiling or cap complete forensic parser payloads.
+
+**Verification and limits.** Formatting, Cargo check with and without Metal,
+Metal Clippy, and `cargo build --release --features metal --offline --locked`
+passed without warnings. TOML and web JavaScript syntax checks also passed.
+Live startup, model capacity checks, SQL timeout behavior, and query performance
+remain unverified.
 
 ## D04 — Character-based annotation budgets
 
@@ -70,6 +99,8 @@ without dropping oversized-unit tails. Each invocation contains one excerpt
 bounded by `max_input_chars`, with exact fragment ranges recorded in provenance.
 The cap measures source characters, not the complete tokenized request;
 system prompts and prior-stage output are additional input.
+`models.annotator.max_completion_tokens` now configures the output allowance,
+including reasoning; it does not provide a complete-request input budget.
 
 **Impact.** Character counts do not establish model token counts or predict
 request cost reliably. Lossless splitting resolves omitted tails but does not
@@ -115,17 +146,18 @@ Explicit entity rejection filters produced candidates; scheduling remains exhaus
 **Impact.** Annotation can dominate ingestion even when dense and lexical
 retrieval already cover much of the material. The implementation has no policy
 for spending annotation effort selectively. The cost is observable; the marginal
-retrieval value of exhaustive annotation has not been measured.
+retrieval value of exhaustive annotation has not been measured. Its cost must be
+assessed against measured query results.
 
-**Proposed remedy.** Design selective annotation using explicit criteria and a
-versioned policy. Preserve visibility of intentionally unannotated coverage,
-failures, pending work, and exhausted retries as different states. This is the
-previously discussed follow-up to richer dense embeddings, not implemented work.
+**Next evaluation.** Measure retrieval value with the implemented annotation
+retrieval paths before deciding whether to reduce annotation. Any later selective
+policy must preserve intentionally unannotated coverage, failures, pending work,
+and exhausted retries as different states. Selectivity remains unimplemented.
 
-**Resolution criteria.** The policy explains which inputs receive each type of
-annotation; omission does not masquerade as complete graph coverage; pending work
-and memo reuse follow the selected policy; reduced inference cost is considered
-alongside observed retrieval changes. Selection criteria still require approval.
+**Resolution criteria.** Measured query results establish whether exhaustive
+annotation justifies its cost. If selectivity is adopted, an approved versioned
+policy explains omissions and preserves correct coverage, pending-work, and memo
+accounting; cost savings are assessed alongside retrieval changes.
 
 ## D07 — Graph connections remain within one document parse
 
@@ -133,7 +165,8 @@ alongside observed retrieval changes. Selection criteria still require approval.
 [src/query/channels.rs](src/query/channels.rs) iterates captured parses and calls
 `mentions_for_name` and `one_hop_edges` using the current parse ID. Far-end entity
 mentions are looked up within that same parse. The active retrieval profile also
-limits graph traversal to one hop.
+limits graph traversal through `retrieval.graph_hop_budget`: 0 disables neighbors,
+1 permits direct neighbors, and other values are rejected. The configured value is 1.
 
 **Impact.** A query can independently match several documents, but a relationship
 in document A cannot lead graph traversal into mentions in document B. For
@@ -156,9 +189,14 @@ returned provenance identifies the actual path used.
 
 **Current behavior.** There is no dedicated public operation to regenerate a
 selected embedding or annotation layer while preserving unrelated results.
+The independent [projection worker](src/projections/worker.rs) incrementally
+publishes annotation-derived graph, summary, dense, and ColBERT representations
+from committed inputs without reannotation. It is not a public layer-rebuild API.
 `evaluate_no_retry_guard` in [src/scheduler.rs](src/scheduler.rs) can skip a
 reparse for an unchanged source/parser identity as `already_parsed`. Thus the
 existing reparse route is not a general projection-refresh command.
+Parser admission limits do not alter successful parser identities; increasing
+them alone also does not bypass `deterministic_no_retry` for a prior failed parse.
 
 The available full reset in [src/reset.rs](src/reset.rs) clears indexed state
 and artifacts and resumes automatic ingestion. Its route and CLI contracts are
@@ -183,50 +221,37 @@ separate design and operational contract before implementation.
 
 ## D09 — Semantic entity retrieval, independent publication, and annotation progress
 
-**Current behavior.** `candidate_entity_names` and `graph_channel` in
-[src/query/channels.rs](src/query/channels.rs) find graph entry points using
-normalized query text and stored entity names. Exact matching is supplemented
-by optional acronym and token-prefix matching. Entity annotations do not have
-a semantic embedding lookup. Passage and section embeddings search document
-content, but do not select graph entities through semantic similarity.
+**Status.** Retrieval and publication are implemented; live relevance and lifecycle
+verification remain pending.
 
-**Impact.** A query can describe a concept without naming it. For example,
-"sticking to daily habits" may be relevant to an annotated entity named
-"self-discipline", yet fail to enter the graph through that entity. Dense
-passage retrieval may still find relevant text, but the entity's relationships
-are not explored through that semantic connection.
+**Current behavior.** [src/query/annotation.rs](src/query/annotation.rs) searches
+published entity, relation, summary, and combined representations with dense
+embeddings and ColBERT scoring. Source windows retain complete coverage and exact
+source ranges. Eligible entity matches supply semantic entry names to
+`graph_channel` in [src/query/channels.rs](src/query/channels.rs), alongside
+exact, acronym, and token-prefix matching.
 
-**Proposed remedy.** Embed distinct entity names using the configured dense
-model and retain their canonical mention mappings. At query time, compare the
-query embedding with entity embeddings eligible within the requested scope,
-then use selected entities as additional entry points for the existing graph
-traversal. Reuse embeddings for identical inputs rather than embedding every
-mention. Keep existing name matching and preserve the source passages as
-evidence. Whether embedding inputs should include entity type or source context,
-and how semantic matches are bounded and ranked, require detailed design.
+Candidates are bounded and scoped to captured parses, model identity, and fresh
+declared inputs. Graph and semantic annotations share one outer fusion
+contribution alongside source dense and lexical retrieval. Annotation identities
+and source ranges survive passage assembly and reranking and appear in client
+attribution. Snapshot/restore includes the published representations and their
+declared inputs without inference.
 
-**Resolution criteria.** Queries using different wording can nominate relevant
-entities and reach their source passages; exact matches retain an intentional
-ranking policy; semantic candidates are bounded and scoped before selection;
-provenance distinguishes semantic entity matching from exact/acronym/prefix
-matching. Embedding identity, freshness, cache publication, and snapshot/restore
-coverage must follow the existing projection lifecycle. Evaluate additional
-useful matches and false positives rather than treating vector similarity as
-proof of relevance.
+**Remaining evaluation.** Measure useful matches and false positives for queries
+using different wording, and verify publication, cancellation, restart, and
+snapshot/restore behavior against live state. Vector similarity alone does not
+establish relevance; retrieval-quality and performance gains remain unmeasured.
 
 ### Independent publication
 
-**Current behavior.** `parse_annotations_complete` in
-[src/annotations/worker.rs](src/annotations/worker.rs) requires fresh coverage
-for every planned excerpt and required annotation type before the worker builds
-summary and graph projections. Unfinished summaries can therefore delay graph
-publication even when its entity and relation inputs are ready.
-
-**Required behavior.** Publish each annotation-derived retrieval representation
-when its own required inputs are ready, without waiting for unrelated annotation
-types. Define dependencies explicitly and preserve consistent query snapshots,
-active-parse identity, freshness, and cache publication. Operators must be able
-to distinguish completed annotation work from pending retrieval publication.
+**Current behavior.** [src/annotations/worker.rs](src/annotations/worker.rs)
+generates and commits annotations. [src/projections/worker.rs](src/projections/worker.rs)
+independently publishes graph, summary, and annotation embedding projections from
+their own committed inputs, without waiting for all annotation types to finish.
+Dense and ColBERT envelopes for a cohort commit together with exact input lineage;
+changed inputs are rediscovered without regenerating committed annotations.
+Projection health reports publication separately from annotation completion.
 
 ### Per-document annotation progress
 

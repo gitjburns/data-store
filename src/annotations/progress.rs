@@ -3,13 +3,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use crate::{
     error::ApiError,
     model::SemanticAnnotationType,
+    monitoring::Monitoring,
+    monitoring_types::WorkIdentity,
     state::AnnotationHealth,
     types::{
         AnnotationActivity, AnnotationDocumentProgress, AnnotationProgressCount,
@@ -37,6 +39,7 @@ pub(super) enum WorkState {
 /// cross into its existing shared health slot. No model thread mutates coverage.
 pub(super) struct DocumentProgress<'slot> {
     slot: &'slot Mutex<AnnotationHealth>,
+    monitoring: Arc<Monitoring>,
     snapshot: AnnotationDocumentProgress,
     items: BTreeMap<String, (usize, WorkState)>,
     /// Index only waits, so live publication does not rescan all completed work.
@@ -71,6 +74,7 @@ impl<'slot> DocumentProgress<'slot> {
     /// by dispatch. Duplicate keys are an accounting error, never extra work.
     pub(super) fn new(
         slot: &'slot Mutex<AnnotationHealth>,
+        monitoring: &Arc<Monitoring>,
         mut snapshot: AnnotationDocumentProgress,
         required_types: &[SemanticAnnotationType],
         planned: Vec<(String, SemanticAnnotationType, WorkState)>,
@@ -126,6 +130,9 @@ impl<'slot> DocumentProgress<'slot> {
             .collect();
         let mut progress = Self {
             slot,
+            // Observations outlive each temporary plan and share only compact
+            // monitoring state; SQLite and per-key accounting remain serial.
+            monitoring: Arc::clone(monitoring),
             snapshot,
             items,
             retry_waiting,
@@ -154,6 +161,24 @@ impl<'slot> DocumentProgress<'slot> {
                 ),
             })?;
         if *previous != state {
+            if state == WorkState::Completed {
+                self.monitoring
+                    .clear_issue(&format!("annotation:{}:{key}", self.snapshot.parse_id));
+                // Discovery never calls transition: only a newly committed
+                // coverage item contributes to the observed completion rate.
+                self.monitoring.record_completed(
+                    WorkIdentity {
+                        worker: crate::monitoring::ANNOTATION_WORKER.to_string(),
+                        document: self.snapshot.source_paths.join(", "),
+                        source_id: Some(self.snapshot.source_id.clone()),
+                        parse_id: Some(self.snapshot.parse_id.clone()),
+                    },
+                    &self.snapshot.by_type[*index].annotation_type,
+                    "Annotation coverage committed",
+                    "annotation work committed",
+                    1,
+                );
+            }
             let group = &mut self.snapshot.by_type[*index];
             // Every key was inserted once; its prior bucket therefore owns one
             // item. Move, rather than accumulate, so retries cannot inflate totals.
@@ -256,6 +281,7 @@ impl<'slot> DocumentProgress<'slot> {
             self.settle();
         }
         self.snapshot.measured_at = worker::annotation_measured_at();
+        self.monitoring.annotation_document(&self.snapshot);
         worker::update_annotation_health(self.slot, |health| {
             if let Some(document) = health.documents.as_mut().and_then(|documents| {
                 documents.iter_mut().find(|document| {

@@ -202,11 +202,14 @@ SELECT COUNT(*) FROM parse_runs WHERE status = 'building'";
 const SELECT_VERIFICATION_HALTED_COUNT_SQL: &str = "
 SELECT COUNT(*) FROM parse_runs WHERE status = 'archiving'";
 
-/// Serving-stale (failed-parse half): parse runs in the terminal `failed`
-/// disposition. Combined with the queue-backlog half below (§13.5): content is
-/// still served while a fresh parse is owed.
+/// Failure history remains durable, but explicit clearance and later successful
+/// attempts retire its contribution to the operational failure backlog.
 const SELECT_FAILED_PARSE_COUNT_SQL: &str = "
-SELECT COUNT(*) FROM parse_runs WHERE status = 'failed'";
+SELECT COUNT(*) FROM parse_runs p WHERE p.status = 'failed'
+AND p.id = (SELECT latest.id FROM parse_runs latest WHERE latest.source_id = p.source_id
+            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+AND NOT EXISTS (SELECT 1 FROM system_events e WHERE e.event_type = ?1
+                AND e.object_type = 'parse' AND e.object_id = p.id)";
 
 /// Serving-stale (queue-backlog half): sync_queue rows for this source_system
 /// that are detected but not yet drained to activation (pending, in_flight, or
@@ -234,13 +237,15 @@ WHERE deactivated_at IS NULL AND mime_type NOT IN (?1, ?2)";
 /// Every prior ParseRun matching one (source, parser identity/configuration)
 /// tuple — the spec §13.5 rule 5 no-blind-retry key. source_id is 1:1 with
 /// source_hash (spec §10 dedup), so a match means identical bytes through an
-/// identical parser, which fails (or succeeds) identically. Ordered so the
-/// guard decision is deterministic when defensive drift leaves multiple
-/// matches.
+/// identical parser. Explicit per-attempt clearance permits a fresh attempt
+/// without erasing that history; a later failure blocks again under its own ID.
 const SELECT_PARSE_RUNS_BY_IDENTITY_SQL: &str = "
 SELECT id, status, held_reason FROM parse_runs
 WHERE source_id = ?1 AND parser_name = ?2 AND parser_version = ?3
   AND parser_config_hash = ?4
+  AND (status != 'failed' OR NOT EXISTS (
+       SELECT 1 FROM system_events e WHERE e.event_type = ?5
+       AND e.object_type = 'parse' AND e.object_id = parse_runs.id))
 ORDER BY created_at, id";
 
 /// `reason` recorded on entries enqueued because a full scan staged a bundle
@@ -426,7 +431,7 @@ enum ParseChainPrefix {
 
 /// Compose the UNIQUE coalescing key of one queue row: connector-scoped
 /// source identity per the schema §9.4 contract.
-fn source_key(source_system: &str, native_uri: &str) -> String {
+pub(crate) fn source_key(source_system: &str, native_uri: &str) -> String {
     format!("{source_system}:{native_uri}")
 }
 
@@ -531,6 +536,11 @@ pub(crate) fn enqueue_coalesced(
         ));
     }
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "enqueue_coalesced")?;
+    if operation_id.is_some() {
+        crate::monitoring_storage::refresh_queue(index_root);
+    } else {
+        crate::monitoring_storage::refresh_queue_throttled(index_root);
+    }
     // The preceding enqueue/coalesce record describes the write attempt;
     // confirm durability here while generic transaction mechanics use DEBUG.
     info!(
@@ -591,6 +601,7 @@ pub(crate) fn claim_pending(index_root: &StorageContext) -> Result<Vec<SyncQueue
         }
     };
     hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "claim_pending")?;
+    crate::monitoring_storage::refresh_queue(index_root);
 
     debug!(
         event = "scheduler.queue_claimed",
@@ -648,6 +659,7 @@ pub(crate) fn complete(index_root: &StorageContext, entry_id: &str) -> Result<()
     }
     // Queue-coupled operation reaches its terminal success only after the queue
     // row is gone. Drops through cleanly for autonomous rows (operation_id None).
+    crate::monitoring_storage::refresh_queue_throttled(index_root);
     if let Some(operation_id) = &operation_id {
         crate::operations::mark_succeeded(index_root, operation_id)?;
         info!(
@@ -707,6 +719,7 @@ pub(crate) fn fail(
     // `running → failed` guard means a still-`pending` operation (fail before
     // drain dispatch) must first be flipped running; an already-terminal one is
     // left as-is (a re-fail of the same entry must not double-transition).
+    crate::monitoring_storage::refresh_queue_throttled(index_root);
     if let Some(operation_id) = &operation_id {
         drive_operation_failed(index_root, operation_id, error_detail)?;
     }
@@ -953,7 +966,7 @@ fn fabric_counts(
     let failed_parse = read_scalar_count(
         &connection,
         SELECT_FAILED_PARSE_COUNT_SQL,
-        params![],
+        params![crate::clear_failures::parse_failure_clear_event_name()?],
         "failed-parse",
     )?;
     let queue_backlog = read_scalar_count(
@@ -1316,6 +1329,7 @@ fn run_scheduler(
     };
 
     let mut generation = startup_permit.generation();
+    let mut corpus_generation = startup_permit.corpus_generation();
     drop(startup_permit);
     let mut cadence = CadenceState::new(index_root.limits().scheduling);
     let mut delay = Duration::ZERO;
@@ -1347,8 +1361,11 @@ fn run_scheduler(
         if permit.generation() != generation {
             generation = permit.generation();
             cadence = CadenceState::new(index_root.limits().scheduling);
-            health = SyncHealth::startup_pending();
-            health.fabric_ready = true;
+            if permit.corpus_generation() != corpus_generation {
+                corpus_generation = permit.corpus_generation();
+                health = SyncHealth::startup_pending();
+                health.fabric_ready = true;
+            }
             health.detail = None;
             // Rebuilding is background work; do not keep readiness at startup
             // pending until an entire fresh-corpus cycle finishes.
@@ -1375,6 +1392,7 @@ fn run_scheduler(
             &context,
             &scope_uri,
             &dispatch,
+            &permit,
         ) {
             Ok(outcome) => match queue_depths(&index_root) {
                 Ok(depths) => {
@@ -1423,51 +1441,55 @@ fn run_scheduler(
                     health.in_flight = depths.in_flight;
                     health.failed = depths.failed;
                     health.coalesced_total = depths.coalesced_total;
+                    let measured_at = index_root.monitoring().observed_at();
+                    index_root.monitoring().update_ingestion(|snapshot| {
+                        snapshot.pending = Some(depths.pending);
+                        snapshot.in_flight = Some(depths.in_flight);
+                        snapshot.failed = Some(depths.failed);
+                        snapshot.queue_measured_at = measured_at;
+                    });
                     health.last_cycle = Some(outcome.stats);
                     health.cadence_ms = Some(delay_ms);
                     // Achieved freshness is measured truth (spec §9.6): the
                     // timestamp is recorded only when the cycle actually
                     // succeeded, and a clock failure loses the update
                     // visibly instead of guessing.
-                    match utc_now() {
-                        Ok(now) => health.last_success_at = Some(now),
-                        Err(source) => error!(
-                            event = "scheduler.freshness_timestamp_failed",
-                            error = %source,
-                            "failed to format last-success timestamp"
-                        ),
+                    if !outcome.paused_for_clear {
+                        match utc_now() {
+                            Ok(now) => health.last_success_at = Some(now),
+                            Err(source) => error!(
+                                event = "scheduler.freshness_timestamp_failed",
+                                error = %source,
+                                "failed to format last-success timestamp"
+                            ),
+                        }
                     }
                     delay_ms
                 }
                 Err(source) => {
-                    // The cycle itself SUCCEEDED; only the post-cycle queue
-                    // depth read failed. Policy: record the cycle as
-                    // successful (stats and achieved freshness advance),
-                    // surface the read failure as its own distinct error
-                    // and in health detail, leave the depth fields at their
-                    // last-known values, and back the cadence off with the
-                    // error growth — conservative, because the backlog
-                    // signal that would justify a faster cadence is
-                    // unavailable. No cycle-failed log is emitted: that
-                    // would misattribute the failure.
+                    // Queue observation failed after completed or safely paused
+                    // work. Retain its stats and last-known depths, but advance
+                    // freshness only for a fully completed cycle. Back off when
+                    // the backlog signal is unavailable, without misattributing
+                    // this read failure to the ingestion work itself.
                     error!(
                         event = "scheduler.queue_depth_read_failed",
                         error = %source,
-                        "queue depth read failed after a successful cycle; \
+                        "queue depth read failed after cycle work; \
                          depths held at last-known values"
                     );
                     health.detail = Some(format!("queue depth read failed: {source}"));
                     health.last_cycle = Some(outcome.stats);
-                    // Achieved freshness still advances: the cycle succeeded
-                    // (spec §9.6 measured truth); a clock failure loses the
-                    // update visibly instead of guessing.
-                    match utc_now() {
-                        Ok(now) => health.last_success_at = Some(now),
-                        Err(source) => error!(
-                            event = "scheduler.freshness_timestamp_failed",
-                            error = %source,
-                            "failed to format last-success timestamp"
-                        ),
+                    // A maintenance pause is not a completed freshness pass.
+                    if !outcome.paused_for_clear {
+                        match utc_now() {
+                            Ok(now) => health.last_success_at = Some(now),
+                            Err(source) => error!(
+                                event = "scheduler.freshness_timestamp_failed",
+                                error = %source,
+                                "failed to format last-success timestamp"
+                            ),
+                        }
                     }
                     let delay_ms = cadence.back_off_after_error();
                     health.cadence_ms = Some(delay_ms);
@@ -1486,6 +1508,8 @@ fn run_scheduler(
         // overwritten with a guess, and it never affects the sync summary or the
         // adaptive cadence.
         publish_cycle_fabric_health(&index_root, connector.source_system(), &fabric_slot);
+        crate::monitoring_storage::refresh_sources(&index_root);
+        index_root.monitoring().schedule_scan_wait(delay_ms);
 
         // Idle without a permit so maintenance can drain; a new generation
         // bypasses this delay and starts with fresh cadence state next cycle.
@@ -1619,7 +1643,7 @@ pub(crate) fn run_annotation_dry_run_pass(
     // completed/failed. Autonomous full-scan detections only (no operator queue
     // coupling in this mode), so the prescreen-override path is not exercised.
     let known = acquisition::known_location_state(&index_root, connector.source_system())?;
-    let scan = match connector.full_scan(&known) {
+    let scan = match connector.full_scan(&known, None) {
         Ok(scan) => scan,
         Err(ScanError::SourceSide {
             failure_class,
@@ -1728,7 +1752,7 @@ pub(crate) fn run_annotation_dry_run_pass(
                 // Run the SHARED prefix, then TRUNCATE (mechanic 1): no gate work,
                 // no complete()/fail(), no bundle removal. The row and bundle stay
                 // exactly as crash-replay would leave them.
-                match parse_chain_prefix(&dispatch, &index_root, entry, &import) {
+                match parse_chain_prefix(&dispatch, &index_root, entry, &import, None) {
                     Ok(ParseChainPrefix::Skipped) => outcome.skipped += 1,
                     Ok(ParseChainPrefix::ParseFailed) => outcome.parse_failed += 1,
                     Ok(ParseChainPrefix::GateExisting { parse_run_id }) => {
@@ -1836,6 +1860,8 @@ fn handle_cycle_error(
 /// Counters and cadence signals of one completed cycle.
 struct CycleOutcome {
     stats: SyncCycleStats,
+    /// A safe yield leaves unprocessed queue entries intact and is not a completed sweep.
+    paused_for_clear: bool,
     /// Scan duration alone supplies the capped cadence floor, distinct from
     /// the whole cycle's elapsed_ms.
     scan_elapsed_ms: u64,
@@ -1861,6 +1887,7 @@ fn run_cycle(
     context: &AcquisitionContext,
     scope_uri: &str,
     dispatch: &ParseDispatchContext,
+    permit: &crate::maintenance::MaintenancePermit,
 ) -> Result<CycleOutcome, ApiError> {
     let cycle_started = Instant::now();
     debug!(event = "scheduler.cycle_started", "sync cycle starting");
@@ -1911,7 +1938,9 @@ fn run_cycle(
         }
     }
 
-    let scan = match connector.full_scan(&known) {
+    crate::monitoring_storage::refresh_queue(index_root);
+    crate::monitoring_storage::refresh_sources(index_root);
+    let scan = match connector.full_scan(&known, Some(index_root.monitoring())) {
         Ok(scan) => scan,
         Err(ScanError::SourceSide {
             failure_class,
@@ -2047,6 +2076,11 @@ fn run_cycle(
     // against its still-present bundle (deletion happens only after
     // complete() succeeds), so backpressure cannot latch on it.
     for entry in &entries {
+        // Each prior source reached its normal commit/cleanup boundary. Retain
+        // undispatched claims and bundles for the next cycle's existing reclaim path.
+        if permit.failure_clear_requested() {
+            break;
+        }
         let entry_started = Instant::now();
         // Queue identity survives scheduling; this child scope carries the
         // readable source into every synchronous import/parse/build boundary.
@@ -2203,6 +2237,7 @@ fn run_cycle(
         }
         match acquisition::import_staged_bundle(index_root, &bundle_dir) {
             Ok(outcome) if outcome.imported => {
+                crate::monitoring_storage::refresh_sources_throttled(index_root);
                 // The acquisition import is durable; the parse chain runs
                 // BEFORE complete(), and the consumed bundle is removed only
                 // AFTER complete() succeeds. A crash anywhere in between
@@ -2335,7 +2370,8 @@ fn run_cycle(
     // partial scan asserts nothing about absent items.
     let mut deletions: u64 = 0;
     let mut source_lifecycle_changed = false;
-    if scan.enumeration_complete {
+    let paused_for_clear = permit.failure_clear_requested();
+    if scan.enumeration_complete && !paused_for_clear {
         let enumeration_record_id =
             acquisition::record_enumeration(index_root, context, scope_uri, scan.elapsed_ms)?;
         let deleted = acquisition::apply_enumeration_deletions(
@@ -2417,7 +2453,15 @@ fn run_cycle(
         || stats.deletions > 0
         || source_lifecycle_changed
         || !scan.enumeration_complete;
-    if report_activity {
+    if paused_for_clear {
+        info!(
+            event = "scheduler.cycle_paused",
+            imported = stats.imported,
+            failures = stats.failures,
+            elapsed_ms = stats.elapsed_ms,
+            "scheduler yielded at a source boundary for failure clearing"
+        );
+    } else if report_activity {
         info!(
             event = "scheduler.cycle_completed",
             enumerated = stats.enumerated,
@@ -2449,6 +2493,7 @@ fn run_cycle(
     let changes = stats.staged + deletions;
     Ok(CycleOutcome {
         stats,
+        paused_for_clear,
         scan_elapsed_ms: scan.elapsed_ms,
         changes,
     })
@@ -2477,6 +2522,7 @@ fn parse_chain_prefix(
     index_root: &StorageContext,
     entry: &SyncQueueEntry,
     import: &ImportOutcome,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<ParseChainPrefix, ApiError> {
     let started = Instant::now();
     // imported=true guarantees this linkage per the ImportOutcome contract;
@@ -2614,6 +2660,9 @@ fn parse_chain_prefix(
     // remains between this check and the worker's own read (recorded
     // residual risk; the structural fix — parsing the acquired bytes
     // themselves — is a worker-input design change deferred by ruling).
+    if let Some(monitor) = monitor {
+        monitor.stage("verifying source bytes", None, "bytes");
+    }
     let live_hash = {
         let live_bytes =
             fs::read(&resolved.absolute_path).map_err(|source| ApiError::SourceResolution {
@@ -2642,6 +2691,11 @@ fn parse_chain_prefix(
     // for succeeded and failed parses alike; `Err` here means its staging
     // workspace itself faulted. A file that vanishes after the check above
     // is the worker's recorded parse outcome.
+    if let Some(monitor) = monitor {
+        // Parsers are opaque subprocess work. Publish the boundary without
+        // inventing a page or byte-completion percentage during extraction.
+        monitor.stage("parsing", None, "units");
+    }
     let bundle_dir = match route {
         ParseRoute::Pdf => dispatch
             .pdf
@@ -2654,9 +2708,32 @@ fn parse_chain_prefix(
         )?,
     };
 
+    if let Some(monitor) = monitor {
+        monitor.stage("validating and importing parse", None, "units");
+    }
     let imported_parse = import_parser_bundle(index_root, &bundle_dir, &profile)?;
     match imported_parse.status {
         ImportedParseStatus::Failed => {
+            if let Some(monitor) = monitor {
+                monitor.identify(Some(source_id), Some(&imported_parse.parse_run_id));
+                index_root.monitoring().set_issue(
+                    format!("ingestion:{}", entry.native_uri),
+                    crate::monitoring_types::MonitorIssue {
+                        identity: monitor.identity(),
+                        stage: "parse validation".to_string(),
+                        state: crate::monitoring_types::MonitorState::Failed,
+                        message: imported_parse.rejection_detail.clone().unwrap_or_else(|| {
+                            "Parser recorded failure without a rejection detail".to_string()
+                        }),
+                        affected: 1,
+                        retry_in_ms: None,
+                        attempt: None,
+                        retry_limit: None,
+                        observed_since: None,
+                        elapsed_ms: 0,
+                    },
+                );
+            }
             // The importer already recorded the failed run and its event;
             // the staged failure bundle stays on disk, inspectable per spec
             // §12.2. The bounded detail rides along so this terminal
@@ -2716,10 +2793,69 @@ fn dispatch_parse_chain(
     entry: &SyncQueueEntry,
     import: &ImportOutcome,
 ) -> Result<ParseChainOutcome, ApiError> {
+    use crate::monitoring_types::{MonitorIssue, MonitorState, WorkIdentity};
+    let identity = WorkIdentity::new(
+        "ingestion",
+        &entry.native_uri,
+        import.source_object_id.as_deref(),
+        None,
+    );
+    let monitoring = index_root.monitoring();
+    let work = monitoring.work(identity.clone(), "parse admission", None, "units");
+    let handle = work.handle();
+    let result = dispatch_parse_chain_observed(dispatch, index_root, entry, import, &handle);
+    let issue_key = format!("ingestion:{}", entry.native_uri);
+    let (state, message) = match &result {
+        Ok(ParseChainOutcome::ParseFailed) => (
+            MonitorState::Failed,
+            "Parser recorded a failed parse".to_string(),
+        ),
+        Ok(ParseChainOutcome::Skipped) => (
+            MonitorState::Complete,
+            "Parse admission completed without a new parse".to_string(),
+        ),
+        Ok(ParseChainOutcome::Gated) => (
+            MonitorState::Complete,
+            "Parse gate lifecycle completed".to_string(),
+        ),
+        Err(source) => (MonitorState::Failed, source.to_string()),
+    };
+    if result.is_err() {
+        monitoring.set_issue(
+            issue_key,
+            MonitorIssue {
+                identity: handle.identity(),
+                stage: "ingestion".to_string(),
+                state,
+                message: message.clone(),
+                affected: 1,
+                retry_in_ms: None,
+                attempt: None,
+                retry_limit: None,
+                observed_since: None,
+                elapsed_ms: 0,
+            },
+        );
+    } else if matches!(&result, Ok(ParseChainOutcome::Gated)) {
+        monitoring.clear_issue(&issue_key);
+    }
+    work.finish(state, &message);
+    result
+}
+
+/// Keep observation ownership outside the fallible chain so every early return
+/// reaches a terminal monitor outcome without changing parse/Operation semantics.
+fn dispatch_parse_chain_observed(
+    dispatch: &ParseDispatchContext,
+    index_root: &StorageContext,
+    entry: &SyncQueueEntry,
+    import: &ImportOutcome,
+    monitor: &crate::monitoring::WorkHandle,
+) -> Result<ParseChainOutcome, ApiError> {
     let started = Instant::now();
     // The prefix consumes only the prefix-scoped slice of the context; the gate
     // continuation below consumes the rest (projections/registry/identity).
-    match parse_chain_prefix(&dispatch.prefix, index_root, entry, import)? {
+    match parse_chain_prefix(&dispatch.prefix, index_root, entry, import, Some(monitor))? {
         ParseChainPrefix::Skipped => Ok(ParseChainOutcome::Skipped),
         ParseChainPrefix::ParseFailed => Ok(ParseChainOutcome::ParseFailed),
         ParseChainPrefix::GateExisting { parse_run_id } => {
@@ -2739,7 +2875,14 @@ fn dispatch_parse_chain(
                             entry.id
                         ),
                     })?;
-            let decision = gate_ready_parse(dispatch, index_root, source_id, &parse_run_id, None)?;
+            let decision = gate_ready_parse(
+                dispatch,
+                index_root,
+                source_id,
+                &parse_run_id,
+                None,
+                monitor,
+            )?;
             info!(
                 event = "scheduler.parse_dispatch.gated_existing",
                 entry_id = entry.id,
@@ -2762,6 +2905,7 @@ fn dispatch_parse_chain(
                 &source_id,
                 &parse_run_id,
                 Some(&bundle_dir),
+                monitor,
             )?;
             info!(
                 event = "scheduler.parse_dispatch.completed",
@@ -2798,7 +2942,9 @@ fn gate_ready_parse(
     source_id: &str,
     parse_run_id: &str,
     consumed_bundle: Option<&Path>,
+    monitor: &crate::monitoring::WorkHandle,
 ) -> Result<ActivationDecision, ApiError> {
+    monitor.identify(Some(source_id), Some(parse_run_id));
     let parse_log = crate::util::LogContext::new("parse", parse_run_id);
     parse_log.record("source_id", source_id);
     parse_log.record(
@@ -2810,14 +2956,22 @@ fn gate_ready_parse(
         },
     );
     let _parse_log = parse_log.enter();
-    build_content_derived_projections(&dispatch.projections, index_root, source_id, parse_run_id)?;
+    build_content_derived_projections(
+        &dispatch.projections,
+        index_root,
+        source_id,
+        parse_run_id,
+        monitor,
+    )?;
 
     // Pre-activation snapshot (§30.6): minted immediately BEFORE the gate. The
     // gate holds the per-source cutover barrier INTERNALLY; the snapshot runs
     // OUTSIDE that hold (this call precedes gate_and_activate), preserving the
     // §31.1 brevity rule.
+    monitor.stage("pre-activation snapshot", None, "artifacts");
     crate::snapshot::pre_activation_snapshot(index_root, &dispatch.identity, parse_run_id)?;
     let store = ArtifactStore::open(index_root)?;
+    monitor.stage("activation gate", None, "sources");
     let decision = activation::gate_and_activate(
         index_root,
         &store,
@@ -2835,6 +2989,17 @@ fn gate_ready_parse(
         ..
     } = &decision
     {
+        // The gate has committed AND published the active parse. Snapshot and
+        // cleanup can still fail afterward; do not erase this successful boundary.
+        index_root.monitoring().record_completed(
+            monitor.identity(),
+            "activation",
+            "Active parse published",
+            "sources activated",
+            1,
+        );
+        crate::monitoring_storage::refresh_sources(index_root);
+        monitor.stage("post-activation snapshot", None, "artifacts");
         crate::snapshot::post_activation_snapshot(index_root, &dispatch.identity, parse_run_id)?;
         // §31.2 steps 3–5: complete the superseded predecessor's
         // archive-verify-delete. The gate verifies over the post_activation
@@ -2843,6 +3008,7 @@ fn gate_ready_parse(
         // `?`, halting this source's lifecycle. Only runs when a predecessor
         // existed (None = first-time activation, nothing to supersede).
         if let Some(predecessor_id) = superseded_predecessor_id {
+            monitor.stage("verifying and archiving predecessor", None, "artifacts");
             crate::restore::complete_superseded_parse(
                 index_root,
                 source_id,
@@ -2857,6 +3023,7 @@ fn gate_ready_parse(
     // BOTH decisions (a hold can supersede an older held one), so it is OUTSIDE
     // the Activated-only block above. Post-barrier, gated over each candidate's
     // own pre_activation snapshot.
+    monitor.stage("held-candidate cleanup", None, "parses");
     clean_superseded_held(index_root, source_id, &decision)?;
     // A freshly-produced bundle is consumed either way (Activated and Held are
     // both recorded outcomes). A deletion error must NOT fail the chain: the
@@ -2905,6 +3072,7 @@ fn build_content_derived_projections(
     index_root: &StorageContext,
     source_id: &str,
     parse_id: &str,
+    monitor: &crate::monitoring::WorkHandle,
 ) -> Result<(), ApiError> {
     let started = Instant::now();
     info!(
@@ -2914,17 +3082,28 @@ fn build_content_derived_projections(
 
     let store = ArtifactStore::open(index_root)?;
     let mut connection = hot_plane::open_write(index_root)?;
+    monitor.stage("opening projection transaction", None, "transactions");
+    monitor.waiting("acquiring SQLite writer lock");
     let tx =
         hot_plane::begin_write_transaction(&mut connection, TX_LOG_NAMESPACE, "projection_build")?;
 
     // The whole build rides `tx`; `run` returns Err on the first builder failure
     // and the transaction is aborted below, so no partial projection set ever
     // commits (activation would otherwise see a torn set).
-    let build = build_projection_transaction(runtime, &store, &tx, source_id, parse_id);
+    monitor.running();
+    let build = build_projection_transaction(runtime, &store, &tx, source_id, parse_id, monitor);
 
     match build {
         Ok(counts) => {
+            monitor.stage("committing content projections", None, "transactions");
             hot_plane::commit_transaction(tx, TX_LOG_NAMESPACE, "projection_build")?;
+            index_root.monitoring().record_completed(
+                monitor.identity(),
+                "content projection commit",
+                "Content-derived projection set committed",
+                "content chunks committed",
+                counts.chunk_count as u64,
+            );
             info!(
                 event = "scheduler.projection_build.success",
                 source_id,
@@ -2974,15 +3153,24 @@ fn build_projection_transaction(
     tx: &Transaction<'_>,
     source_id: &str,
     parse_id: &str,
+    monitor: &crate::monitoring::WorkHandle,
 ) -> Result<ProjectionBuildCounts, ApiError> {
+    monitor.stage("chunk construction", None, "chunks");
     // 1. Chunk — chunks are the input the lexical and dense channels read back,
     //    so they are built first. Token counts are measured against the ColBERT
     //    tokenizer (C6b contract) via the runtime accessor.
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::Chunk)?;
-    let chunk_count =
-        chunk::build_chunks(tx, source_id, parse_id, runtime.colbert.tokenizer(), store)?;
+    let chunk_count = chunk::build_chunks(
+        tx,
+        source_id,
+        parse_id,
+        runtime.colbert.tokenizer(),
+        store,
+        Some(monitor),
+    )?;
 
     // 2. Lexical — FTS5 index over the chunks just built.
+    monitor.stage("lexical indexing", Some(chunk_count as u64), "chunks");
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::LexicalDocument)?;
     lexical::build_lexical_index(tx, source_id, parse_id)?;
 
@@ -2996,12 +3184,15 @@ fn build_projection_transaction(
     //    the exclusive gate is never held across the network round-trips.
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::DenseVector)?;
     let dense_outcome = if runtime.dense.uses_local_model_gate() {
+        monitor.stage("dense embeddings", Some(chunk_count as u64), "chunks");
+        monitor.waiting("waiting for local model gate");
         let permit = acquire_model_call_gate_on(
             &runtime.gate,
             parse_id,
             DENSE_MODEL_ROLE,
             DENSE_CALL_PURPOSE,
         )?;
+        monitor.running();
         let outcome = dense::build_dense_vectors(
             tx,
             source_id,
@@ -3010,6 +3201,7 @@ fn build_projection_transaction(
             runtime.dense_dimension,
             Some(&permit),
             &runtime.embedding_identity,
+            Some(monitor),
         )?;
         section_dense::build_section_dense(
             tx,
@@ -3021,6 +3213,7 @@ fn build_projection_transaction(
             runtime.colbert.tokenizer(),
             Some(&permit),
             &runtime.embedding_identity,
+            Some(monitor),
         )?;
         // `permit` drops here: the dense gate release precedes the colbert
         // acquire, honoring the non-overlapping-roles gate boundary.
@@ -3036,6 +3229,7 @@ fn build_projection_transaction(
             runtime.dense_dimension,
             None,
             &runtime.embedding_identity,
+            Some(monitor),
         )?;
         section_dense::build_section_dense(
             tx,
@@ -3047,6 +3241,7 @@ fn build_projection_transaction(
             runtime.colbert.tokenizer(),
             None,
             &runtime.embedding_identity,
+            Some(monitor),
         )?;
         outcome
     };
@@ -3057,6 +3252,8 @@ fn build_projection_transaction(
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::MultiVector)?;
     {
         let permit = if runtime.colbert.uses_local_model_gate() {
+            monitor.stage("ColBERT embeddings", None, "units");
+            monitor.waiting("waiting for local model gate");
             Some(acquire_model_call_gate_on(
                 &runtime.gate,
                 parse_id,
@@ -3066,6 +3263,7 @@ fn build_projection_transaction(
         } else {
             None
         };
+        monitor.running();
         multivector::build_multivectors(
             tx,
             source_id,
@@ -3074,12 +3272,14 @@ fn build_projection_transaction(
             runtime.colbert_dimension,
             permit.as_ref(),
             &runtime.embedding_identity,
+            Some(monitor),
         )?;
         // The local ColBERT permit drops before the non-model view builder.
     }
 
     // 5. Derived view — render + archive; independent of chunks/vectors, run
     //    last so the content-addressed ArtifactStore write is the final step.
+    monitor.stage("archiving derived view", None, "artifacts");
     envelope::delete_for_parse(tx, parse_id, envelope::ProjectionType::DerivedView)?;
     view::build_derived_view(tx, store, source_id, parse_id)?;
 
@@ -3295,7 +3495,8 @@ fn evaluate_no_retry_guard(
                 source_id,
                 profile.parser_name,
                 profile.parser_version,
-                profile.parser_config_hash
+                profile.parser_config_hash,
+                crate::clear_failures::parse_failure_clear_event_name()?
             ],
             |row| {
                 Ok((

@@ -22,6 +22,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[path = "data-store/serve.rs"]
 mod serve;
 
+// The monitor owns only presentation; measured state shares the server's wire types.
+#[path = "data-store/monitor.rs"]
+mod monitor;
+#[path = "../monitoring_types.rs"]
+mod monitoring_types;
+
 // Client configuration uses the same required fields and validation as the service.
 #[path = "../client_limits.rs"]
 mod client_limits;
@@ -39,6 +45,8 @@ use provenance::{
 // and never reconstruct operational state from diagnostic prose.
 #[path = "../types.rs"]
 mod health_types;
+// Shared monitoring types refer to the server module's canonical name.
+use health_types as types;
 use health_types::{
     AnnotationDocumentProgress, AnnotationWorkCounts, HealthBackend, HealthComponent,
     HealthObservations, HealthResponse, HealthStatus,
@@ -115,6 +123,7 @@ struct ClientContext {
 // `query` are direct request/response. `Exit`/`Help` are local REPL controls.
 #[derive(Debug)]
 enum Command {
+    ClearFailures,
     Health {
         details: bool,
     },
@@ -264,6 +273,15 @@ const COMMAND_SPECS: &[CommandSpec] = &[
             "data-store [--config <path>] --reparse <sourceId> <sourceSystem> <nativeUri>",
         ),
         build: build_reparse_command,
+    },
+    CommandSpec {
+        repl_name: "clear-failures",
+        repl_aliases: &[],
+        cli_flag: Some("--clear-failures"),
+        cli_aliases: &[],
+        repl_usage: "clear-failures (unblock failed background work)",
+        cli_usage: Some("data-store [--config <path>] --clear-failures"),
+        build: build_clear_failures_command,
     },
     CommandSpec {
         repl_name: "activate",
@@ -416,6 +434,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 #[derive(Debug)]
 enum StartupSelection {
     Help,
+    /// A full-screen read-only session has no REPL command or admin operation.
+    Monitor {
+        config_path: PathBuf,
+    },
     Client {
         config_path: PathBuf,
         command: Option<Command>,
@@ -785,13 +807,16 @@ struct ErrorDetail {
     message: String,
 }
 
-/// Start one command-line operation, the interactive client, or the web UI serve
-/// mode after resolving config.
+/// Resolve config once before entering an operation, REPL, web UI, or monitor.
 fn main() -> Result<()> {
     match parse_startup_args()? {
         StartupSelection::Help => {
             render_cli_help();
             Ok(())
+        }
+        StartupSelection::Monitor { config_path } => {
+            let (context, _config_dir) = build_client_context(&config_path)?;
+            monitor::run(context)
         }
         StartupSelection::Client {
             config_path,
@@ -847,12 +872,21 @@ fn parse_startup_arguments(args: &[String]) -> Result<StartupSelection> {
     let mut command = None;
     let mut help_requested = false;
     let mut bind_arg: Option<String> = None;
+    let mut monitor_requested = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if arg == "--config" {
             let value = take_startup_value(args, &mut index, "--config", "path")?;
             config_path = PathBuf::from(value);
+            continue;
+        }
+        if arg == "--monitor" {
+            if monitor_requested {
+                bail!("--monitor may only be provided once");
+            }
+            monitor_requested = true;
+            index += 1;
             continue;
         }
         // `--serve` is collected here, beside `--config`, precisely because it is a
@@ -883,6 +917,14 @@ fn parse_startup_arguments(args: &[String]) -> Result<StartupSelection> {
             bail!("--help cannot be combined with operation flags");
         }
         return Ok(StartupSelection::Help);
+    }
+    // The full-screen session owns this terminal until exit; no second startup
+    // mode or operation can run alongside it in the same process.
+    if monitor_requested {
+        if command.is_some() || bind_arg.is_some() {
+            bail!("--monitor cannot be combined with --serve or operation flags");
+        }
+        return Ok(StartupSelection::Monitor { config_path });
     }
     // Validated and checked after help so `--help --serve <anything>` still prints
     // usage without rejecting the address or binding a socket. Serve mode occupies
@@ -964,9 +1006,8 @@ fn find_cli_command_spec(value: &str) -> Option<&'static CommandSpec> {
 
 /// Identify startup flags so positional command parsing can stop before the next option.
 fn is_startup_flag(value: &str) -> bool {
-    // `--serve` is listed explicitly: like `--config`, it is a startup option and
-    // therefore absent from `COMMAND_SPECS`.
-    value == "--config" || value == "--serve" || find_cli_command_spec(value).is_some()
+    // Startup modes are absent from the one-shot/REPL command registry.
+    matches!(value, "--config" | "--serve" | "--monitor") || find_cli_command_spec(value).is_some()
 }
 
 /// Parse REPL arguments by handing the command's trailing tokens to its builder.
@@ -1033,6 +1074,12 @@ fn build_ingest_command(args: &[String]) -> Result<Command> {
         source_system: args[0].clone(),
         native_uri: args[1].clone(),
     })
+}
+
+/// Reset failure eligibility through the standard authenticated Operation lifecycle.
+fn build_clear_failures_command(args: &[String]) -> Result<Command> {
+    require_arg_count(args, 0, "clear-failures")?;
+    Ok(Command::ClearFailures)
 }
 
 /// Build the `reparse` command targeting `POST /sources/{sourceId}/parses`.
@@ -1391,6 +1438,9 @@ fn split_shell_like(line: &str) -> Result<Vec<String>> {
 /// the decoded value so stage 2 can swap them without touching this dispatch.
 fn execute_command(context: &ClientContext, command: Command) -> Result<bool> {
     match command {
+        Command::ClearFailures => {
+            run_admin_operation(context, "POST", "/clear-failures", None)?;
+        }
         Command::Health { details } => {
             let health: HealthResponse = get_public(context, HEALTH_PATH)?;
             if details {
@@ -2285,6 +2335,11 @@ fn render_operation(record: &OperationRecord) {
                     "  note: storage cleared; automatic rebuilding resumed. Corpus ingestion \
                      and annotation generation continue in the background."
                 );
+            } else if record.operation_type == "clear_failures" {
+                // A successful reset changes eligibility, not the outcome of the next attempts.
+                println!(
+                    "  note: failure blocks cleared; background work is eligible to resume. Follow ingestion completion in --monitor."
+                );
             } else if is_parse_producing_operation(&record.operation_type) {
                 println!(
                     "  note: the operation lifecycle completed, but this does NOT confirm the \
@@ -2782,13 +2837,12 @@ fn render_help() {
     }
 }
 
-/// Print executable-level usage for the interactive, one-shot, and serve startup
-/// modes. Serve is printed by hand because it is a startup mode, not a
-/// `COMMAND_SPECS` entry.
+/// Include terminal/web startup modes beside the shared command-registry usage.
 fn render_cli_help() {
     println!("Usage:");
     println!("  data-store [--config <path>]");
     println!("  data-store [--config <path>] --serve <host>:<port>");
+    println!("  data-store [--config <path>] --monitor");
     for spec in COMMAND_SPECS {
         if let Some(usage) = spec.cli_usage {
             println!("  {usage}");
@@ -2797,6 +2851,7 @@ fn render_cli_help() {
     println!();
     println!("Options:");
     println!("  --config <path>  Service config path; defaults to config.toml");
+    println!("  --monitor        Full-screen read-only ingestion dashboard; Q or Ctrl-C exits");
     println!(
         "  --serve <addr>   Serve the read-only web UI on <host>:<port> (e.g. localhost:8092)"
     );

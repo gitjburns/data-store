@@ -40,6 +40,9 @@ impl RuntimeSettings {
 pub(crate) struct StorageContext {
     index_root: PathBuf,
     settings: Arc<RuntimeSettings>,
+    // Every clone belongs to this storage owner's monitoring run. Observations
+    // are transient and do not enter immutable settings or artifact identities.
+    monitoring: Arc<crate::monitoring::Monitoring>,
 }
 
 impl StorageContext {
@@ -48,7 +51,13 @@ impl StorageContext {
         Self {
             index_root,
             settings,
+            monitoring: Arc::new(crate::monitoring::Monitoring::new()),
         }
+    }
+
+    /// Share observations with admitted workers without a global registry or SQL reads.
+    pub(crate) fn monitoring(&self) -> &Arc<crate::monitoring::Monitoring> {
+        &self.monitoring
     }
 
     /// Borrow operational limits without re-reading TOML during an operation.

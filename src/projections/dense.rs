@@ -191,6 +191,9 @@ pub(crate) struct DenseBuildOutcome {
 /// committing the failure marker in a separate transaction if it wants the
 /// event durable. This builder keeps the atomic unit whole and surfaces the
 /// error; failure-event durability policy belongs to the integration caller.
+// Keep caller-owned transaction, target, backend admission, producer identity,
+// validation dimension, and observer explicit at this projection boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dense_vectors(
     tx: &Transaction<'_>,
     source_id: &str,
@@ -199,6 +202,7 @@ pub(crate) fn build_dense_vectors(
     expected_dimension: usize,
     _gate: Option<&ModelCallPermit>,
     model_identity: &str,
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<DenseBuildOutcome, ApiError> {
     let started = Instant::now();
 
@@ -206,6 +210,13 @@ pub(crate) fn build_dense_vectors(
     // producer input refs and the number of embeddings, so it is gathered
     // before the envelope is opened.
     let chunks = read_parse_chunks(tx, parse_id)?;
+    if let Some(monitor) = monitor {
+        monitor.stage(
+            "dense passage embeddings",
+            Some(chunks.len() as u64),
+            "chunks embedded",
+        );
+    }
 
     info!(
         event = "dense_build.started",
@@ -232,6 +243,7 @@ pub(crate) fn build_dense_vectors(
         dense_backend,
         expected_dimension,
         &chunks,
+        monitor,
     ) {
         Ok(counts) => {
             // Dense payloads live entirely in the `chunk_dense_vectors` hot
@@ -340,6 +352,7 @@ fn build_all_chunks(
     dense_backend: &DenseEmbeddingBackend,
     expected_dimension: usize,
     chunks: &[StoredChunk],
+    monitor: Option<&crate::monitoring::WorkHandle>,
 ) -> Result<DenseBuildCounts, ApiError> {
     // Idempotent rebuild: clear the parse's prior dense plane before inserting.
     // Shares the caller's transaction, so a mid-build failure rolls this delete
@@ -360,8 +373,16 @@ fn build_all_chunks(
         // runtime self-logs its own `model_call.*` events per chunk; no vector
         // values are logged here (forbidden).
         DenseEmbeddingBackend::Local(runtime) => {
-            for chunk in chunks {
-                let raw_vector = runtime.embed_passage_vector(&chunk.targeting_text)?;
+            for (index, chunk) in chunks.iter().enumerate() {
+                let call = dense_backend.monitor_call(monitor, "passage embedding");
+                let result = runtime.embed_passage_vector(&chunk.targeting_text);
+                if let Some(call) = call {
+                    call.finish_result(&result);
+                }
+                let raw_vector = result?;
+                if let Some(monitor) = monitor {
+                    monitor.progress((index + 1) as u64, Some(chunks.len() as u64));
+                }
                 persist_chunk_vector(
                     tx,
                     source_id,
@@ -387,7 +408,13 @@ fn build_all_chunks(
                 .map(|chunk| chunk.targeting_text.as_str())
                 .collect();
             let text_windows: Vec<&[&str]> = texts.chunks(client.batch_size()).collect();
-            let window_vectors = embed_windows_concurrently(client, &text_windows, parse_id)?;
+            let window_vectors = embed_windows_concurrently(
+                client,
+                &text_windows,
+                parse_id,
+                monitor,
+                "passage embedding",
+            )?;
 
             // All windows embedded and length-checked; now persist serially in
             // chunk order on the caller's transaction. Every window's vectors
@@ -446,8 +473,14 @@ fn embed_windows_concurrently(
     client: &HttpDenseClient,
     windows: &[&[&str]],
     parse_id: &str,
+    monitor: Option<&crate::monitoring::WorkHandle>,
+    stage: &str,
 ) -> Result<Vec<Vec<Vec<f32>>>, ApiError> {
     let mut results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(windows.len());
+    // Only completed batch responses advance this counter; scoped HTTP threads
+    // share an atomic count, never SQLite state or a guessed in-call percentage.
+    let completed = std::sync::atomic::AtomicU64::new(0);
+    let total = windows.iter().map(|window| window.len() as u64).sum();
 
     // The client's configured concurrency bounds HTTP calls in flight per scope.
     // An open scope holds only Rust borrows locally — but
@@ -461,12 +494,25 @@ fn embed_windows_concurrently(
             let handles: Vec<_> = wave
                 .iter()
                 .map(|window| {
+                    let completed = &completed;
                     // Shared `&client` crosses the scope boundary by reference
                     // (Sync); the borrow lives only for this scope.
-                    scope.spawn(
-                        crate::util::LogContext::current()
-                            .wrap(move || client.embed_passage_vectors(window)),
-                    )
+                    scope.spawn(crate::util::LogContext::current().wrap(move || {
+                        let result = client.embed_passage_vectors(window, monitor, stage);
+                        if result.is_ok()
+                            && let Some(monitor) = monitor
+                        {
+                            completed.fetch_add(
+                                window.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            monitor.progress(
+                                completed.load(std::sync::atomic::Ordering::Relaxed),
+                                Some(total),
+                            );
+                        }
+                        result
+                    }))
                 })
                 .collect();
             // Join every thread in the wave before leaving the scope: an in-flight
@@ -521,18 +567,35 @@ pub(crate) fn embed_texts(
     backend: &DenseEmbeddingBackend,
     texts: &[&str],
     parse_id: &str,
+    monitor: Option<&crate::monitoring::WorkHandle>,
+    stage: &str,
 ) -> Result<Vec<Vec<f32>>, ApiError> {
     match backend {
         DenseEmbeddingBackend::Local(runtime) => texts
             .iter()
-            .map(|text| runtime.embed_complete_passage_vector(text))
+            .enumerate()
+            .map(|(index, text)| {
+                let call = backend.monitor_call(monitor, stage);
+                let result = runtime.embed_complete_passage_vector(text);
+                if let Some(call) = call {
+                    call.finish_result(&result);
+                }
+                if result.is_ok()
+                    && let Some(monitor) = monitor
+                {
+                    monitor.progress((index + 1) as u64, Some(texts.len() as u64));
+                }
+                result
+            })
             .collect(),
         DenseEmbeddingBackend::Http(client) => {
             let windows: Vec<&[&str]> = texts.chunks(client.batch_size()).collect();
-            Ok(embed_windows_concurrently(client, &windows, parse_id)?
-                .into_iter()
-                .flatten()
-                .collect())
+            Ok(
+                embed_windows_concurrently(client, &windows, parse_id, monitor, stage)?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
         }
     }
 }
