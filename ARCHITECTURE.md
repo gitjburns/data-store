@@ -83,7 +83,7 @@ corrupting the record. Clients observe progress by polling
 `GET /operations/{operationId}` — there is no streamed progress anywhere in
 the API.
 
-Two execution shapes exist (`src/http.rs`):
+Three execution shapes exist (`src/http.rs`):
 
 - **Detached tasks** (activate/accept/discard/snapshot/restore). The handler
   authorizes, awaits `insert_pending` (itself a `spawn_blocking` call), and
@@ -108,6 +108,16 @@ Two execution shapes exist (`src/http.rs`):
   the connector's unchanged-prescreen so unchanged content is force-staged —
   a parser rollout over unchanged content would otherwise be defeated by the
   (mtime, size) prescreen.
+
+- **Drain-gated maintenance operations** (`POST /rebuild-all`, `POST
+  /clear-failures`; `src/reset.rs`, `src/clear_failures.rs`). The handler
+  authorizes, then awaits a blocking `reserve` that closes the shared admission
+  gate, drains admitted work, and only then calls `insert_pending` — so the
+  `pending` row exists only after draining, and a drain failure returns an
+  error with no Operation row. The handler then returns **202 Accepted** and a
+  detached `spawn_blocking` closure runs `mark_running` → the clearing or
+  failure-clear work inside `catch_unwind` → `mark_succeeded` or `mark_failed`,
+  and releases or retains the maintenance hold as Section 1.2 describes.
 
 **Operation-succeeded ≠ parse-outcome.** An Operation records that the
 requested unit of work ran to completion and left a durable domain record; the
@@ -381,13 +391,15 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   text with a per-build ColBERT tokenizer copy, disabling truncation and padding
   while retaining special tokens. Oversized words split at measured UTF-8
   boundaries; their final suffix can join following words. Every retained chunk
-  is recounted and checked against 512 tokens before persistence. The
-  400-character minimum applies to normalized fragments, including split
-  remainders. The chunker name, version, and limits determine `chunkerConfigHash`.
+  is recounted and checked against `indexing.chunk_max_tokens` (shipped value:
+  512) before persistence. The `indexing.min_search_unit_chars` minimum (shipped
+  value: 400) applies to normalized fragments, including split remainders. The
+  chunker name, version, and limits determine `chunkerConfigHash`.
 
   Section windows retain the existing passage vectors and add heading-prefixed
-  canonical text, capped at 2,048 tokens measured with the local ColBERT
-  tokenizer. Unsectioned text uses explicit document-scoped windows. The
+  canonical text, capped at `indexing.section_max_tokens` (shipped value: 2,048)
+  measured with the local ColBERT tokenizer. Unsectioned text uses explicit
+  document-scoped windows. The
   self-contained artifact records exact text fragments, canonical membership,
   model/tokenizer identity, window-policy hash, and vectors. Its `dense_vector`
   envelope uses `index_name = section_dense_v1`; the passage envelope retains
@@ -788,7 +800,7 @@ Missing persisted passage/section representations still require an explicit rebu
 open read-only transaction → capture scoped active parses → cutover-barrier probe
        ↓
 source dense: passages + sections + source windows ┐
-lexical chunks ───────────────────────────────────┼→ grouped RRF (100 targets)
+lexical chunks ───────────────────────────────────┼→ grouped RRF (`colbert_candidate_pool_size` targets)
 graph + semantic annotation matches ──────────────┘
        ↓
 ColBERT MaxSim (persisted unit, annotation, and source-window matrices)

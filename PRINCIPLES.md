@@ -192,10 +192,12 @@ Async boundaries must be intentional.
 - Narrowed external-response structs must preserve the protocol contract,
   including unknown fields when required for round-trip correctness. Logging
   or archiving the original payload does not compensate for a broken contract.
-- Events streamed to clients must remain stable, explicit, and easy to audit.
-  Adding or changing event fields is a cross-boundary change.
-- Streamed events must make terminal state explicit: every stream ends in a
-  clear terminal success or error event.
+- Client-observable Operation records and durable `system_events` rows must
+  remain stable, explicit, and easy to audit. Adding or changing their fields
+  is a cross-boundary change.
+- Every Operation must reach an explicit terminal status, `succeeded` or
+  `failed`, including on panic. Asynchronous work never ends in an ambiguous
+  or stuck state.
 
 ## Structural Fixes
 
@@ -217,7 +219,7 @@ Async boundaries must be intentional.
 - The absence of automated tests does not weaken correctness requirements.
   Verification still includes formatting, compilation, linting, strict
   configuration validation, startup and runtime guard checks, query limits,
-  timeout behavior, terminal stream events, and clear diagnostics.
+  timeout behavior, terminal Operation status, and clear diagnostics.
 - Pure logic should still be written so it can be checked or tested later
   without starting the HTTP server, Tokio runtime, or network dependencies.
 - Do not add test modules, test functions, test fixture files, or integration
