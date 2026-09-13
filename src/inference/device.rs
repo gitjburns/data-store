@@ -8,6 +8,7 @@ use candle_core::Error as CandleError;
 use crate::{
     config::{InferenceConfig, InferenceDeviceKind},
     error::ApiError,
+    limits::DiagnosticLimits,
 };
 
 #[derive(Debug, Clone)]
@@ -28,17 +29,26 @@ impl SelectedDevice {
 }
 
 /// Create the configured Candle device, failing clearly when the backend is unavailable.
-pub fn initialize_device(config: &InferenceConfig) -> Result<SelectedDevice, ApiError> {
+/// Initialization failures use the caller's diagnostic bounds before a runtime exists.
+pub fn initialize_device(
+    config: &InferenceConfig,
+    diagnostics: &DiagnosticLimits,
+) -> Result<SelectedDevice, ApiError> {
     match config.device {
-        InferenceDeviceKind::Cuda => initialize_cuda(config.device_index),
-        InferenceDeviceKind::Metal => initialize_metal(config.device_index),
+        InferenceDeviceKind::Cuda => initialize_cuda(config.device_index, diagnostics),
+        InferenceDeviceKind::Metal => initialize_metal(config.device_index, diagnostics),
     }
 }
 
 /// Initialize a CUDA device when the binary was compiled with CUDA support.
 #[cfg(feature = "cuda")]
-fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
-    let candle = create_candle_device(format!("CUDA device {index}"), || Device::new_cuda(index))?;
+fn initialize_cuda(
+    index: usize,
+    diagnostics: &DiagnosticLimits,
+) -> Result<SelectedDevice, ApiError> {
+    let candle = create_candle_device(format!("CUDA device {index}"), diagnostics, || {
+        Device::new_cuda(index)
+    })?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Cuda,
@@ -49,7 +59,10 @@ fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
 
 /// Report an explicit build-feature error for CUDA when support is not compiled in.
 #[cfg(not(feature = "cuda"))]
-fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
+fn initialize_cuda(
+    index: usize,
+    _diagnostics: &DiagnosticLimits,
+) -> Result<SelectedDevice, ApiError> {
     Err(ApiError::InferenceInit {
         message: format!(
             "config requested cuda:{index}, but this binary was not built with --features cuda"
@@ -59,9 +72,13 @@ fn initialize_cuda(index: usize) -> Result<SelectedDevice, ApiError> {
 
 /// Initialize a Metal device when the binary was compiled with Metal support.
 #[cfg(feature = "metal")]
-fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
-    let candle =
-        create_candle_device(format!("Metal device {index}"), || Device::new_metal(index))?;
+fn initialize_metal(
+    index: usize,
+    diagnostics: &DiagnosticLimits,
+) -> Result<SelectedDevice, ApiError> {
+    let candle = create_candle_device(format!("Metal device {index}"), diagnostics, || {
+        Device::new_metal(index)
+    })?;
 
     Ok(SelectedDevice {
         kind: InferenceDeviceKind::Metal,
@@ -72,7 +89,10 @@ fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
 
 /// Report an explicit build-feature error for Metal when support is not compiled in.
 #[cfg(not(feature = "metal"))]
-fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
+fn initialize_metal(
+    index: usize,
+    _diagnostics: &DiagnosticLimits,
+) -> Result<SelectedDevice, ApiError> {
     Err(ApiError::InferenceInit {
         message: format!(
             "config requested metal:{index}, but this binary was not built with --features metal"
@@ -82,7 +102,11 @@ fn initialize_metal(index: usize) -> Result<SelectedDevice, ApiError> {
 
 /// Create a Candle accelerator device and convert backend panics into readiness diagnostics.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn create_candle_device<F>(label: String, create: F) -> Result<Device, ApiError>
+fn create_candle_device<F>(
+    label: String,
+    diagnostics: &DiagnosticLimits,
+    create: F,
+) -> Result<Device, ApiError>
 where
     F: FnOnce() -> Result<Device, CandleError>,
 {
@@ -94,7 +118,7 @@ where
         Err(payload) => Err(ApiError::InferenceInit {
             message: format!(
                 "failed to initialize {label}: Candle backend panicked: {}",
-                crate::util::panic_payload_message(payload.as_ref())
+                crate::util::panic_payload_message(payload.as_ref(), diagnostics)
             ),
         }),
     }

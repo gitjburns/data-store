@@ -60,7 +60,7 @@ impl InferenceRuntime {
         // accelerator APIs, including on builds with no accelerator features.
         let model_path = config.models.colbert.local_path()?;
         progress("device_initializing")?;
-        let device = device::initialize_device(&config.inference)?;
+        let device = device::initialize_device(&config.inference, &config.diagnostics)?;
         progress(&format!("device_ready details=\"{}\"", device.label()))?;
         progress("colbert_artifacts_validating")?;
         let artifacts = artifacts::ModelArtifacts::load("colbert", model_path)?;
@@ -88,7 +88,7 @@ impl InferenceRuntime {
         progress: InferenceProgress<'_>,
     ) -> Result<DenseEmbeddingRuntime, ApiError> {
         progress("device_initializing")?;
-        let device = device::initialize_device(&config.inference)?;
+        let device = device::initialize_device(&config.inference, &config.diagnostics)?;
         progress(&format!("device_ready details=\"{}\"", device.label()))?;
         progress("dense_artifacts_validating")?;
         // Cross-dtype validation is a LOCAL-backend-only diagnostic (it loads
@@ -122,7 +122,7 @@ impl InferenceRuntime {
             || config.models.reranker.backend == RerankerBackendKind::Local;
         let device = if needs_accelerator {
             progress("device_initializing")?;
-            let device = device::initialize_device(&config.inference)?;
+            let device = device::initialize_device(&config.inference, &config.diagnostics)?;
             progress(&format!("device_ready details=\"{}\"", device.label()))?;
             Some(device)
         } else {
