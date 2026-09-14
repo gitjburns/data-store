@@ -138,40 +138,46 @@ re-deriving them; anything else is read at phase time.
 
 ## 4. Orchestration model
 
-- **The orchestrator edits nothing and reads no source.** It writes briefs,
-  launches agents, relays reports, obtains approvals, and tracks phase state.
-  One exception: subagents may not delete files, so the orchestrator deletes
-  the nine PDF-only files of Section 3 itself as Phase 1 step zero, under the
-  user's explicit instruction, before the Phase 1 agent launches.
-- **Implementation agents are forks** (`subagent_type: "fork"`), so they
-  inherit the onboarding, the spec, and this plan. One agent per phase unless
-  a phase says otherwise. An agent runs `cargo fmt`, `cargo check`, and
-  `cargo clippy` before reporting.
-- **Verification agents are fresh `general-purpose` agents.** They receive
-  the phase brief, the spec, this plan, and the implementation agent's
-  report, and read the files those name. They check scope completeness
-  against the phase brief, PRINCIPLES.md and AGENTS.md comment and
-  error-handling rules, and consistency with neighbouring code. They run no
-  git and edit nothing. The orchestrator checks scope containment by holding
-  the report's files-changed list against the brief's file list.
-- **Gates.** A phase starts when the user approves its brief. Approval
-  authorizes writes to the files the brief names and the Cargo checks. An
-  agent that needs anything else stops and reports; the orchestrator brings
-  the item to the user and resumes the same agent by message. Config edits
-  beyond `config.example.toml`, new dependencies beyond Section 2, and any
-  behavior the spec does not state are always escalations.
+- **One Workflow script covers Phases 1 through 6.** The orchestrator
+  authors it, the user approves it once, and the orchestrator launches it.
+  Phase 7 runs outside the workflow under per-command approval. The
+  orchestrator edits no source and reads no source. One exception: subagents
+  may not delete files, so the orchestrator deletes the nine PDF-only files
+  of Section 3 itself, under the user's explicit instruction, before the
+  workflow launches.
+- **Agents start fresh.** Every agent prompt carries the reading list
+  AGENTS.md, PRINCIPLES.md, DIAGNOSTICS.md, SPEC-epub.md, PLAN-epub.md, and
+  its phase brief, citing governing sections. Implementation agents run
+  `cargo fmt`, `cargo check`, and `cargo clippy` before reporting. Agents run
+  no other project code and no git.
+- **Each phase ends with verification inside the workflow.** Independent
+  verification agents check scope completeness against the brief,
+  PRINCIPLES.md and AGENTS.md comment and error-handling rules, and
+  consistency with neighbouring code. Findings are confirmed by independent
+  skeptics before a fix agent applies them within the brief's file list. The
+  loop repeats until a round is dry, bounded and logged. The script checks
+  each report's files-changed list against the brief's file list.
+- **Stops.** The workflow returns when an agent reports an escalation or a
+  scope violation. The orchestrator brings the item to the user and resumes
+  the same run from the point of stop. Config edits beyond
+  `config.example.toml`, new dependencies beyond Section 2, and any behavior
+  the spec does not state are always escalations.
+- **Mechanical compile fixes outside the file list are allowed.** An agent
+  may edit an unlisted file when the compiler requires it and the fix changes
+  no behavior beyond the approved intent. Each such file is listed under
+  files changed with the reason, and the phase's verifiers check that no
+  behavior changed. Any other edit to an unlisted file is a scope violation.
 - **Report shape**, mandatory for every agent: files changed with one line
   each; Cargo results (verbatim output on any failure or warning); residual
   risk; open escalations. Nothing else.
-- **Agents run no project code.** `cargo` commands only. The acceptance CLI
-  verbs are run by the orchestrator under per-command approval.
 - **Sequencing.** Phases 1 through 3 are sequential. Phase 4 runs in the
-  waves of Section 6.4 and may overlap with Phases 5 and 6. Integration and
-  acceptance are last.
+  waves of Section 6.4. Phase 5 runs after Phase 4 wave D. Phase 6 runs
+  concurrently with Phase 4. Phase 7 is last, outside the workflow.
 
 ## 5. Brief template
 
-Each brief contains: phase name; spec sections that govern it; the file list
+Each brief is an agent prompt in the workflow script and contains: phase
+name; spec sections that govern it; the file list
 from Section 6; the steps; the verification commands; the report shape; and
 the escalation rule. Briefs restate nothing from the spec or this plan; they
 cite section numbers.
@@ -185,7 +191,8 @@ Files deleted: the nine PDF-only files in Section 3. Files edited:
 `src/dry_run.rs`, `src/source.rs`, `src/acquisition.rs`, `src/config.rs`,
 `src/parsing_limits.rs`, `src/limits.rs`, `src/identity.rs`, `src/error.rs`,
 `src/restore.rs` (doc comment only), `src/monitoring_storage.rs`,
-`src/parse/cleanup.rs`, `config.example.toml`.
+`src/parse/cleanup.rs`, `src/parse/bundle.rs` (step 6 only),
+`config.example.toml`.
 
 Steps:
 0. Orchestrator, before the agent launches: delete the nine files (Section
@@ -304,7 +311,7 @@ the existing reader caps; the importer recomputes each file's SHA-256 and
 fails the parse as a contract violation on mismatch; stores each via
 `ArtifactStore::put_bytes`; inserts each into the canonical bundle manifest
 with `artifact_type = "image"` keyed `artifacts/<hash>`. Bodies are not
-rewritten. May run concurrently with Phase 4.
+rewritten. Runs after Phase 4 wave D.
 
 ### 6.6 Phase 6 — Documentation (spec 13.6)
 
