@@ -900,9 +900,10 @@ dispatch in `main.rs`, `PdfParser` and its threading through
 `ParsePrefixContext` and `DryRunInputs`, `ParseRoute::Pdf`, `MIME_TYPE_PDF`,
 `resolve_source_reference`, the `mupdf` and `fancy-regex` dependencies, the
 PDF arm of `src/parse/cleanup.rs` and its regex repair passes, the
-`PdfConfig`/`DoclingConfig` types and validation, and the `[parsing]` process
-and sampling keys. Startup, health, identity capture, and monitoring lose
-their PDF-engine fields.
+`PdfConfig`/`DoclingConfig` types and validation,
+`src/bin/pdf-extract-diagnostic.rs`, and the `[parsing]` process and sampling
+keys. Startup, health, identity capture, and monitoring lose their PDF-engine
+fields.
 
 ### 13.2 Model revision
 
