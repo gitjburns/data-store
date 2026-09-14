@@ -599,10 +599,13 @@ A page marker is any of, in precedence order within one document:
 A `page-list` navigation supplies labels by target id and overrides labels
 derived above. Each marker becomes a `page` unit with `ordinal` in reading
 order across the parse and `label` when known; unlabeled markers get warning
-`epub_page_marker_unlabeled` aggregated per document. Every unit whose start
-lies at or after marker k and before marker k+1 gets `appears_on` to page k;
-a unit spanning a marker gets edges to both pages. Documents with no markers
-produce no pages and no edges.
+`epub_page_marker_unlabeled` aggregated per document. Only leaf units carry
+page membership: every `text_block`, `caption`, `table_cell`, `code_block`,
+and `figure` unit gets `appears_on` to each page whose range its extent
+intersects, so a leaf spanning a marker gets one edge per page. `document`,
+`page`, and the container types get no `appears_on`; a container's pages are
+derivable through `contains`. Documents with no markers produce no pages and
+no edges.
 
 ### 7.7 Container mapping
 
@@ -911,14 +914,18 @@ Update `src/model/unit.rs`, `body.rs`, `locator.rs`, `relationship.rs`,
 `parse.rs` (metrics) to Section 2. Every exhaustive match over `ContentType`,
 `TextBlockRole`, `Locator`, and `UnitRelationshipType` updates with it:
 `assembly::evidence::evidence_text`, `projections::chunk::extract_targeting_text`
-(which now chunks `code` for `code_block`, aligning it with the other three
+(which now chunks `code` for `code_block`, aligning it with the other four
 readers), `projections::multivector::evidence_text`,
-`annotations::producer::evidence_text`,
+`annotations::producer::evidence_text`, `projections::view` text extraction,
 `query::passages` role checks (prose is `paragraph`, `quote`, `definition`,
 `unknown`; no furniture), `sections.rs` (walk `contains` only), the importer's
 text projection, `conformance.rs` (Section 2.6), and the web and CLI unit
 renderers. No schema `CHECK` constrains `content_type` or
 `relationship_type`, so no setup script is needed.
+
+The closed sets `SectionKind`, `TextBlockRole`, `ListKind`, `AsideKind`, and
+`TableRowRole` are enums with wire names in `src/model/body.rs`, defined once
+there; the EPUB worker imports them and declares no parallel copies.
 
 `query::passages::SearchResult` loses `pageNumbers`; PROTOCOL.md, the CLI
 result renderer, and the web console drop the field with no replacement.

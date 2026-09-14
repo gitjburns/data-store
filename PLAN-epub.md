@@ -26,7 +26,9 @@ delegates every edit, check, and review to subagents.
 - **Cargo.toml.** Editing it directly is approved within the owning phase:
   Phase 1 removes `mupdf` and `fancy-regex`; Phase 4 adds `zip` (default
   features off, `deflate` only), `roxmltree`, and `regex`. No other
-  dependency change.
+  dependency change. The first `cargo check` after each of these edits
+  rewrites `Cargo.lock`; that is the accepted consequence of the approved
+  edit, not a dependency-management command.
 - **Out of scope, listed in the completion report as candidates for the
   ingestion pipeline refactor:** a config-backed EPUB worker timeout; the
   activation dominance gate in `src/activation.rs` (untouched); stale PDF
@@ -138,15 +140,20 @@ re-deriving them; anything else is read at phase time.
 
 - **The orchestrator edits nothing and reads no source.** It writes briefs,
   launches agents, relays reports, obtains approvals, and tracks phase state.
+  One exception: subagents may not delete files, so the orchestrator deletes
+  the nine PDF-only files of Section 3 itself as Phase 1 step zero, under the
+  user's explicit instruction, before the Phase 1 agent launches.
 - **Implementation agents are forks** (`subagent_type: "fork"`), so they
   inherit the onboarding, the spec, and this plan. One agent per phase unless
   a phase says otherwise. An agent runs `cargo fmt`, `cargo check`, and
   `cargo clippy` before reporting.
 - **Verification agents are fresh `general-purpose` agents.** They receive
-  the phase brief, the spec, this plan, and read the diff. They check scope
-  completeness against the phase brief, PRINCIPLES.md and AGENTS.md comment
-  and error-handling rules, consistency with neighbouring code, and that no
-  file outside the phase scope changed. They edit nothing.
+  the phase brief, the spec, this plan, and the implementation agent's
+  report, and read the files those name. They check scope completeness
+  against the phase brief, PRINCIPLES.md and AGENTS.md comment and
+  error-handling rules, and consistency with neighbouring code. They run no
+  git and edit nothing. The orchestrator checks scope containment by holding
+  the report's files-changed list against the brief's file list.
 - **Gates.** A phase starts when the user approves its brief. Approval
   authorizes writes to the files the brief names and the Cargo checks. An
   agent that needs anything else stops and reports; the orchestrator brings
@@ -181,8 +188,12 @@ Files deleted: the nine PDF-only files in Section 3. Files edited:
 `src/parse/cleanup.rs`, `config.example.toml`.
 
 Steps:
-1. Remove the nine files and their `mod` lines. Remove `mupdf` and
-   `fancy-regex` from `Cargo.toml`.
+0. Orchestrator, before the agent launches: delete the nine files (Section
+   4 exception). This must precede the agent's first Cargo check because
+   `src/bin/pdf-extract-diagnostic.rs` is auto-discovered and fails to build
+   once `mupdf` is gone.
+1. Remove the nine files' `mod` lines. Remove `mupdf` and `fancy-regex` from
+   `Cargo.toml`.
 2. `ParseRoute` becomes `{ PlainText }`. Remove `pdf` from
    `ParsePrefixContext` and the three threading signatures. Remove
    `MIME_TYPE_PDF` and the `.pdf` arm; the unparseable-MIME SQL and the
@@ -219,7 +230,10 @@ Steps:
 1. Rewrite the model files to spec Section 2 exactly: types, bodies with
    `deny_unknown_fields`, `TextBlockBody.role` required, the two-kind
    locator union, the six relationship types, `ParseMetrics` counts.
-   `wire_name` matches and `content_type_body_matches` gain the new types.
+   `SectionKind`, `TextBlockRole`, `ListKind`, `AsideKind`, and
+   `TableRowRole` are enums with wire names in `body.rs`, the single
+   definition Phase 4 imports. `wire_name` matches and
+   `content_type_body_matches` gain the new types.
 2. Follow compile errors through every match. The five text extractors
    select `text` for `text_block`, `caption`, `table_cell`, `code` for
    `code_block`, none otherwise, with no `normalizedText` fallback; the
@@ -307,7 +321,7 @@ and 3.
 User steps, in the project root:
 
 ```sh
-cp *.epub "$(rg -o 'corpus_root = "\K[^"]+' config.toml)"/
+cp *.epub "$(rg -P -o 'corpus_root = "\K[^"]+' config.toml)"/
 data-store-service --config config.toml --setup-storage   # fresh index_root
 # or: data-store --config config.toml --rebuild-all         # during startup delay
 # then start the server as usual
@@ -382,7 +396,7 @@ pub(crate) fn codepoint(name: &str) -> Option<u32>;   // XHTML 1.1 named entitie
 
 ```rust
 pub(crate) const KIND_PATTERNS_VERSION: &str = "1";
-pub(crate) enum SectionKind { /* spec 2.2 */ }  impl SectionKind { pub(crate) fn wire_name(self) -> &'static str }
+use crate::model::body::SectionKind;   // defined once in the model (Phase 2); no local copy
 pub(crate) fn kind_from_semantic(value: &str) -> Option<SectionKind>;   // epub:type, data-type, landmark, guide
 pub(crate) fn kind_from_text(text: &str) -> Option<SectionKind>;        // spec 7.2 rule 4
 pub(crate) fn split_label(heading: &str) -> (Option<String>, String);   // spec 7.3 label/headingText
@@ -487,9 +501,12 @@ pub(crate) fn resolve_all(links: &[LinkRecord], units: &UnitIndex, emitter: &mut
 **`blocks.rs`**
 
 ```rust
-pub(crate) struct BlockContext<'a> { pub document: &'a str, pub section_kind: SectionKind,
-    pub text: &'a TextContext<'a>, pub emitter: &'a mut Emitter<'a>, pub links: &'a mut Vec<LinkRecord>,
-    pub units: &'a mut UnitIndex, pub report: &'a mut StructureReport }
+// 'e is the borrow of the emitter and other mutable state; 'a is the emitter's own
+// lifetime and the borrowed document text. Keeping them distinct avoids the
+// `&'a mut Emitter<'a>` shape, which pins the emitter for its whole lifetime.
+pub(crate) struct BlockContext<'e, 'a> { pub document: &'a str, pub section_kind: SectionKind,
+    pub text: &'e TextContext<'a>, pub emitter: &'e mut Emitter<'a>, pub links: &'e mut Vec<LinkRecord>,
+    pub units: &'e mut UnitIndex, pub report: &'e mut StructureReport }
 pub(crate) fn page_marker(node: roxmltree::Node, labels: &BTreeMap<(String, Option<String>), String>,
     document: &str) -> Option<Option<String>>;                                    // spec 7.6 rules 1, 3, 4; Some(label)
 pub(crate) fn dp_page_marker(pi: roxmltree::Node) -> Option<Option<String>>;    // spec 7.6 rule 2
@@ -505,7 +522,7 @@ pub(crate) fn detect_caption(...) -> Option<CaptionCandidate>;                  
 pub(crate) fn pair_caption(ctx: &mut BlockContext, subject: &str, caption: CaptionCandidate, parent: &str) -> WorkerResult<()>;
 pub(crate) fn is_footnote_block(node: roxmltree::Node, section_kind: SectionKind) -> bool;   // spec 7.10
 pub(crate) fn footnote_label(text: &str) -> Option<String>;
-pub(crate) fn aside_kind(node: roxmltree::Node) -> Option<AsideKindWire>;
+pub(crate) fn aside_kind(node: roxmltree::Node) -> Option<crate::model::body::AsideKind>;   // model enum, not a local copy
 ```
 
 Exact argument shapes for `emit_text_block` and `detect_caption` are chosen
@@ -540,3 +557,15 @@ Then: data-store-service --config config.toml --setup-storage (fresh index_root)
 followed by: phases completed with verification results; Section 14 findings
 per sample; stale references left in `SPEC-projection-decouple.md`; the
 deferred items from Section 2.
+
+## 9. Status
+
+Updated in place at the end of each session.
+
+- Phase 1 — PDF decommissioning: not started.
+- Phase 2 — Content model v0.4: not started.
+- Phase 3 — `[epub]` configuration: not started.
+- Phase 4 — EPUB worker: not started.
+- Phase 5 — Importer image archival: not started.
+- Phase 6 — Documentation: not started.
+- Phase 7 — Acceptance: not started.
