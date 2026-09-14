@@ -23,15 +23,16 @@ form §N without a document name refer to the canonical spec.
   conformance dimensions, and importer archival of image artifacts.
 - Decommissioning of the Docling and MuPDF PDF workers and every setting,
   dependency, route, and code path that exists only for them.
-- The plain-text worker remains and is the ingestion path for every format
-  that is not EPUB; conversion into plain text is external to this service.
+- The plain-text worker remains. Only `text/plain` and EPUB are routed;
+  other formats are converted to plain text outside this service and are
+  otherwise counted as unparseable (Section 3.1).
 
 ### 1.2 Out of scope
 
 - DRM-protected archives. Encrypted members are a recorded parse failure.
 - Fixed-layout rendering semantics, media overlays, scripting, and multiple
-  renditions. Content is parsed as reflowable XHTML; only the first `rootfile`
-  is read.
+  renditions. Content is parsed as reflowable XHTML; only the first package
+  `rootfile` (Section 5.2) is read.
 - Right-to-left and vertical writing modes. Text is extracted; direction is
   not recorded.
 - Inline SVG content and MathML rendering beyond alternate text.
@@ -110,7 +111,7 @@ type TextSectionBody = {
   kind: SectionKind
   headingText?: string
   headingLevel: number     // depth in the section tree; children of document = 1
-  label?: string           // declared number or ordinal, e.g. "Chapter 1.", "3.2.1"
+  label?: string           // declared number as matched, e.g. "Chapter 1.", "3.2.1."
   sectionPath: string[]    // heading trail from level 1 to this section, inclusive
 }
 
@@ -223,7 +224,7 @@ type DomPathLocator = {
   document: string         // package-relative href of the content document
   path: string             // element path, Section 9.1
   elementId?: string       // the element's id attribute when present
-  nodeRange?: [number, number]  // child-node index range for a text run within the element
+  nodeRange?: [number, number]  // inclusive 0-based child-node index range within the element, counting every node kind
 }
 
 type CharRangeLocator = { kind: "char_range"; start: number; end: number }
@@ -274,8 +275,10 @@ Removed: `ocrRegionCount`.
 ### 2.6 Conformance dimensions
 
 Existing: `locator_coverage`, `relationship_coverage`,
-`caption_pairing_rate`, `table_decomposition_rate` (a table counts as
-decomposed when a `table_cell` is reachable through `contains`).
+`caption_pairing_rate` (redefined: fraction of `caption` units with at
+least one `caption_of` edge, since `captionForUnitIds` is removed),
+`table_decomposition_rate` (a table counts as decomposed when a
+`table_cell` is reachable through `contains`).
 
 Added, each present only when its subject population is non-empty:
 
@@ -371,10 +374,14 @@ as empty files for in-process workers.
 
 ### 5.1 Archive
 
-- Read with the `zip` crate, deflate only. Members are read into memory
-  through a reader capped at `max_member_bytes`; declared sizes are not
-  trusted. Running total is capped at `max_total_member_bytes`; member count at
-  `max_members`. Exceeding any cap is a recorded parse failure naming the cap.
+- Read with the `zip` crate. `stored` and `deflate` members are accepted
+  (the `mimetype` member is always `stored`); any other method is a recorded
+  parse failure. Members are read into memory through a reader capped at
+  `max_member_bytes`; declared sizes are not trusted. The total of distinct
+  members read, counted once per member even though the two-pass walk of
+  Section 11.2 reads content documents twice, is capped at
+  `max_total_member_bytes`; member count at `max_members`. Exceeding any cap
+  is a recorded parse failure naming the cap.
 - Nothing is extracted to disk. Member names are used only as lookup keys
   after normalization (Section 5.4).
 - Encrypted members, unsupported compression methods, and an archive that is
@@ -400,6 +407,8 @@ as empty files for in-process workers.
   empty values are omitted.
 - Manifest items are indexed by `id` with `href`, `media-type`, and
   `properties`. Hrefs resolve against the package document's directory.
+- The package `guide` element's `reference` entries (`type`, `href`), when
+  present, are retained as kind hints for Section 7.2 rule 3.
 - Spine `itemref` elements define reading order. An `idref` with no manifest
   item is a warning `epub_spine_item_missing` and is skipped. `linear="no"`
   items are emitted in place and recorded in the raw report. A spine with no
@@ -424,8 +433,8 @@ href) or `span` (label, no target) and its nested `ol`. For NCX, the
 `navMap > navPoint` tree with `navLabel/text` and `content/@src`. Labels are
 whitespace-normalized. Targets are split into document href and fragment.
 
-Landmarks: an EPUB 3 `nav` with `epub:type="landmarks"` and an NCX `guide`
-supply kind hints (Section 7.2). A `nav` with `epub:type="page-list"`
+Landmarks: an EPUB 3 `nav` with `epub:type="landmarks"` and the package
+document's `guide` element (Section 5.2) supply kind hints (Section 7.2). A `nav` with `epub:type="page-list"`
 supplies page labels (Section 7.6).
 
 ### 5.4 Href resolution
@@ -444,8 +453,10 @@ are external and never resolved.
   present. A member declaring any other encoding is accepted only when every
   byte is below 0x80 and is then decoded as ASCII; a byte at or above 0x80
   under such a declaration is a recorded parse failure naming the member and
-  the declared encoding.
-- Before parsing, a bounded pre-pass rewrites named character references from
+  the declared encoding. A member with no byte-order mark that declares no
+  encoding, UTF-8, or UTF-16, and whose bytes are not valid UTF-8, is a
+  recorded parse failure naming the member.
+- Before parsing, one linear pre-pass rewrites named character references from
   the XHTML 1.1 entity set to numeric references. The table lives in its own
   source file and is versioned by `entityTableVersion`. References not in the
   table and not one of the five XML entities are left for the parser, which
@@ -475,27 +486,44 @@ Kind is determined by the first rule that matches, in this order:
    kind table.
 2. HTMLBook `data-type` on the same elements, mapped by the kind table.
 3. A landmarks or guide entry whose target resolves to the section's target.
-4. The navigation label or heading text matched against the kind pattern
-   table: leading words such as `chapter`, `part`, `book`, `volume`,
+4. The navigation label, then the heading text, matched against the kind
+   pattern table: exactly these leading words, `chapter`, `part`, `book`, `volume`,
    `appendix`, `preface`, `foreword`, `introduction`, `prologue`, `epilogue`,
    `afterword`, `conclusion`, `glossary`, `bibliography`, `index`, `notes`,
    `endnotes`, `acknowledgments`, `dedication`, `contents`, `copyright`,
    `colophon`, `cover`, `title page`, case-insensitive, with punctuation and
-   roman or arabic numerals ignored.
-5. `unknown`.
+   roman or arabic numerals ignored. Words map to the kind of the same name
+   except: `book` and `volume` map to `part`; `endnotes` maps to `notes`;
+   `contents` maps to `toc`; `copyright` maps to `copyright_page`;
+   `title page` maps to `titlepage`.
+5. `section` for a section opened by a heading (7.4 rule 5); else `unknown`.
+
+The kind table, applied by rules 1 to 3 to `epub:type`, `data-type`,
+landmark, and guide values (a space-separated value matches on any token):
+`cover`, `titlepage`, `toc`, `preface`, `foreword`, `introduction`,
+`prologue`, `epilogue`, `afterword`, `conclusion`, `part`, `chapter`,
+`appendix`, `glossary`, `bibliography`, `index`, `acknowledgments`,
+`dedication`, `epigraph`, `colophon` map to the kind of the same name;
+`halftitlepage` and `title-page` to `titlepage`; `copyright-page` to
+`copyright_page`; `volume` to `part`; `subchapter`, `division`, and HTMLBook
+`sect1` through `sect5` to `section`; `endnotes`, `footnotes`, `rearnotes`,
+and `notes` to `notes`; `text` (a guide type) to `chapter`. Any other value,
+including `bodymatter`, `frontmatter`, `backmatter`, and `book`, does not
+match, and the next rule applies.
 
 Rule 4 exists for the EPUB 2 samples, none of which carries semantic types.
 The kind and pattern tables live in their own source file, versioned by
-`kindPatternsVersion`. A section created from a heading with no other signal
-is `section`.
+`kindPatternsVersion`.
 
 ### 7.3 Section labels and headings
 
 - HTMLBook marks the number in `span.label` inside the heading; the span text
   becomes `label`, the remainder `headingText` (AI Engineering, DDIA).
-- Otherwise a leading token matching `<kindword> <numeral>[.:-]` or a bare
-  `<numeral>.<numeral>...` prefix becomes `label` and the rest `headingText`
-  (TCP/IP `3.2.1. The IEEE 802 ...`, Civilization `CHAPTER IX`).
+- Otherwise a leading token matching `<kindword> <numeral>[.:-]?` or a bare
+  `<numeral>.<numeral>...` prefix, including its trailing punctuation,
+  becomes `label` and the rest `headingText` (TCP/IP `3.2.1. The IEEE 802
+  ...`, Civilization `CHAPTER IX`). The same split applies when a navigation
+  label supplies `headingText`.
 - A heading whose text contains a line break (`<br/>`) is split at the first
   break: first line is `label` when it matches a kind word, else the whole
   text is `headingText` (Civilization `CHAPTER IX<br/>Babylonia`).
@@ -511,10 +539,12 @@ authoritative for content order. Construction:
 1. Every navigation node becomes a `text_section`. Its target is a document
    href plus optional fragment. Nodes nest as in the navigation tree.
 2. Content documents are walked in spine order, block by block (Section 7.5).
-   The current section is the deepest navigation section whose target has
-   been passed in reading order, across document boundaries. A target is
-   passed when the walk reaches the element carrying the fragment id, or any
-   element for a fragment-less target at the start of its document.
+   The current section is the navigation section whose target was most
+   recently passed in reading order, across document boundaries. A target is
+   passed at the start of the first block that is, or contains, the element
+   carrying the fragment id, including blocks that are dropped as
+   whitespace-only, or at the start of the document for a fragment-less
+   target.
 3. A navigation section is emitted at the position where its target is
    passed. Its `headingText` is the text of the target element when that
    element is a heading (Section 7.5 heading rule), else of the first heading
@@ -525,7 +555,10 @@ authoritative for content order. Construction:
 4. A navigation node whose target does not resolve is emitted immediately
    after its previous sibling, or at its parent's position when first, with
    `headingText` from the label and warning `epub_nav_target_unresolved`.
-5. A heading element that is not a navigation target and is not inside an
+   A node that declares no target (an EPUB 3 `span` entry) is emitted at
+   the same position with `headingText` from the label and no warning.
+5. A heading element that is not a navigation target, was not consumed as a
+   section's `headingText` by rule 3 or rule 6, and is not inside an
    aside, figure, table, list, or blockquote opens a subsection under the
    current section. Subsections derived from headings nest among themselves
    by `h` number: a heading of number N closes open heading-derived
@@ -555,15 +588,18 @@ children in document order, treating each as one of:
   wholesale; its content is the section tree.
 - **Page marker** (Section 7.6).
 - **Heading**: `h1`–`h6`, and any element with `epub:type="title"` when no
-  `h` element is present in its container. A heading inside an aside, figure,
-  table, list item, or blockquote is that container's title or caption, not a
+  `h` element is present in its container; such a pseudo-heading supplies
+  `headingText` but has no `h` number and never opens a subsection under 7.4
+  rule 5. A heading inside an aside or figure is that container's title or
+  caption; a heading inside a table cell, list item, or blockquote is an
+  ordinary text-bearing block with that container's role; neither is a
   section heading. A heading outside those containers is emitted as a
   `text_block` with role `heading` contained by the section it opens or
   belongs to, so heading text is retrievable evidence, and also populates that
   section's `headingText`.
 - **Container**: `section`, `article`, `div`, `aside`, `blockquote`,
   `figure`, `table`, `ul`, `ol`, `dl`, `li`, `dt`, `dd`, `pre`, `math`,
-  `header`, `footer`, `main`, `details`, `summary`, `center`. Mapping is in
+  `svg`, `header`, `footer`, `main`, `details`, `summary`, `center`. Mapping is in
   Section 7.7. Unlisted block-level elements are walked as generic
   containers and counted under `epub_unknown_element` per local name.
 - **Text-bearing block**: an element whose children are text nodes and
@@ -574,56 +610,84 @@ children in document order, treating each as one of:
   children becomes one `text_block`; block children are handled in place.
   The Strange Loop sample nests a list-like `div` inside a paragraph `div`.
 - **Whitespace-only block**: dropped and counted under
-  `epub_empty_blocks_dropped`. The Elements sample and the Calibre samples
-  emit these as spacers.
+  `epub_empty_blocks_dropped`, unless it contains an `img` or `svg`, in
+  which case only the figures are emitted (Section 7.9). The Elements sample
+  and the Calibre samples emit these as spacers.
+
+Categories are tested in the order listed. An element in the Container list
+always maps by Section 7.7, even when its children are only text and inline
+elements; a mapped container whose children are only text and inline elements
+holds one `text_block` made from that run (an `li` with bare text is a
+`list_item` containing one `text_block`). A generic container (`section`,
+`article`, `div`, `header`, `footer`, `main`, `center`, `details`, `summary`,
+or an unlisted block element) whose children are only text and inline
+elements is itself the text-bearing block. Page markers (Section 7.6) are
+detected on every descendant element and processing instruction, including
+those inside text-bearing blocks.
 
 Inline elements: `a`, `abbr`, `b`, `bdi`, `bdo`, `br`, `cite`, `code`,
 `data`, `dfn`, `em`, `i`, `img`, `kbd`, `mark`, `q`, `s`, `samp`, `small`,
 `span`, `strong`, `sub`, `sup`, `time`, `tt`, `u`, `var`, `wbr`, and `math`
-when it has a block ancestor with text. Retailer wrappers such as
-`span.koboSpan` are inline and transparent.
+when its parent element contains non-whitespace text outside the `math`.
+Retailer wrappers such as `span.koboSpan` are inline and transparent.
 
 ### 7.6 Page markers
 
-A page marker is any of, in precedence order within one document:
+A page marker is any of. All four rules apply throughout every document;
+precedence is per element, so an element matching more than one rule takes
+the label of the lowest-numbered rule:
 
 1. An element with `epub:type="pagebreak"` or `role="doc-pagebreak"`; label
    from `title`, then `aria-label`, then text content.
 2. A `<?dp n="…" folio="…"?>` processing instruction; label from `folio`
    (Strange Loop).
 3. An empty `a` or `span` whose `id` matches `^(page|pg|p)[_-]?([0-9]+|[ivxlcdm]+)$`
-   case-insensitive; label from the captured group (Civilization).
+   case-insensitive; label from the second capture group (Civilization).
 4. A block element whose `id` matches the same pattern; the marker is at the
    block's start and the block is still emitted (Elements).
 
 A `page-list` navigation supplies labels by target id and overrides labels
 derived above. Each marker becomes a `page` unit with `ordinal` in reading
-order across the parse and `label` when known; unlabeled markers get warning
+order across the parse and `label` when known, contained by the section
+current at the marker, or by `document` when no section is current;
+unlabeled markers get warning
 `epub_page_marker_unlabeled` aggregated per document. Only leaf units carry
 page membership: every `text_block`, `caption`, `table_cell`, `code_block`,
 and `figure` unit gets `appears_on` to each page whose range its extent
-intersects, so a leaf spanning a marker gets one edge per page. `document`,
-`page`, and the container types get no `appears_on`; a container's pages are
-derivable through `contains`. Documents with no markers produce no pages and
-no edges.
+intersects, so a leaf spanning a marker gets one edge per page. A marker
+inside a text-bearing block splits that block's extent at the marker's
+position for `appears_on` only; the block remains one unit. Page ranges span
+document boundaries: a leaf in a document with no markers lies on the last
+marker passed in any earlier document; a leaf before the first marker of the
+parse gets no `appears_on`. `document`, `page`, and the container
+types get no `appears_on`; a container's pages are derivable through
+`contains`. A parse with no markers produces no pages and no edges.
 
 ### 7.7 Container mapping
 
 | Source | Unit | Rules |
 | --- | --- | --- |
-| `section`, `article`, `div`, `header`, `footer`, `main`, `center` without an aside kind | none | Walked; contributes `data-type`/`epub:type` to section kind and closes heading subsections (7.4 rule 5). |
-| `aside`, or `div`/`section`/`blockquote` whose `epub:type` or `data-type` is `note`, `tip`, `warning`, `caution`, `important`, `sidebar`, `epigraph`, or `example` | `aside` | `kind` from the type; `title` from the first heading inside, which is also emitted as a `text_block` role `heading` contained by the aside. An `aside` with no recognized type is kind `unknown`. HTMLBook `example` contains a `pre`: the heading becomes a `caption` paired to the `code_block` (7.9), and the `code_block` takes `label`/`title` from it. |
-| `blockquote` without an aside kind | none | Walked; its text-bearing blocks get role `quote`; a descendant with `epub:type="attribution"`, `data-type="attribution"`, or a `cite` block gets role `attribution`. Calibre uses `blockquote` for indentation (TCP/IP); this is emitted faithfully as `quote` and recorded as a deviation (Section 12). |
+| `section`, `article`, `div`, `header`, `footer`, `main`, `center` without an aside kind | none | Walked; contributes `data-type`/`epub:type` to section kind. Only `section` closes heading subsections (7.4 rule 5). |
+| `aside`, or `div`/`section`/`blockquote` whose `epub:type` or `data-type` is `note`, `tip`, `warning`, `caution`, `important`, `sidebar`, `epigraph`, or `example` | `aside` | `kind` from the type; `title` from the first heading inside, which is also emitted as a `text_block` role `heading` contained by the aside. An `aside` with no recognized type is kind `unknown`. HTMLBook `example` contains a `pre`: the aside still takes `title` from the heading, but the heading is emitted as a `caption` paired to the first `code_block` in the aside (7.9 rule 4) instead of as a heading `text_block`, and the `code_block` takes `label`/`title` from it. Text-bearing blocks inside an aside are role `paragraph`, except that an aside made from `blockquote` keeps the `quote`/`attribution` roles of the `blockquote` row. |
+| `blockquote` without an aside kind | none | Walked; its text-bearing blocks get role `quote`; a descendant with `epub:type="attribution"`, `data-type="attribution"`, or a text-bearing block whose only element child is `cite`, gets role `attribution`. Calibre uses `blockquote` for indentation (TCP/IP); this is emitted faithfully as `quote` and recorded as a deviation (Section 12). |
 | `ul`, `ol` | `list` | `kind` `unordered`/`ordered`; `start` from the attribute. Each `li` becomes a `list_item` with `ordinal`; the item's text-bearing blocks are `text_block` role `paragraph` contained by the item; nested lists are contained by the item. |
 | `dl` | `list` | `kind` `definition`. Each `dt` and its following `dd` elements up to the next `dt` form one `list_item`; the `dt` text is a `text_block` role `term`, each `dd` text-bearing block role `definition`. |
 | `table` | `table`, `table_row`, `table_cell` | Section 7.8. |
 | `figure`, `img` | `figure` | Section 7.9. |
-| `pre` | `code_block` | `code` is the verbatim text with CRLF normalized to LF and one leading newline stripped; `language` from `data-code-language`, then a `class` token of the form `language-X`, `lang-X`, or `X` when the `pre` or its first `code` child carries `data-type="programlisting"`; else absent. |
-| monospace block | `code_block` | A text-bearing block, outside `pre`, whose every text character is inside `tt`, `code`, `kbd`, or `samp` descendants and whose extracted text contains at least one line break. Language absent. Counted under `epub_code_heuristic`. Exists for TCP/IP listings. |
+| `pre` | `code_block` | `code` is the verbatim text with CRLF normalized to LF and one leading newline stripped; `language` from `data-code-language`; else from a `class` token `language-X` or `lang-X` on the `pre` or its first `code` child; else from a bare `class` token `X` only when the `pre` or its first `code` child carries `data-type="programlisting"`; else absent. |
+| monospace block | `code_block` | A text-bearing block, outside `pre`, whose every non-whitespace text character is inside `tt`, `code`, `kbd`, or `samp` descendants and whose extracted text contains at least one line break. `code` is the Section 8 step 1 to 3 text with each line trimmed and interior space runs kept. Language absent. Counted under `epub_code_heuristic`. Takes precedence over the `blockquote` `quote` role. Exists for TCP/IP listings. |
 | block `math` | `text_block` role `formula` | Text from `alttext`, else the text content of an `annotation` child, else the flattened text. |
 | inline `math` | none | Its `alttext` or flattened text is inlined into the enclosing block's text. |
 | `svg` | `figure` | No bytes archived; `altText` from `title` or `desc`; warning `epub_svg_inline`. |
 | `hr`, `wbr` | none | Ignored. |
+
+Role precedence when several rules apply to one text-bearing block: code
+heuristic (becomes `code_block`), then `footnote`, `title`/`subtitle`,
+`attribution`, `quote`, `term`/`definition`, `paragraph`. Heading elements
+are always `heading` except where 7.5 makes them a container's title or
+caption. An `aside`, `div`, or `section` whose `epub:type` is `footnote`,
+`endnote`, or `rearnote` emits no `aside` unit; its blocks are footnote
+blocks under the enclosing parent.
 
 ### 7.8 Tables
 
@@ -634,25 +698,32 @@ no edges.
 - Cells occupy a grid honoring `rowspan` and `colspan`; `rowIndex` and
   `columnIndex` are grid positions; `rowCount` and `columnCount` are the
   grid's extent. Spans are declared only when greater than one.
-- `th` cells, and every cell in a `thead` row, are listed in `headers`.
+- `th` cells, and every cell in a `thead` row, are listed in `headers`; an
+  empty one has `text` `""`.
 - Cell `text` is the extracted text of the cell's content; block children
-  inside a cell are flattened into one text separated by newlines. Footnote
-  rows (AI Engineering `tr.footnotes`) are ordinary rows.
+  inside a cell are flattened into one text separated by newlines. A cell
+  with no text is emitted with `text` absent. Figures, lists, and code inside
+  a cell produce no units of their own and `img` alt text is not included
+  (recorded deviation, Section 12). Footnote rows (AI Engineering
+  `tr.footnotes`) are ordinary rows.
 - Containment: table `contains` each row; row `contains` each cell. Every
   cell carries a locator.
 
 ### 7.9 Figures and captions
 
 Figure detection: a `figure` element, or an `img` not inside a `figure`. A
-`figure` with several `img` children yields one figure per image, all sharing
-the caption. An `img` inside a text-bearing block yields a `figure` emitted
-immediately after that block, contained by the same parent; its `alt` is not
-inlined into the block text.
+`figure` with several `img` children yields one figure per image, each with
+its locator on its `img`, all sharing the caption. An `img` inside a
+text-bearing block yields a `figure` emitted immediately after that block,
+contained by the same parent; its `alt` is not inlined into the block text.
+Text-bearing blocks inside a `figure` element that are not its caption are
+contained by the figure's parent, after the figures.
 
-Image archival: the `src` resolves to a manifest member; its bytes are hashed
-and, when at most `max_image_bytes`, written to `artifacts/<sha256>`;
-`imageHash`, `imageMediaType` (from the manifest), and `imageSizeBytes` are
-set. Oversized images set no hash and record `epub_image_too_large`; missing
+Image archival: the `src` resolves to an archive member (Section 5.4); its
+bytes are hashed and, when at most `max_image_bytes`, written to
+`artifacts/<sha256>`; `imageHash` and `imageSizeBytes` are set, and
+`imageMediaType` is set from the manifest item for that member when one
+exists. Oversized images set no hash and record `epub_image_too_large`; missing
 members record `epub_image_missing`. `altText` is the `alt` attribute when
 non-empty.
 
@@ -662,17 +733,24 @@ Caption detection, first match wins:
 2. Inside a `figure`: a heading element, or a text-bearing block whose text
    matches the caption label pattern (O'Reilly `h6`).
 3. Adjacent sibling: the text-bearing block immediately before or immediately
-   after the figure, in that order of preference, whose text matches the
-   caption label pattern
-   `^(figure|fig\.?|table|illustration|plate|map|exhibit|listing|example)\s*[\divxlc]`
-   case-insensitive, and that is not already paired (TCP/IP captions precede
-   images; Civilization captions follow them in `p.figcap`).
+   after the figure, table, or code block, in that order of preference, whose
+   text matches the caption label pattern
+   `^(figure|fig\.?|table|illustration|plate|map|exhibit|listing|example)\s*[\divxlc][\w.\-–]*[.:]?`
+   case-insensitive, and that is not already paired; the caption `label` is
+   the matched text, trimmed (TCP/IP captions precede
+   images; Civilization captions follow them in `p.figcap`). For a figure
+   made from an `img` inside a text-bearing block, the adjacent blocks are
+   those before and after that containing block.
+4. Inside an aside of kind `example`: the first heading element, paired to
+   the first `code_block` in the aside (7.7).
 
-A detected caption becomes a `caption` unit with `label` from the leading
+A detected caption becomes one `caption` unit with `label` from the leading
 label pattern and `text` as the full caption text, contained by the same
-parent as its subject, and paired both ways: `caption_of` from caption to
-subject and `has_caption` from subject to caption. The subject's own
-`caption` field receives the caption text. Captions are also evidence text.
+parent as its subject, and paired both ways with every subject it serves (one
+unit with one pair per image for a multi-image `figure`): `caption_of` from caption to
+subject and `has_caption` from subject to caption. The subject's `caption`
+field (figure, table) or `title` field (code block) receives the caption
+text. Captions are also evidence text.
 A figure with no caption pairs nothing. A caption pattern block that has no
 adjacent figure, table, or code block stays a `text_block` role `paragraph`.
 
@@ -690,16 +768,21 @@ A block is a footnote when any of:
 Footnote blocks get role `footnote`. `label` is the leading marker when the
 text starts with a marker pattern `^(\d+|[a-z]|[ivxlcdm]+)[.)]?\s` or
 `^page\s+[\divxlc]+\s` (Strange Loop keys notes by print page); the text is
-left intact. A backlink `a` at the start of a footnote is removed from the
-text (Civilization, DDIA).
+left intact. A backlink, an `a` at the start of a footnote block with an
+internal href or `epub:type="backlink"`, is not a note reference: its text
+stays in the block, `label` is read from that text, and no edge is emitted
+(Civilization, DDIA).
 
 ### 7.11 Title and subtitle blocks
 
-Within a section, a text-bearing block that is not a heading element and whose
-normalized text equals the section's `label`, its `headingText`, or the
-navigation label is emitted with role `title`. A block immediately following a
-`title` block, before any `paragraph`, whose normalized text is a remaining
-component of the navigation label is role `subtitle`. Chapter-opener `div`
+Within a section, a text-bearing block that is not a heading element, is not
+itself a navigation target (7.4 rule 3), and whose
+text after Section 8 normalization equals, case-insensitively, the section's
+`label`, its `headingText`, or the navigation label is emitted with role
+`title`. A block immediately following a `title` block, before any
+`paragraph`, whose normalized text equals, case-insensitively, the navigation
+label with the `title` block's text and any leading `:`, `.`, or dash removed
+and trimmed is role `subtitle`. Chapter-opener `div`
 titles in the Strange Loop sample resolve this way; everything else with no
 signal is `paragraph`.
 
@@ -712,7 +795,8 @@ Applied to every text-bearing block, caption, cell, term, and definition:
 2. Remove the text of: `a` elements that are note references (Section 10.3);
    empty anchors, including HTMLBook `a[data-type="indexterm"]`; `sup`
    elements whose only content is a note reference; `img` (handled as figure);
-   `script` and `style` if encountered inline.
+   page-marker elements of Section 7.6 rules 1 and 3; `script` and `style`
+   if encountered inline.
 3. Replace inline `math` with its text (Section 7.7).
 4. Normalize: convert NBSP and other Unicode space separators to U+0020;
    collapse runs of spaces and tabs to one space; trim each line; drop empty
@@ -721,8 +805,10 @@ Applied to every text-bearing block, caption, cell, term, and definition:
 5. No repairs. Doubled spaces from PDF reflow are collapsed by step 4; split
    headings, hyphenation, and quote styles are emitted as found.
 
-`pre` content skips steps 1 and 4 beyond CRLF normalization. Unicode
-normalization to NFC happens at import, not in the worker.
+`pre` content applies steps 1 to 3 with whitespace preserved and without the
+`br` newline rule, then only CRLF to LF normalization and the leading-newline
+strip of Section 7.7; step 4 does not apply. Unicode normalization to NFC
+happens at import, not in the worker.
 
 `language`: the nearest ancestor `lang` or `xml:lang`, else the package
 language.
@@ -744,10 +830,12 @@ tree after the entity pre-pass, which does not change structure.
 
 - Every unit carries exactly one `dom_path` locator.
 - `document`: the package document, path `/package[1]`.
-- `page`: the marker element, or for `<?dp?>` the following element with
-  `nodeRange` naming the instruction's position.
+- `page`: the marker element, or for `<?dp?>` the instruction's parent
+  element with `nodeRange` `[i, i]` where `i` is the instruction's child-node
+  index.
 - Sections: the navigation target element when resolved, else the heading
-  element, else the document `body`.
+  element for heading-derived sections, else the `body` of the content
+  document being walked when the section is emitted (7.4 rules 4 and 6).
 - Text blocks from mixed content: the parent element with `nodeRange` set to
   the child-node index range of the run.
 - Every other unit: its source element.
@@ -759,7 +847,7 @@ Locator coverage is therefore 1.0 for every EPUB parse.
 
 ### 10.1 Emission order
 
-After all units: `contains` edges in unit order; then `precedes` edges per
+After all units: `contains` edges in child-unit order; then `precedes` edges per
 sibling group in unit order; then `appears_on` in unit order; then caption
 pairs in caption order, `caption_of` before `has_caption`; then `references`
 in source order of the links. Sequence indexes follow emission.
@@ -776,17 +864,25 @@ level-1 sections and any pre-section content.
 A link is a note reference when it carries `data-type="noteref"` or
 `epub:type="noteref"`, or when it is inside a `sup` and its target resolves to
 a footnote block, or when its target resolves to a footnote block and the link
-text is a marker pattern (Section 7.10). A note reference produces
-`references` with role `footnote` from the block containing the link to the
-footnote block, and is removed from the block text.
+text is a marker pattern (Section 7.10). A target resolves to a footnote
+block when the element carrying the target id is a footnote block or lies
+inside one (Civilization and TCP/IP anchor the id on an `a` inside the note
+paragraph). A note reference produces `references` with role `footnote` from
+the evidence unit (`text_block`, `caption`, `table_cell`, or `code_block`)
+containing the link to the footnote block, and is removed from the unit's
+text.
 
 ### 10.4 Cross-references and index locators
 
 Every other `a` with a fragment or member-relative href is an internal link.
-If its target element lies inside an emitted unit, a `references` edge is
-produced from the containing block to that unit, role `index_locator` when the
-containing block is inside a section of kind `index`, else `cross_reference`.
-Links to the `document` unit's own section targets resolve to those sections.
+Its target resolves to the innermost unit whose source element contains the
+target element, else to the section current at the target's walk position;
+a `references` edge is produced from the evidence unit containing the link
+to that unit, role
+`index_locator` when the containing unit is inside a section of kind `index`,
+else `cross_reference`.
+A target element that is a navigation target resolves to the `text_section`
+unit emitted for it, not to the heading `text_block` inside it.
 Unresolved internal links are counted per document under
 `epub_link_unresolved` and listed in the raw report. External links contribute
 their text only.
@@ -824,13 +920,24 @@ failures seal a failure bundle and return `Ok`; only staging faults return
 
 1. Open the bundle writer with the worker identity.
 2. Read the archive member directory; enforce member count.
-3. Read `mimetype`, container, package; read the navigation source.
-4. Walk spine documents in order, building units, relationships, page
-   markers, images, and the report incrementally. Unit and relationship
-   records are streamed to the bundle as they are finalized; images are
-   written to `artifacts/` as encountered, deduplicated by hash.
-5. Write `parser_raw/epub_structure.json`.
-6. Seal the bundle with metrics and `ParserResult`; `toolIdentity` records
+3. Read the container and package, then `mimetype` (so its warnings can be
+   keyed by the package href); read the navigation source.
+4. Pass one: parse every spine document and record, per `(member, element
+   id)`, whether the element is, or lies inside, a footnote block by Section
+   7.10 rules 1 and 2, or lies in a document for which any navigation node
+   targeting it, or the navigation section current at its start, has kind
+   `notes`. Section 10.3 needs this before pass two because note targets may
+   lie in later documents.
+5. Pass two: walk spine documents in order, building units, page markers,
+   images, and the report incrementally. A block is finalized only after the
+   next sibling block is classified (one-block lookahead), so a preceding
+   caption block can be re-typed and a following caption can fill its
+   subject's field before either is written. Unit records are streamed to
+   the bundle as they are finalized; relationships are buffered and written
+   in the Section 10.1 order after the last unit; images are written to
+   `artifacts/` as encountered, deduplicated by hash.
+6. Write `parser_raw/epub_structure.json`.
+7. Seal the bundle with metrics and `ParserResult`; `toolIdentity` records
    the package version and the navigation source kind.
 
 Candidate counts are checked against `[parsing]` caps as they grow; exceeding
@@ -869,7 +976,8 @@ Stage names for failures: `archive`, `container`, `package`, `navigation`,
 
 Warnings are aggregated per code per document so `max_candidate_warnings`
 bounds them: one warning per (code, document) with a count in the message,
-and the first instance's locator. Codes: `epub_mimetype_missing`,
+and the first instance's locator. Warnings raised before any content document
+is walked use the package document href as their document key. Codes: `epub_mimetype_missing`,
 `epub_mimetype_mismatch`, `epub_package_version`, `epub_spine_item_missing`,
 `epub_navigation_missing`, `epub_nav_target_unresolved`, `epub_unknown_element`,
 `epub_empty_blocks_dropped`, `epub_page_marker_unlabeled`, `epub_image_missing`,
@@ -891,6 +999,8 @@ and the first instance's locator. Codes: `epub_mimetype_missing`,
 - Alt text that is auto-generated by the producer is emitted as found (AI
   Engineering).
 - Print pages have no geometry; `page` units carry an ordinal and a label only.
+- Figures, lists, and code inside table cells are flattened into cell text;
+  images inside cells (Civilization) are not archived.
 
 ## 13. Implementation consequences
 

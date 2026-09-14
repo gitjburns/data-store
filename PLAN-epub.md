@@ -9,8 +9,11 @@ disagree, the spec wins on content; this plan wins on process.
 
 SPEC-epub.md replaces the Docling and MuPDF PDF workers with an in-process
 EPUB worker and revises the content model to v0.4. The existing fabric corpus
-is disposable. The work lands in one session driven by an orchestrator that
-delegates every edit, check, and review to subagents.
+is disposable. The work spans several sessions. Each session runs one Workflow
+covering one phase, or one or two waves of Phase 4, driven by an orchestrator
+that delegates every source edit, Cargo check, and review to single-task
+subagents. A session targets 250K tokens and never exceeds 500K, counting the
+orchestrator and its agents together; onboarding costs about 100K of that.
 
 ## 2. Decisions not recorded in the spec
 
@@ -43,16 +46,19 @@ delegates every edit, check, and review to subagents.
   Section 8 removes note-reference text at extraction time. Targets may lie in
   later spine documents. The worker therefore walks the spine twice: pass one
   parses each document and records, per `(member, element id)`, whether the
-  element is a footnote by Section 7.10 rules 1 and 2, or lies in a document
-  whose navigation section has kind `notes` (rule 3 at document granularity);
-  pass two emits. Heading-derived `notes` subsections inside a document are
+  element is, or lies inside, a footnote block by Section 7.10 rules 1 and 2,
+  or lies in a document for which any navigation node targeting it, or the
+  navigation section current at its start, has kind `notes` (rule 3 at
+  document granularity); pass two emits. Heading-derived `notes` subsections inside a document are
   not footnote containers for link classification. This is the one precision
   loss accepted by this plan.
 
 ## 3. Verified repository facts
 
-Verified 2026-09-13 against the tree. Agents may rely on these without
-re-deriving them; anything else is read at phase time.
+Verified 2026-09-13 against the tree before any phase ran. Agents may rely
+on these without re-deriving them; anything else is read at phase time. Line
+numbers are valid only until Phase 1 edits the file; after that, locate by
+the item name with `rg -n`.
 
 - `sql/fabric/schema.sql` has no `CHECK` on `content_type`,
   `relationship_type`, or `locators_json`. No setup script is needed.
@@ -135,29 +141,51 @@ re-deriving them; anything else is read at phase time.
 - Toolchain: edition 2024, rustc 1.96. `std::sync::LazyLock` is available.
 - The six sample EPUBs are in the repository root with the names in Section
   1.3.
+- Binaries and CLI verbs used in Section 6.7, verified against README.md:
+  server `data-store-service` with `--config`, `--setup-storage`; client
+  `data-store` with `--config`, `--rebuild-all`, `--health`,
+  `--health-details`, `--held-parses`, `--source <sourceId>`,
+  `--unit <unitId>`, `--query <text...>`. Artifact blob path
+  `<index_root>/fabric/artifacts/sha256/<2hex>/<hash>` verified against
+  ARCHITECTURE.md §2.2.
+- Not verified: which locator kind `src/parse/text_worker.rs` emits.
+  `char_range` stays in the spec 2.3 union for it. Phase 2 agent (b) reads
+  the worker and, if it emits a removed kind, escalates before editing.
 
 ## 4. Orchestration model
 
-- **One Workflow script covers Phases 1 through 6.** The orchestrator
-  authors it, the user approves it once, and the orchestrator launches it.
-  Phase 7 runs outside the workflow under per-command approval. The
-  orchestrator edits no source and reads no source. One exception: subagents
-  may not delete files, so the orchestrator deletes the nine PDF-only files
-  of Section 3 itself, under the user's explicit instruction, before the
-  workflow launches.
-- **Agents start fresh.** Every agent prompt carries the reading list
-  AGENTS.md, PRINCIPLES.md, DIAGNOSTICS.md, SPEC-epub.md, PLAN-epub.md, and
-  its phase brief, citing governing sections. Implementation agents run
-  `cargo fmt`, `cargo check`, and `cargo clippy` before reporting. Agents run
-  no other project code and no git.
-- **Each phase ends with verification inside the workflow.** Independent
-  verification agents check scope completeness against the brief,
-  PRINCIPLES.md and AGENTS.md comment and error-handling rules, and
-  consistency with neighbouring code. Findings are confirmed by independent
-  skeptics before a fix agent applies them within the brief's file list. The
-  loop repeats until a round is dry, bounded and logged. The script checks
-  each report's files-changed list against the brief's file list.
-- **Stops.** The workflow returns when an agent reports an escalation or a
+- **One phase per Workflow; one Workflow per session, or two when the
+  Sequencing bullet allows (Phase 3 after Phase 2, Phase 5 after wave D).**
+  The orchestrator
+  authors the script, the user approves it, and the orchestrator launches it.
+  Phase 4 is the exception: its waves (Section 6.4) may be split across
+  sessions, at most two waves per Workflow. Phase 7 runs outside any
+  Workflow under per-command approval. The orchestrator edits no source and
+  reads no source. One exception: subagents may not delete files, so the
+  orchestrator deletes the nine PDF-only files of Section 3 itself, under the
+  user's explicit instruction, before the Phase 1 Workflow launches.
+- **Agents read no onboarding documents.** An agent reads only the files in
+  its brief's file list and files the compiler names. Everything else it
+  needs is in the brief (Section 5), which the orchestrator writes from
+  SPEC-epub.md and this plan. Implementation agents run `cargo check` and
+  `cargo clippy` from the project root before reporting; they do not format.
+  After the last implementation agent of each phase or wave, one format
+  agent runs `cargo fmt`, `cargo check`, and `cargo clippy`, edits nothing
+  else, and reports; the verifier runs after it. Agents run no other project
+  code and no git.
+- **One task per agent.** A task is one module, or one bounded edit set that
+  names its files and the items to change. Section 6 gives the agent split
+  and order for every phase.
+- **One verifier per phase, or per wave in Phase 4.** After the
+  implementation agents, one verifier
+  agent checks, against the briefs: every file in each files-changed list is
+  in the brief's file list or is a declared compile fix; every new or edited
+  function has a purpose comment; no `unwrap`/`expect` outside the
+  PRINCIPLES.md exceptions; no new `async`; no stub body remains in files the
+  phase owns; behavior matches the quoted spec text. A fix agent runs once,
+  only when the verifier reports findings. Findings still open after the fix
+  go to the user in the completion report; there is no second round.
+- **Stops.** The Workflow returns when an agent reports an escalation or a
   scope violation. The orchestrator brings the item to the user and resumes
   the same run from the point of stop. Config edits beyond
   `config.example.toml`, new dependencies beyond Section 2, and any behavior
@@ -165,22 +193,63 @@ re-deriving them; anything else is read at phase time.
 - **Mechanical compile fixes outside the file list are allowed.** An agent
   may edit an unlisted file when the compiler requires it and the fix changes
   no behavior beyond the approved intent. Each such file is listed under
-  files changed with the reason, and the phase's verifiers check that no
+  files changed with the reason, and the phase's verifier checks that no
   behavior changed. Any other edit to an unlisted file is a scope violation.
 - **Report shape**, mandatory for every agent: files changed with one line
   each; Cargo results (verbatim output on any failure or warning); residual
   risk; open escalations. Nothing else.
-- **Sequencing.** Phases 1 through 3 are sequential. Phase 4 runs in the
-  waves of Section 6.4. Phase 5 runs after Phase 4 wave D. Phase 6 runs
-  concurrently with Phase 4. Phase 7 is last, outside the workflow.
+- **Sequencing.** Phases 1, 2, and 3 run in that order, one session each;
+  Phase 3 may share a session with Phase 2 when budget allows. Phase 4 waves
+  A through D run in order. Phase 5 runs after wave D. Phase 6 runs in its
+  own session any time after Phase 3. Phase 7 is last.
+- **Within a phase, agents run sequentially in the Section 6 order** unless
+  Section 6 says otherwise. Cargo checks must pass clean for the format
+  agent of a phase or wave. An implementation agent whose check fails only
+  because of items owned by a later or concurrently running agent lists
+  those errors as expected in its report; that is not a failure.
 
 ## 5. Brief template
 
-Each brief is an agent prompt in the workflow script and contains: phase
-name; spec sections that govern it; the file list
-from Section 6; the steps; the verification commands; the report shape; and
-the escalation rule. Briefs restate nothing from the spec or this plan; they
-cite section numbers.
+Each brief is a self-contained agent prompt in the Workflow script. It
+contains, in this order:
+
+1. Phase, wave, and task name.
+2. The governing spec text, quoted verbatim from SPEC-epub.md, and the
+   Section 7 contract for any module the task owns, quoted verbatim.
+3. The Section 3 facts the task needs: file paths, line numbers, names.
+4. The owned file list (the edit allowlist the verifier checks), the
+   read-only file list (files the agent may read but not edit, such as
+   `epub/mod.rs` for Wave B and C agents or `src/model/body.rs` for Phase 2
+   consumers), and the steps.
+5. The coding rules block, verbatim:
+   - Every function carries a comment immediately before it stating purpose
+     or key invariant, never restating the signature. Public items use doc
+     comments. Comment non-obvious invariants, ownership, ordering, and
+     error policy inline.
+   - No `unwrap` or `expect` in runtime code; propagate `Result` with source
+     context preserved. The only permitted uses are startup fail-fast,
+     verification-only code, and a locally proven invariant with a comment
+     stating the proof at the call site. No boxed dynamic errors, `clone`,
+     `Arc`, or `allow` without a stated reason.
+   - No new `async`. SQLite work stays synchronous. No runtime schema or
+     data migration. No tests, test modules, or fixtures.
+   - Typed structs with `deny_unknown_fields` for data this service owns.
+     Shared enums and constants are defined once and imported.
+   - Large SQL, prompts, tables, or regex sets live in named constants or
+     dedicated files, not inside function bodies.
+   - Log lifecycle boundaries and errors with local context; never log
+     document text, secrets, or large payloads.
+   - Run only `cargo check`, `cargo clippy`, `cargo fmt` when this brief
+     says so, and read-only commands (`rg`, `sed -n`, `ls`, `cat`). Do not
+     delete, move, or copy files, run git, start servers, or run project
+     binaries. Read nothing outside the owned and read-only file lists
+     except files the compiler names.
+6. The report shape, the escalation rule, and the mechanical-compile-fix
+   exception, all quoted from Section 4.
+
+Briefs do not cite documents the agent cannot read; they carry the text.
+Phase 6 briefs are the one exception: a documentation agent's file list
+includes SPEC-epub.md in full.
 
 ## 6. Phases
 
@@ -195,12 +264,16 @@ Files deleted: the nine PDF-only files in Section 3. Files edited:
 `config.example.toml`.
 
 Steps:
-0. Orchestrator, before the agent launches: delete the nine files (Section
-   4 exception). This must precede the agent's first Cargo check because
-   `src/bin/pdf-extract-diagnostic.rs` is auto-discovered and fails to build
-   once `mupdf` is gone.
+0. Orchestrator, immediately before agent (a) launches: delete the nine
+   files (Section 4 exception). Agent (a) removes their `mod` lines and the
+   `mupdf` dependency in the same step, so the tree never has a `mod` line
+   for a missing file or the auto-discovered
+   `src/bin/pdf-extract-diagnostic.rs` without `mupdf`.
 1. Remove the nine files' `mod` lines. Remove `mupdf` and `fancy-regex` from
-   `Cargo.toml`.
+   `Cargo.toml`. In `main.rs` remove the MuPDF `run_internal_command`
+   dispatch, both `PdfParser::from_config` uses, and the `pdf` argument at
+   the `start` and `run_scheduler` call sites; in `dry_run.rs` remove the
+   `pdf` field of `DryRunInputs` and its use.
 2. `ParseRoute` becomes `{ PlainText }`. Remove `pdf` from
    `ParsePrefixContext` and the three threading signatures. Remove
    `MIME_TYPE_PDF` and the `.pdf` arm; the unparseable-MIME SQL and the
@@ -217,10 +290,24 @@ Steps:
 5. `config.example.toml`: delete `[pdf]` and `[docling]`, the ten `[parsing]`
    keys, and the Docling mention in the `[storage]` comment.
 6. `BundleWriter::finish` still takes stdout/stderr slices bounded by
-   `process_log_bytes`. With that key removed, bound them by a constant in
-   `bundle.rs` or drop the bound; the agent chooses and comments the choice.
+   `process_log_bytes`. With that key removed, bound them by a constant
+   `PROCESS_LOG_CAPTURE_BYTES` in `bundle.rs` whose value is the
+   `process_log_bytes` value `config.example.toml` carried before step 5,
+   with a comment that in-process workers pass empty slices.
+7. Agent (e) also runs `rg -n -i 'docling|mupdf|pdf_engine|pdfengine' src assets`
+   and removes every remaining reference (spec 13.1 names startup, health,
+   identity capture, and monitoring). Files this sweep names are in agent
+   (e)'s owned list by this rule; each is reported with the reason.
 
 Compiles with PlainText as the only route.
+
+Agents, sequential: (a) `Cargo.toml`, `src/parse/mod.rs`, `src/main.rs`,
+`src/dry_run.rs` (step 1, after step 0); (b) `config.rs`,
+`parsing_limits.rs`, `limits.rs`, `identity.rs`, `error.rs`, `restore.rs`
+comment (step 3); (c) `scheduler.rs`, `source.rs`, `acquisition.rs`,
+`monitoring_storage.rs` (step 2); (d) `cleanup.rs` (step 4); (e) `bundle.rs`
+and `config.example.toml` (steps 5, 6, and 7). Then the format agent, then
+the verifier.
 
 ### 6.2 Phase 2 — Content model v0.4 (spec 2, 13.2, 13.5)
 
@@ -251,6 +338,12 @@ Steps:
    `section_dense.rs`. Prose in `passages.rs` is `paragraph`, `quote`,
    `definition`, `unknown`.
 4. `sections.rs` and the `section_dense.rs` mirror walk `contains` only.
+   The removed relationship and role names also appear as string literals
+   in SQL and in `conformance.rs` (`has_table_cell_descendant`), which the
+   compiler will not flag: run
+   `rg -n "physically_contains|logically_contains|follows|continues_on|derived_from|'header'|'footer'|image_region|normalizedText|normalized_text|page_bbox|pageNumbers|captionForUnitIds" src assets`
+   and update every hit. `caption_pairing_rate` in `conformance.rs` is
+   redefined over `caption_of` edges (spec 2.6).
 5. `cleanup.rs` plain-text arm: remove furniture removal and role gates that
    named `Header`/`Footer`; `text_worker.rs` writes `role: paragraph`, no
    `normalized_text`.
@@ -265,6 +358,19 @@ Steps:
 8. Web console `derivedBodyParts` and `RELATIONSHIP_TYPES` follow the new
    sets; CLI unit rendering follows the new body fields.
 
+Agents, sequential: (a) the six model files, `wire_name`, and
+`content_type_body_matches` (step 1); (b) the five text extractors,
+`text_projection_hash`, `text_worker.rs`, `cleanup.rs` (steps 2 and 5);
+(c) `passages.rs`, `channels.rs`, `annotation.rs`, `section_dense.rs`,
+`sections.rs` (steps 3, 4, and the server side of 7); (d) `conformance.rs`
+and `parse.rs` report fields (step 6); (e) `src/bin/data-store.rs` and
+`assets/web/app.js` (client side of 7, and 8). Then the format agent, then
+the verifier. The tree
+does not compile between (a) and (e), so if the budget runs short the
+session stops at an agent boundary, Section 9 records the last completed
+agent and the current compile errors, and the next session resumes with the
+next agent.
+
 ### 6.3 Phase 3 — `[epub]` configuration (spec 4, 13.4)
 
 Files: `src/config.rs`, a new `src/epub_limits.rs` mirroring
@@ -275,7 +381,8 @@ Steps: `EpubLimits` with the six keys, `deny_unknown_fields`, positivity
 checks in `RuntimeLimits::validate`, field `epub` on `ServiceConfig` and
 `RuntimeLimits`, folded in `runtime_limits()`, captured in identity. The
 `[epub]` section goes where `[pdf]` was, with one comment line per key
-taken from spec Section 4.
+taken from spec Section 4. One implementation agent, then the format agent,
+then the verifier.
 
 ### 6.4 Phase 4 — EPUB worker (spec 3, 5–12)
 
@@ -283,21 +390,39 @@ Files: `Cargo.toml`; new `src/parse/epub/` modules per Section 7 of this
 plan; `src/parse/mod.rs`; `src/acquisition.rs`; `src/scheduler.rs`;
 `src/monitoring_storage.rs`.
 
-Waves, each a set of agents that may run concurrently, each wave gated on the
-previous wave's `cargo check`:
+Waves, one agent per named module, agents within a wave concurrent because
+their files are disjoint, each wave gated on the previous wave's
+`cargo check`, and a format agent then a verifier after each wave. A Workflow covers one or two
+waves; Section 9 records which wave is next.
 
-- **Wave A (leaf modules):** `entities.rs`, `kinds.rs`, `archive.rs`,
-  `xhtml.rs`, `text.rs`, `report.rs`. Also `mod.rs` skeleton: constants,
-  error types, `Emitter`, capability profile, config hash, and
-  `run_epub_parse` calling a stub `structure::walk_spine`.
+- **Wave A (leaf modules), two steps.** Step 1, one agent: add the three
+  dependencies to `Cargo.toml`, add `mod epub;` to `src/parse/mod.rs`, write
+  the `mod.rs` skeleton (constants, error types, `Emitter`, capability
+  profile, config hash, and `run_epub_parse` written in full against the
+  stub signatures: the spec 11.2 sequence, the 11.4 events, the two-pass
+  walk, `report::write`, the 10.1 relationship flush, metrics, and
+  `ParserResult`), and write every other Section 7 module as a compiling
+  stub carrying its contracted signatures: each fallible body returns an
+  `EpubFailure` at stage `Package`; each non-fallible body returns the
+  type's empty, `false`, or `None` value; stub parameters are prefixed `_`;
+  the `LazyLock<Regex>` statics get the placeholder pattern `^$`. Because
+  nothing calls into `src/parse/epub/` until Wave D, step 1 puts
+  `#![allow(dead_code)] // removed in Wave D when the route is wired` at the
+  top of `epub/mod.rs`; without it the mandatory clean `cargo clippy` cannot
+  hold. The first `cargo check` after step 1 fetches the three crates and
+  needs network access. Step 2, six concurrent agents, one each, replacing
+  the stubs: `entities.rs`, `kinds.rs`, `archive.rs`, `xhtml.rs`, `text.rs`,
+  `report.rs`. Each later wave's verifier confirms no stub body and no `_`
+  parameter prefix remains in that wave's files.
 - **Wave B:** `package.rs`, `navigation.rs`, `links.rs`.
 - **Wave C:** `blocks.rs`, then `structure.rs` (sequential: `structure`
   depends on `blocks`).
 - **Wave D (integration, one agent):** wire `ParseRoute::Epub`,
-  `MIME_TYPE_EPUB` and the `.epub` arm in `acquisition.rs`, the profile and
-  worker-call arms in `parse_chain_prefix`, the third MIME parameter in
-  both unparseable-MIME sites, the dry-run path (no change expected beyond
-  compile), and the Section 11.4 log events. Full Cargo checks.
+  `MIME_TYPE_EPUB` and the `.epub` arm in `acquisition.rs`, the profile,
+  containment, and worker-call arms in `parse_chain_prefix`, the second MIME
+  parameter in both unparseable-MIME sites, the dry-run path (no change
+  expected beyond compile), and removal of the Wave A `allow(dead_code)`.
+  Full Cargo checks.
 
 Every module carries the Section 7 contract; agents may add private items
 freely and must not change a contracted signature without escalation.
@@ -311,17 +436,24 @@ the existing reader caps; the importer recomputes each file's SHA-256 and
 fails the parse as a contract violation on mismatch; stores each via
 `ArtifactStore::put_bytes`; inserts each into the canonical bundle manifest
 with `artifact_type = "image"` keyed `artifacts/<hash>`. Bodies are not
-rewritten. Runs after Phase 4 wave D.
+rewritten. One implementation agent, then the format agent, then the
+verifier. Runs after Phase 4
+wave D, in the same or a later session.
 
 ### 6.6 Phase 6 — Documentation (spec 13.6)
 
 Files, each read at this phase: `canonical_content_graph_retrieval_fabric_v_0_3.md`,
 `SPEC-SERVER.md`, `PROTOCOL.md`, `ARCHITECTURE.md`, `README.md`,
 `INSTALL.md`, `DIAGNOSTICS.md`, `SPEC-CLIENT.md`, `SPEC-web-ui.md`,
-`QUICKSTART.md`. Three agents, split by file, may run concurrently with
-Phase 4. Each edit describes the v0.4 system as the spec states it; no
+`QUICKSTART.md`. Three agents, split by file, concurrent, in one Workflow in
+a session of their own any time after Phase 3; each brief's file list
+includes SPEC-epub.md in full (Section 5 exception). Then one verifier; no
+format agent, since no Rust changes.
+Each edit describes the v0.4 system as the spec states it; no
 history or migration prose. `config.example.toml` is owned by Phases 1
-and 3.
+and 3. The canonical spec file keeps its `v_0_3` filename (agents cannot
+move files); its title and revision summary say 0.4. The orchestrator sets
+the SPEC-epub.md status line to "implemented" in the Phase 7 status update.
 
 ### 6.7 Phase 7 — Acceptance (spec 14)
 
@@ -370,6 +502,7 @@ pub(crate) fn run_epub_parse(index_root: &StorageContext, source_absolute_path: 
 
 pub(crate) enum EpubStage { Archive, Container, Package, Navigation, Document(String), Caps }
 pub(crate) struct EpubFailure { pub stage: EpubStage, pub detail: String }   // recorded outcome
+impl EpubFailure { pub(crate) fn with_stage(self, stage: EpubStage) -> Self; } // helpers (archive, xhtml) return stage Archive; the caller that knows the boundary re-stages before propagating
 pub(crate) enum WorkerError { Recorded(EpubFailure), Fault(ApiError) }       // Fault = staging I/O only
 pub(crate) type WorkerResult<T> = Result<T, WorkerError>;
 
@@ -406,7 +539,7 @@ pub(crate) const KIND_PATTERNS_VERSION: &str = "1";
 use crate::model::body::SectionKind;   // defined once in the model (Phase 2); no local copy
 pub(crate) fn kind_from_semantic(value: &str) -> Option<SectionKind>;   // epub:type, data-type, landmark, guide
 pub(crate) fn kind_from_text(text: &str) -> Option<SectionKind>;        // spec 7.2 rule 4
-pub(crate) fn split_label(heading: &str) -> (Option<String>, String);   // spec 7.3 label/headingText
+pub(crate) fn split_label(heading: &str) -> (Option<String>, String);   // spec 7.3 rules 2–3 on text; blocks::split_heading applies rule 1 first
 pub(crate) static PAGE_ID: LazyLock<Regex>;            // spec 7.6 rule 3
 pub(crate) static CAPTION_LABEL: LazyLock<Regex>;      // spec 7.9 rule 3
 pub(crate) static FOOTNOTE_MARKER: LazyLock<Regex>;    // spec 7.10, first form
@@ -420,7 +553,7 @@ pub(crate) struct Archive { /* zip::ZipArchive<File>, normalized name index, run
 pub(crate) fn open(path: &Path, limits: &EpubLimits) -> Result<Archive, EpubFailure>; // member count, encryption, method
 impl Archive {
     pub(crate) fn contains(&self, member: &str) -> bool;
-    pub(crate) fn read(&mut self, member: &str) -> Result<Option<Vec<u8>>, EpubFailure>; // per-member and total caps
+    pub(crate) fn read(&mut self, member: &str) -> Result<Option<Vec<u8>>, EpubFailure>; // per-member cap; total cap counts each member once (spec 5.1)
     pub(crate) fn member_count(&self) -> usize;
     pub(crate) fn total_bytes_read(&self) -> u64;
 }
@@ -470,9 +603,11 @@ impl StructureReport {
 ```rust
 pub(crate) struct ManifestItem { pub href: String /* normalized member */, pub media_type: String, pub properties: Vec<String> }
 pub(crate) struct SpineItem { pub idref: String, pub href: String, pub linear: bool }
+pub(crate) struct GuideReference { pub kind: String, pub href: String }   // OPF guide entry, spec 5.2
 pub(crate) struct Package { pub href: String, pub version: String, pub metadata: DocumentBody,
-    pub manifest: BTreeMap<String, ManifestItem>, pub spine: Vec<SpineItem>, pub toc_id: Option<String> }
-pub(crate) fn check_mimetype(archive: &mut Archive, emitter: &mut Emitter) -> Result<(), EpubFailure>;
+    pub manifest: BTreeMap<String, ManifestItem>, pub spine: Vec<SpineItem>, pub toc_id: Option<String>,
+    pub guide: Vec<GuideReference> }
+pub(crate) fn check_mimetype(archive: &mut Archive, package_href: &str, emitter: &mut Emitter) -> Result<(), EpubFailure>; // called after read_package; warnings keyed by package_href
 pub(crate) fn read_container(archive: &mut Archive) -> Result<String, EpubFailure>;   // rootfile href
 pub(crate) fn read_package(archive: &mut Archive, rootfile: &str, limits: &EpubLimits,
     emitter: &mut Emitter) -> Result<Package, EpubFailure>;
@@ -498,7 +633,8 @@ pub(crate) enum HrefOutcome { Internal(Target), External, Unresolvable }
 pub(crate) fn resolve(base_member: &str, href: &str) -> HrefOutcome;                 // spec 5.4
 pub(crate) struct FootnoteIndex { /* (member, id) -> bool from pass one */ }
 impl FootnoteIndex { pub(crate) fn is_footnote(&self, target: &Target) -> bool; }
-pub(crate) struct LinkRecord { pub from_local_id: String, pub target: Target, pub role_hint: LinkRole }
+pub(crate) struct LinkRecord { pub from_local_id: String, pub document: String, pub href: String,
+    pub locator: Locator, pub target: Target, pub role_hint: LinkRole }        // document/href/locator feed spec 11.5 warnings and the 11.3 report
 pub(crate) enum LinkRole { Footnote, CrossReference, IndexLocator }
 pub(crate) struct UnitIndex { /* (member, id) -> unit local id, filled in pass two */ }
 pub(crate) fn resolve_all(links: &[LinkRecord], units: &UnitIndex, emitter: &mut Emitter,
@@ -508,32 +644,53 @@ pub(crate) fn resolve_all(links: &[LinkRecord], units: &UnitIndex, emitter: &mut
 **`blocks.rs`**
 
 ```rust
-// 'e is the borrow of the emitter and other mutable state; 'a is the emitter's own
-// lifetime and the borrowed document text. Keeping them distinct avoids the
-// `&'a mut Emitter<'a>` shape, which pins the emitter for its whole lifetime.
-pub(crate) struct BlockContext<'e, 'a> { pub document: &'a str, pub section_kind: SectionKind,
-    pub text: &'e TextContext<'a>, pub emitter: &'e mut Emitter<'a>, pub links: &'e mut Vec<LinkRecord>,
+// Three lifetimes, all distinct: 'a is the emitter's own borrow (limits held for
+// the whole parse); 'd is the current content document's text and parsed tree,
+// which is shorter-lived than the emitter; 'e is the borrow of the emitter and
+// the other mutable state for one block call. `&'e mut Emitter<'a>` with
+// `document: &'d str` compiles because 'a is never tied to 'd; sharing them
+// would pin every document's text for the emitter's whole lifetime.
+pub(crate) struct BlockContext<'e, 'a, 'd> { pub document: &'d str, pub section_kind: SectionKind,
+    pub text: &'e TextContext<'d>, pub emitter: &'e mut Emitter<'a>, pub links: &'e mut Vec<LinkRecord>,
     pub units: &'e mut UnitIndex, pub report: &'e mut StructureReport }
+// One block's source: a whole element, or a mixed-content run of child nodes
+// under `parent` (spec 7.5), whose `node_range` becomes the locator's nodeRange.
+pub(crate) enum BlockSource<'d, 'input> { Element(roxmltree::Node<'d, 'input>),
+    Run { parent: roxmltree::Node<'d, 'input>, nodes: Vec<roxmltree::Node<'d, 'input>>, node_range: [u64; 2] } }
+pub(crate) enum CaptionPosition { Inside, Before, After }                        // which candidate was consumed; Before/After name the caller's pending sibling block
+pub(crate) struct CaptionCandidate<'d, 'input> { pub position: CaptionPosition, pub node: Option<roxmltree::Node<'d, 'input>>,
+    pub label: Option<String>, pub text: String, pub rule: u8 }                  // node is Some for Inside (Node is Copy); rule = spec 7.9 rule number, for the report
+// Container emitters emit the container unit only and return what walk_spine
+// needs to walk the children itself with that parent; they never walk children.
+pub(crate) struct ListEmission<'d, 'input> { pub list_id: String,
+    pub items: Vec<(String, Vec<(roxmltree::Node<'d, 'input>, TextBlockRole)>)> } // per list_item: its id and the child nodes to walk with their role (term/definition for dl)
+pub(crate) struct AsideEmission<'d, 'input> { pub aside_id: String, pub children: Vec<roxmltree::Node<'d, 'input>>,
+    pub pending_caption: Option<CaptionCandidate<'d, 'input>> }                  // pending_caption: spec 7.9 rule 4, applied by walk_spine to the first code_block emitted under this aside
 pub(crate) fn page_marker(node: roxmltree::Node, labels: &BTreeMap<(String, Option<String>), String>,
     document: &str) -> Option<Option<String>>;                                    // spec 7.6 rules 1, 3, 4; Some(label)
 pub(crate) fn dp_page_marker(pi: roxmltree::Node) -> Option<Option<String>>;    // spec 7.6 rule 2
-pub(crate) fn emit_text_block(ctx: &mut BlockContext, node_or_run: ..., parent: &str, role: TextBlockRole) -> WorkerResult<Option<String>>;
-pub(crate) fn emit_table(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;   // spec 7.8
-pub(crate) fn emit_list(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;    // ul, ol, dl
+pub(crate) fn emit_text_block(ctx: &mut BlockContext, source: &BlockSource, parent: &str, role: TextBlockRole)
+    -> WorkerResult<Option<String>>;                                              // None when dropped as empty
+pub(crate) fn emit_table(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;   // spec 7.8; owns rows, cells, and its <caption> internally
+pub(crate) fn emit_list<'d, 'input>(ctx: &mut BlockContext, node: roxmltree::Node<'d, 'input>, parent: &str)
+    -> WorkerResult<ListEmission<'d, 'input>>;                                    // ul, ol, dl: emits list and list_item units only
 pub(crate) fn emit_figure(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str, package: &Package,
-    archive: &mut Archive) -> WorkerResult<Vec<String>>;                            // spec 7.9, one per image
-pub(crate) fn emit_aside(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;
-pub(crate) fn emit_code(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str, heuristic: bool) -> WorkerResult<String>;
+    archive: &mut Archive, caption: Option<&CaptionCandidate>) -> WorkerResult<Vec<String>>; // spec 7.9, one per image; caption fills FigureBody.caption before streaming
+pub(crate) fn emit_aside<'d, 'input>(ctx: &mut BlockContext, node: roxmltree::Node<'d, 'input>, parent: &str)
+    -> WorkerResult<AsideEmission<'d, 'input>>;                                   // emits the aside unit only
+pub(crate) fn emit_code(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str, heuristic: bool,
+    caption: Option<&CaptionCandidate>) -> WorkerResult<String>;                  // caption fills CodeBlockBody.title/label before streaming
+pub(crate) fn split_heading(node: roxmltree::Node, text: &TextContext) -> (Option<String>, String); // spec 7.3 rule 1 (span.label) then kinds::split_label; walk_spine calls this for TextSectionBody
 pub(crate) fn emit_formula(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;
-pub(crate) fn detect_caption(...) -> Option<CaptionCandidate>;                     // spec 7.9 rules 1–3
-pub(crate) fn pair_caption(ctx: &mut BlockContext, subject: &str, caption: CaptionCandidate, parent: &str) -> WorkerResult<()>;
+pub(crate) fn detect_caption<'d, 'input>(subject: roxmltree::Node<'d, 'input>, before: Option<&BlockSource<'d, 'input>>,
+    after: Option<&BlockSource<'d, 'input>>, text: &TextContext) -> Option<CaptionCandidate<'d, 'input>>; // spec 7.9 rules 1–3; before/after are the adjacent sibling blocks
+pub(crate) fn pair_caption(ctx: &mut BlockContext, subjects: &[String], caption: &CaptionCandidate, parent: &str) -> WorkerResult<String>; // emits the caption unit and caption_of/has_caption edges only; returns the caption id
 pub(crate) fn is_footnote_block(node: roxmltree::Node, section_kind: SectionKind) -> bool;   // spec 7.10
 pub(crate) fn footnote_label(text: &str) -> Option<String>;
 pub(crate) fn aside_kind(node: roxmltree::Node) -> Option<crate::model::body::AsideKind>;   // model enum, not a local copy
 ```
 
-Exact argument shapes for `emit_text_block` and `detect_caption` are chosen
-by the Wave C agent and recorded in the module's doc comment.
+All signatures above are fixed; the Wave A stub carries them verbatim.
 
 **`structure.rs`**
 
@@ -546,13 +703,18 @@ pub(crate) fn walk_spine(archive: &mut Archive, package: &Package, navigation: &
 ```
 
 `walk_spine` owns the section stack, the current-section rule, page
-ordinals, `appears_on` assignment, title/subtitle detection, and the
-`document` unit. It calls `blocks.rs` for every container and text block and
-collects `LinkRecord`s for `links::resolve_all` at the end.
+ordinals, `appears_on` assignment, title/subtitle detection, the one-block
+lookahead of spec 11.2, the `document` unit, and every child walk: it calls
+`blocks.rs` to emit each container or text block, then walks the returned
+child nodes itself with that container as parent. It holds an
+`AsideEmission::pending_caption` until the first `code_block` under that
+aside, and collects `LinkRecord`s for `links::resolve_all` at the end.
 
 ## 8. Completion report
 
-The final report to the user leads with:
+Every session ends with the agents' reports rolled up per Section 4's report
+shape, open verifier findings, and the Section 9 update. The final report
+after Phase 7 leads with:
 
 ```
 Action required: edit config.toml, config.toml.local, config.toml.remote
@@ -567,7 +729,13 @@ deferred items from Section 2.
 
 ## 9. Status
 
-Updated in place at the end of each session.
+Updated in place at the end of each session. The "Next" line names the
+phase, wave, or agent the next session starts with and any state it must
+know.
+
+Next: Phase 1. Before its Workflow launches, the orchestrator deletes the
+nine PDF-only files of Section 3 under the user's explicit instruction
+(Section 4). No source has been changed yet.
 
 - Phase 1 — PDF decommissioning: not started.
 - Phase 2 — Content model v0.4: not started.
