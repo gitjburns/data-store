@@ -32,7 +32,8 @@ Async/`tokio` is confined to HTTP serving and annotator HTTP I/O. Every piece of
 lifecycle machinery is synchronous OS-thread work over `rusqlite`:
 
 - the acquisition/parse/gate scheduler (`src/scheduler.rs`) runs on one
-  `std::thread`;
+  `std::thread`; the EPUB worker (`src/parse/epub/`) and the plain-text worker
+  (`src/parse/text_worker.rs`) run inline on it, with no child processes;
 - the annotation worker (`src/annotations/worker.rs`) runs on its own
   `std::thread`;
 - the annotation projection worker (`src/projections/worker.rs`) runs on a
@@ -303,9 +304,12 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   (`import_validated_bundle`: `store.put_bytes` then a single write tx). Objects
   are keyed by immutable content identity; locations record where each was seen.
 
-- **Parse.** `dispatch_parse_chain` routes by the stored authoritative MIME type
-  to `src/parse/pdf.rs` or `src/parse/text_worker.rs`; an
-  unroutable type is warn-only. Workers are untrusted producers outside the hot
+- **Parse.** `dispatch_parse_chain` routes by the stored authoritative MIME type:
+  `application/epub+zip` (`MIME_TYPE_EPUB`, from the case-insensitive `.epub`
+  extension) to `src/parse/epub/` and `text/plain` to
+  `src/parse/text_worker.rs`; `ParseRoute` has exactly `Epub` and `PlainText`.
+  An unroutable type is warn-only and counted as unparseable in health; the
+  count excludes both routed types. Workers are untrusted producers outside the hot
   retrieval trust boundary (§12.1): they emit a **staged candidate bundle**, and
   `src/parse/importer.rs` performs digest verification and the **§13.1 hard
   gates** (id assignment, local-ref integrity, capability profile,
@@ -315,10 +319,10 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   or gate breach becomes a durable failed `parse_runs` row (`Ok` with a failed
   status); `Err` is reserved for faults of the canonical side itself.
 
-  Before staging candidates, Docling and plain-text workers run versioned cleanup
-  (`src/parse/cleanup.rs`): conservative prose repair, explicit furniture removal,
-  and geometry-supported PDF paragraph reflow. Original locators survive merges;
-  reading-order links are rebuilt before canonical hashing. Original extraction,
+  Before staging candidates, the plain-text worker runs versioned cleanup
+  (`src/parse/cleanup.rs`, plain-text arm only): conservative prose repair.
+  Original locators survive merges; reading-order links are rebuilt before
+  canonical hashing. Original extraction,
   pre-cleanup candidates, and the cleanup report are archived through the existing
   artifact store and `parser_raw_output_uri`, including verified failed parses.
   Cleanup changes parser identity; existing sources receive it through reparse.
@@ -347,37 +351,65 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
      new SourceObject by the next scan), so changed bytes can never bind
      old-hash identity to new content.
 
-  PDF dispatch (`src/parse/pdf.rs`) selects exactly `[pdf].engine`: `docling`
-  or `mupdf`. Normal ingestion, explicit reparsing, and annotation dry runs share
-  this selection. Both engines run in child processes under the positive
-  `[pdf].document_timeout_seconds` limit; their parent owns waiting, timeout
-  termination/reaping, and durable lifecycle diagnostics. Dispatch remains
-  synchronous, with no automatic fallback.
+  The EPUB worker (`src/parse/epub/`) parses EPUB 2 and EPUB 3 archives
+  in-process on the scheduler thread with the `zip` and `roxmltree` crates; no
+  external tool, child process, or wall-clock budget is involved. Normal
+  ingestion, explicit reparsing, and the annotation dry run reach it through the
+  shared parse prefix. Module layout (SPEC-epub.md 11.1):
 
-  Docling (`src/parse/pdf_worker.rs`, `src/docling.rs`) launches its configured
-  external CLI and monitors process activity (`src/docling_activity.rs`). MuPDF
-  (`src/parse/mupdf_worker.rs`) launches the same service executable in a private
-  extraction mode before normal service initialization. Only native extraction
-  (`src/parse/native_pdf.rs`) runs in that child; the parent maps its output into
-  staged candidates. Physical pages, cleaned paragraphs, and image bounds become
-  `page`, `text_block`, and `figure` units with page locators and reading-order
-  relationships. Native dehyphenation is enabled. Production and the diagnostic
-  share `src/parse/mupdf_cleanup.rs`: margin/folio removal, paragraph joining,
-  junk filtering, and ordered generic text repairs, without font rules, hierarchy
-  inference, or OCR. Merged paragraphs retain every contributing source page/line locator.
-  Missing embedded text and unsupported block categories produce diagnostics.
-  The complete native extraction and `mupdf_cleanup.json` (source line references,
-  removed text, paragraph preparation, and per-pass repairs) are archived through
-  `parser_raw_output_uri`.
+  ```
+  src/parse/epub/
+    mod.rs          worker entry, identity, capability profile, staging
+    archive.rs      capped zip member reading
+    package.rs      container, OPF metadata, manifest, spine
+    navigation.rs   nav document, NCX, landmarks, page-list
+    xhtml.rs        entity pre-pass, decoding, DOM helpers, element paths
+    text.rs         text extraction
+    structure.rs    section tree and block walk
+    blocks.rs       container mapping, tables, figures, captions, notes
+    links.rs        href resolution, note references, cross-references
+    report.rs       raw structure report
+    entities.rs     XHTML entity table (external-artifact rule)
+    kinds.rs        semantic section kind table
+  ```
 
-  Each engine has a distinct parser identity. MuPDF identity includes extraction
-  flags, mapping and cleanup versions, and the compiled dependency-lock hash.
-  Moving the timeout to `[pdf]` preserves Docling's effective identity when settings are
-  equivalent. Identity changes permit a new candidate through the §13.5 guard;
-  changing the selector alone does not enqueue unchanged indexed sources.
-  Explicit reparsing uses the existing projection and activation path, including
-  held candidates. Returning to a previously used identity remains subject to the
-  no-repeat guard; archived parses can be restored through the snapshot lifecycle.
+  The worker records only structure the source declares (container, package,
+  spine, navigation tree, `epub:type` and HTMLBook `data-type` semantics, HTML
+  element semantics, attributes, ids, hrefs); no rule infers structure from
+  text content. The navigation tree is authoritative for section hierarchy and
+  spine order for content order. The spine is walked twice: pass one records,
+  per `(member, element id)`, whether the element lies in a footnote block, so
+  note references whose targets lie in later documents can be classified; pass
+  two emits units, page markers, images, and the raw report with one-block
+  lookahead. Unit records stream to the bundle as finalized; relationships are
+  buffered and written after the last unit in the order `contains`, `precedes`,
+  `appears_on`, caption pairs, `references`. Image bytes are written to the
+  bundle's `artifacts/<sha256>` as encountered, deduplicated by hash, and
+  `FigureBody.imageHash` is the artifact-store key; the importer recomputes each
+  hash, writes the file to the artifact store, and lists it in the canonical
+  bundle manifest with `artifactType = "image"`. Every unit carries exactly one
+  `dom_path` locator. `parser_raw/epub_structure.json` records the package,
+  manifest, spine, navigation resolution, and per-document counts, with no
+  content text beyond navigation labels and headings. The bundle's bounded
+  stdout/stderr logs are empty files.
+
+  Admission budgets come from `[epub]` (member count, per-member and total
+  decompressed bytes, XML document bytes, image bytes, element depth) and from
+  the `[parsing]` candidate caps; exceeding one is a recorded parse failure
+  naming the cap. The worker follows the plain-text worker's outcome model:
+  source-caused failures (encrypted members, unsupported compression, missing
+  container or rootfile, malformed XML, unsupported encodings, an unreadable
+  declared navigation source, a spine with no resolvable content documents)
+  seal a failure bundle and return `Ok`; only staging faults return `Err`.
+
+  Parser identity is `parserName = "epub"`, `parserVersion = "1"`, and a
+  `parserConfigHash` over the worker's `mappingVersion`, `sectionRulesVersion`,
+  `kindPatternsVersion`, and `entityTableVersion` constants; admission caps are
+  not identity, and there is no dependency-lock hash. Identity changes permit a
+  new candidate through the §13.5 guard. Explicit reparsing uses the existing
+  projection and activation path, including held candidates; returning to a
+  previously used identity remains subject to the no-repeat guard, and archived
+  parses can be restored through the snapshot lifecycle.
 
 - **Build projections.** Between import and gate, `build_content_derived_projections`
   builds the content-derived projections in **one transaction**
@@ -813,8 +845,8 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
 ### Stages
 
 - **Channels** (`src/query/channels.rs`). The **dense** and **lexical** channels
-  generate chunk-grained candidates and resolve chunk → unit, excluding units
-  explicitly marked as headers or footers. The **graph** channel (D9) performs
+  generate chunk-grained candidates and resolve chunk → unit. The **graph**
+  channel (D9) performs
   entity-name matching of query text against stored entity-annotation names and
   one semantic relational hop over
   `graph_entity_mentions`/`graph_entity_edges`, tiered deterministically (multi-entity units,
@@ -873,7 +905,7 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   the local runtime lock.
 - **Final results and assembly** (`src/query/passages.rs`, `src/assembly/`).
   Apply the requested passage count within configured result bounds, resolve source
-  locations and physical PDF page references, and retain exactly the selected
+  locations, and retain exactly the selected
   canonical constituents in `evidencePack`. AssemblyPolicy v3 adds no neighbors
   or containers; raw safety-limit failures are errors. Citation and evidence
   reads share the query transaction, and every pack includes an assembly trace.
@@ -1017,10 +1049,6 @@ query/document limits are separate. HTTP initialization checks the configured
 capacity against `/v1/models`; requests disable server-side truncation and expose
 overlength rejections. Existing local-model prefix allocation and ColBERT token-ID
 prefix handling remain unchanged. Annotation representations use complete windows.
-
-Optional Docling native sampling drains bounded output while polling and shares
-the remaining PDF deadline. Sampling timeout or partial capture is reported as
-unavailable telemetry, not a complete sample.
 
 **Accelerator initialization is conditional.** If any retrieval backend is local,
 `[inference]` selects its CUDA or Metal device and the binary must include the

@@ -1,8 +1,17 @@
-//! Typed ContentUnit bodies (spec §18) and the contentType-to-body mapping
-//! validator (spec §15.2). Typed bodies preserve source-derived structure;
-//! Markdown renderings are derived views, never substitutes.
+//! Typed ContentUnit bodies (SPEC-epub §2.2, superseding canonical §18) and
+//! the contentType-to-body mapping validator (spec §15.2). Typed bodies
+//! preserve source-derived structure. No body field may reference another
+//! unit; pairing and containment are relationships only (§16.1 body-hash
+//! rule).
+//!
+//! The closed sets `SectionKind`, `TextBlockRole`, `ListKind`, `AsideKind`,
+//! and `TableRowRole` are defined once here; the EPUB worker imports them
+//! and declares no parallel copies (SPEC-epub §13.2).
 
-// Consumed from C4 onward; remove when C4 wires it.
+// Body structs exist to be validated by strict deserialization in
+// `content_type_body_matches` and to be emitted by workers; the core never
+// reads most of their fields by name, so the field-level dead-code lint is
+// silenced for this module.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
@@ -21,15 +30,18 @@ pub(crate) fn content_type_body_matches(
     body: &serde_json::Value,
 ) -> Result<(), ApiError> {
     let result = match content_type {
+        ContentType::Document => typed_body_check::<DocumentBody>(body),
         ContentType::Page => typed_body_check::<PageBody>(body),
         ContentType::TextSection => typed_body_check::<TextSectionBody>(body),
         ContentType::TextBlock => typed_body_check::<TextBlockBody>(body),
+        ContentType::List => typed_body_check::<ListBody>(body),
+        ContentType::ListItem => typed_body_check::<ListItemBody>(body),
+        ContentType::Aside => typed_body_check::<AsideBody>(body),
         ContentType::Table => typed_body_check::<TableBody>(body),
         ContentType::TableRow => typed_body_check::<TableRowBody>(body),
         ContentType::TableCell => typed_body_check::<TableCellBody>(body),
         ContentType::Figure => typed_body_check::<FigureBody>(body),
         ContentType::Caption => typed_body_check::<CaptionBody>(body),
-        ContentType::ImageRegion => typed_body_check::<ImageRegionBody>(body),
         ContentType::CodeBlock => typed_body_check::<CodeBlockBody>(body),
     };
     // A mismatch is a demonstrable structural fault (§13.1): surface the
@@ -51,66 +63,180 @@ fn typed_body_check<T: serde::de::DeserializeOwned>(
     T::deserialize(body).map(|_: T| ())
 }
 
-/// Spec §18 `PageBody`: the physical page container for `page` units.
+/// SPEC-epub §2.2 `DocumentBody`: source metadata carried by the single
+/// root `document` unit of a parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DocumentBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) creators: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) identifiers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+}
+
+/// SPEC-epub §2.2 `PageBody`: a print-page marker for `page` units.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PageBody {
-    pub(crate) page_number: u64,
-    pub(crate) width: f64,
-    pub(crate) height: f64,
+    /// 1-based position among the parse's page markers.
+    pub(crate) ordinal: u64,
+    /// Printed folio as declared, e.g. "xiv", "218".
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) rotation: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) rendered_image_uri: Option<String>,
+    pub(crate) label: Option<String>,
 }
 
-/// Spec §18 `TextSectionBody`: the logical section container for
+/// SPEC-epub §2.2 `TextSectionBody`: the logical section container for
 /// `text_section` units. A container, not a paragraph (§15.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TextSectionBody {
+    pub(crate) kind: SectionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) heading_text: Option<String>,
+    /// Depth in the section tree; children of `document` are level 1.
+    pub(crate) heading_level: u64,
+    /// Declared number as matched, e.g. "Chapter 1.", "3.2.1.".
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) heading_level: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) section_path: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_text: Option<String>,
+    pub(crate) label: Option<String>,
+    /// Heading trail from level 1 to this section, inclusive.
+    pub(crate) section_path: Vec<String>,
 }
 
-/// Spec §18 `TextBlockBody`: the atomic textual evidence unit for
-/// `text_block` units (§15.2).
+/// SPEC-epub §2.2 `SectionKind`: the closed set of `text_section` kinds.
+/// `Unknown` is the kind for a section the worker could not classify;
+/// `section_kind_coverage` (SPEC-epub §2.6) counts sections whose kind is
+/// not `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SectionKind {
+    Part,
+    Chapter,
+    Section,
+    Preface,
+    Foreword,
+    Introduction,
+    Prologue,
+    Epilogue,
+    Afterword,
+    Conclusion,
+    Appendix,
+    Glossary,
+    Bibliography,
+    Index,
+    Notes,
+    Acknowledgments,
+    Dedication,
+    Epigraph,
+    Titlepage,
+    CopyrightPage,
+    Cover,
+    Toc,
+    Colophon,
+    Unknown,
+}
+
+/// SPEC-epub §2.2 `TextBlockBody`: the atomic textual evidence unit for
+/// `text_block` units (§15.2). `role` is required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TextBlockBody {
     pub(crate) text: String,
+    pub(crate) role: TextBlockRole,
+    /// Declared marker: footnote number, item number.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) block_role: Option<TextBlockRole>,
+    pub(crate) label: Option<String>,
+    /// BCP 47 tag from the nearest declared language.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) language: Option<String>,
 }
 
-/// Spec §18 `TextBlockBody.blockRole`.
+/// SPEC-epub §2.2 `TextBlockRole`: the closed set of `text_block` roles.
+/// There are no furniture roles (`header`/`footer` were removed in v0.4);
+/// prose for passage assembly is `paragraph`, `quote`, `definition`, and
+/// `unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TextBlockRole {
     Paragraph,
     Heading,
-    ListItem,
+    Title,
+    Subtitle,
+    Term,
+    Definition,
     Footnote,
-    Header,
-    Footer,
     Quote,
+    Attribution,
     Formula,
     Unknown,
 }
 
-/// Spec §18 `TableBody`: the table container for `table` units. Normalized
-/// renderings are supplements to the decomposed rows/cells, not substitutes
-/// (§15.2).
+/// SPEC-epub §2.2 `ListBody`: the list container for `list` units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListBody {
+    pub(crate) kind: ListKind,
+    /// Declared start for ordered lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start: Option<u64>,
+}
+
+/// SPEC-epub §2.2 `ListBody.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ListKind {
+    Ordered,
+    Unordered,
+    Definition,
+}
+
+/// SPEC-epub §2.2 `ListItemBody`: one item container of a list for
+/// `list_item` units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListItemBody {
+    /// 1-based position within the list.
+    pub(crate) ordinal: u64,
+    /// Declared marker text when the source renders one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+}
+
+/// SPEC-epub §2.2 `AsideBody`: the aside container for `aside` units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AsideBody {
+    pub(crate) kind: AsideKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+}
+
+/// SPEC-epub §2.2 `AsideBody.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AsideKind {
+    Note,
+    Tip,
+    Warning,
+    Caution,
+    Important,
+    Sidebar,
+    Epigraph,
+    Example,
+    Unknown,
+}
+
+/// SPEC-epub §2.2 `TableBody`: the table container for `table` units. The
+/// decomposed rows/cells are `contains` children, not body fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TableBody {
@@ -120,40 +246,24 @@ pub(crate) struct TableBody {
     pub(crate) column_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) headers: Option<Vec<TableHeader>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_markdown: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_csv_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_html_uri: Option<String>,
 }
 
-/// Spec §18 `TableHeader`: one header cell declaration within `TableBody`.
+/// SPEC-epub §2.2 `TableHeader`: one header cell declaration within
+/// `TableBody`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TableHeader {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) row_index: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) column_index: Option<u64>,
+    pub(crate) row_index: u64,
+    pub(crate) column_index: u64,
     pub(crate) text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) span: Option<TableHeaderSpan>,
-}
-
-/// Spec §18 `TableHeader.span`: the inline `{ rowSpan?, columnSpan? }`
-/// object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct TableHeaderSpan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) row_span: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) column_span: Option<u64>,
 }
 
-/// Spec §18 `TableRowBody`: one row of a decomposed table for `table_row`
-/// units.
+/// SPEC-epub §2.2 `TableRowBody`: one row of a decomposed table for
+/// `table_row` units.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TableRowBody {
@@ -162,7 +272,7 @@ pub(crate) struct TableRowBody {
     pub(crate) role: Option<TableRowRole>,
 }
 
-/// Spec §18 `TableRowBody.role`.
+/// SPEC-epub §2.2 `TableRowBody.role`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TableRowRole {
@@ -171,8 +281,8 @@ pub(crate) enum TableRowRole {
     Footer,
 }
 
-/// Spec §18 `TableCellBody`: one cell of a decomposed table for `table_cell`
-/// units; first-class when table retrieval matters (§15.2).
+/// SPEC-epub §2.2 `TableCellBody`: one cell of a decomposed table for
+/// `table_cell` units; first-class when table retrieval matters (§15.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TableCellBody {
@@ -184,128 +294,51 @@ pub(crate) struct TableCellBody {
     pub(crate) column_span: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_text: Option<String>,
-    /// Spec allows `string | number | boolean | null`; explicit null is a
-    /// present value distinct from an absent field (§1.1), hence the custom
-    /// deserializer instead of plain `Option` null-collapsing.
-    #[serde(
-        default,
-        deserialize_with = "some_table_cell_value",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) value: Option<TableCellValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) value_type: Option<TableCellValueType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) header_refs: Option<Vec<String>>,
 }
 
-/// Spec §18 `TableCellBody.value`: closed union of primitive cell values.
-/// `Null` represents an explicitly null cell value, which the spec treats as
-/// distinct from the `value` field being absent. The JSON shapes of the
-/// variants are disjoint, so untagged matching is unambiguous.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum TableCellValue {
-    String(String),
-    Number(serde_json::Number),
-    Boolean(bool),
-    Null,
-}
-
-/// Deserialize `TableCellBody.value` so explicit JSON null becomes
-/// `Some(TableCellValue::Null)`: plain `Option` would map null to `None`,
-/// collapsing the spec's present-null / absent distinction (§1.1).
-fn some_table_cell_value<'de, D>(deserializer: D) -> Result<Option<TableCellValue>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    TableCellValue::deserialize(deserializer).map(Some)
-}
-
-/// Spec §18 `TableCellBody.valueType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TableCellValueType {
-    String,
-    Number,
-    Date,
-    Boolean,
-    Currency,
-    Unknown,
-}
-
-/// Spec §18 `FigureBody`: a visual object for `figure` units.
+/// SPEC-epub §2.2 `FigureBody`: a visual object for `figure` units.
+/// `image_hash` is the artifact-store key (SPEC-epub §2.7); the store
+/// resolves hash to blob, so bodies are never rewritten at import.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct FigureBody {
+    /// SHA-256 hex of the archived image bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) image_uri: Option<String>,
+    pub(crate) image_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) caption: Option<String>,
+    pub(crate) image_media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) alt_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) figure_type: Option<FigureType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) ocr_text: Option<String>,
+    pub(crate) caption: Option<String>,
 }
 
-/// Spec §18 `FigureBody.figureType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FigureType {
-    Chart,
-    Diagram,
-    Photo,
-    Screenshot,
-    Drawing,
-    Unknown,
-}
-
-/// Spec §18 `CaptionBody`: an independent caption unit for `caption` units.
-/// Post-import, pairing to figures/tables is authoritative via
-/// caption_of/has_caption UnitRelationship edges; `captionForUnitIds` is a
-/// spec-optional field this system's workers deliberately leave absent,
-/// because the importer never remaps references embedded inside bodies and
-/// bodyHash must stay purely content-derived (§16.1).
+/// SPEC-epub §2.2 `CaptionBody`: an independent caption unit for `caption`
+/// units. Pairing to figures/tables is expressed only through
+/// `caption_of`/`has_caption` UnitRelationship edges, never in the body
+/// (§16.1 body-hash rule).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CaptionBody {
     pub(crate) text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) caption_for_unit_ids: Option<Vec<String>>,
-}
-
-/// Spec §18 `ImageRegionBody`: a region inside an image for `image_region`
-/// units.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ImageRegionBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) image_uri: Option<String>,
+    /// E.g. "Figure 1-1.", "Table 3-1.".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) ocr_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) confidence: Option<f64>,
 }
 
-/// Spec §18 `CodeBlockBody`: a code fragment for `code_block` units.
+/// SPEC-epub §2.2 `CodeBlockBody`: a code fragment for `code_block` units.
+/// `code` is the evidence text (the `textHash` projection for this type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CodeBlockBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) language: Option<String>,
     pub(crate) code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_code: Option<String>,
+    pub(crate) language: Option<String>,
+    /// E.g. "Example 2-1.".
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) start_line: Option<u64>,
+    pub(crate) label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) end_line: Option<u64>,
+    pub(crate) title: Option<String>,
 }

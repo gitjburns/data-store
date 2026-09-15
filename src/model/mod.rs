@@ -46,11 +46,11 @@ pub(crate) use {
     },
     annotation::{AnnotationFreshnessStatus, SemanticAnnotation, SemanticAnnotationType},
     body::{
-        CaptionBody, FigureBody, FigureType, PageBody, TableBody, TableCellBody, TableHeader,
-        TableHeaderSpan, TextBlockBody, TextBlockRole, TextSectionBody, content_type_body_matches,
+        CaptionBody, CodeBlockBody, TableCellBody, TextBlockBody, TextBlockRole,
+        content_type_body_matches,
     },
     event::{SystemEvent, SystemEventType},
-    locator::{CharRangeLocator, CoordinateSystem, Locator, PageBboxLocator},
+    locator::{CharRangeLocator, Locator},
     parse::{
         ConformanceReport, ParseHeldReason, ParseMetrics, ParseRun, ParseRunStatus, ParseWarning,
         ParseWarningSeverity, ParserCapabilityProfile,
@@ -76,19 +76,18 @@ pub(crate) use operation::{Operation, OperationStatus, OperationType};
 // reads them back into these shapes (SourceObject carrying its SourceLocation
 // list and the DeletionEvidence/DeletionSignal already above). No lint allow.
 pub(crate) use source::{SourceLocation, SourceLocationStatus, SourceObject};
-// Not-yet-wired re-exports: the body/locator variants no current parser
-// emits and the typed source rows later clusters read. Remove each name from
+// Not-yet-wired re-exports: the SPEC-epub §2 body types, closed-set enums,
+// locator, and relationship-role set that only the EPUB worker (Phase 4) and
+// its importer/conformance consumers emit or inspect. Remove each name from
 // this allow block when its consumer wires it.
 #[allow(unused_imports)]
 pub(crate) use {
     body::{
-        CodeBlockBody, ImageRegionBody, TableCellValue, TableCellValueType, TableRowBody,
-        TableRowRole,
+        AsideBody, AsideKind, DocumentBody, FigureBody, ListBody, ListItemBody, ListKind, PageBody,
+        SectionKind, TableBody, TableHeader, TableRowBody, TableRowRole, TextSectionBody,
     },
-    locator::{
-        ByteRangeLocator, DomPathLocator, RepoPathLocator, TableCellLocator, TimeRangeLocator,
-        XmlPathLocator,
-    },
+    locator::DomPathLocator,
+    relationship::RELATIONSHIP_ROLES_REFERENCES,
     // `ChannelReplayMode` is the `ForensicSnapshotManifest.channel_replay_modes`
     // field type; at MVP no per-channel replay claim is emitted, so it has no
     // external consumer. Its consumer is the post-MVP verified-recompute tier

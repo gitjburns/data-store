@@ -35,7 +35,7 @@
 //! NO MODEL CALL ANYWHERE IN THIS MODULE (§38, hard invariant, mirror of
 //! `snapshot::verify`). Restore RE-IMPORTS archived bytes and RE-DERIVES the
 //! deterministic planes; it never re-embeds, re-parses, or re-scores. A grep for
-//! `embed|InferenceRuntime|score_|docling` over this file must stay empty.
+//! `embed|InferenceRuntime|score_` over this file must stay empty.
 
 use crate::runtime::StorageContext;
 use std::time::Instant;

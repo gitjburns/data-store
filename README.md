@@ -39,7 +39,7 @@ cadence:
   │ ACQUIRE  │   raw bytes land in the content-addressed artifact store first
   └────┬─────┘
        ▼
-  ┌──────────┐   PDF: configured Docling or MuPDF; plain text: text worker.
+  ┌──────────┐   EPUB: in-process EPUB worker; plain text: text worker.
   │  PARSE   │   Imported bundles become canonical units; invalid bundles fail.
   └────┬─────┘
        ▼
@@ -394,7 +394,7 @@ curl -s http://127.0.0.1:8091/query \
 ```
 
 The response carries ranked `results` with passage text, source locations,
-section headings, and physical PDF page references, alongside the complete
+and section headings, alongside the complete
 canonical constituents in `evidencePack`. Oversized single-unit excerpts are
 labeled `truncated`; their full bodies remain in the pack. Per-stage retrieval
 `diagnostics` are attached only when `debug` is `true`.
@@ -514,14 +514,13 @@ comments specify units, enforcement scope, and excess-input behavior. The sectio
 | `[resources]` | Read, allocation, and inventory admission guards. |
 | `[workers]` | Annotation/projection batching, concurrency, polling, and publication allowances. |
 | `[sqlite]` | Lock-wait timeout, cooperative SQL execution timeout, and progress-callback cadence. |
-| `[parsing]` | Candidate acceptance, process capture/polling, optional sampling, and regex execution budgets. |
+| `[parsing]` | Candidate unit, relationship, and warning caps and the unit-body byte limit. |
 | `[scheduling]` | Sync cadence, backoff, and maintenance polling. |
 | `[diagnostics]` | Operational error, identifier, and progress-summary bounds. |
 | `[inference]` | Accelerator selection for local retrieval models. Required but unused when dense, ColBERT, and the reranker all use HTTP; no local accelerator is initialized in that mode. |
 | `[storage]` | Corpus root and service-owned index root. |
 | `[connectors.filesystem]` | Governance domain stamped on acquired sources. |
-| `[pdf]` | Required `engine` (`docling` or `mupdf`) and positive `document_timeout_seconds`; no automatic fallback. |
-| `[docling]` | Docling executable and conversion controls. Required for `engine = "docling"`; validated whenever supplied. |
+| `[epub]` | EPUB admission budgets, all required: archive member count, per-member and total decompressed bytes, XML document bytes, image bytes, and element nesting depth. |
 | `[models]` | Dense, ColBERT, and reranker each select an exclusive `local` or `http` backend. Remote ColBERT uses vLLM `/pooling` token inference, a matching local tokenizer, persisted document matrices, and CPU MaxSim; no local ColBERT weights are loaded. The annotator uses an external chat-completions endpoint. See **INSTALL.md** for backend fields. |
 | `[policies]` | Paths to entity-match enable flags and annotator naming rules. Numeric entity-matching limits live in `config.toml`. |
 
@@ -538,15 +537,18 @@ handling remains in place; annotation windows preserve complete input through sp
 Construction settings are recorded with new projections. Restore validates their
 recorded settings or explicit legacy formats without inference. Current resource
 guards may refuse large historical artifacts without declaring them corrupt.
-`[parsing]` resource and observation limits do not change successful parser identities.
+`[parsing]` and `[epub]` admission limits do not change parser identities.
 
-MuPDF extracts embedded text into cleaned paragraphs with source locators,
-physical pages, and image bounds. Cleanup removes margin text, folios, and junk
-paragraphs, joins wrapped lines, and applies generic text repairs. It does not
-perform OCR or infer heading/table hierarchy. Changing the engine or cleanup
-version does not automatically replace indexed parses;
-explicit reparsing uses the normal activation gate. See **INSTALL.md** for
-switching engines and the existing-identity restriction.
+The EPUB worker parses `.epub` files (EPUB 2 and EPUB 3) in-process with no
+external tool. It records only structure the source declares: sections from
+the navigation document or NCX and from headings, print pages from declared
+page-break markers, lists, tables decomposed to cells, figures with their
+image bytes archived by hash, captions, code blocks from `pre`, asides, and
+footnote and cross-reference links. No structure is inferred from text
+content; a source that declares no semantics for a feature gets no such
+feature. DRM-protected archives are recorded parse failures. Other formats are
+converted to plain text outside this service; only `text/plain` and EPUB are
+routed.
 
 ### Annotation settings
 

@@ -36,7 +36,7 @@
 //!       predicate; one-hop, semantic-only. entityType is metadata, NOT
 //!       identity.
 //!   (5) Rebuilt from CA entity/relation annotations (read via
-//!       `annotations::store::fresh_for_active_parse`), never from Docling.
+//!       `annotations::store::fresh_for_active_parse`), never from parser output.
 //!   (7) Envelope via `super::envelope` only (projection_type GraphProjection);
 //!       this module hand-writes NO `retrieval_projections` SQL.
 //!   (8) PURE functions taking (tx/conn, identifiers); touches NO

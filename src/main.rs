@@ -9,8 +9,6 @@ mod client_limits;
 mod config;
 mod connectors;
 mod deletion;
-mod docling;
-mod docling_activity;
 mod dry_run;
 mod error;
 mod events;
@@ -259,11 +257,6 @@ impl StartupReporter {
 
 /// Start the standalone Data Store service.
 fn main() -> anyhow::Result<()> {
-    // The bounded MuPDF child must extract and exit without initializing the
-    // service, opening its store, or competing with the parent's log lifecycle.
-    if let Some(outcome) = parse::mupdf_worker::run_internal_command() {
-        return outcome;
-    }
     let cli_options = resolve_cli_options_from_args()?;
     // Bootstrap output stays on stdout so a launcher can find config/log
     // diagnostics before it backgrounds the service.
@@ -576,7 +569,6 @@ async fn run_http_service(
     let scheduler_corpus_root = config.storage.corpus_root.clone();
     let scheduler_index_root = storage.clone();
     let scheduler_governance_domain = config.connectors.filesystem.governance_domain.clone();
-    let scheduler_pdf = parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?;
     let annotation_index_root = storage.clone();
     let annotation_annotator = config.models.annotator.clone();
     let annotation_config_root = config.config_root().to_path_buf();
@@ -778,7 +770,6 @@ async fn run_http_service(
                 scheduler_corpus_root,
                 scheduler_index_root,
                 scheduler_governance_domain,
-                scheduler_pdf,
                 Arc::clone(&cutover_registry),
                 scheduler_projection_runtime,
                 application_identity,
@@ -1132,7 +1123,7 @@ fn register_policy_versions(
 
 /// CA2-P5 annotation dry-run mode. One deliberate operator pass for the
 /// ruleset-authoring loop: acquisition + parse across the corpus (parses left
-/// READY for the next normal start's §13.5 GateExisting adoption — Docling is
+/// READY for the next normal start's §13.5 GateExisting adoption — parsing is
 /// paid once), entity/relation producers sampled over the first N section
 /// groups per source, then the reduced inspection router served until
 /// `POST /shutdown`.
@@ -1150,7 +1141,7 @@ fn register_policy_versions(
 ///   reads, and shutdown; mutating admin routes would accept work nothing
 ///   drains here.
 ///
-/// The HTTP listener serves DURING the pass (Docling over a corpus can take
+/// The HTTP listener serves DURING the pass (parsing a corpus can take
 /// a long time), so health and vocabulary are inspectable while sampling is
 /// still running; pass completion or failure is logged, and a failed pass
 /// keeps serving so whatever landed stays inspectable.
@@ -1286,7 +1277,6 @@ async fn run_annotation_dry_run_mode(
         corpus_root: config.storage.corpus_root.clone(),
         index_root: storage.clone(),
         governance_domain: config.connectors.filesystem.governance_domain.clone(),
-        pdf: parse::pdf::PdfParser::from_config(&config.pdf, config.docling.as_ref())?,
         annotator: config.models.annotator.clone(),
         config_root: config.config_root().to_path_buf(),
         groups_per_source,
@@ -1323,7 +1313,7 @@ async fn run_annotation_dry_run_mode(
     let app = http::build_dry_run_router(state).layer(TraceLayer::new_for_http());
 
     // The pass runs on a blocking task while the listener serves, so the
-    // inspection surface answers during long Docling conversions. Completion
+    // inspection surface answers during long parse passes. Completion
     // and failure are logged by the wrapper task; a failed pass deliberately
     // keeps the service up — partial vocabulary is still worth inspecting.
     let pass_shutdown = Arc::clone(&shutdown_signal);

@@ -17,7 +17,7 @@ use crate::canonical::{canonical_sha256_hex_of, sha256_hex_bytes};
 use crate::error::ApiError;
 use crate::inference::ColbertCandidateScore;
 use crate::limits::RetrievalLimits;
-use crate::model::{ContentType, Locator, SourceLocationStatus};
+use crate::model::{ContentType, SourceLocationStatus};
 use crate::projections::annotation::slice_chars;
 use crate::query::annotation::ScoredExcerpt;
 use crate::query::model::RetrievalHit;
@@ -31,20 +31,18 @@ use crate::sections::read_section;
 // an explicit error, never a silently shortened raw evidence record.
 const UNIT_SQL: &str = "
 SELECT source_id, content_type,
-       CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END,
-       CASE WHEN length(CAST(COALESCE(locators_json, '[]') AS BLOB)) <= ?4
-            THEN COALESCE(locators_json, '[]') END
+       CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END
 FROM content_units WHERE parse_id = ?1 AND id = ?2";
+// Reading order is the single `precedes` edge type (SPEC-epub §2.4); the
+// previous neighbor is the edge's `from` side, the next neighbor its `to` side.
 const PREVIOUS_SQL: &str = "
-SELECT DISTINCT CASE WHEN from_unit_id = ?2 THEN to_unit_id ELSE from_unit_id END
+SELECT DISTINCT from_unit_id
 FROM unit_relationships WHERE parse_id = ?1 AND
- ((relationship_type = 'precedes' AND to_unit_id = ?2) OR
-  (relationship_type = 'follows' AND from_unit_id = ?2)) LIMIT 2";
+  relationship_type = 'precedes' AND to_unit_id = ?2 LIMIT 2";
 const NEXT_SQL: &str = "
-SELECT DISTINCT CASE WHEN from_unit_id = ?2 THEN to_unit_id ELSE from_unit_id END
+SELECT DISTINCT to_unit_id
 FROM unit_relationships WHERE parse_id = ?1 AND
- ((relationship_type = 'precedes' AND from_unit_id = ?2) OR
-  (relationship_type = 'follows' AND to_unit_id = ?2)) LIMIT 2";
+  relationship_type = 'precedes' AND from_unit_id = ?2 LIMIT 2";
 const LOCATIONS_SQL: &str = "
 SELECT CASE WHEN length(CAST(native_uri AS BLOB)) <= ?2 THEN native_uri END, status
 FROM source_locations WHERE source_id = ?1
@@ -72,8 +70,6 @@ pub(crate) struct SearchResult {
     pub(crate) source_excerpts: Vec<SourceExcerpt>,
     pub(crate) source_locations: Vec<SourceCitation>,
     pub(crate) section_path: Vec<String>,
-    /// Physical PDF page positions, not printed page labels inferred from text.
-    pub(crate) page_numbers: Vec<u64>,
     pub(crate) score: f64,
     /// A legacy unit seed was clipped by the passage budget; exact retrieved windows remain complete.
     pub(crate) truncated: bool,
@@ -87,7 +83,6 @@ struct PassagePart {
     start_char: usize,
     end_char: usize,
     text: String,
-    pages: Vec<u64>,
 }
 
 impl PassagePart {
@@ -289,13 +284,6 @@ impl PassageCandidate {
         let retrieval_provenance = self.retrieval_provenance(pool, channel_hits)?;
         let source_excerpts = self.source_excerpts();
         let source_locations = read_locations(conn, &self.source_id)?;
-        let page_numbers = self
-            .parts
-            .iter()
-            .flat_map(|p| p.pages.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
         Ok(SearchResult {
             text: self.text,
             source_id: self.source_id,
@@ -304,7 +292,6 @@ impl PassageCandidate {
             source_excerpts,
             source_locations,
             section_path: self.section_path,
-            page_numbers,
             score,
             truncated: self.truncated,
             retrieval_provenance,
@@ -423,50 +410,33 @@ struct Unit {
     source_id: String,
     content_type: ContentType,
     body: Value,
-    locators: Vec<Locator>,
 }
 
 impl Unit {
-    /// Recognize page furniture by the parser's explicit role, never by guessing
-    /// from numeric text (numbers can be legitimate evidence).
-    fn is_furniture(&self) -> bool {
-        self.content_type == ContentType::TextBlock
-            && matches!(
-                self.body.get("blockRole").and_then(Value::as_str),
-                Some("header" | "footer")
-            )
-    }
-
-    /// Only ordinary prose is expanded; lists, formulas, captions, cells and code
-    /// retain their own structural boundaries instead of being mixed into prose.
+    /// Only ordinary prose is expanded (SPEC-epub §13.2: `paragraph`, `quote`,
+    /// `definition`, `unknown`); headings, terms, footnotes, formulas, captions,
+    /// cells and code retain their own structural boundaries instead of being
+    /// mixed into prose. `role` is required on every v0.4 `text_block` body, so
+    /// a missing role is treated as non-prose rather than defaulted.
     fn is_prose(&self) -> bool {
         self.content_type == ContentType::TextBlock
             && matches!(
-                self.body.get("blockRole").and_then(Value::as_str),
-                None | Some("paragraph" | "unknown")
+                self.body.get("role").and_then(Value::as_str),
+                Some("paragraph" | "quote" | "definition" | "unknown")
             )
     }
 
-    /// Resolve the shared evidence-text contract and its physical page citations.
+    /// Resolve the shared evidence-text contract for this unit's whole text.
     fn part(&self) -> Option<PassagePart> {
         let text = evidence_text(self.content_type, &self.body)?;
         if text.trim().is_empty() {
             return None;
         }
-        let pages = self
-            .locators
-            .iter()
-            .filter_map(|locator| match locator {
-                Locator::PageBbox(page) => Some(page.page_number),
-                _ => None,
-            })
-            .collect();
         Some(PassagePart {
             id: self.id.clone(),
             start_char: 0,
             end_char: text.chars().count(),
             text,
-            pages,
         })
     }
 }
@@ -678,9 +648,6 @@ fn build_excerpt_passage(
             "exact passage seed and canonical unit have different sources",
         ));
     }
-    if unit.is_furniture() {
-        return Ok(None);
-    }
     let Some(mut part) = unit.part() else {
         return Ok(None);
     };
@@ -708,7 +675,7 @@ fn build_excerpt_passage(
             "exact passage annotation attribution has a different supporting range",
         ));
     }
-    // Recorded unit locators remain authoritative; character offsets cannot invent finer page positions.
+    // The seed's exact window replaces the whole-unit text; its offsets stay verbatim.
     part.text = text.to_owned();
     part.start_char = seed.excerpt.start_char;
     part.end_char = seed.excerpt.end_char;
@@ -753,7 +720,8 @@ fn passage_candidate_id(
 
 /// Follow canonical reading-order edges around a seed, stopping at section or
 /// content boundaries. Alternating directions avoids spending the whole budget
-/// on just the preceding context. Traversal itself is bounded even across furniture.
+/// on just the preceding context. Traversal is bounded by `max_passage_units`
+/// and by the cycle check, independent of what each neighbor turns out to be.
 fn build_passage(
     conn: &Connection,
     parse_id: &str,
@@ -761,9 +729,6 @@ fn build_passage(
     tokenizer: &Tokenizer,
 ) -> Result<Option<PassageCandidate>, ApiError> {
     let unit = read_unit(conn, parse_id, anchor)?;
-    if unit.is_furniture() {
-        return Ok(None);
-    }
     let Some(mut part) = unit.part() else {
         return Ok(None);
     };
@@ -806,9 +771,6 @@ fn build_passage(
                 return Err(failure(format!(
                     "passage crosses source at unit {next} in parse {parse_id}"
                 )));
-            }
-            if neighbor.is_furniture() {
-                continue;
             }
             if !neighbor.is_prose() || read_section(conn, parse_id, &next)?.0 != section_id {
                 cursors[direction] = None;
@@ -948,14 +910,6 @@ fn merge_part(left: &PassagePart, right: &PassagePart) -> Result<Option<PassageP
         start_char: earlier.start_char,
         end_char: earlier.end_char.max(later.end_char),
         text,
-        pages: earlier
-            .pages
-            .iter()
-            .chain(&later.pages)
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
     }))
 }
 
@@ -1023,20 +977,14 @@ fn bounded_text(
 /// Read a bounded canonical unit, failing on missing or oversized authoritative data.
 fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, ApiError> {
     let body_limit = conn.limits().resources.max_source_body_bytes;
-    let cell_limit = conn.limits().resources.max_json_cell_bytes;
     let row = conn
-        .query_row(
-            UNIT_SQL,
-            params![parse_id, unit_id, body_limit, cell_limit],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
+        .query_row(UNIT_SQL, params![parse_id, unit_id, body_limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
         .optional()
         .map_err(|source| {
             failure(format!(
@@ -1049,11 +997,6 @@ fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, A
             "resource limit: body of {unit_id} exceeds {body_limit} bytes"
         ))
     })?;
-    let locators = row.3.ok_or_else(|| {
-        failure(format!(
-            "resource limit: locators of {unit_id} exceed {cell_limit} bytes"
-        ))
-    })?;
     Ok(Unit {
         id: unit_id.to_string(),
         source_id: row.0,
@@ -1061,8 +1004,6 @@ fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, A
             .map_err(|source| failure(format!("content type of {unit_id}: {source}")))?,
         body: serde_json::from_str(&body)
             .map_err(|source| failure(format!("body of {unit_id}: {source}")))?,
-        locators: serde_json::from_str(&locators)
-            .map_err(|source| failure(format!("locators of {unit_id}: {source}")))?,
     })
 }
 

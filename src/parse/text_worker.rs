@@ -268,10 +268,12 @@ fn run_text_parse_inner(
     let mut units = Vec::with_capacity(paragraphs.len());
     let mut relationships = Vec::with_capacity(paragraphs.len().saturating_sub(1));
     for (index, paragraph) in paragraphs.into_iter().enumerate() {
+        // Every plain-text block is a paragraph (SPEC-epub §13.5); the
+        // worker declares no label or language.
         let body = TextBlockBody {
             text: paragraph.text,
-            normalized_text: None,
-            block_role: Some(TextBlockRole::Paragraph),
+            role: TextBlockRole::Paragraph,
+            label: None,
             language: None,
         };
         // Serialization of our own typed body is a worker-side invariant;
@@ -404,9 +406,12 @@ fn text_parse_metrics(unit_count: u64, relationship_count: u64) -> ParseMetrics 
         unit_count: Some(unit_count),
         relationship_count: Some(relationship_count),
         page_count: None,
+        section_count: None,
+        list_count: None,
+        aside_count: None,
         table_count: None,
         figure_count: None,
-        ocr_region_count: None,
+        code_block_count: None,
         annotation_count: None,
         projection_count: None,
     }

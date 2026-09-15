@@ -1,11 +1,10 @@
 # SPEC-EPUB — EPUB Parser Engine and Content Model v0.4
 
-Status: approved design, not yet implemented. This document is the contract for
-the EPUB parser worker and for the content-model revision it requires. Until
-implementation lands, the canonical spec, SPEC-SERVER.md, PROTOCOL.md,
-ARCHITECTURE.md, README.md, INSTALL.md, DIAGNOSTICS.md, and
-config.example.toml describe the pre-revision system; Section 13 lists the
-updates each of them needs afterwards. Where this document and those documents
+Status: implemented (2026-09-14). This document is the contract for the EPUB
+parser worker and for the content-model revision it requires. The canonical
+spec, SPEC-SERVER.md, PROTOCOL.md, ARCHITECTURE.md, README.md, INSTALL.md,
+DIAGNOSTICS.md, and config.example.toml describe the revised system; Section
+13 lists the updates each received. Where this document and those documents
 disagree, this document wins for EPUB and for the content model.
 
 Terminology follows the canonical spec (ContentUnit, UnitRelationship, Locator,
@@ -41,7 +40,16 @@ form §N without a document name refer to the canonical spec.
 - Print-page geometry. Pages carry an ordinal and a label only.
 - Automated tests. Verification is Section 14.
 
-### 1.3 Sample corpus
+### 1.3 Structure only
+
+The parser records only structure the source declares: the container, package,
+spine, navigation tree, `epub:type` and HTMLBook `data-type` semantics, HTML
+element semantics, attributes, ids, and hrefs. No rule infers structure from
+text content: no keyword, numeral, marker, or label pattern decides a section
+kind, label, page, caption, code block, or note. A source that declares no
+semantics for a feature gets no such feature.
+
+### 1.4 Sample corpus
 
 The rules in this document are grounded in six files in the repository root.
 Each rule that exists because of one sample names it.
@@ -111,7 +119,7 @@ type TextSectionBody = {
   kind: SectionKind
   headingText?: string
   headingLevel: number     // depth in the section tree; children of document = 1
-  label?: string           // declared number as matched, e.g. "Chapter 1.", "3.2.1."
+  label?: string           // declared number from a `span.label` inside the heading, e.g. "Chapter 1."
   sectionPath: string[]    // heading trail from level 1 to this section, inclusive
 }
 
@@ -127,7 +135,7 @@ type SectionKind =
 type TextBlockBody = {
   text: string
   role: TextBlockRole
-  label?: string           // declared marker: footnote number, item number
+  label?: string           // declared marker from a `span.label` inside the block
   language?: string        // BCP 47 tag from the nearest declared language
 }
 
@@ -190,13 +198,13 @@ type FigureBody = {
 
 type CaptionBody = {
   text: string
-  label?: string           // e.g. "Figure 1-1.", "Table 3-1."
+  label?: string           // from a `span.label` inside the caption, e.g. "Figure 1-1."
 }
 
 type CodeBlockBody = {
   code: string
   language?: string
-  label?: string           // e.g. "Example 2-1."
+  label?: string           // from the paired caption's label, e.g. "Example 2-1."
   title?: string
 }
 ```
@@ -318,7 +326,8 @@ distinct image, named by the lowercase SHA-256 hex of its bytes. The importer:
 - `parserConfigHash` is the canonical hash of
   `{ mappingVersion, sectionRulesVersion, kindPatternsVersion, entityTableVersion }`,
   each a string constant in the worker. Any change to a mapping rule, a
-  section rule, a kind pattern, or the entity table bumps its constant.
+  section rule, the semantic kind table, or the entity table bumps its
+  constant.
 - Admission caps (Section 4) are not identity: they decide whether a parse
   completes, not what a completed parse contains.
 - No dependency-lock hash. A well-formed document parses identically across
@@ -486,17 +495,7 @@ Kind is determined by the first rule that matches, in this order:
    kind table.
 2. HTMLBook `data-type` on the same elements, mapped by the kind table.
 3. A landmarks or guide entry whose target resolves to the section's target.
-4. The navigation label, then the heading text, matched against the kind
-   pattern table: exactly these leading words, `chapter`, `part`, `book`, `volume`,
-   `appendix`, `preface`, `foreword`, `introduction`, `prologue`, `epilogue`,
-   `afterword`, `conclusion`, `glossary`, `bibliography`, `index`, `notes`,
-   `endnotes`, `acknowledgments`, `dedication`, `contents`, `copyright`,
-   `colophon`, `cover`, `title page`, case-insensitive, with punctuation and
-   roman or arabic numerals ignored. Words map to the kind of the same name
-   except: `book` and `volume` map to `part`; `endnotes` maps to `notes`;
-   `contents` maps to `toc`; `copyright` maps to `copyright_page`;
-   `title page` maps to `titlepage`.
-5. `section` for a section opened by a heading (7.4 rule 5); else `unknown`.
+4. `section` for a section opened by a heading (7.4 rule 5); else `unknown`.
 
 The kind table, applied by rules 1 to 3 to `epub:type`, `data-type`,
 landmark, and guide values (a space-separated value matches on any token):
@@ -511,22 +510,18 @@ and `notes` to `notes`; `text` (a guide type) to `chapter`. Any other value,
 including `bodymatter`, `frontmatter`, `backmatter`, and `book`, does not
 match, and the next rule applies.
 
-Rule 4 exists for the EPUB 2 samples, none of which carries semantic types.
-The kind and pattern tables live in their own source file, versioned by
-`kindPatternsVersion`.
+The EPUB 2 samples carry no semantic types; their sections are `unknown`
+except heading-opened subsections. The kind table lives in its own source
+file, versioned by `kindPatternsVersion`.
 
 ### 7.3 Section labels and headings
 
 - HTMLBook marks the number in `span.label` inside the heading; the span text
   becomes `label`, the remainder `headingText` (AI Engineering, DDIA).
-- Otherwise a leading token matching `<kindword> <numeral>[.:-]?` or a bare
-  `<numeral>.<numeral>...` prefix, including its trailing punctuation,
-  becomes `label` and the rest `headingText` (TCP/IP `3.2.1. The IEEE 802
-  ...`, Civilization `CHAPTER IX`). The same split applies when a navigation
-  label supplies `headingText`.
-- A heading whose text contains a line break (`<br/>`) is split at the first
-  break: first line is `label` when it matches a kind word, else the whole
-  text is `headingText` (Civilization `CHAPTER IX<br/>Babylonia`).
+- Otherwise the whole heading text is `headingText` and `label` is absent
+  (TCP/IP `3.2.1. The IEEE 802 ...`, Civilization `CHAPTER IX`).
+- Line breaks inside a heading become one space in `headingText`
+  (Civilization `CHAPTER IX<br/>Babylonia`).
 - `sectionPath` entries are `label` and `headingText` joined by one space when
   both exist, else whichever exists.
 - `headingLevel` is tree depth, never the `h` number.
@@ -633,21 +628,20 @@ Retailer wrappers such as `span.koboSpan` are inline and transparent.
 
 ### 7.6 Page markers
 
-A page marker is any of. All four rules apply throughout every document;
-precedence is per element, so an element matching more than one rule takes
-the label of the lowest-numbered rule:
+A page marker is any of. Both rules apply throughout every document;
+precedence is per element, so an element matching both takes the label of
+rule 1:
 
 1. An element with `epub:type="pagebreak"` or `role="doc-pagebreak"`; label
    from `title`, then `aria-label`, then text content.
 2. A `<?dp n="…" folio="…"?>` processing instruction; label from `folio`
    (Strange Loop).
-3. An empty `a` or `span` whose `id` matches `^(page|pg|p)[_-]?([0-9]+|[ivxlcdm]+)$`
-   case-insensitive; label from the second capture group (Civilization).
-4. A block element whose `id` matches the same pattern; the marker is at the
-   block's start and the block is still emitted (Elements).
 
-A `page-list` navigation supplies labels by target id and overrides labels
-derived above. Each marker becomes a `page` unit with `ordinal` in reading
+Element ids are not page markers; Civilization's `page_N` anchors and the
+Elements sample's page ids produce no pages. A `page-list` navigation
+supplies labels by target id for elements that are markers under rule 1 or
+rule 2, and overrides labels derived above; a page-list target that is not a
+marker produces no page. Each marker becomes a `page` unit with `ordinal` in reading
 order across the parse and `label` when known, contained by the section
 current at the marker, or by `document` when no section is current;
 unlabeled markers get warning
@@ -668,22 +662,22 @@ types get no `appears_on`; a container's pages are derivable through
 | Source | Unit | Rules |
 | --- | --- | --- |
 | `section`, `article`, `div`, `header`, `footer`, `main`, `center` without an aside kind | none | Walked; contributes `data-type`/`epub:type` to section kind. Only `section` closes heading subsections (7.4 rule 5). |
-| `aside`, or `div`/`section`/`blockquote` whose `epub:type` or `data-type` is `note`, `tip`, `warning`, `caution`, `important`, `sidebar`, `epigraph`, or `example` | `aside` | `kind` from the type; `title` from the first heading inside, which is also emitted as a `text_block` role `heading` contained by the aside. An `aside` with no recognized type is kind `unknown`. HTMLBook `example` contains a `pre`: the aside still takes `title` from the heading, but the heading is emitted as a `caption` paired to the first `code_block` in the aside (7.9 rule 4) instead of as a heading `text_block`, and the `code_block` takes `label`/`title` from it. Text-bearing blocks inside an aside are role `paragraph`, except that an aside made from `blockquote` keeps the `quote`/`attribution` roles of the `blockquote` row. |
+| `aside`, or `div`/`section`/`blockquote` whose `epub:type` or `data-type` is `note`, `tip`, `warning`, `caution`, `important`, `sidebar`, `epigraph`, or `example` | `aside` | `kind` from the type; `title` from the first heading inside, which is also emitted as a `text_block` role `heading` contained by the aside. An `aside` with no recognized type is kind `unknown`. HTMLBook `example` contains a `pre`: the aside still takes `title` from the heading, but the heading is emitted as a `caption` paired to the first `code_block` in the aside (7.9 rule 3) instead of as a heading `text_block`, and the `code_block` takes `label`/`title` from it. Text-bearing blocks inside an aside are role `paragraph`, except that an aside made from `blockquote` keeps the `quote`/`attribution` roles of the `blockquote` row. |
 | `blockquote` without an aside kind | none | Walked; its text-bearing blocks get role `quote`; a descendant with `epub:type="attribution"`, `data-type="attribution"`, or a text-bearing block whose only element child is `cite`, gets role `attribution`. Calibre uses `blockquote` for indentation (TCP/IP); this is emitted faithfully as `quote` and recorded as a deviation (Section 12). |
 | `ul`, `ol` | `list` | `kind` `unordered`/`ordered`; `start` from the attribute. Each `li` becomes a `list_item` with `ordinal`; the item's text-bearing blocks are `text_block` role `paragraph` contained by the item; nested lists are contained by the item. |
 | `dl` | `list` | `kind` `definition`. Each `dt` and its following `dd` elements up to the next `dt` form one `list_item`; the `dt` text is a `text_block` role `term`, each `dd` text-bearing block role `definition`. |
 | `table` | `table`, `table_row`, `table_cell` | Section 7.8. |
 | `figure`, `img` | `figure` | Section 7.9. |
 | `pre` | `code_block` | `code` is the verbatim text with CRLF normalized to LF and one leading newline stripped; `language` from `data-code-language`; else from a `class` token `language-X` or `lang-X` on the `pre` or its first `code` child; else from a bare `class` token `X` only when the `pre` or its first `code` child carries `data-type="programlisting"`; else absent. |
-| monospace block | `code_block` | A text-bearing block, outside `pre`, whose every non-whitespace text character is inside `tt`, `code`, `kbd`, or `samp` descendants and whose extracted text contains at least one line break. `code` is the Section 8 step 1 to 3 text with each line trimmed and interior space runs kept. Language absent. Counted under `epub_code_heuristic`. Takes precedence over the `blockquote` `quote` role. Exists for TCP/IP listings. |
 | block `math` | `text_block` role `formula` | Text from `alttext`, else the text content of an `annotation` child, else the flattened text. |
 | inline `math` | none | Its `alttext` or flattened text is inlined into the enclosing block's text. |
 | `svg` | `figure` | No bytes archived; `altText` from `title` or `desc`; warning `epub_svg_inline`. |
 | `hr`, `wbr` | none | Ignored. |
 
-Role precedence when several rules apply to one text-bearing block: code
-heuristic (becomes `code_block`), then `footnote`, `title`/`subtitle`,
-`attribution`, `quote`, `term`/`definition`, `paragraph`. Heading elements
+Role precedence when several rules apply to one text-bearing block:
+`footnote`, then `title`/`subtitle`, `attribution`, `quote`,
+`term`/`definition`, `paragraph`. Only `pre` produces `code_block`; TCP/IP's
+`blockquote > p > tt` listings are `quote` blocks with newlines. Heading elements
 are always `heading` except where 7.5 makes them a container's title or
 caption. An `aside`, `div`, or `section` whose `epub:type` is `footnote`,
 `endnote`, or `rearnote` emits no `aside` unit; its blocks are footnote
@@ -730,29 +724,22 @@ non-empty.
 Caption detection, first match wins:
 
 1. `figcaption`, or `caption` for tables.
-2. Inside a `figure`: a heading element, or a text-bearing block whose text
-   matches the caption label pattern (O'Reilly `h6`).
-3. Adjacent sibling: the text-bearing block immediately before or immediately
-   after the figure, table, or code block, in that order of preference, whose
-   text matches the caption label pattern
-   `^(figure|fig\.?|table|illustration|plate|map|exhibit|listing|example)\s*[\divxlc][\w.\-–]*[.:]?`
-   case-insensitive, and that is not already paired; the caption `label` is
-   the matched text, trimmed (TCP/IP captions precede
-   images; Civilization captions follow them in `p.figcap`). For a figure
-   made from an `img` inside a text-bearing block, the adjacent blocks are
-   those before and after that containing block.
-4. Inside an aside of kind `example`: the first heading element, paired to
+2. Inside a `figure`: the first heading element (O'Reilly `h6`).
+3. Inside an aside of kind `example`: the first heading element, paired to
    the first `code_block` in the aside (7.7).
 
-A detected caption becomes one `caption` unit with `label` from the leading
-label pattern and `text` as the full caption text, contained by the same
-parent as its subject, and paired both ways with every subject it serves (one
-unit with one pair per image for a multi-image `figure`): `caption_of` from caption to
-subject and `has_caption` from subject to caption. The subject's `caption`
-field (figure, table) or `title` field (code block) receives the caption
-text. Captions are also evidence text.
-A figure with no caption pairs nothing. A caption pattern block that has no
-adjacent figure, table, or code block stays a `text_block` role `paragraph`.
+Sibling blocks are never captions: TCP/IP's `Figure N-N.` paragraphs before
+images and Civilization's `p.figcap` paragraphs after them stay `text_block`
+role `paragraph`, and those figures pair nothing.
+
+A detected caption becomes one `caption` unit with `label` from a
+`span.label` inside it when present and `text` as the full caption text,
+contained by the same parent as its subject, and paired both ways with every
+subject it serves (one unit with one pair per image for a multi-image
+`figure`): `caption_of` from caption to subject and `has_caption` from
+subject to caption. The subject's `caption` field (figure, table) or `title`
+field (code block) receives the caption text. Captions are also evidence
+text. A figure with no caption pairs nothing.
 
 ### 7.10 Notes and footnotes
 
@@ -765,13 +752,12 @@ A block is a footnote when any of:
   `footnotes`, `endnotes`, or `rearnotes`;
 - it is a paragraph within a section of kind `notes`.
 
-Footnote blocks get role `footnote`. `label` is the leading marker when the
-text starts with a marker pattern `^(\d+|[a-z]|[ivxlcdm]+)[.)]?\s` or
-`^page\s+[\divxlc]+\s` (Strange Loop keys notes by print page); the text is
-left intact. A backlink, an `a` at the start of a footnote block with an
-internal href or `epub:type="backlink"`, is not a note reference: its text
-stays in the block, `label` is read from that text, and no edge is emitted
-(Civilization, DDIA).
+Footnote blocks get role `footnote`. `label` comes only from a `span.label`
+inside the block; marker text such as `12.` or `Page 41` stays in the text
+and yields no label. A backlink, an `a` at the start of a footnote block with
+an internal href or `epub:type="backlink"`, is not a note reference: its text
+stays in the block and no edge is emitted (Civilization, DDIA). The EPUB 2
+samples declare no note semantics, so their endnotes are ordinary paragraphs.
 
 ### 7.11 Title and subtitle blocks
 
@@ -795,13 +781,15 @@ Applied to every text-bearing block, caption, cell, term, and definition:
 2. Remove the text of: `a` elements that are note references (Section 10.3);
    empty anchors, including HTMLBook `a[data-type="indexterm"]`; `sup`
    elements whose only content is a note reference; `img` (handled as figure);
-   page-marker elements of Section 7.6 rules 1 and 3; `script` and `style`
+   page-marker elements of Section 7.6 rule 1; `script` and `style`
    if encountered inline.
 3. Replace inline `math` with its text (Section 7.7).
 4. Normalize: convert NBSP and other Unicode space separators to U+0020;
-   collapse runs of spaces and tabs to one space; trim each line; drop empty
-   lines except that a single blank line is preserved between non-empty
-   lines when it came from two consecutive `br`; trim the whole.
+   treat newlines and carriage returns inside source text nodes as spaces,
+   so `br` is the only line-break source; collapse runs of spaces and tabs
+   to one space; trim each line; drop empty lines except that a single blank
+   line is preserved between non-empty lines when it came from two
+   consecutive `br`; trim the whole.
 5. No repairs. Doubled spaces from PDF reflow are collapsed by step 4; split
    headings, hyphenation, and quote styles are emitted as found.
 
@@ -862,9 +850,8 @@ level-1 sections and any pre-section content.
 ### 10.3 Note references
 
 A link is a note reference when it carries `data-type="noteref"` or
-`epub:type="noteref"`, or when it is inside a `sup` and its target resolves to
-a footnote block, or when its target resolves to a footnote block and the link
-text is a marker pattern (Section 7.10). A target resolves to a footnote
+`epub:type="noteref"`, or when its target resolves to a footnote block
+(Section 7.10). A target resolves to a footnote
 block when the element carrying the target id is a footnote block or lies
 inside one (Civilization and TCP/IP anchor the id on an `a` inside the note
 paragraph). A note reference produces `references` with role `footnote` from
@@ -906,11 +893,11 @@ src/parse/epub/
   links.rs        href resolution, note references, cross-references
   report.rs       raw structure report
   entities.rs     XHTML entity table (external-artifact rule)
-  kinds.rs        section kind and pattern tables
+  kinds.rs        semantic section kind table
 ```
 
-Dependencies added: `zip` with default features off and `deflate` only,
-`roxmltree`, and `regex`.
+Dependencies added: `zip` with default features off and `deflate` only, and
+`roxmltree`.
 
 The worker follows the plain-text worker's outcome model: source-caused
 failures seal a failure bundle and return `Ok`; only staging faults return
@@ -950,8 +937,8 @@ read, manifest counts by media type, spine items with linear flags, the
 navigation tree with each node's resolution status and emitted unit id, per
 document: units emitted by type, blocks dropped, unknown elements by local
 name, page markers with labels and ordinals, unresolved links with hrefs,
-caption pairings by rule number, code heuristic applications, and the kind
-rule that fired for each section. It contains no content text beyond
+caption pairings by rule number, and the kind rule that fired for each
+section. It contains no content text beyond
 navigation labels and headings.
 
 ### 11.4 Diagnostics
@@ -981,8 +968,7 @@ is walked use the package document href as their document key. Codes: `epub_mime
 `epub_mimetype_mismatch`, `epub_package_version`, `epub_spine_item_missing`,
 `epub_navigation_missing`, `epub_nav_target_unresolved`, `epub_unknown_element`,
 `epub_empty_blocks_dropped`, `epub_page_marker_unlabeled`, `epub_image_missing`,
-`epub_image_too_large`, `epub_svg_inline`, `epub_code_heuristic`,
-`epub_link_unresolved`.
+`epub_image_too_large`, `epub_svg_inline`, `epub_link_unresolved`.
 
 ## 12. Recorded deviations
 
@@ -993,6 +979,11 @@ is walked use the package document href as their document key. Codes: `epub_mime
   lists, Civilization numbered notes, Elements lettered items).
 - Headings split across paragraphs by PDF reflow remain paragraphs; the
   section heading comes from the navigation label (Elements).
+- No structure is inferred from text (Section 1.3). Sources without semantic
+  markup get section kind `unknown`, no section labels, pages only from
+  explicit markers, captions only from `figcaption`, table `caption`, or a
+  heading inside `figure`, code blocks only from `pre`, and notes only from
+  `noteref`/footnote semantics. This applies to all four EPUB 2 samples.
 - Index entries are emitted as ordinary blocks under an `index` section with
   `index_locator` edges; retrieval-side handling of index noise is outside
   this document.
@@ -1081,10 +1072,10 @@ Expected properties, all derived from the surveys in Section 1.3:
 
 | Sample | Expected |
 | --- | --- |
-| Strange Loop | 24 chapter sections with nested subsections from the NCX; 427 page units with folio labels; `title` and `subtitle` blocks on chapter openers; notes section kind `notes` with `footnote` roles labeled `Page …`; index section kind `index` |
-| TCP/IP | Sections nested to `h5` under a three-level NCX; captions labeled `Figure`/`Table` paired to figures for every `Figure N-N.`/`Table N-N.` block adjacent to an image; code blocks from the monospace heuristic; `footnote` references into the endnotes document; no page units |
-| Civilization | Six-level section tree from the NCX; 37 tables decomposed with cells; captions paired after images in the photo-insert documents; both in-file and cross-file footnote references; page units from `page_N` anchors; parse completes within caps |
-| Elements | Sections from NCX labels; anchored bold paragraphs remain paragraphs; spacer blocks dropped and counted; no failures |
+| Strange Loop | 24 sections with nested subsections from the NCX, kind `unknown`; 427 page units with folio labels from `<?dp?>`; `title` and `subtitle` blocks on chapter openers; notes and index sections kind `unknown` with `paragraph` roles |
+| TCP/IP | Sections nested to `h5` under a three-level NCX; no captions (sibling `Figure N-N.` blocks stay paragraphs); no code blocks (listings are `quote` blocks); endnote links are `cross_reference` references; no page units |
+| Civilization | Six-level section tree from the NCX; 37 tables decomposed with cells; no captions; in-file and cross-file note links are `cross_reference` references; no page units; parse completes within caps |
+| Elements | Sections from NCX labels; anchored bold paragraphs remain paragraphs; spacer blocks dropped and counted; no page units; no failures |
 | AI Engineering | `nav` chosen over NCX; sections to depth 4 with `label` from `span.label`; 49 tables decomposed with header rows; 162 figures with paired `h6` captions; 54 code blocks with language; 23 sidebars and 61 admonitions as asides; `dl` as definition lists; footnote references resolved; MathML formulas as `formula` blocks; index locators emitted |
 | DDIA | Kobo spans transparent in text; scripts and styles skipped; epigraphs as asides; titled examples as caption-paired code blocks; 1.6 MB index document parsed within caps; over a thousand footnote references resolved |
 

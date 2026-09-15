@@ -28,7 +28,7 @@ cp config.example.toml config.toml
 ```
 
 Fill the placeholder paths (`[storage].corpus_root`, `[storage].index_root`,
-`[docling]`, `[models.*]` — all documented inline in the example). Unknown or
+`[models.*]` — all documented inline in the example). Unknown or
 misspelled keys anywhere in `config.toml` are fatal at startup. Relative paths
 resolve against the config file's directory. Config is startup-only: any edit
 requires a service restart.
@@ -73,7 +73,7 @@ data-store --config config.toml --shutdown                       # end dry-run m
 Scope `all` is required — sampled parses are never active. Editing the naming
 document changes producer identity; the entity-match document is
 query-time-only. The next normal start adopts the dry-run's parses without
-re-running Docling.
+re-parsing.
 
 ## 5. Start and verify
 

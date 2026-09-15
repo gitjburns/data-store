@@ -13,10 +13,9 @@ REPL (see `SPEC-CLIENT.md`).
 
 ## 1. Prerequisites and configuration
 
-The `mupdf` dependency builds bundled native sources and generates bindings with
-libclang. Unix builds require `make` and a C/C++ toolchain. MuPDF uses AGPL-3.0
-licensing. Production PDF extraction selects Docling or MuPDF through `[pdf]`;
-MuPDF needs no Python environment. The standalone evaluator is described in section 4.
+Parsing needs no external tool: EPUB (`.epub`, EPUB 2 and EPUB 3) and plain
+text are parsed in-process by the service binary. Other formats are converted
+to plain text outside this service before they enter the corpus.
 
 ### Copy the example configuration
 
@@ -70,14 +69,17 @@ start, fill in at least the following:
 - **`[storage].index_root`** — the service-owned root for the fabric hot plane
   and the artifact store (see storage setup below).
 
-- **`[pdf].engine`** — required, either `docling` or `mupdf`, without fallback.
-  **`document_timeout_seconds`** is required and positive for either engine;
-  it belongs under `[pdf]`, not `[docling]`.
-
-- **`[docling].python_path`** and **`docling_path`** — the Python environment and
-  the Docling executable launched for PDF conversion. The `[docling]` section
-  is required when `engine = "docling"`; it may be omitted for MuPDF. When
-  supplied, every Docling setting is validated even if MuPDF is selected.
+- **`[epub]`** — six required admission budgets for EPUB archives:
+  `max_members` (archive members accepted before the parse fails as a recorded
+  outcome), `max_member_bytes` (decompressed bytes accepted for any single
+  member), `max_total_member_bytes` (decompressed bytes accepted across all
+  members read), `max_document_bytes` (decoded bytes accepted for any XML
+  member), `max_image_bytes` (bytes accepted for one image; larger images are
+  not archived and produce a warning), and `max_element_depth` (element
+  nesting depth accepted in any XML member). Exceeding a budget other than
+  `max_image_bytes` is a recorded parse failure naming the budget. The budgets
+  are not part of parser identity. `config.example.toml` ships `10000`,
+  `67108864`, `536870912`, `16777216`, `16777216`, and `256`.
 
 - **`[models.colbert].backend`** — required, selecting `local` or `http` without
   fallback. Local requires an absolute `path` to ColBERT-Zero artifacts. HTTP
@@ -119,29 +121,6 @@ start, fill in at least the following:
   by content-hashing each document, so do not add one. Both documents are loaded
   once at startup and are strictly validated (unknown keys or invalid values are
   fatal); an edit takes effect only after a service restart.
-
-### PDF engine selection
-
-All shipped configurations select Docling. To select MuPDF, set:
-
-```toml
-[pdf]
-engine = "mupdf"
-document_timeout_seconds = 3600
-```
-
-The selection applies to normal ingestion, explicit reparsing, and annotation
-dry runs. MuPDF extracts embedded text with native dehyphenation, removes margin
-text and folios, joins lines into paragraphs, filters junk paragraphs, and applies
-generic text repairs. Source locators, physical pages, and image bounds remain
-available. It performs no OCR or heading/table inference. Pages without
-embedded text produce warnings; section 4 describes the cleanup preview and report.
-
-Changing the engine or cleanup version does not enqueue unchanged indexed sources.
-Explicitly reparse each source to build a candidate with the selected engine; the normal
-activation gate may hold it for operator acceptance. Selecting an engine identity
-already used for that source remains subject to the no-repeat guard. Use the
-existing snapshot restore operation to restore an archived parse.
 
 ### Remote ColBERT
 
@@ -303,33 +282,6 @@ check as the first live confirmation of the install rather than a re-run of
 previously verified behavior.
 
 For interactive use of the service, see `SPEC-CLIENT.md`.
-
-### Native PDF extraction evaluation
-
-Build the standalone evaluator from the repository root:
-
-```sh
-cargo build --release --features metal --bin pdf-extract-diagnostic
-```
-
-Run `target/release/pdf-extract-diagnostic <input.pdf> <new-output-directory>`.
-Both paths must resolve inside this repository. Use a stable input PDF and a new
-output directory whose parent already exists; existing directories are rejected.
-
-The evaluator writes `raw.json` (text, fonts, block/line/span bounds),
-`extracted.md`, `cleaned.md`, `mupdf_cleanup.json`, and `report.json` (timings,
-counts, and terminal status). JSON publication uses sibling `.json.tmp` files,
-which may remain after interruption. It reads the PDF without changing it and
-does not open the database.
-
-`extracted.md` shows native extraction with page markers. `cleaned.md` uses the
-production MuPDF cleaner and emits one paragraph per line, without page markers
-or empty-page notices. `mupdf_cleanup.json` records source line references,
-removed margin/folio/junk text, paragraph preparation, and per-pass repairs.
-Native dehyphenation is enabled. Image categories/bounds are recorded, but pixels
-and per-character quads are not exported. The report records extraction flags
-and the compiled dependency-lock hash.
-On macOS, `/usr/bin/time -l` can wrap the command to measure peak memory separately.
 
 ## 5. Annotation dry-run mode (authoring rulesets on a fresh corpus)
 

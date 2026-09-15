@@ -1054,10 +1054,7 @@ pub(crate) fn validate_archived_plane(
     for relation in relationships.iter().filter(|relation| {
         relation.get("parse_id").and_then(Value::as_str) == Some(plane.parse_id.as_str())
     }) {
-        if !matches!(
-            archived_string(relation, "relationship_type")?,
-            "logically_contains" | "contains"
-        ) {
+        if archived_string(relation, "relationship_type")? != "contains" {
             continue;
         }
         let from = archived_string(relation, "from_unit_id")?;
@@ -1095,7 +1092,8 @@ pub(crate) fn validate_archived_plane(
 }
 
 /// Resolve the archived equivalent of read_section without opening a scratch DB.
-/// Parent sets mirror SQL DISTINCT and omit physical page containment identically.
+/// Parent sets mirror SQL DISTINCT over `contains` edges and, like the SQL,
+/// never admit a `page` unit as an ancestor.
 fn archived_section(
     unit_id: &str,
     parse_id: &str,
@@ -1225,7 +1223,7 @@ fn validate_window(
 }
 
 /// Read canonical evidence in the same sequence as passage chunking, retaining
-/// even short nonempty leaves and excluding only explicitly labeled furniture.
+/// even short nonempty leaves.
 fn read_leaves(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Vec<Leaf>, ApiError> {
     let mut leaves = Vec::new();
     visit_leaves(conn, source_id, parse_id, |leaf| {
@@ -1300,16 +1298,9 @@ fn visit_leaves(
     Ok(())
 }
 
-/// Keep live and archived furniture exclusion and canonical evidence fields identical.
+/// Keep live and archived leaf selection identical: the shared evidence-text
+/// contract, minus blank text. v0.4 has no furniture roles to exclude.
 fn eligible_text(kind: ContentType, body: &Value) -> Option<String> {
-    if kind == ContentType::TextBlock
-        && matches!(
-            body.get("blockRole").and_then(Value::as_str),
-            Some("header" | "footer")
-        )
-    {
-        return None;
-    }
     evidence_text(kind, body).filter(|text| !text.trim().is_empty())
 }
 

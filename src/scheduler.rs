@@ -49,7 +49,7 @@ use crate::{
     // Parse routing matches on the same mime constants acquisition writes
     // into source_objects.mime_type, so the routing vocabulary is
     // single-sourced.
-    acquisition::{self, AcquisitionContext, ImportOutcome, MIME_TYPE_PDF, MIME_TYPE_PLAIN_TEXT},
+    acquisition::{self, AcquisitionContext, ImportOutcome, MIME_TYPE_EPUB, MIME_TYPE_PLAIN_TEXT},
     activation::{self, ActivationDecision},
     artifact_store::ArtifactStore,
     config::{DenseModelConfig, StorageConfig},
@@ -69,15 +69,15 @@ use crate::{
     },
     parse::{
         bundle::{BUNDLE_DIR_NAME_PREFIX, BUNDLE_TEMP_DIR_SUFFIX, parse_staging_root},
+        epub,
         importer::{ImportedParseStatus, import_parser_bundle},
-        pdf::PdfParser,
         text_worker,
     },
     primitives::utc_now,
     projections::{
         chunk, dense, dense_cache::DenseCache, envelope, lexical, multivector, section_dense, view,
     },
-    source::{corpus_relative_source, resolve_contained_source, resolve_source_reference},
+    source::{corpus_relative_source, resolve_contained_source},
     state::{
         CutoverRegistry, ExclusiveGate, FabricHealth, FabricSourceCounts, ShutdownSignal,
         SyncCycleStats, SyncHealth, acquire_model_call_gate_on,
@@ -226,10 +226,11 @@ SELECT COUNT(*) FROM source_locations
 WHERE source_system = ?1 AND status = 'access_lost'";
 
 /// Unparseable-MIME: imported, still-active source objects whose stored
-/// authoritative mime type has no registered parser route (neither PDF nor
-/// plain text). The durable, honest measure of the no-parser dispatch outcome
-/// (§13.5) — the routing itself is warn-only, but the source object it left
-/// unparsed persists with its unroutable mime_type.
+/// authoritative mime type has no registered parser route (the two bound
+/// parameters are exactly the `ParseRoute` MIME vocabulary). The durable,
+/// honest measure of the no-parser dispatch outcome (§13.5) — the routing
+/// itself is warn-only, but the source object it left unparsed persists with
+/// its unroutable mime_type.
 const SELECT_UNPARSEABLE_MIME_COUNT_SQL: &str = "
 SELECT COUNT(*) FROM source_objects
 WHERE deactivated_at IS NULL AND mime_type NOT IN (?1, ?2)";
@@ -287,10 +288,12 @@ pub(crate) struct QueueDepths {
 }
 
 /// Parser worker a routed mime type resolves to (spec §12: one worker per
-/// supported input class).
+/// supported input class). Exactly the two routed MIMEs of `acquisition`
+/// (SPEC-epub §3.1); every `match` on it in `parse_chain_prefix` is
+/// exhaustive so adding a route cannot silently fall through.
 #[derive(Debug, Clone, Copy)]
 enum ParseRoute {
-    Pdf,
+    Epub,
     PlainText,
 }
 
@@ -329,7 +332,7 @@ pub(crate) struct ProjectionRuntime {
 /// containment → identity check → worker → import) needs — deliberately free of
 /// any projection-build, gate, or snapshot handle. `storage` re-packages the
 /// exact corpus/index roots main read from config.storage — no new configuration
-/// is introduced — because `crate::source::resolve_source_reference` takes the
+/// is introduced — because `crate::source::resolve_contained_source` takes the
 /// typed config shape.
 ///
 /// OWNERSHIP BOUNDARY (CA2-P5): this split exists because the annotation
@@ -340,9 +343,6 @@ pub(crate) struct ProjectionRuntime {
 /// gate continuation needs belongs on `ParseDispatchContext` instead.
 struct ParsePrefixContext {
     storage: StorageConfig,
-    // Identity lookup and execution share this selection, including reparses
-    // and annotation dry runs that reuse the same parse-chain prefix.
-    pdf: PdfParser,
 }
 
 /// Everything the FULL drain-loop parse chain needs beyond the queue entry
@@ -984,7 +984,7 @@ fn fabric_counts(
     let unparseable_mime = read_scalar_count(
         &connection,
         SELECT_UNPARSEABLE_MIME_COUNT_SQL,
-        params![MIME_TYPE_PDF, MIME_TYPE_PLAIN_TEXT],
+        params![MIME_TYPE_PLAIN_TEXT, MIME_TYPE_EPUB],
         "unparseable-mime",
     )?;
 
@@ -1068,11 +1068,10 @@ fn read_scalar_count(
 }
 
 /// Spawn the sync scheduler thread: one std::thread running fabric
-/// validation, then the adaptive scan/drain loop until shutdown. `pdf`
-/// and `registry` feed the drain-loop parse chain (C5c): the selected PDF
-/// producer and the per-source cutover barriers activation swaps
-/// behind. The caller (main) owns the JoinHandle and joins it after the
-/// HTTP server exits so scheduler shutdown is observable.
+/// validation, then the adaptive scan/drain loop until shutdown. `registry`
+/// feeds the drain-loop parse chain (C5c): the per-source cutover barriers
+/// activation swaps behind. The caller (main) owns the JoinHandle and joins
+/// it after the HTTP server exits so scheduler shutdown is observable.
 // The parameter list is the thread's full startup input set (roots, connector
 // identity, the C6 projection runtime, shutdown, and the health slot); grouping
 // them into a struct would only rename the same fields, so the arity allow is
@@ -1082,7 +1081,6 @@ pub(crate) fn start(
     corpus_root: PathBuf,
     index_root: StorageContext,
     governance_domain: String,
-    pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
     // The C6 content-derived build handles (inference runtimes, expected
     // dimensions, the shared model-call gate, the active dense cache). Owned by
@@ -1124,7 +1122,6 @@ pub(crate) fn start(
                     corpus_root,
                     index_root,
                     governance_domain,
-                    pdf,
                     registry,
                     projections,
                     identity,
@@ -1177,7 +1174,6 @@ fn run_scheduler(
     corpus_root: PathBuf,
     index_root: StorageContext,
     governance_domain: String,
-    pdf: PdfParser,
     registry: Arc<CutoverRegistry>,
     projections: ProjectionRuntime,
     identity: ApplicationIdentity,
@@ -1321,7 +1317,6 @@ fn run_scheduler(
                 corpus_root,
                 index_root: index_root.to_path_buf(),
             },
-            pdf,
         },
         registry,
         projections,
@@ -1567,7 +1562,7 @@ pub(crate) struct DryRunPassOutcome {
 /// is left un-held (`held_reason` NULL) — the exact precondition the NEXT normal
 /// start's §13.5 GateExisting arm adopts (reclaiming the `in_flight` row,
 /// rebuilding projections from canonical rows, gating WITHOUT re-invoking
-/// Docling). Docling is paid once here and never redone.
+/// the parser worker). The parse is paid once here and never redone.
 ///
 /// The full dispatch prefix runs unchanged, so every guard that must still run
 /// does: the §13.5 no-retry guard, corpus containment, and the pre-worker
@@ -1592,7 +1587,6 @@ pub(crate) fn run_annotation_dry_run_pass(
     corpus_root: PathBuf,
     index_root: StorageContext,
     governance_domain: String,
-    pdf: PdfParser,
 ) -> Result<DryRunPassOutcome, ApiError> {
     let started = Instant::now();
     info!(
@@ -1634,7 +1628,6 @@ pub(crate) fn run_annotation_dry_run_pass(
             corpus_root,
             index_root: index_root.to_path_buf(),
         },
-        pdf,
     };
 
     // ONE full scan (which also stages new/changed items) then a single uncapped
@@ -2554,7 +2547,7 @@ fn parse_chain_prefix(
         read_source_mime_type(&connection, source_id)?
     };
     let route = match mime_type.as_str() {
-        MIME_TYPE_PDF => ParseRoute::Pdf,
+        MIME_TYPE_EPUB => ParseRoute::Epub,
         MIME_TYPE_PLAIN_TEXT => ParseRoute::PlainText,
         _ => {
             // Nothing-to-parse is a recorded outcome, not a failure: this
@@ -2574,7 +2567,7 @@ fn parse_chain_prefix(
     // derivation the worker stamps into its bundles, so the §13.5 guard and
     // the staged manifest can never disagree.
     let profile = match route {
-        ParseRoute::Pdf => dispatch.pdf.effective_capability_profile()?,
+        ParseRoute::Epub => epub::epub_capability_profile()?,
         ParseRoute::PlainText => text_worker::plain_text_capability_profile()?,
     };
     info!(
@@ -2638,15 +2631,15 @@ fn parse_chain_prefix(
         NoRetryGuardDecision::Dispatch => {}
     }
 
-    // Both routes resolve through the crate::source containment authority
+    // Every route resolves through the crate::source containment authority
     // (traversal components rejected, canonicalized symlink-resolved path
     // verified inside the corpus root, so a corrupted or foreign queue row
-    // cannot point a worker outside the corpus); the PDF resolver
-    // additionally enforces the .pdf extension Docling requires.
+    // cannot point a worker outside the corpus).
     let relative = corpus_relative_source(&dispatch.storage.corpus_root, &entry.native_uri)?;
     let resolved = match route {
-        ParseRoute::Pdf => resolve_source_reference(&dispatch.storage, &relative)?,
-        ParseRoute::PlainText => resolve_contained_source(&dispatch.storage, &relative)?,
+        ParseRoute::Epub | ParseRoute::PlainText => {
+            resolve_contained_source(&dispatch.storage, &relative)?
+        }
     };
 
     // Identity check (spec §10 rule 1: identity is content): the run will be
@@ -2692,14 +2685,14 @@ fn parse_chain_prefix(
     // workspace itself faulted. A file that vanishes after the check above
     // is the worker's recorded parse outcome.
     if let Some(monitor) = monitor {
-        // Parsers are opaque subprocess work. Publish the boundary without
+        // Parsers are opaque worker work. Publish the boundary without
         // inventing a page or byte-completion percentage during extraction.
         monitor.stage("parsing", None, "units");
     }
     let bundle_dir = match route {
-        ParseRoute::Pdf => dispatch
-            .pdf
-            .run(index_root, resolved, source_id, source_hash)?,
+        ParseRoute::Epub => {
+            epub::run_epub_parse(index_root, &resolved.absolute_path, source_id, source_hash)?
+        }
         ParseRoute::PlainText => text_worker::run_text_parse(
             index_root,
             &resolved.absolute_path,

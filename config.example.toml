@@ -43,87 +43,13 @@ device_index = 0
 [storage]
 # Corpus root containing source files addressed by corpus-relative ingest references.
 corpus_root = "/absolute/path/to/corpus"
-# Service-owned index root for SQLite storage and Docling conversion artifacts.
+# Service-owned index root for SQLite storage and parse artifacts.
 index_root = "/absolute/path/to/indexes"
 
 [connectors.filesystem]
 # Governance domain stamped on every SourceLocation acquired by the
 # filesystem connector (spec §6 reservation 3; an external fact).
 governance_domain = "local-corpus"
-
-[pdf]
-# Select docling or mupdf exclusively; failures never switch engines.
-engine = "docling"
-# Per-document timeout in seconds; timeout fails without publishing a partial parse.
-document_timeout_seconds = 7200
-
-# Required for engine = "docling"; validated whenever present.
-[docling]
-# Python executable for the environment where Docling is installed. The service
-# launches docling_path directly, but keeps this path in config so startup and
-# failure diagnostics identify the expected Python environment.
-python_path = "/absolute/path/to/python"
-
-# Docling executable launched directly for structured PDF conversion.
-docling_path = "/absolute/path/to/docling"
-
-# PDF parser backend passed as --pdf-backend.
-#
-# Valid values:
-# - pypdfium2: Uses the PDFium-based parser. This matched the legacy Data Store
-#   UI default. Good first choice for text-layer PDFs when you want predictable
-#   extraction without Docling's newer parser stack.
-# - docling_parse: Docling's default parser backend in the installed CLI. Uses
-#   Docling's current parser stack and may provide richer layout recovery, but
-#   can be slower or heavier on difficult books.
-# - dlparse_v1: Older Docling Parse backend. Keep available for compatibility
-#   testing when newer parser versions regress on a specific PDF.
-# - dlparse_v2: Newer Docling Parse backend than v1. Use when comparing parser
-#   quality or performance against v1/v4/docling_parse.
-# - dlparse_v4: Newer Docling Parse backend than v2. Use when testing Docling's
-#   more recent parser behavior on layout-heavy PDFs.
-pdf_backend = "pypdfium2"
-
-# OCR behavior for bitmap/scanned page content.
-#
-# Valid values:
-# - auto: The service passes no OCR flag and lets Docling's CLI default decide.
-#   In the installed Docling CLI, the default is OCR enabled. This may invoke
-#   RapidOCR and can be very slow on CPU.
-# - on: Passes --ocr and explicitly enables OCR.
-# - off: Passes --no-ocr and disables OCR. Best default for text-layer PDFs
-#   such as most ebooks, papers, and generated PDFs. Scanned PDFs may produce
-#   little or no text with OCR disabled.
-ocr_mode = "off"
-
-# Accelerator device passed to Docling as --device. This controls Docling's
-# Python/PyTorch-side processing only. It is separate from [inference].device,
-# which controls the Rust/Candle embedding and reranking models.
-#
-# Valid values:
-# - auto: Let Docling choose a device. Convenient, but less predictable because
-#   device selection depends on the installed Python packages and hardware.
-# - cpu: Force CPU execution. Most compatible, but slowest for OCR/model-heavy
-#   conversion.
-# - cuda: Use NVIDIA CUDA. Relevant on machines with NVIDIA GPUs, CUDA drivers,
-#   and a CUDA-enabled PyTorch/Docling environment. Not useful on Apple Silicon.
-# - mps: Use Apple's Metal Performance Shaders through PyTorch. Relevant on
-#   Apple Silicon when the installed Docling/OCR/model stack supports MPS.
-# - xpu: Use Intel's accelerator path for Intel GPUs/XPUs through PyTorch.
-#   Relevant only on systems with Intel accelerator support and a compatible
-#   Python/PyTorch environment.
-device = "mps"
-
-# Number of worker threads passed as --num-threads. This bounds Docling's CPU
-# parallelism. Higher values may improve throughput but can increase contention,
-# memory pressure, and interference with the Rust service.
-num_threads = 10
-
-# Number of pages Docling processes per batch, passed as --page-batch-size.
-# Lower values can reduce peak memory usage and isolate problematic pages.
-# Higher values can improve throughput when the selected backend/device has
-# enough memory.
-page_batch_size = 10
 
 [models.dense]
 # Dense embedding backend selection. There is no fallback between backends;
@@ -405,24 +331,20 @@ max_candidate_relationships = 4000000
 max_candidate_warnings = 10000
 # UTF-8 bytes in one candidate unit body; excess fails parse acceptance.
 max_unit_body_bytes = 4194304
-# Captured bytes per child stdout/stderr stream; extra bytes are drained without retention.
-process_log_bytes = 65536
-# Bytes per subprocess pipe read; larger output is handled with repeated bounded reads.
-process_read_chunk_bytes = 8192
-# Milliseconds between process completion/deadline checks for each PDF engine.
-mupdf_poll_ms = 25
-docling_poll_ms = 250
-# Milliseconds until the first Docling progress update and between later updates.
-docling_feedback_initial_ms = 1000
-docling_feedback_interval_ms = 1000
-# Seconds of native Docling process sampling; 0 disables sampling, not document processing.
-docling_sample_seconds = 0
-# Milliseconds allowed beyond sampling duration before stopping the sample collector.
-activity_sample_grace_ms = 15000
-# Milliseconds between sample-process completion checks.
-activity_poll_ms = 100
-# Regex backtracking steps per PDF cleanup match; exhaustion fails cleanup explicitly.
-cleanup_regex_backtrack_limit = 5000000
+
+[epub]
+# Archive members accepted before the parse fails as a recorded outcome.
+max_members = 10000
+# Decompressed bytes accepted for any single member.
+max_member_bytes = 67108864
+# Decompressed bytes accepted across all members read.
+max_total_member_bytes = 536870912
+# Decoded bytes accepted for any XML member (package, navigation, content).
+max_document_bytes = 16777216
+# Bytes accepted for one image; larger images are not archived (warning).
+max_image_bytes = 16777216
+# Element nesting depth accepted in any XML member.
+max_element_depth = 256
 
 [scheduling]
 # Minimum filesystem sweep delay in milliseconds; faster suggestions are clamped here.
@@ -449,11 +371,6 @@ persisted_detail_chars = 500
 error_chain_depth = 16
 # Unicode characters from provider error bodies included in model failure context.
 model_error_excerpt_chars = 2048
-# Unicode characters of subprocess progress retained per log update.
-progress_log_chars = 240
-# Unicode characters retained for sampled process names and sampling error text.
-activity_process_name_chars = 80
-activity_error_chars = 240
 # Unicode characters in diagnostic key/name previews; longer identifiers are abbreviated.
 identifier_preview_chars = 64
 # Hash characters shown in diagnostic prefixes; the complete stored hash remains unchanged.

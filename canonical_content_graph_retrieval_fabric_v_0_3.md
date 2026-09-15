@@ -1,62 +1,31 @@
 # Canonical Content Graph and Retrieval Fabric
 
-Version: 0.3
+Version: 0.4
 Status: Draft Specification
-Supersedes: 0.2
+Supersedes: 0.3
 
-## Revision Summary (0.2 → 0.3)
+## Revision Summary (0.3 → 0.4)
 
-This revision corrects foundational operating-model assumptions in v0.2 and
-resolves the ambiguities and unstated costs identified during design review.
-The canonical content model, evidence substrate, and forensic architecture of
-v0.2 are retained. The major changes:
+This revision is the content-model revision that accompanies the EPUB parser
+worker (SPEC-epub.md). The operating model, acquisition layer, security
+reservations, replay model, audit SLA, forensic architecture, activation
+gating, and deletion lifecycle of v0.3 are retained. The content model is:
 
-1. **Operating model corrected.** The corpus is external and uncontrolled;
-   acquisition, parsing, and activation are autonomous and unattended. All
-   v0.2 language premised on operator-timed, migration-like activation is
-   removed or rewritten.
-2. **Acquisition layer added.** Connectors, acquisition bundles, acquisition
-   provenance, declared change-detection capability, the explicit sync queue,
-   and adaptive knob-free scheduling are now specified (§9).
-3. **Security model replaced.** The v0.2 "corpus is the security boundary"
-   posture is replaced by *permissions deferred by design*: five normative
-   reservations create the slot for a future entitlement layer without
-   implementing one (§6).
-4. **Replay honesty.** Boolean replay claims are replaced by graded replay
-   fidelity modes. The committed retrieval replay mode is `record_replay`;
-   rank-stable live recompute is a documented optional future tier (§29).
-5. **Audit SLA.** The committed, breach-defined guarantee structure is now
-   normative (§29): universal execution records, bit-exact evidence replay,
-   and external-call record completeness.
-6. **Forensic snapshots are content-addressed manifests** over an immutable
-   artifact store, with tiered mechanical verification and scheduled restore
-   drills (§30).
-7. **QueryExecutionRecords embed the full EvidencePack** (v0.2 §22/§24
-   behavior affirmed after review), with storage compression recommended and
-   a defined migration path to reference-style records if volume demands (§28).
-8. **Superseded parses are deleted after verification; rollback is always
-   restore-from-store.** No grace window (§31).
-9. **Activation quality gating** uses binary structural invariants, measured
-   conformance reports, and a knob-free dominance rule for re-parses of
-   unchanged content, with held parses and explicit asynchronous disposition.
-   Absolute quality thresholds are prohibited (§13).
-10. **Deletion lifecycle added**: evidence-based deletion inference, the
-    access-lost state, location-scoped deletion, reappearance as restore, and
-    a named deferral for compliance-driven erasure (§11).
-11. **Freshness is measured truth, not a target.** Detection cadence adapts
-    from observed signals within no configured bounds; pending work is bounded
-    by latest-state coalescing; achieved freshness is logged, health-surfaced,
-    and recorded per query (§9.6, §28).
-12. **Configuration principle**: configuration records external facts; it must
-    not encode internal guesses (§35).
-13. **Mechanical resolutions**: RetrievalProjection envelope/payload
-    unification, normative `planHash` coverage, canonical ID scheme, and
-    first-class source locations with content-based identity (§10, §16, §22,
-    §24).
-14. **Annotation memoization reservations**: schema hooks for content-hash
-    annotation reuse are defined; implementation is deferred (§20, §21).
-15. **Single search executor.** This specification assumes exactly one search
-    executor. Multi-executor deployment is out of scope.
+1. **ContentType** is a closed set of thirteen types with `document` as the
+   single root unit of a parse and `list`, `list_item`, and `aside` as
+   containers; exactly four types carry evidence text (§15).
+2. **Locators** are a closed union of `dom_path` and `char_range` (§17).
+3. **Typed bodies** reject unknown fields, hold no reference to another unit,
+   and carry no normalized-text or rendering fields (§18).
+4. **UnitRelationship** is a closed set of six types; `references` is the only
+   type with roles (§19).
+5. **ParseMetrics** counts every container type (§12).
+6. **Conformance dimensions** are the six named keys of §12.5.
+7. **Parser output bundles** archive image bytes under `artifacts/` by
+   SHA-256, and the importer lists them in the canonical bundle manifest
+   (§12.2, §12.3).
+8. **Parsers** are plain text and EPUB 2/3; every other format is converted to
+   plain text outside this system (§4, §5, §36).
 
 ## 1. Purpose
 
@@ -198,6 +167,9 @@ The system supports:
 - Immutable source object storage with content-based identity and
   location-scoped presence.
 - Versioned parse runs with measured conformance and unattended activation.
+- Parsing of plain-text (`text/plain`) and EPUB 2 and 3
+  (`application/epub+zip`) sources; every other format is converted to plain
+  text outside this system.
 - Typed canonical content units, durable structural relationships, and
   versioned semantic annotations.
 - Disposable but snapshot-preserved retrieval projections.
@@ -220,6 +192,12 @@ The system supports:
 - Verified counterfactual replay (rank-stable recompute) — documented future
   tier, not committed (see §29.4).
 - Multi-executor search deployment.
+- Parsing of any format other than plain text and EPUB; a source of any other
+  MIME type is counted as unparseable.
+- DRM-protected EPUB archives, fixed-layout rendering, media overlays,
+  scripting, multiple renditions, remote resources, inline markup inside unit
+  text, and print-page geometry (a `page` carries an ordinal and a label
+  only).
 - Specific implementation languages, frameworks, parser products, container
   runtimes, queue products, or deployment platforms.
 
@@ -677,9 +655,12 @@ type ParseMetrics = {
   unitCount?: number
   relationshipCount?: number
   pageCount?: number
+  sectionCount?: number
+  listCount?: number
+  asideCount?: number
   tableCount?: number
   figureCount?: number
-  ocrRegionCount?: number
+  codeBlockCount?: number
   annotationCount?: number
   projectionCount?: number
 }
@@ -743,8 +724,12 @@ Rules: `manifest.json` records file hashes, parser identity, configuration
 hash, source hash, schema version, creation time. Candidate records may use
 parser-local references; the core replaces them with canonical IDs at import.
 Candidate ContentUnits must be typed; Markdown-only output is insufficient.
-Large binaries are referenced as hashed artifacts. Failure bundles may be
-preserved for diagnostics. Bundles are not queryable.
+Large binaries are referenced as hashed artifacts. `artifacts/` holds image
+bytes, one file per distinct image, named by the lowercase SHA-256 hex of its
+bytes; `FigureBody.imageHash` is that name, and no body field carries a
+storage URI. `stdout.log` and `stderr.log` are empty files for in-process
+workers. Failure bundles may be preserved for diagnostics. Bundles are not
+queryable.
 
 ### 12.3 Canonical Parse Artifact Bundle
 
@@ -769,8 +754,13 @@ canonical_parse_bundle/
 Rules: created by the core, never the parser; all records use canonical IDs
 and canonical serialization; the manifest records every file path, artifact
 type, hash, byte size, schema version, source ID, parse ID, parser identity,
-configuration hash, creation time, and manifest hash. Renderings may be
-included as derived-view artifacts but never replace typed records.
+configuration hash, creation time, and manifest hash. At import the core
+recomputes the hash of every file under the staged bundle's `artifacts/`; a
+name that does not equal its hash is a contract violation (recorded parse
+failure). Each verified file is written to the artifact store and listed in
+the manifest with `artifactType = "image"`; bodies are not rewritten, and the
+store resolves `imageHash` to the blob. Renderings may be included as
+derived-view artifacts but never replace typed records.
 
 ### 12.4 Parser Capability Profile
 
@@ -817,8 +807,25 @@ type ConformanceReport = {
 }
 ```
 
-`dimensions` is the extensible set of measured conformance metrics used by
-the activation dominance rule (§13.3). The report is persisted in the
+`dimensions` is the set of measured conformance metrics used by the
+activation dominance rule (§13.3), every one oriented so that higher is
+better. Keys:
+
+```text
+locator_coverage
+relationship_coverage
+caption_pairing_rate     fraction of caption units with at least one
+                         caption_of edge
+table_decomposition_rate fraction of table units with a table_cell reachable
+                         through contains
+list_decomposition_rate  fraction of list units with a list_item reachable
+                         through contains
+section_kind_coverage    fraction of text_section units whose kind is not
+                         unknown
+```
+
+`list_decomposition_rate` and `section_kind_coverage` are present only when
+their subject population is non-empty. The report is persisted in the
 canonical parse bundle and logged. Conformance is always measured and always
 reported; it gates activation only as defined in §13.
 
@@ -945,26 +952,39 @@ type ContentUnit<TBody = unknown> = {
 
 ### 15.1 ContentType
 
+Closed set:
+
 ```ts
 type ContentType =
+  | "document"
   | "page"
   | "text_section"
   | "text_block"
+  | "list"
+  | "list_item"
+  | "aside"
   | "table"
   | "table_row"
   | "table_cell"
   | "figure"
   | "caption"
-  | "image_region"
   | "code_block"
 ```
 
-Interpretation as in v0.2: `page` is a physical page container;
-`text_section` a logical section container; `text_block` the atomic textual
-evidence unit (paragraph, list item, heading, quote, footnote); `table`,
-`table_row`, `table_cell` the tabular decomposition; `figure` a visual
-object; `caption` an independent caption unit; `image_region` a region
-inside an image; `code_block` a code fragment.
+Interpretation: `document` is the single root unit of a parse and carries
+source metadata; `page` is a print-page marker; `text_section` is a logical
+container with a kind and an optional heading; `text_block` is the atomic
+textual evidence unit; `list`, `list_item`, and `aside` are containers;
+`table`, `table_row`, and `table_cell` are the tabular decomposition;
+`figure` is a visual object; `caption` is an independent caption unit;
+`code_block` is a code fragment.
+
+Evidence-bearing types, whose text feeds chunking, multi-vector projections,
+annotation, and passages: `text_block`, `caption`, `table_cell`,
+`code_block`. All other types carry no evidence text.
+
+Text projection for `textHash`: `text` for `text_block`, `caption`, and
+`table_cell`; `code` for `code_block`; absent for every other type.
 
 ### 15.2 ContentType-to-Body Mapping
 
@@ -972,18 +992,19 @@ Each `contentType` requires its specific body type; a mismatch is invalid and
 rejected at creation (a §13.1 invariant):
 
 ```text
-page → PageBody            table → TableBody
-text_section → TextSectionBody   table_row → TableRowBody
-text_block → TextBlockBody       table_cell → TableCellBody
-figure → FigureBody              caption → CaptionBody
-image_region → ImageRegionBody   code_block → CodeBlockBody
+document → DocumentBody          table → TableBody
+page → PageBody                  table_row → TableRowBody
+text_section → TextSectionBody   table_cell → TableCellBody
+text_block → TextBlockBody       figure → FigureBody
+list → ListBody                  caption → CaptionBody
+list_item → ListItemBody         code_block → CodeBlockBody
+aside → AsideBody
 ```
 
 Rules: `text_section` is a container, not a paragraph; `text_block` is the
 preferred atomic evidence unit; captions are independent ContentUnits; table
-cells are first-class when table retrieval matters; ContentUnits are not
-chunks; typed bodies preserve source-derived structure — Markdown renderings
-are not substitutes.
+cells are first-class; ContentUnits are not chunks; typed bodies preserve
+source-derived structure — Markdown renderings are not substitutes.
 
 ## 16. Hashing Model and Canonical IDs
 
@@ -1053,50 +1074,26 @@ never re-derived.
 
 ## 17. Locators
 
-Locators map ContentUnits back to source positions. Unchanged from v0.2:
+Locators map ContentUnits back to source positions. Closed union:
 
 ```ts
-type Locator =
-  | PageBBoxLocator
-  | CharRangeLocator
-  | ByteRangeLocator
-  | TimeRangeLocator
-  | DomPathLocator
-  | XmlPathLocator
-  | TableCellLocator
-  | RepoPathLocator
-```
+type Locator = DomPathLocator | CharRangeLocator
 
-```ts
-type PageBBoxLocator = {
-  kind: "page_bbox"
-  pageNumber: number
-  bbox: [number, number, number, number]
-  coordinateSystem?: "pdf_points" | "pixels" | "normalized"
+type DomPathLocator = {
+  kind: "dom_path"
+  document: string         // package-relative href of the content document
+  path: string             // element path, e.g. /html[1]/body[1]/div[1]/p[5]
+  elementId?: string       // the element's id attribute when present
+  nodeRange?: [number, number]  // inclusive 0-based child-node index range
+                                // within the element, counting every node kind
 }
 
 type CharRangeLocator = { kind: "char_range"; start: number; end: number }
-type ByteRangeLocator = { kind: "byte_range"; start: number; end: number }
-type TimeRangeLocator = { kind: "time_range"; startMs: number; endMs: number }
-type DomPathLocator = { kind: "dom_path"; path: string }
-type XmlPathLocator = { kind: "xml_path"; path: string }
-
-type TableCellLocator = {
-  kind: "table_cell"
-  rowIndex: number
-  columnIndex: number
-  rowSpan?: number
-  columnSpan?: number
-}
-
-type RepoPathLocator = {
-  kind: "repo_path"
-  path: string
-  startLine?: number
-  endLine?: number
-  commit?: string
-}
 ```
+
+`path` is the sequence of steps from the document element to the target
+element, each `/<localname>[<n>]` where `n` is the 1-based index of the
+element among siblings with the same local name.
 
 Rules: every evidence-bearing ContentUnit should have at least one locator
 when possible; locators are durable canonical provenance; retrieval
@@ -1104,31 +1101,71 @@ projections must not be the only path back to source evidence.
 
 ## 18. Typed Bodies
 
-Unchanged from v0.2.
+Every body rejects unknown fields. Optional fields are omitted when absent.
+No body field may reference another unit; pairing and containment are
+relationships only (§16.1). The closed sets `SectionKind`, `TextBlockRole`,
+`ListBody.kind`, `AsideBody.kind`, and `TableRowBody.role` are defined once
+here; producers declare no parallel copies.
 
 ```ts
+type DocumentBody = {
+  title?: string
+  creators?: string[]
+  publisher?: string
+  language?: string
+  identifiers?: string[]
+  date?: string
+  description?: string
+}
+
 type PageBody = {
-  pageNumber: number
-  width: number
-  height: number
-  rotation?: number
-  renderedImageUri?: string
+  ordinal: number          // 1-based position among the parse's page markers
+  label?: string           // printed folio as declared, e.g. "xiv", "218"
 }
 
 type TextSectionBody = {
+  kind: SectionKind
   headingText?: string
-  headingLevel?: number
-  sectionPath?: string[]
-  normalizedText?: string
+  headingLevel: number     // depth in the section tree; children of document = 1
+  label?: string           // declared number, e.g. "Chapter 1."
+  sectionPath: string[]    // heading trail from level 1 to this section, inclusive
 }
+
+type SectionKind =
+  | "part" | "chapter" | "section"
+  | "preface" | "foreword" | "introduction" | "prologue"
+  | "epilogue" | "afterword" | "conclusion"
+  | "appendix" | "glossary" | "bibliography" | "index" | "notes"
+  | "acknowledgments" | "dedication" | "epigraph"
+  | "titlepage" | "copyright_page" | "cover" | "toc" | "colophon"
+  | "unknown"
 
 type TextBlockBody = {
   text: string
-  normalizedText?: string
-  blockRole?:
-    | "paragraph" | "heading" | "list_item" | "footnote"
-    | "header" | "footer" | "quote" | "formula" | "unknown"
-  language?: string
+  role: TextBlockRole
+  label?: string           // declared marker inside the block
+  language?: string        // BCP 47 tag from the nearest declared language
+}
+
+type TextBlockRole =
+  | "paragraph" | "heading" | "title" | "subtitle"
+  | "term" | "definition"
+  | "footnote" | "quote" | "attribution" | "formula" | "unknown"
+
+type ListBody = {
+  kind: "ordered" | "unordered" | "definition"
+  start?: number           // declared start for ordered lists
+}
+
+type ListItemBody = {
+  ordinal: number          // 1-based position within the list
+  label?: string           // declared marker text when the source renders one
+}
+
+type AsideBody = {
+  kind: "note" | "tip" | "warning" | "caution" | "important"
+      | "sidebar" | "epigraph" | "example" | "unknown"
+  title?: string
 }
 
 type TableBody = {
@@ -1136,16 +1173,14 @@ type TableBody = {
   rowCount: number
   columnCount: number
   headers?: TableHeader[]
-  normalizedMarkdown?: string
-  normalizedCsvUri?: string
-  normalizedHtmlUri?: string
 }
 
 type TableHeader = {
-  rowIndex?: number
-  columnIndex?: number
+  rowIndex: number
+  columnIndex: number
   text: string
-  span?: { rowSpan?: number; columnSpan?: number }
+  rowSpan?: number
+  columnSpan?: number
 }
 
 type TableRowBody = {
@@ -1159,41 +1194,33 @@ type TableCellBody = {
   rowSpan?: number
   columnSpan?: number
   text?: string
-  normalizedText?: string
-  value?: string | number | boolean | null
-  valueType?: "string" | "number" | "date" | "boolean" | "currency" | "unknown"
-  headerRefs?: string[]
 }
 
 type FigureBody = {
-  imageUri?: string
-  caption?: string
+  imageHash?: string       // SHA-256 hex of the archived image bytes (§12.2)
+  imageMediaType?: string
+  imageSizeBytes?: number
   altText?: string
-  figureType?: "chart" | "diagram" | "photo" | "screenshot" | "drawing" | "unknown"
-  ocrText?: string
+  caption?: string
 }
 
 type CaptionBody = {
   text: string
-  normalizedText?: string
-  captionForUnitIds?: string[]
-}
-
-type ImageRegionBody = {
-  imageUri?: string
-  label?: string
-  ocrText?: string
-  confidence?: number
+  label?: string           // declared marker inside the caption, e.g. "Figure 1-1."
 }
 
 type CodeBlockBody = {
-  language?: string
   code: string
-  normalizedCode?: string
-  startLine?: number
-  endLine?: number
+  language?: string
+  label?: string           // from the paired caption's label, e.g. "Example 2-1."
+  title?: string
 }
 ```
+
+`FigureBody.caption`, `TableBody.caption`, and `CodeBlockBody.title` hold the
+text of the paired `caption` unit; the pairing itself is the `caption_of` /
+`has_caption` relationship pair (§19). The prose roles a passage builder
+treats as body text are `paragraph`, `quote`, `definition`, and `unknown`.
 
 ## 19. UnitRelationship Model
 
@@ -1223,27 +1250,36 @@ type UnitRelationship = {
 }
 ```
 
+Closed set:
+
 ```ts
 type UnitRelationshipType =
   | "contains"
-  | "physically_contains"
-  | "logically_contains"
   | "precedes"
-  | "follows"
   | "appears_on"
   | "caption_of"
   | "has_caption"
   | "references"
-  | "continues_on"
-  | "derived_from"
 ```
 
-Durable canonical relationships are structural (page contains block, table
-contains row, caption caption_of figure, block continues_on block, unit
-appears_on page). Semantic or retrieval relationships (supports-claim,
-similar-to, relevant-to) must not be canonical UnitRelationships; they belong
-in SemanticAnnotation or RetrievalProjection state. Relationships never cross
-a source boundary.
+`relationshipRole` values:
+
+```text
+references    footnote | cross_reference | index_locator
+all others    none
+```
+
+Durable canonical relationships are structural: every unit except `document`
+has exactly one parent and one `contains` edge from it, and `primaryParentId`
+names that parent; siblings under one parent are chained by `precedes` in
+reading order; a `caption` unit is `caption_of` its subject and the subject
+`has_caption` it; leaf evidence units and figures are `appears_on` each page
+whose range they intersect; `references` runs from the evidence unit
+containing a link to its target unit. Section resolution walks `contains`
+upward to the nearest `text_section`. Semantic or retrieval relationships
+(supports-claim, similar-to, relevant-to) must not be canonical
+UnitRelationships; they belong in SemanticAnnotation or RetrievalProjection
+state. Relationships never cross a source boundary.
 
 ## 20. Provenance
 
@@ -2488,20 +2524,20 @@ health, and leave alerting thresholds to the operator's monitoring layer.
 
 ## 36. MVP Scope
 
-Recommended MVP content types: page, text_section, text_block, table,
-table_cell, figure, caption.
+Recommended MVP content types: the full §15.1 set — document, page,
+text_section, text_block, list, list_item, aside, table, table_row,
+table_cell, figure, caption, code_block.
 
-Recommended MVP relationships: contains, logically_contains,
-physically_contains, precedes, appears_on, caption_of, has_caption,
-references, continues_on.
+Recommended MVP relationships: the full §19 set — contains, precedes,
+appears_on, caption_of, has_caption, references.
 
 Recommended MVP retrieval projections: lexical_document, chunk,
 dense_vector, summary, derived_view. Forward-compatible:
 learned_sparse_vector, multi_vector, graph_projection, temporal_projection.
 
 Recommended MVP connectors: filesystem (full_scan), one API-based connector
-with incremental detection. Recommended MVP parsers: PDF, plain text; then
-DOCX, HTML, image-with-OCR.
+with incremental detection. Recommended MVP parsers: plain text and EPUB 2/3;
+every other format is converted to plain text outside the system.
 
 Recommended MVP behavior:
 

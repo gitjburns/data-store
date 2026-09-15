@@ -100,8 +100,9 @@ pub(crate) enum ParseWarningSeverity {
     Error,
 }
 
-/// Spec §12. Counts summarizing what the parse produced; all fields are
-/// optional because parsers only report what they measure.
+/// SPEC-epub §2.5 `ParseMetrics` (superseding spec §12). Counts summarizing
+/// what the parse produced; all fields are optional because parsers only
+/// report what they measure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ParseMetrics {
@@ -112,11 +113,17 @@ pub(crate) struct ParseMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) page_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) section_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) list_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) aside_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) table_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) figure_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) ocr_region_count: Option<u64>,
+    pub(crate) code_block_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) annotation_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +170,12 @@ pub(crate) struct ConformanceReport {
     pub(crate) caption_pairing_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) table_decomposition_rate: Option<f64>,
+    // SPEC-epub §2.6: present only when the parse has at least one `list` /
+    // `text_section` respectively; absent means unmeasurable, not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) list_decomposition_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) section_kind_coverage: Option<f64>,
 
     /// Extensible set of measured conformance metrics compared dimension by
     /// dimension by the activation dominance rule (§13.3).

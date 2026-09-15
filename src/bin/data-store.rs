@@ -552,7 +552,6 @@ struct QueryResultView {
     text: String,
     source_locations: Vec<QueryLocationView>,
     section_path: Vec<String>,
-    page_numbers: Vec<u64>,
     truncated: bool,
     /// Absence from an older server is shown explicitly, never treated as no match.
     retrieval_provenance: Option<RetrievalProvenance>,
@@ -676,7 +675,8 @@ struct ModelCountView {
 }
 
 /// Client mirror of the §15 ContentUnit (`GET /units/{unitId}`). `body` is the
-/// arbitrary §18 payload, kept as raw JSON and rendered losslessly.
+/// typed SPEC-epub §2.2 payload, kept as raw JSON and rendered losslessly so
+/// every body shape prints without a client-side field mirror.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContentUnitView {
@@ -2398,13 +2398,6 @@ fn render_query(response: &QueryResponse) {
         if !result.section_path.is_empty() {
             println!("  {}", result.section_path.join(" › "));
         }
-        if result.page_numbers.is_empty() {
-            println!("  Page information unavailable");
-        } else {
-            // These are physical PDF pages; never imply they are printed labels.
-            let pages: Vec<String> = result.page_numbers.iter().map(u64::to_string).collect();
-            println!("  PDF pages: {}", pages.join(", "));
-        }
         println!();
         println!("{}", result.text);
         if result.truncated {
@@ -2684,7 +2677,8 @@ fn render_vocabulary_counts(
 }
 
 /// Render one §15 ContentUnit. Hashes and structural convenience fields are
-/// surfaced compactly; the arbitrary §18 `body` is rendered in full (lossless).
+/// surfaced compactly; the typed SPEC-epub §2.2 `body` is rendered in full
+/// (lossless), so it follows the body fields of every content type.
 fn render_unit(unit: &ContentUnitView) {
     println!("Unit: {}", unit.id);
     println!("  source: {} parse: {}", unit.source_id, unit.parse_id);

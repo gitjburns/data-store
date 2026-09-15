@@ -133,7 +133,6 @@ The full set of error kinds and their HTTP statuses, as emitted by the service:
 | `source_resolution`             | 400 | Source-coordinate resolution failure. |
 | `unauthorized`                  | 401 | Missing/malformed bearer token or token mismatch (protected routes). |
 | `payload_too_large`             | 413 | Request body exceeds the global size limit. |
-| `docling_conversion`            | 422 | Document conversion failure during ingest/parse. |
 | `not_found`                     | 404 | Addressed resource absent (or, for unit reads, not served — see below). |
 | `service_unavailable`           | 503 | Capacity/admission saturation, rebuild maintenance, or a subsystem temporarily unavailable. |
 | `cutover_barrier_active`        | 503 | Query rejected because the targeted source is mid-cutover. **Retryable** — the barrier holds only for the last milliseconds of a cutover; retry the request. |
@@ -142,7 +141,6 @@ The full set of error kinds and their HTTP statuses, as emitted by the service:
 | `invalid_config`                | 500 | |
 | `invalid_cli`                   | 500 | |
 | `inference_init`                | 500 | |
-| `docling_unavailable`           | 500 | |
 | `internal_io`                   | 500 | |
 | `unit_splitting`                | 500 | |
 | `storage_init`                  | 500 | |
@@ -458,7 +456,6 @@ when the request set `debug: true`:
       "sourceExcerpts": [{"unitId": "...", "startChar": 0, "endChar": 23, "textHash": "..."}],
       "sourceLocations": [{"nativeUri": "...", "status": "current"}],
       "sectionPath": ["Section heading"],
-      "pageNumbers": [12],
       "score": 0.87,
       "truncated": false,
       "retrievalProvenance": {
@@ -507,7 +504,6 @@ when the request set `debug: true`:
 | `sourceExcerpts` | array | Displayed canonical ranges, in passage order: `unitId`, `startChar`, `endChar`, `textHash`. Offsets are Unicode-scalar positions; `endChar` is exclusive and the hash covers the excerpt's UTF-8 bytes. |
 | `sourceLocations` | array of object | Recorded locations, each with `nativeUri` and availability `status`. |
 | `sectionPath` | array of string | Section headings, or an empty array when unavailable. |
-| `pageNumbers` | array of integer | Physical PDF page positions, not printed page labels; empty when unavailable. |
 | `score` | number | Final passage reranker score. |
 | `truncated` | bool | A legacy whole-unit candidate was clipped to fit the passage limit. Retrieved exact windows remain complete; full canonical bodies remain in `evidencePack`. |
 | `retrievalProvenance` | object | Server-computed candidate attribution, present independently of `debug` and evidence toggles. |
@@ -703,18 +699,57 @@ API.
 `contentType` wire values (`snake_case`, closed set):
 
 ```
-page, text_section, text_block, table, table_row, table_cell,
-figure, caption, image_region, code_block
+document, page, text_section, text_block, list, list_item, aside,
+table, table_row, table_cell, figure, caption, code_block
 ```
 
-`body` is typed per `contentType`; the typed bodies serialize as their model
-structs in `src/model/body.rs`. `locators` entries are the closed Locator
-union, discriminated by a `kind` field with these wire values (`snake_case`;
-per-kind payload fields live in `src/model/locator.rs`):
+`body` is typed per `contentType` (`camelCase` fields, unknown fields
+rejected, optional fields omitted when absent); the typed bodies serialize as
+their model structs in `src/model/body.rs`, with field lists in the canonical
+spec §18:
+
+| `contentType` | Body | Fields |
+|---------------|------|--------|
+| `document` | `DocumentBody` | `title`, `creators`, `publisher`, `language`, `identifiers`, `date`, `description` (all optional) |
+| `page` | `PageBody` | `ordinal` (always), `label` |
+| `text_section` | `TextSectionBody` | `kind`, `headingLevel`, `sectionPath` (always); `headingText`, `label` |
+| `text_block` | `TextBlockBody` | `text`, `role` (always); `label`, `language` |
+| `list` | `ListBody` | `kind` (always: `ordered` \| `unordered` \| `definition`); `start` |
+| `list_item` | `ListItemBody` | `ordinal` (always); `label` |
+| `aside` | `AsideBody` | `kind` (always: `note` \| `tip` \| `warning` \| `caution` \| `important` \| `sidebar` \| `epigraph` \| `example` \| `unknown`); `title` |
+| `table` | `TableBody` | `rowCount`, `columnCount` (always); `caption`, `headers` (array of `{ rowIndex, columnIndex, text, rowSpan?, columnSpan? }`) |
+| `table_row` | `TableRowBody` | `rowIndex` (always); `role` (`header` \| `body` \| `footer`) |
+| `table_cell` | `TableCellBody` | `rowIndex`, `columnIndex` (always); `rowSpan`, `columnSpan`, `text` |
+| `figure` | `FigureBody` | `imageHash`, `imageMediaType`, `imageSizeBytes`, `altText`, `caption` (all optional) |
+| `caption` | `CaptionBody` | `text` (always); `label` |
+| `code_block` | `CodeBlockBody` | `code` (always); `language`, `label`, `title` |
+
+`text_block.role` wire values (`snake_case`, closed set):
 
 ```
-page_bbox, char_range, byte_range, time_range,
-dom_path, xml_path, table_cell, repo_path
+paragraph, heading, title, subtitle, term, definition,
+footnote, quote, attribution, formula, unknown
+```
+
+`text_section.kind` wire values (`snake_case`, closed set):
+
+```
+part, chapter, section, preface, foreword, introduction, prologue,
+epilogue, afterword, conclusion, appendix, glossary, bibliography, index,
+notes, acknowledgments, dedication, epigraph, titlepage, copyright_page,
+cover, toc, colophon, unknown
+```
+
+`textHash` is present only for `text_block`, `caption`, `table_cell` (over
+`text`) and `code_block` (over `code`). `locators` entries are the closed
+Locator union, discriminated by a `kind` field with these wire values
+(`snake_case`; per-kind payload fields live in `src/model/locator.rs`):
+
+```
+dom_path    document (string), path (string), elementId (string, omitted when
+            absent), nodeRange ([start, end] inclusive 0-based child-node
+            indexes, omitted when absent)
+char_range  start, end
 ```
 
 **Errors:** `404` `not_found` (`"no active unit <unitId>"`) when the unit is
@@ -754,7 +789,7 @@ An invalid `direction` value is rejected `400` `bad_request`
 | `fromUnitId` | string | always |
 | `toUnitId` | string | always |
 | `relationshipType` | string enum | always — see values below |
-| `relationshipRole` | string | omitted when absent |
+| `relationshipRole` | string | omitted when absent — set only on `references`: `footnote` \| `cross_reference` \| `index_locator` |
 | `sequenceIndex` | `u64` | omitted when absent |
 | `confidence` | number | omitted when absent |
 | `provenance` | object | omitted when absent — Provenance (producer identity/lineage; fields in `src/model/provenance.rs`) |
@@ -764,8 +799,7 @@ An invalid `direction` value is rejected `400` `bad_request`
 `relationshipType` wire values (`snake_case`, closed set):
 
 ```
-contains, physically_contains, logically_contains, precedes, follows,
-appears_on, caption_of, has_caption, references, continues_on, derived_from
+contains, precedes, appears_on, caption_of, has_caption, references
 ```
 
 **Errors:** `404` `not_found` (`"no active unit <unitId>"`) when the anchor unit
@@ -921,7 +955,7 @@ with `400 bad_request` before creating an Operation or queue entry.
 curl -s -X POST http://localhost:PORT/sources \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"sourceSystem":"filesystem","nativeUri":"/absolute/corpus/path/doc.pdf"}'
+  -d '{"sourceSystem":"filesystem","nativeUri":"/absolute/corpus/path/doc.epub"}'
 ```
 
 ---
@@ -950,7 +984,7 @@ path source (for Operation-target integrity):
 curl -s -X POST http://localhost:PORT/sources/SOURCE_ID/parses \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"sourceSystem":"filesystem","nativeUri":"/absolute/corpus/path/doc.pdf"}'
+  -d '{"sourceSystem":"filesystem","nativeUri":"/absolute/corpus/path/doc.epub"}'
 ```
 
 ---
@@ -1220,8 +1254,9 @@ validation failures occur only after the bearer token is verified.
 `locator` (a Locator, omitted when absent — kinds under
 [`GET /units/{unitId}`](#get-unitsunitid)). `metrics` (`ParseMetrics`) is all
 optional `u64` counts, each omitted when absent: `unitCount`,
-`relationshipCount`, `pageCount`, `tableCount`, `figureCount`,
-`ocrRegionCount`, `annotationCount`, `projectionCount`.
+`relationshipCount`, `pageCount`, `sectionCount`, `listCount`, `asideCount`,
+`tableCount`, `figureCount`, `codeBlockCount`, `annotationCount`,
+`projectionCount`.
 
 `conformanceReport` — `ConformanceReport` fields (`camelCase`):
 
@@ -1233,7 +1268,7 @@ optional `u64` counts, each omitted when absent: `unitCount`,
 | `locatorCoverage` | number | always |
 | `captionPairingRate` | number | omitted when absent |
 | `tableDecompositionRate` | number | omitted when absent |
-| `dimensions` | object (string → number) | always — the metrics compared by the activation dominance rule |
+| `dimensions` | object (string → number) | always — the metrics compared by the activation dominance rule. Keys: `locator_coverage`, `relationship_coverage`, `caption_pairing_rate`, `table_decomposition_rate`, `list_decomposition_rate`, `section_kind_coverage`; the last two are present only when their subject population is non-empty |
 | `measuredAt` | string | always |
 | `reportHash` | string | always |
 
@@ -1385,7 +1420,7 @@ To observe progress and outcome, poll
 [`GET /operations/{operationId}`](#get-operationsoperationid). The `status` walks
 `pending` → `running` → terminal (`succeeded` or `failed`). On `failed`, the
 `error` field carries the failure detail; the corresponding error kind (e.g.
-`restore_failed`, `snapshot_verification_failed`, `docling_conversion`) is what a
+`restore_failed`, `snapshot_verification_failed`) is what a
 synchronous call would have returned.
 
 There is **no streaming**: poll the single-JSON Operation row. (`POST /shutdown`

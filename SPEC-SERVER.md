@@ -40,8 +40,9 @@ operator prompting:
 2. **Acquire** — staged bundles are imported, recording genuine acquisition
    provenance (a `SourceLocation` stamped with the connector's governance
    domain).
-3. **Parse** — the drain dispatches a parse chain per queued item (the configured
-   Docling or MuPDF engine for PDFs, then canonical unit/relationship construction).
+3. **Parse** — the drain dispatches a parse chain per queued item (the EPUB or
+   plain-text worker selected by MIME type, then canonical unit/relationship
+   construction).
    **A source has at most one active parse**; a fresh parse is built and gated
    against the current active parse.
 4. **Build projections** — content-derived retrieval projections (chunk,
@@ -229,35 +230,25 @@ tokenization and remote-ColBERT MaxSim run on the CPU.
 | --- | --- |
 | `governance_domain` | Governance domain stamped on every `SourceLocation` the connector acquires (spec §6 reservation 3): an external governance fact assigned at acquisition, retaggable without re-parse or re-index. Non-empty. |
 
-### 2.8 `[pdf]` and `[docling]`
+### 2.8 `[epub]`
 
-`[pdf]` is required and selects one engine without fallback:
-
-| Key | Meaning |
-| --- | --- |
-| `engine` | Exactly `docling` or `mupdf`. Applies to ingestion, explicit reparsing, and annotation dry runs. |
-| `document_timeout_seconds` | Positive per-document child-process timeout for either engine. This key is no longer accepted under `[docling]`. |
-
-`[docling]` is required when `engine = "docling"`; it may be omitted for MuPDF.
-Whenever supplied, the section is fully validated, including required keys:
+Required. Every key is an admission budget for the EPUB worker (§10.9):
+exceeding one is a recorded parse failure naming the cap, except
+`max_image_bytes`, which leaves the oversized image unarchived with a warning.
+The budgets decide whether a parse completes, not what a completed parse
+contains, so they are not parser identity and do not enter the no-repeat
+guard tuple (§10.6).
 
 | Key | Meaning |
 | --- | --- |
-| `python_path` | Python executable recorded for the configured Docling environment (diagnostic; the service launches `docling_path` directly). Absolute. |
-| `docling_path` | Docling executable launched for PDF→DoclingDocument JSON conversion. Absolute. |
-| `pdf_backend` | One of `pypdfium2`, `docling_parse`, `dlparse_v1`, `dlparse_v2`, `dlparse_v4`. |
-| `ocr_mode` | One of `auto`, `on`, `off`. |
-| `device` | Docling's Python-side device: one of `auto`, `cpu`, `cuda`, `mps`, `xpu` (separate from `[inference].device`). |
-| `num_threads` | Docling worker thread count. Must be > 0. |
-| `page_batch_size` | Docling page batch size. Must be > 0. |
+| `max_members` | Archive members accepted before the parse fails as a recorded outcome. |
+| `max_member_bytes` | Decompressed bytes accepted for any single member; declared sizes are not trusted. |
+| `max_total_member_bytes` | Decompressed bytes accepted across all members read, counted once per distinct member. |
+| `max_document_bytes` | Decoded bytes accepted for any XML member (package, navigation, content). |
+| `max_image_bytes` | Bytes accepted for one image; larger images are not archived (`epub_image_too_large`). |
+| `max_element_depth` | Element nesting depth accepted in any XML member. |
 
-The shared timeout and Docling's `pdf_backend`, `ocr_mode`, `device`, `num_threads`,
-and `page_batch_size` are parser-identity-bearing.
-Moving the timeout to `[pdf]` preserves Docling's effective identity for equivalent
-settings. MuPDF has a distinct identity covering extraction flags, candidate
-mapping and cleanup versions, and the compiled dependency-lock hash. Engine,
-timeout, or cleanup changes do not enqueue unchanged indexed sources; explicit
-reparsing remains subject to the no-repeat guard (§10.6) and activation gate (§11).
+The worker has no wall-clock budget (§19).
 
 ### 2.9 `[models.dense]`, `[models.colbert]`, `[models.reranker]`, `[models.annotator]`
 
@@ -361,6 +352,20 @@ changing naming rules changes application identity, not producer memo identity.
 
 System-assigned versioning of these documents is recorded in the append-only
 `policy_versions` table with a `policy.changed` event per advance (§3, §16).
+
+### 2.11 `[parsing]`
+
+Required. Every key is a candidate-acceptance cap applied to a parser's
+output before activation: exceeding one is a recorded parse failure with no
+partial publish. The caps do not bound complete forensic `parser_raw` payloads
+and are not parser identity (§10.6).
+
+| Key | Meaning |
+| --- | --- |
+| `max_candidate_units` | Candidate units accepted for one parse. Cannot exceed 1000000 because canonical IDs retain six-digit ordering. |
+| `max_candidate_relationships` | Candidate relationships accepted for one parse. |
+| `max_candidate_warnings` | Candidate warnings accepted for one parse. |
+| `max_unit_body_bytes` | UTF-8 bytes accepted in one candidate unit body. |
 
 ---
 
@@ -540,8 +545,8 @@ Health reports the inference component not-ready with the mode message
 `annotation dry-run mode: inference not initialized` — by design; `ready=false`
 is the expected state of this mode.
 
-The pass **truncates at import-READY**: parses run through acquisition, the selected
-PDF engine or plain-text worker, and import (`parse_runs` reach `ready`). **No
+The pass **truncates at import-READY**: parses run through acquisition, the EPUB
+or plain-text worker, and import (`parse_runs` reach `ready`). **No
 projections are built, no gating or activation runs**, queue rows are left
 `in_flight`, and acquisition bundles are retained on disk. The next **normal**
 start with the same parser identity adopts this state through the §13.5
@@ -912,18 +917,18 @@ file. Staged bundles are plain JSON claims, not canonical state:
 canonicalization happens exactly once, at import, when the core builds the
 canonical parse bundle.
 
-PDF workers share `src/parse/pdf.rs` for engine selection and parser identity.
-Docling runs its configured CLI; MuPDF runs a private child mode of the same
-service executable before normal initialization. The synchronous parent enforces
-the document timeout, terminates and reaps timed-out children, and records durable
-start/completion/failure diagnostics. Extraction failures become failed parser
-bundles; there is no fallback to the other engine.
+Two workers exist, both in-process on the scheduler thread and routed by MIME
+type: `text/plain` to the plain-text worker and `application/epub+zip` (the
+`.epub` extension, case-insensitive) to the EPUB worker (§10.9). `ParseRoute`
+has exactly these two arms; both resolve sources through
+`resolve_contained_source`. A source of any other MIME type is not parsed and
+is counted under the fabric component's `unparseable_mime` health count (§7).
+The annotation dry run (§4.7) reaches both workers through the shared parse
+prefix.
 
-MuPDF maps every physical page, cleaned paragraph, and image bounds to `page`,
-`text_block`, and `figure` candidates. Merged paragraphs retain every contributing
-source page/line locator; relationships preserve paragraph order. Cleanup (§10.8)
-uses no font size/weight rules, hierarchy inference, or OCR. Pages without embedded
-text and unsupported native block categories produce diagnostics.
+Both workers follow one outcome model: a source-caused failure seals a failure
+bundle and returns `Ok`; only a staging fault returns `Err`. Neither has a
+fallback worker.
 
 ### 10.2 The importer is the sole canonical writer
 
@@ -967,9 +972,17 @@ The split mirrors acquisition:
 Conformance measurement is **pure** — no IO, no clock, no storage — and is
 **always measured, never a gate**: no absolute threshold exists. It produces
 the `ConformanceReport` whose `dimensions` map the §11.2 dominance rule later
-compares. Dimension keys are a stable persisted contract
-(`locator_coverage`, `caption_pairing_rate`, `table_decomposition_rate`,
-`relationship_coverage`), every dimension oriented so higher is better.
+compares. Dimension keys are a stable persisted contract, every dimension
+oriented so higher is better: `locator_coverage`, `relationship_coverage`,
+`caption_pairing_rate` (fraction of `caption` units with at least one
+`caption_of` edge), `table_decomposition_rate` (fraction of `table` units with
+a `table_cell` reachable through `contains`), `list_decomposition_rate`
+(fraction of `list` units with a `list_item` reachable through `contains`),
+and `section_kind_coverage` (fraction of `text_section` units whose kind is
+not `unknown`). `list_decomposition_rate` and `section_kind_coverage` are
+present only when their subject population is non-empty; under the §11.2
+absence rule a dimension the candidate lacks but the active report carries
+compares as worse.
 
 ### 10.6 No blind retry (spec §13.5)
 
@@ -980,10 +993,11 @@ bytes through an identical parser — which fails (or succeeds) identically, so
 re-parsing is pointless or forbidden. Outcomes: dispatch (no prior run),
 dispatch over stale `building` wreckage (surfaced, so a crash cannot block the
 source), gate an existing un-held `ready` run (crash-recovery idempotence), or
-skip. Only new content or a new parser identity licenses a re-parse; PDF engine
-selection and identity-bearing settings (§2.8) determine this tuple. Returning to
-an engine identity already used for that source does not bypass the guard. An
-archived parse can instead be restored through the existing snapshot lifecycle.
+skip. Only new content or a new parser identity licenses a re-parse; each
+worker's identity is its name, version, and configuration hash (§10.8 for
+plain text, §10.9 for EPUB), and `[epub]` budgets are not part of it (§2.8).
+An archived parse can instead be restored through the existing snapshot
+lifecycle.
 
 ### 10.7 Pre-worker content-identity check
 
@@ -995,48 +1009,99 @@ skip is self-healing — the changed bytes are re-detected, re-staged, and
 re-parsed under their own new SourceObject by the next scan. The residual
 instant between this check and the worker's own read is a recorded residual.
 
-### 10.8 Cleanup and original extraction
+### 10.8 Plain-text worker, cleanup, and original extraction
 
-Docling and plain-text workers apply `src/parse/cleanup.rs` before staging bundles.
-Cleanup v2 repairs conservative prose spacing and contractions, preserves
-recognized code/math and structured content, and removes explicitly marked leaf
-headers/footers. PDF paragraph reflow preserves hard hyphens; only discretionary
-soft hyphens are removed. Cross-page joins require matching parents, consecutive
-page endpoints, aligned columns, and lowercase continuation. Plain-text line
-breaks remain intact. Merges retain original locators and rebuild sibling order.
-Whitespace-only lines do not trigger indentation protection; nonblank indented
-lines and nonblank lines containing tabs remain protected.
+The plain-text worker emits `text_block` units with `role = paragraph` and
+applies the plain-text arm of `src/parse/cleanup.rs` (version 2, hashed as
+`cleanupVersion` into its parser configuration) before staging bundles:
+conservative prose spacing and contraction repairs that preserve recognized
+code/math and structured content. Line breaks remain intact. Whitespace-only
+lines do not trigger indentation protection; nonblank indented lines and
+nonblank lines containing tabs remain protected.
 
-Their `parser_raw/` contains original extractor output, `pre_cleanup.json`
-(units and relationships), and `cleanup.json` (version, counts, removals, merge aliases).
-The importer archives verified raw bytes before either a ready or verified-failure
-commit; `parse_runs.parser_raw_output_uri` points to their artifact manifest.
-Unverified bundles retain the existing staged-failure handling.
+Its `parser_raw/` contains original extractor output, `pre_cleanup.json`
+(units and relationships), and `cleanup.json` (version, counts, removals, merge
+aliases). The EPUB worker's `parser_raw/` holds `epub_structure.json` (§10.9).
+The importer archives verified raw bytes before either a ready or
+verified-failure commit; `parse_runs.parser_raw_output_uri` points to their
+artifact manifest. Unverified bundles retain the existing staged-failure
+handling. Startup does not rewrite stored content. Snapshot references retain
+raw artifacts, but the snapshot verifier does not recursively verify their
+nested blobs.
 
-MuPDF enables native dehyphenation, then applies `src/parse/mupdf_cleanup.rs` in
-both production and the diagnostic preview. It removes lines wholly above the
-top 50 PDF points or starting within the bottom 25 points, and standalone numeric
-or lowercase Roman folios. Block lines join into paragraphs; trailing-hyphen
-joins and unterminated/lowercase continuations can span blocks and pages.
+### 10.9 EPUB worker
 
-Before generic repairs, the junk filter drops paragraphs whose wordlike tokens
-are half or fewer of all tokens. After surrounding punctuation is stripped,
-wordlike tokens require at least three ASCII letters and contain only letters,
-apostrophes, or hyphens. Paragraphs starting with `#` or containing a whole word
-`chapter`, `part`, or `book` (case-insensitive) bypass this filter and remain plain
-text. Ordered generic punctuation, contraction, quote, echo, and hyphen repairs
-then run; echo removal protects doubled initials. There are no book-specific
-substitutions.
+SPEC-epub.md is the contract for the worker's structure, text, locator, and
+relationship rules; this section states its service-facing contract.
 
-MuPDF archives the complete native extraction and `mupdf_cleanup.json` through
-`parser_raw_output_uri`. The cleanup report preserves source line references,
-removed margin/folio/junk text, paragraph preparation, and per-pass repairs.
-Its cleanup version participates in parser identity.
-
-Docling and plain-text workers use version 2 and hash `cleanupVersion` into their
-parser configuration. Existing documents require explicit reparsing to receive cleanup; startup
-does not rewrite stored content. Snapshot references retain raw artifacts, but
-the existing snapshot verifier does not recursively verify their nested blobs.
+- **Identity.** `parserName = "epub"`, `parserVersion = "1"`;
+  `parserConfigHash` is the canonical hash of `{ mappingVersion,
+  sectionRulesVersion, kindPatternsVersion, entityTableVersion }`, each a
+  string constant in the worker. A change to a mapping rule, a section rule,
+  the semantic kind table, or the entity table bumps its constant. There is
+  no dependency-lock hash. `[epub]` budgets (§2.8) are not identity.
+- **Capability profile.** Emits every §15.1 content type (`document`, `page`,
+  `text_section`, `text_block`, `list`, `list_item`, `aside`, `table`,
+  `table_row`, `table_cell`, `figure`, `caption`, `code_block`), every §19
+  relationship type (`contains`, `precedes`, `appears_on`, `caption_of`,
+  `has_caption`, `references`), and locator kind `dom_path` only. Every unit
+  carries exactly one `dom_path` locator, so `locator_coverage` is 1.0 for
+  every EPUB parse.
+- **Structure only.** The worker records only structure the source declares
+  (container, package, spine, navigation tree, `epub:type` and HTMLBook
+  `data-type` semantics, HTML element semantics, attributes, ids, hrefs). No
+  rule infers structure from text content. Text is plain, extracted without
+  repairs; Unicode NFC normalization happens at import.
+- **Archive.** Read with the `zip` crate, `stored` and `deflate` members only,
+  nothing extracted to disk, members read through a reader capped by the
+  §2.8 budgets. Encrypted members, other compression methods, a non-zip
+  archive, a missing or unparseable `META-INF/container.xml`, a missing
+  package document, a spine with no resolvable content document, a chosen
+  navigation member that is missing or fails to parse, an XML member that is
+  not well-formed or exceeds `max_element_depth`, an undecodable member, and
+  a `[parsing]` candidate cap exceeded are recorded parse failures. Failure
+  stages are `archive`, `container`, `package`, `navigation`,
+  `document:<href>`, and `caps`.
+- **Sequence.** Open the bundle writer; read the member directory; read
+  container, package, `mimetype`, and the navigation source; pass one parses
+  every spine document to record footnote targets; pass two walks spine
+  documents in order with one-block lookahead, streaming unit records as
+  they finalize, buffering relationships for emission after the last unit in
+  the order `contains`, `precedes`, `appears_on`, caption pairs, `references`,
+  and writing images to `artifacts/` as encountered, deduplicated by hash;
+  write `parser_raw/epub_structure.json`; seal the bundle with metrics and
+  `ParserResult`, whose `toolIdentity` records the package version and the
+  navigation source kind. The bundle's `stdout.log` and `stderr.log` are
+  empty files.
+- **Images.** Each image at most `max_image_bytes` is written to
+  `artifacts/<sha256>`; `FigureBody.imageHash`, `imageSizeBytes`, and
+  `imageMediaType` (from the manifest item) are set. The importer recomputes
+  each artifact's hash (a mismatch is a recorded parse failure), writes it to
+  the artifact store, and lists it in the canonical bundle manifest with
+  `artifactType = "image"`; bodies are not rewritten (§10.2).
+- **Raw report.** `parser_raw/epub_structure.json`: package version and
+  metadata, manifest counts by media type, spine items with linear flags, the
+  navigation tree with each node's resolution status and emitted unit id,
+  and per document the units emitted by type, blocks dropped, unknown
+  elements by local name, page markers with labels and ordinals, unresolved
+  links, caption pairings by rule number, and the kind rule that fired for
+  each section. It contains no content text beyond navigation labels and
+  headings.
+- **Warnings.** Aggregated per code per document (one warning per (code,
+  document) with a count in the message and the first instance's locator) so
+  `max_candidate_warnings` bounds them; warnings raised before any content
+  document is walked use the package document href as their key. Codes:
+  `epub_mimetype_missing`, `epub_mimetype_mismatch`, `epub_package_version`,
+  `epub_spine_item_missing`, `epub_navigation_missing`,
+  `epub_nav_target_unresolved`, `epub_unknown_element`,
+  `epub_empty_blocks_dropped`, `epub_page_marker_unlabeled`,
+  `epub_image_missing`, `epub_image_too_large`, `epub_svg_inline`,
+  `epub_link_unresolved`.
+- **Diagnostics.** Service-log events `parse.epub_worker.started`,
+  `epub.archive.opened`, `epub.package.read`, `epub.document.mapped`,
+  `epub.mapping.completed`, `parse.epub_worker.completed`,
+  `parse.epub_worker.parse_failed_recorded`, and
+  `parse.epub_worker.worker_faulted`; fields are in DIAGNOSTICS.md.
 
 ---
 
@@ -1275,8 +1340,7 @@ an immediate 503. (§7.)
 2. **Cutover-barrier probe** over the captured sources, before any retrieval
    stage (§11.4).
 3. **Dense + lexical candidate generation**, with independent candidate limits
-   of 100 per channel. Resolve chunks to canonical units and exclude explicit
-   header/footer units before they consume ranking slots.
+   of 100 per channel. Resolve chunks to canonical units.
    Dense additionally shortlists 20 section windows with the same query vector;
    each nominates up to five units by best fine-chunk cosine within that window.
    Units without fine vectors cannot be nominated. Equal-weight RRF combines
@@ -1384,7 +1448,7 @@ deactivation path snapshots *before* acquiring the barrier.
 
 Every snapshot stamps the §30.2 **ApplicationIdentity**, captured once at
 startup and threaded explicitly (never a global): the system version
-(`CARGO_PKG_VERSION`), the spec version constant (**"0.3"**), the compiled
+(`CARGO_PKG_VERSION`), the spec version constant (**"0.4"**), the compiled
 build features (via `cfg!`, sorted), and an aggregate configuration hash over
 a canonical projection of the audit-relevant config. The configuration hash
 covers **secret file paths only, never secret values** — it changes when a
@@ -1522,8 +1586,7 @@ HTTP status:
 
 - **Client boundary** — 400 (`bad_request`), 401 (`unauthorized`), 404
   (`not_found`: an absent resource and a non-active parse's units are
-  indistinguishable by design), 413 (`payload_too_large`), 422
-  (`docling_conversion`).
+  indistinguishable by design), 413 (`payload_too_large`).
 - **Availability, retryable** — 503: `service_unavailable` (admission
   saturation, not-ready) and `cutover_barrier_active` (query rejected
   mid-cutover **before any retrieval stage**; barrier holds last milliseconds,
@@ -1594,5 +1657,26 @@ These are deliberate, recorded deviations, not defects:
   improvised**: no existing deletion path (§15.8) erases artifact-store
   content, and ad-hoc removal from the write-once stores is outside every
   contract in this spec.
+- **Two parse formats.** Only `text/plain` and `application/epub+zip` are
+  routed to a worker (§10.1); a source of any other MIME type is counted as
+  `unparseable_mime` (§7). Conversion of other formats to plain text happens
+  outside this service.
+- **EPUB worker has no wall-clock budget.** Its bounds are the `[epub]`
+  admission budgets (§2.8) and the `[parsing]` candidate caps; a config-backed
+  timeout is deferred to the ingestion pipeline refactor. Spec §12.1 rule 5's
+  explicit timeout is therefore not implemented for this worker.
+- **EPUB structural deviations.** Layout `blockquote` emitted as role
+  `quote`; `br`-separated or styled-paragraph lists kept as single
+  `text_block` units; reflow-split headings kept as paragraphs with the
+  section heading taken from the navigation label; no structure inferred from
+  text, so sources without semantic markup get section kind `unknown`, no
+  section labels, pages only from explicit markers, captions only from
+  `figcaption`, table `caption`, or a heading inside `figure`, code blocks
+  only from `pre`, and notes only from `noteref`/footnote semantics; index
+  entries emitted as ordinary blocks under an `index` section with
+  `index_locator` edges; producer-generated alt text emitted as found; print
+  pages without geometry; figures, lists, and code inside table cells
+  flattened into cell text with their images not archived. SPEC-epub.md §12
+  is the list of record.
 
 No guarantees beyond those the code implements are claimed here.

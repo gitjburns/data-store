@@ -1,53 +1,31 @@
 //! Conservative cleanup for parser-declared prose; uncertain formatting stays verbatim.
 
-/// Repair extraction spacing without guessing missing words or changing plain-text
-/// line structure. Only PDF callers may opt into conservative soft-wrap reflow.
-pub(super) fn clean_prose(text: &str, reflow_lines: bool) -> String {
+/// Repair extraction spacing without guessing missing words or changing
+/// line structure.
+pub(super) fn clean_prose(text: &str) -> String {
     if is_protected(text) {
         return text.to_string();
     }
 
-    // Keep each original line ending, including CRLF and a final newline. A
-    // caller allowing PDF reflow authorizes only the explicitly checked joins.
-    let lines: Vec<(String, &str)> = text
-        .split_inclusive('\n')
-        .map(|line| {
-            let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
-                (body, "\r\n")
-            } else if let Some(body) = line.strip_suffix('\n') {
-                (body, "\n")
-            } else {
-                (line, "")
-            };
-            (repair_contractions(&normalize_horizontal(body)), ending)
-        })
-        .collect();
-
+    // Keep each original line ending, including CRLF and a final newline.
     let mut cleaned = String::with_capacity(text.len());
-    for (index, (line, ending)) in lines.iter().enumerate() {
-        let join = if reflow_lines && !ending.is_empty() {
-            lines
-                .get(index + 1)
-                .and_then(|(next, _)| reflow_separator(line, next))
+    for line in text.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
         } else {
-            None
+            (line, "")
         };
-        if let Some(separator) = join {
-            // The discretionary marker explicitly permits joining fragments;
-            // an ordinary hard hyphen is source content and remains literal.
-            cleaned.push_str(line.strip_suffix('\u{00ad}').unwrap_or(line));
-            cleaned.push_str(separator);
-        } else {
-            cleaned.push_str(line);
-            cleaned.push_str(ending);
-        }
+        cleaned.push_str(&repair_contractions(&normalize_horizontal(body)));
+        cleaned.push_str(ending);
     }
     cleaned
 }
 
 /// Whitespace can carry syntax in code, mathematics, or indented material. A
 /// paragraph label alone is insufficient evidence to rewrite those strings.
-/// Isolated numbers and punctuation also remain untouched, including during merging.
+/// Isolated numbers and punctuation also remain untouched.
 pub(super) fn is_protected(text: &str) -> bool {
     !text.chars().any(char::is_alphabetic)
         || text.chars().any(|character| {
@@ -155,20 +133,6 @@ fn is_horizontal_space(character: char) -> bool {
         character,
         ' ' | '\u{00a0}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
-}
-
-/// Join only an unfinished prose line followed by lowercase continuation.
-/// Sentence endings, quotes, blank lines, and other uncertain boundaries survive.
-fn reflow_separator(previous: &str, next: &str) -> Option<&'static str> {
-    if !next.chars().next().is_some_and(char::is_lowercase) {
-        return None;
-    }
-    let mut ending = previous.chars().rev();
-    match ending.next()? {
-        '-' | '\u{00ad}' if ending.next().is_some_and(char::is_alphabetic) => Some(""),
-        character if character.is_alphanumeric() || character == ',' => Some(" "),
-        _ => None,
-    }
 }
 
 /// Remove only spaces around a recognized contraction apostrophe. Adjacent

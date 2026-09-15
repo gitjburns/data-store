@@ -386,37 +386,42 @@ fn chunkable_unit(row: UnitRow) -> Result<Option<ChunkableUnit>, ApiError> {
 /// Past this point the returned string is targeting text (§23), not canonical
 /// evidence, even though the bytes came from a canonical unit body.
 ///
-/// Which types contribute text and why the rest are skipped:
+/// Which types contribute text (the SPEC-epub §2.1 evidence-bearing set) and
+/// why the rest are skipped:
 ///   - text_block  -> body.text: the atomic textual evidence unit; its prose is
 ///     exactly what lexical/dense retrieval should aim at.
-///   - text_section -> body.normalizedText: a section is a CONTAINER (§15.2),
-///     not a paragraph; its only own text is the optional normalized rendering,
-///     so we index that when present and skip the section otherwise (its child
-///     text_blocks carry the paragraph text and are chunked in their own right).
 ///   - caption     -> body.text: caption prose is short but retrieval-relevant.
-///   - table_cell  -> body.text, else body.normalizedText: a cell's displayed
-///     text, falling back to its normalized form; the typed `value` is not text.
+///   - table_cell  -> body.text: a cell's displayed text.
+///   - code_block  -> body.code: the code fragment is the unit's evidence text
+///     (§2.2 text projection), so it is chunked like the other three.
 ///
-/// Skipped types (page, table, table_row, figure, image_region, code_block):
-/// structural or non-prose containers with no direct renderable text. table and
-/// table_row carry their text through their decomposed table_cell children;
-/// figures/image_regions carry OCR/alt text out of scope for this text chunker;
-/// code_block prose is skipped here (its `code` field is not natural-language
-/// targeting text).
+/// Skipped types (document, page, text_section, list, list_item, aside, table,
+/// table_row, figure): structural containers or markers with no direct text.
+/// A text_section is a CONTAINER (§15.2), not a paragraph; its child
+/// text_blocks carry the paragraph text and are chunked in their own right.
+/// table and table_row carry their text through their decomposed table_cell
+/// children.
+///
+/// This is one of five synchronized readers; field selection must stay aligned
+/// with `assembly::evidence::evidence_text`,
+/// `projections::multivector::evidence_text`,
+/// `annotations::producer::evidence_text`, and `projections::view`'s
+/// `render_document` (no normalized-text fallback anywhere).
 fn extract_targeting_text(content_type: ContentType, body: &Value) -> Option<String> {
     match content_type {
-        ContentType::TextBlock => string_field(body, "text"),
-        ContentType::TextSection => string_field(body, "normalizedText"),
-        ContentType::Caption => string_field(body, "text"),
-        ContentType::TableCell => {
-            string_field(body, "text").or_else(|| string_field(body, "normalizedText"))
+        ContentType::TextBlock | ContentType::Caption | ContentType::TableCell => {
+            string_field(body, "text")
         }
-        ContentType::Page
+        ContentType::CodeBlock => string_field(body, "code"),
+        ContentType::Document
+        | ContentType::Page
+        | ContentType::TextSection
+        | ContentType::List
+        | ContentType::ListItem
+        | ContentType::Aside
         | ContentType::Table
         | ContentType::TableRow
-        | ContentType::Figure
-        | ContentType::ImageRegion
-        | ContentType::CodeBlock => None,
+        | ContentType::Figure => None,
     }
 }
 

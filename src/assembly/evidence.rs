@@ -575,28 +575,32 @@ fn reason_wire_name(reason: &AssemblyReason) -> &'static str {
 /// container/structural types that carry no direct text.
 ///
 /// Shared by passage construction so displayed content and retained evidence
-/// use the same canonical text fields. Projection and annotation extraction must
-/// continue to select these same fields when content types evolve.
+/// use the same canonical text fields. This is one of five synchronized
+/// readers of the SPEC-epub §2.1 evidence-bearing types (`text` for
+/// text_block, caption, table_cell; `code` for code_block; nothing else, no
+/// normalized-text fallback): `projections::chunk::extract_targeting_text`,
+/// `projections::multivector::evidence_text`,
+/// `annotations::producer::evidence_text`, and `projections::view`'s
+/// `render_document` must select the same fields when content types evolve.
+/// The importer's `text_projection_hash` follows the same rule (§2.2).
 pub(crate) fn evidence_text(content_type: ContentType, body: &Value) -> Option<String> {
     match content_type {
-        ContentType::TextBlock | ContentType::Caption => body
+        ContentType::TextBlock | ContentType::Caption | ContentType::TableCell => body
             .get("text")
             .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::TableCell => body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .or_else(|| body.get("normalizedText").and_then(|value| value.as_str()))
             .map(str::to_string),
         ContentType::CodeBlock => body
             .get("code")
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        ContentType::Page
+        ContentType::Document
+        | ContentType::Page
         | ContentType::TextSection
+        | ContentType::List
+        | ContentType::ListItem
+        | ContentType::Aside
         | ContentType::Table
         | ContentType::TableRow
-        | ContentType::Figure
-        | ContentType::ImageRegion => None,
+        | ContentType::Figure => None,
     }
 }

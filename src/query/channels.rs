@@ -29,7 +29,7 @@ use tracing::{debug, error, info};
 use crate::artifact_store::ArtifactStore;
 use crate::error::ApiError;
 use crate::model::ContentType;
-use crate::model::body::{TextBlockBody, TextBlockRole};
+use crate::model::body::TextBlockBody;
 use crate::policy::EntityMatchPolicy;
 use crate::primitives::bm25::build_bm25_queries;
 use crate::primitives::fusion::{Bm25Match, DenseMatch};
@@ -1088,18 +1088,16 @@ FROM content_units WHERE id = ?1 AND parse_id = ?2";
         .map_err(|source| ApiError::StorageOperation {
             message: format!("invalid content type for candidate unit {unit_id}: {source}"),
         })?;
-    let eligible = if content_type == ContentType::TextBlock {
-        let body: TextBlockBody =
+    // v0.4 has no furniture roles (SPEC-epub §2.2), so every decodable unit is
+    // eligible; a `text_block` body is still decoded strictly so a malformed
+    // one fails here rather than later in evidence assembly.
+    if content_type == ContentType::TextBlock {
+        let _body: TextBlockBody =
             serde_json::from_str(&body_json).map_err(|source| ApiError::StorageOperation {
                 message: format!("invalid text-block body for candidate unit {unit_id}: {source}"),
             })?;
-        !matches!(
-            body.block_role,
-            Some(TextBlockRole::Header | TextBlockRole::Footer)
-        )
-    } else {
-        true
-    };
+    }
+    let eligible = true;
     owners.insert(
         unit_id.to_owned(),
         CandidateUnit {

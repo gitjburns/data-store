@@ -21,26 +21,19 @@ orchestrator and its agents together; onboarding costs about 100K of that.
   discarded. No reader tolerates pre-v0.4 bodies, locators, or relationships.
   Acceptance begins with `--setup-storage` on a fresh index root or
   `--rebuild-all`.
-- **Configuration files.** Only `config.example.toml` is edited. The
-  operational files `config.toml`, `config.toml.local`, and
-  `config.toml.remote` are not touched. The completion report leads with
-  "Action required" naming those three files, the `[epub]` keys to add, and
-  the `[pdf]`, `[docling]`, and `[parsing]` keys to remove.
+- **Configuration files.** Agents edit only `config.example.toml`. The
+  operational `config.toml` is the user's. The three `[diagnostics]` keys
+  `progress_log_chars`, `activity_process_name_chars`, and
+  `activity_error_chars` were removed with the Docling activity sampler.
 - **Cargo.toml.** Editing it directly is approved within the owning phase:
   Phase 1 removes `mupdf` and `fancy-regex`; Phase 4 adds `zip` (default
-  features off, `deflate` only), `roxmltree`, and `regex`. No other
-  dependency change. The first `cargo check` after each of these edits
+  features off, `deflate` only) and `roxmltree`. No other dependency change. The first `cargo check` after each of these edits
   rewrites `Cargo.lock`; that is the accepted consequence of the approved
   edit, not a dependency-management command.
 - **Out of scope, listed in the completion report as candidates for the
   ingestion pipeline refactor:** a config-backed EPUB worker timeout; the
   activation dominance gate in `src/activation.rs` (untouched); stale PDF
   references in `SPEC-projection-decouple.md` (not edited).
-- **Acceptance ownership.** The user copies the six sample EPUBs from the
-  repository root into the configured `storage.corpus_root`, runs setup or
-  rebuild, and starts the server. The orchestrator runs the CLI verbs and the
-  bundle lookup under per-command approval. Section 14 mismatches are
-  reported as findings, never adjusted to pass.
 - **Footnote resolution needs two passes.** Section 10.3 decides whether a
   link is a note reference by whether its target is a footnote block, and
   Section 8 removes note-reference text at extraction time. Targets may lie in
@@ -95,7 +88,8 @@ the item name with `rg -n`.
   invariant. `config.example.toml:46` comment mentions Docling artifacts.
 - Bundle writer `src/parse/bundle.rs`: `BundleWriter::create(staging_root,
   BundleIdentity, RuntimeLimits)` 461, `append_candidate_unit` 522,
-  `append_candidate_relationship` 531, `append_warning` 540,
+  `append_candidate_relationship` 531, `append_warning` (removed in Phase 1
+  as dead code; Wave A step 1 restores it, streaming to `warnings.jsonl`),
   `parser_raw_dir()` 547, `artifacts_dir()` 557 (currently dead code; Phase 4
   makes it live), `finish(self, &ParserResult, &ParseMetrics, stdout, stderr)`
   580. `ParserResult.tool_identity: BTreeMap<String, String>` 213.
@@ -141,7 +135,7 @@ the item name with `rg -n`.
 - Toolchain: edition 2024, rustc 1.96. `std::sync::LazyLock` is available.
 - The six sample EPUBs are in the repository root with the names in Section
   1.3.
-- Binaries and CLI verbs used in Section 6.7, verified against README.md:
+- Binaries and CLI verbs for operating the service, verified against README.md:
   server `data-store-service` with `--config`, `--setup-storage`; client
   `data-store` with `--config`, `--rebuild-all`, `--health`,
   `--health-details`, `--held-parses`, `--source <sourceId>`,
@@ -159,8 +153,7 @@ the item name with `rg -n`.
   The orchestrator
   authors the script, the user approves it, and the orchestrator launches it.
   Phase 4 is the exception: its waves (Section 6.4) may be split across
-  sessions, at most two waves per Workflow. Phase 7 runs outside any
-  Workflow under per-command approval. The orchestrator edits no source and
+  sessions, at most two waves per Workflow. The orchestrator edits no source and
   reads no source. One exception: subagents may not delete files, so the
   orchestrator deletes the nine PDF-only files of Section 3 itself, under the
   user's explicit instruction, before the Phase 1 Workflow launches.
@@ -190,6 +183,13 @@ the item name with `rg -n`.
   the same run from the point of stop. Config edits beyond
   `config.example.toml`, new dependencies beyond Section 2, and any behavior
   the spec does not state are always escalations.
+- **Approvals known in advance are collected up front.** The session's
+  opening message lists every approval the phase will need (script, file
+  deletions, `Cargo.toml` and `config.example.toml` edits, network access
+  for a dependency fetch, verification commands) and one "proceed" covers
+  them all. Only unexpected items, the Stops above, interrupt a running
+  phase. The status update at session end is included in that up-front
+  approval.
 - **Mechanical compile fixes outside the file list are allowed.** An agent
   may edit an unlisted file when the compiler requires it and the fix changes
   no behavior beyond the approved intent. Each such file is listed under
@@ -201,7 +201,7 @@ the item name with `rg -n`.
 - **Sequencing.** Phases 1, 2, and 3 run in that order, one session each;
   Phase 3 may share a session with Phase 2 when budget allows. Phase 4 waves
   A through D run in order. Phase 5 runs after wave D. Phase 6 runs in its
-  own session any time after Phase 3. Phase 7 is last.
+  own session any time after Phase 3 and is last.
 - **Within a phase, agents run sequentially in the Section 6 order** unless
   Section 6 says otherwise. Cargo checks must pass clean for the format
   agent of a phase or wave. An implementation agent whose check fails only
@@ -396,7 +396,9 @@ their files are disjoint, each wave gated on the previous wave's
 waves; Section 9 records which wave is next.
 
 - **Wave A (leaf modules), two steps.** Step 1, one agent: add the three
-  dependencies to `Cargo.toml`, add `mod epub;` to `src/parse/mod.rs`, write
+  dependencies to `Cargo.toml`, add `mod epub;` to `src/parse/mod.rs`,
+  restore `BundleWriter::append_warning` in `src/parse/bundle.rs` (Phase 1
+  removed it as dead code), write
   the `mod.rs` skeleton (constants, error types, `Emitter`, capability
   profile, config hash, and `run_epub_parse` written in full against the
   stub signatures: the spec 11.2 sequence, the 11.4 events, the two-pass
@@ -405,7 +407,7 @@ waves; Section 9 records which wave is next.
   stub carrying its contracted signatures: each fallible body returns an
   `EpubFailure` at stage `Package`; each non-fallible body returns the
   type's empty, `false`, or `None` value; stub parameters are prefixed `_`;
-  the `LazyLock<Regex>` statics get the placeholder pattern `^$`. Because
+  (the regex statics of the pre-amendment contract are gone). Because
   nothing calls into `src/parse/epub/` until Wave D, step 1 puts
   `#![allow(dead_code)] // removed in Wave D when the route is wired` at the
   top of `epub/mod.rs`; without it the mandatory clean `cargo clippy` cannot
@@ -453,36 +455,7 @@ Each edit describes the v0.4 system as the spec states it; no
 history or migration prose. `config.example.toml` is owned by Phases 1
 and 3. The canonical spec file keeps its `v_0_3` filename (agents cannot
 move files); its title and revision summary say 0.4. The orchestrator sets
-the SPEC-epub.md status line to "implemented" in the Phase 7 status update.
-
-### 6.7 Phase 7 — Acceptance (spec 14)
-
-User steps, in the project root:
-
-```sh
-cp *.epub "$(rg -P -o 'corpus_root = "\K[^"]+' config.toml)"/
-data-store-service --config config.toml --setup-storage   # fresh index_root
-# or: data-store --config config.toml --rebuild-all         # during startup delay
-# then start the server as usual
-```
-
-Orchestrator steps, each under approval, run from the project root:
-
-```sh
-data-store --config config.toml --health
-data-store --config config.toml --health-details
-data-store --config config.toml --held-parses
-data-store --config config.toml --source <sourceId>
-data-store --config config.toml --unit <unitId>
-data-store --config config.toml --query <text>
-```
-
-Raw report: the parse run's `artifact_bundle_uri` is read from
-`parse_runs` in `<index_root>/fabric/fabric.sqlite3` by a read-only query;
-the manifest lists `parser_raw_output` entries; `epub_structure.json` is the
-blob at `<index_root>/fabric/artifacts/sha256/<2hex>/<hash>`. Compare
-against the Section 14 table. Every warning code present must map to a
-Section 1.3 property of that sample.
+the SPEC-epub.md status line to "implemented" when Phase 6 completes.
 
 ## 7. EPUB worker module contract
 
@@ -517,7 +490,8 @@ impl Emitter<'_> {
 }
 ```
 
-`run_epub_parse` owns: `BundleWriter::create`, the Section 11.4 events, the
+`run_epub_parse` owns: `BundleWriter::create`, the Section 11.4 events except
+`epub.document.mapped` (owned by `walk_spine`, which holds its fields), the
 two-pass spine walk, `report::write`, the Section 10.1 relationship flush,
 metrics, `ParserResult` with `tool_identity = { "packageVersion", "navigationSource" }`,
 and mapping `EpubFailure` to a sealed failure (`Ok`) and `Fault` to `Err`.
@@ -538,12 +512,7 @@ pub(crate) fn codepoint(name: &str) -> Option<u32>;   // XHTML 1.1 named entitie
 pub(crate) const KIND_PATTERNS_VERSION: &str = "1";
 use crate::model::body::SectionKind;   // defined once in the model (Phase 2); no local copy
 pub(crate) fn kind_from_semantic(value: &str) -> Option<SectionKind>;   // epub:type, data-type, landmark, guide
-pub(crate) fn kind_from_text(text: &str) -> Option<SectionKind>;        // spec 7.2 rule 4
-pub(crate) fn split_label(heading: &str) -> (Option<String>, String);   // spec 7.3 rules 2–3 on text; blocks::split_heading applies rule 1 first
-pub(crate) static PAGE_ID: LazyLock<Regex>;            // spec 7.6 rule 3
-pub(crate) static CAPTION_LABEL: LazyLock<Regex>;      // spec 7.9 rule 3
-pub(crate) static FOOTNOTE_MARKER: LazyLock<Regex>;    // spec 7.10, first form
-pub(crate) static FOOTNOTE_PAGE_MARKER: LazyLock<Regex>; // spec 7.10, second form
+// No text-pattern items: structure only (spec 1.3).
 ```
 
 **`archive.rs`**
@@ -555,7 +524,7 @@ impl Archive {
     pub(crate) fn contains(&self, member: &str) -> bool;
     pub(crate) fn read(&mut self, member: &str) -> Result<Option<Vec<u8>>, EpubFailure>; // per-member cap; total cap counts each member once (spec 5.1)
     pub(crate) fn member_count(&self) -> usize;
-    pub(crate) fn total_bytes_read(&self) -> u64;
+    pub(crate) fn declared_total_bytes(&self) -> u64;   // sum of central-directory declared sizes; logged by epub.archive.opened, never used for caps
 }
 ```
 
@@ -583,7 +552,6 @@ pub(crate) fn extract(node: roxmltree::Node, ctx: &TextContext) -> String;      
 pub(crate) fn extract_run(nodes: &[roxmltree::Node], ctx: &TextContext) -> String; // mixed-content run
 pub(crate) fn extract_pre(node: roxmltree::Node) -> String;                       // CRLF→LF, one leading newline stripped
 pub(crate) fn language(node: roxmltree::Node, package_language: Option<&str>) -> Option<String>;
-pub(crate) fn is_monospace_block(node: roxmltree::Node) -> bool;                  // spec 7.7 code heuristic
 ```
 
 **`report.rs`**
@@ -593,7 +561,7 @@ pub(crate) struct StructureReport { /* serde Serialize; spec 11.3 fields */ }
 impl StructureReport {
     pub(crate) fn new(package_version: &str, metadata: &DocumentBody) -> Self;
     // one recording method per 11.3 fact: manifest_counts, spine_item, nav_node, document_summary,
-    // unresolved_link, caption_pairing, code_heuristic, section_kind_rule, page_marker
+    // unresolved_link, caption_pairing, section_kind_rule, page_marker
     pub(crate) fn write(&self, raw_dir: &Path) -> Result<(), ApiError>;  // parser_raw/epub_structure.json
 }
 ```
@@ -608,7 +576,7 @@ pub(crate) struct Package { pub href: String, pub version: String, pub metadata:
     pub manifest: BTreeMap<String, ManifestItem>, pub spine: Vec<SpineItem>, pub toc_id: Option<String>,
     pub guide: Vec<GuideReference> }
 pub(crate) fn check_mimetype(archive: &mut Archive, package_href: &str, emitter: &mut Emitter) -> Result<(), EpubFailure>; // called after read_package; warnings keyed by package_href
-pub(crate) fn read_container(archive: &mut Archive) -> Result<String, EpubFailure>;   // rootfile href
+pub(crate) fn read_container(archive: &mut Archive, limits: &EpubLimits) -> Result<String, EpubFailure>;   // rootfile href; spec 6 rules apply to the container too
 pub(crate) fn read_package(archive: &mut Archive, rootfile: &str, limits: &EpubLimits,
     emitter: &mut Emitter) -> Result<Package, EpubFailure>;
 ```
@@ -618,7 +586,7 @@ pub(crate) fn read_package(archive: &mut Archive, rootfile: &str, limits: &EpubL
 ```rust
 pub(crate) enum NavigationSource { Nav, Ncx, None }   impl NavigationSource { pub(crate) fn wire_name(self) -> &'static str }
 pub(crate) struct Target { pub member: String, pub fragment: Option<String> }
-pub(crate) struct NavNode { pub label: String, pub target: Option<Target>, pub kind_hint: Option<SectionKind>,
+pub(crate) struct NavNode { pub label: String, pub href: Option<String> /* as written; None for a span entry */, pub target: Option<Target>, pub kind_hint: Option<SectionKind>,
     pub children: Vec<NavNode>, pub resolved: bool }
 pub(crate) struct Navigation { pub source: NavigationSource, pub toc: Vec<NavNode>,
     pub page_labels: BTreeMap<(String, Option<String>), String> }
@@ -657,36 +625,38 @@ pub(crate) struct BlockContext<'e, 'a, 'd> { pub document: &'d str, pub section_
 // under `parent` (spec 7.5), whose `node_range` becomes the locator's nodeRange.
 pub(crate) enum BlockSource<'d, 'input> { Element(roxmltree::Node<'d, 'input>),
     Run { parent: roxmltree::Node<'d, 'input>, nodes: Vec<roxmltree::Node<'d, 'input>>, node_range: [u64; 2] } }
-pub(crate) enum CaptionPosition { Inside, Before, After }                        // which candidate was consumed; Before/After name the caller's pending sibling block
-pub(crate) struct CaptionCandidate<'d, 'input> { pub position: CaptionPosition, pub node: Option<roxmltree::Node<'d, 'input>>,
+// Every caption lies inside its subject (spec 1.3), so no position field.
+pub(crate) struct CaptionCandidate<'d, 'input> { pub node: Option<roxmltree::Node<'d, 'input>>,
     pub label: Option<String>, pub text: String, pub rule: u8 }                  // node is Some for Inside (Node is Copy); rule = spec 7.9 rule number, for the report
 // Container emitters emit the container unit only and return what walk_spine
 // needs to walk the children itself with that parent; they never walk children.
 pub(crate) struct ListEmission<'d, 'input> { pub list_id: String,
     pub items: Vec<(String, Vec<(roxmltree::Node<'d, 'input>, TextBlockRole)>)> } // per list_item: its id and the child nodes to walk with their role (term/definition for dl)
 pub(crate) struct AsideEmission<'d, 'input> { pub aside_id: String, pub children: Vec<roxmltree::Node<'d, 'input>>,
-    pub pending_caption: Option<CaptionCandidate<'d, 'input>> }                  // pending_caption: spec 7.9 rule 4, applied by walk_spine to the first code_block emitted under this aside
+    pub pending_caption: Option<CaptionCandidate<'d, 'input>> }                  // pending_caption: spec 7.9 rule 3, applied by walk_spine to the first code_block emitted under this aside
 pub(crate) fn page_marker(node: roxmltree::Node, labels: &BTreeMap<(String, Option<String>), String>,
-    document: &str) -> Option<Option<String>>;                                    // spec 7.6 rules 1, 3, 4; Some(label)
+    document: &str) -> Option<Option<String>>;                                    // spec 7.6 rule 1; Some(label)
 pub(crate) fn dp_page_marker(pi: roxmltree::Node) -> Option<Option<String>>;    // spec 7.6 rule 2
 pub(crate) fn emit_text_block(ctx: &mut BlockContext, source: &BlockSource, parent: &str, role: TextBlockRole)
     -> WorkerResult<Option<String>>;                                              // None when dropped as empty
-pub(crate) fn emit_table(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;   // spec 7.8; owns rows, cells, and its <caption> internally
+pub(crate) struct TableEmission<'d, 'input> { pub table_id: String, pub caption_id: Option<String>,
+    pub cells: Vec<(String, roxmltree::Node<'d, 'input>)> }                    // cell ids with their source nodes so walk_spine can assign appears_on; caption_id so it can chain precedes among siblings
+pub(crate) fn emit_table<'d, 'input>(ctx: &mut BlockContext, node: roxmltree::Node<'d, 'input>, parent: &str)
+    -> WorkerResult<TableEmission<'d, 'input>>;                                   // spec 7.8; owns rows, cells, their contains/precedes edges, and its <caption> internally
 pub(crate) fn emit_list<'d, 'input>(ctx: &mut BlockContext, node: roxmltree::Node<'d, 'input>, parent: &str)
     -> WorkerResult<ListEmission<'d, 'input>>;                                    // ul, ol, dl: emits list and list_item units only
 pub(crate) fn emit_figure(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str, package: &Package,
     archive: &mut Archive, caption: Option<&CaptionCandidate>) -> WorkerResult<Vec<String>>; // spec 7.9, one per image; caption fills FigureBody.caption before streaming
 pub(crate) fn emit_aside<'d, 'input>(ctx: &mut BlockContext, node: roxmltree::Node<'d, 'input>, parent: &str)
     -> WorkerResult<AsideEmission<'d, 'input>>;                                   // emits the aside unit only
-pub(crate) fn emit_code(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str, heuristic: bool,
-    caption: Option<&CaptionCandidate>) -> WorkerResult<String>;                  // caption fills CodeBlockBody.title/label before streaming
-pub(crate) fn split_heading(node: roxmltree::Node, text: &TextContext) -> (Option<String>, String); // spec 7.3 rule 1 (span.label) then kinds::split_label; walk_spine calls this for TextSectionBody
+pub(crate) fn emit_code(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str,
+    caption: Option<&CaptionCandidate>) -> WorkerResult<String>;                  // pre only; caption fills CodeBlockBody.title/label before streaming
+pub(crate) fn split_heading(node: roxmltree::Node, text: &TextContext) -> (Option<String>, String); // spec 7.3: span.label -> label, remainder -> headingText; no text split; walk_spine calls this for TextSectionBody
 pub(crate) fn emit_formula(ctx: &mut BlockContext, node: roxmltree::Node, parent: &str) -> WorkerResult<String>;
 pub(crate) fn detect_caption<'d, 'input>(subject: roxmltree::Node<'d, 'input>, before: Option<&BlockSource<'d, 'input>>,
-    after: Option<&BlockSource<'d, 'input>>, text: &TextContext) -> Option<CaptionCandidate<'d, 'input>>; // spec 7.9 rules 1–3; before/after are the adjacent sibling blocks
+    after: Option<&BlockSource<'d, 'input>>, text: &TextContext) -> Option<CaptionCandidate<'d, 'input>>; // spec 7.9 rules 1–3 (figcaption/caption, heading inside figure, example-aside heading); before/after are never captions and are retained only for the lookahead contract
 pub(crate) fn pair_caption(ctx: &mut BlockContext, subjects: &[String], caption: &CaptionCandidate, parent: &str) -> WorkerResult<String>; // emits the caption unit and caption_of/has_caption edges only; returns the caption id
-pub(crate) fn is_footnote_block(node: roxmltree::Node, section_kind: SectionKind) -> bool;   // spec 7.10
-pub(crate) fn footnote_label(text: &str) -> Option<String>;
+pub(crate) fn is_footnote_block(node: roxmltree::Node, section_kind: SectionKind) -> bool;   // spec 7.10, semantic rules only
 pub(crate) fn aside_kind(node: roxmltree::Node) -> Option<crate::model::body::AsideKind>;   // model enum, not a local copy
 ```
 
@@ -702,7 +672,8 @@ pub(crate) fn walk_spine(archive: &mut Archive, package: &Package, navigation: &
     report: &mut StructureReport) -> WorkerResult<()>;                            // pass two: spec 7.1, 7.4, 7.5, 7.6, 7.11, then links::resolve_all
 ```
 
-`walk_spine` owns the section stack, the current-section rule, page
+`walk_spine` emits `epub.document.mapped` at each document boundary and
+owns the section stack, the current-section rule, page
 ordinals, `appears_on` assignment, title/subtitle detection, the one-block
 lookahead of spec 11.2, the `document` unit, and every child walk: it calls
 `blocks.rs` to emit each container or text block, then walks the returned
@@ -713,19 +684,7 @@ aside, and collects `LinkRecord`s for `links::resolve_all` at the end.
 ## 8. Completion report
 
 Every session ends with the agents' reports rolled up per Section 4's report
-shape, open verifier findings, and the Section 9 update. The final report
-after Phase 7 leads with:
-
-```
-Action required: edit config.toml, config.toml.local, config.toml.remote
-  add [epub] with the six keys from config.example.toml
-  remove [pdf], [docling], and the ten [parsing] keys listed in SPEC-epub.md Section 4
-Then: data-store-service --config config.toml --setup-storage (fresh index_root) or --rebuild-all
-```
-
-followed by: phases completed with verification results; Section 14 findings
-per sample; stale references left in `SPEC-projection-decouple.md`; the
-deferred items from Section 2.
+shape, open verifier findings, and the Section 9 update.
 
 ## 9. Status
 
@@ -733,14 +692,21 @@ Updated in place at the end of each session. The "Next" line names the
 phase, wave, or agent the next session starts with and any state it must
 know.
 
-Next: Phase 1. Before its Workflow launches, the orchestrator deletes the
-nine PDF-only files of Section 3 under the user's explicit instruction
-(Section 4). No source has been changed yet.
+Next: nothing. Development is complete; the service runs on `config.toml`.
+Section 3 line numbers are stale; locate by name. The Section 7 contract is
+current. Known deviations: the EPUB worker has no wall-clock timeout
+(canonical spec §12.1 rule 5; SPEC-epub.md Section 4 defers it);
+`SPEC_VERSION` in `src/identity.rs` is `"0.4"`.
 
-- Phase 1 — PDF decommissioning: not started.
-- Phase 2 — Content model v0.4: not started.
-- Phase 3 — `[epub]` configuration: not started.
-- Phase 4 — EPUB worker: not started.
-- Phase 5 — Importer image archival: not started.
-- Phase 6 — Documentation: not started.
-- Phase 7 — Acceptance: not started.
+- Phase 1 — PDF decommissioning: complete. `PROCESS_LOG_CAPTURE_BYTES =
+  65536`.
+- Phase 2 — Content model v0.4: complete. `PLAIN_TEXT_PARSER_VERSION` and
+  `CLEANUP_VERSION` were not bumped.
+- Phase 3 — `[epub]` configuration: complete. `src/epub_limits.rs` is
+  declared with `#[path]` beside `parsing_limits` in `src/limits.rs`.
+- Phase 4 — EPUB worker: complete. Dependencies are `zip` and `roxmltree`.
+- Phase 5 — Importer image archival: complete. The reader records artifact
+  paths; the importer re-hashes, fails the parse on a name mismatch, stores
+  via `put_bytes`, and manifests as `artifact_type = "image"`.
+- Phase 6 — Documentation: complete. The canonical spec file keeps its
+  `v_0_3` name with a 0.4 title.

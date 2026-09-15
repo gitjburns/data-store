@@ -14,12 +14,13 @@ SELECT DISTINCT p.id, p.content_type,
 FROM unit_relationships r JOIN content_units p
   ON p.parse_id = r.parse_id AND p.id = r.from_unit_id
 WHERE r.parse_id = ?1 AND r.to_unit_id = ?2
-  AND r.relationship_type IN ('logically_contains', 'contains')
+  AND r.relationship_type = 'contains'
   AND p.content_type != 'page'
 LIMIT 2";
 
-/// Resolve the nearest logical section without treating physical page containment
-/// as ancestry. Ambiguous parents, cycles, and excessive depth are explicit errors.
+/// Resolve the nearest `text_section` by walking `contains` upward (SPEC-epub
+/// §2.4); a `page` unit is never treated as an ancestor. Ambiguous parents,
+/// cycles, and excessive depth are explicit errors.
 pub(crate) fn read_section(
     conn: &Connection,
     parse_id: &str,

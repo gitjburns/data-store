@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 #[path = "parsing_limits.rs"]
 mod parsing;
 pub use parsing::ParsingLimits;
+// Same isolation as parsing_limits.rs: EPUB admission budgets stay importable
+// without the server runtime.
+#[path = "epub_limits.rs"]
+mod epub;
+pub use epub::EpubLimits;
 
 /// Query work, presentation, and evidence budgets captured for each retrieval profile.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -122,9 +127,6 @@ pub struct DiagnosticLimits {
     pub persisted_detail_chars: usize,
     pub error_chain_depth: usize,
     pub model_error_excerpt_chars: usize,
-    pub progress_log_chars: usize,
-    pub activity_process_name_chars: usize,
-    pub activity_error_chars: usize,
     pub identifier_preview_chars: usize,
     pub hash_prefix_chars: usize,
     pub sweep_example_paths: usize,
@@ -140,6 +142,7 @@ pub struct RuntimeLimits {
     pub workers: WorkerLimits,
     pub sqlite: SqliteLimits,
     pub parsing: ParsingLimits,
+    pub epub: EpubLimits,
     pub scheduling: SchedulingLimits,
     pub diagnostics: DiagnosticLimits,
     pub client: ClientLimits,
@@ -177,6 +180,7 @@ impl RuntimeLimits {
         let m = self.resources;
         let w = self.workers;
         let p = self.parsing;
+        let e = self.epub;
         let s = self.scheduling;
         let d = self.diagnostics;
         positive_values(&[
@@ -336,30 +340,15 @@ impl RuntimeLimits {
                 p.max_candidate_warnings as u128,
             ),
             ("parsing.max_unit_body_bytes", p.max_unit_body_bytes as u128),
-            ("parsing.process_log_bytes", p.process_log_bytes as u128),
+            ("epub.max_members", e.max_members as u128),
+            ("epub.max_member_bytes", e.max_member_bytes as u128),
             (
-                "parsing.process_read_chunk_bytes",
-                p.process_read_chunk_bytes as u128,
+                "epub.max_total_member_bytes",
+                e.max_total_member_bytes as u128,
             ),
-            ("parsing.mupdf_poll_ms", p.mupdf_poll_ms as u128),
-            ("parsing.docling_poll_ms", p.docling_poll_ms as u128),
-            (
-                "parsing.docling_feedback_initial_ms",
-                p.docling_feedback_initial_ms as u128,
-            ),
-            (
-                "parsing.docling_feedback_interval_ms",
-                p.docling_feedback_interval_ms as u128,
-            ),
-            (
-                "parsing.activity_sample_grace_ms",
-                p.activity_sample_grace_ms as u128,
-            ),
-            ("parsing.activity_poll_ms", p.activity_poll_ms as u128),
-            (
-                "parsing.cleanup_regex_backtrack_limit",
-                p.cleanup_regex_backtrack_limit as u128,
-            ),
+            ("epub.max_document_bytes", e.max_document_bytes as u128),
+            ("epub.max_image_bytes", e.max_image_bytes as u128),
+            ("epub.max_element_depth", e.max_element_depth as u128),
             ("scheduling.min_interval_ms", s.min_interval_ms as u128),
             ("scheduling.max_backoff_ms", s.max_backoff_ms as u128),
             (
@@ -379,18 +368,6 @@ impl RuntimeLimits {
             (
                 "diagnostics.model_error_excerpt_chars",
                 d.model_error_excerpt_chars as u128,
-            ),
-            (
-                "diagnostics.progress_log_chars",
-                d.progress_log_chars as u128,
-            ),
-            (
-                "diagnostics.activity_process_name_chars",
-                d.activity_process_name_chars as u128,
-            ),
-            (
-                "diagnostics.activity_error_chars",
-                d.activity_error_chars as u128,
             ),
             (
                 "diagnostics.identifier_preview_chars",
@@ -479,11 +456,6 @@ impl RuntimeLimits {
                 m.embedding_read_buffer_bytes,
             ),
             ("parsing.max_unit_body_bytes", p.max_unit_body_bytes),
-            ("parsing.process_log_bytes", p.process_log_bytes),
-            (
-                "parsing.process_read_chunk_bytes",
-                p.process_read_chunk_bytes,
-            ),
         ] {
             // Bounded readers may retain one extra byte to detect overflow.
             if bytes >= isize::MAX as usize {

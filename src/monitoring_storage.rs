@@ -5,7 +5,7 @@ use rusqlite::params;
 use std::collections::BTreeSet;
 
 use crate::{
-    acquisition::{MIME_TYPE_PDF, MIME_TYPE_PLAIN_TEXT},
+    acquisition::{MIME_TYPE_EPUB, MIME_TYPE_PLAIN_TEXT},
     error::ApiError,
     hot_plane,
     monitoring::progress_count,
@@ -177,10 +177,14 @@ fn source_observations(
                     parse_id.as_deref().unwrap_or("identity unavailable")
                 ),
             )),
-            None if !matches!(mime.as_str(), MIME_TYPE_PDF | MIME_TYPE_PLAIN_TEXT) => Some((
-                MonitorState::Unavailable,
-                format!("No parser is registered for content type {mime}."),
-            )),
+            // The routable MIME set is exactly the scheduler's `ParseRoute`
+            // vocabulary; a stored type outside it has no parser.
+            None if mime.as_str() != MIME_TYPE_PLAIN_TEXT && mime.as_str() != MIME_TYPE_EPUB => {
+                Some((
+                    MonitorState::Unavailable,
+                    format!("No parser is registered for content type {mime}."),
+                ))
+            }
             _ => None,
         };
         if let Some((state, message)) = explanation {

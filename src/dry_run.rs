@@ -76,8 +76,6 @@ pub(crate) struct DryRunInputs {
     pub(crate) corpus_root: PathBuf,
     pub(crate) index_root: crate::runtime::StorageContext,
     pub(crate) governance_domain: String,
-    /// The same startup-selected PDF producer used by ordinary ingestion.
-    pub(crate) pdf: crate::parse::pdf::PdfParser,
     /// The annotator model config (endpoint, model, max_input_chars, …).
     pub(crate) annotator: AnnotatorModelConfig,
     /// Config-file parent directory, for resolving the annotator's api-key file.
@@ -141,7 +139,6 @@ pub(crate) fn run(
         inputs.corpus_root.clone(),
         inputs.index_root.clone(),
         inputs.governance_domain,
-        inputs.pdf,
     )?;
     info!(
         event = "dry_run.pass_boundary",

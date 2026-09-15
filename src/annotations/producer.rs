@@ -253,7 +253,7 @@ impl ProducerKind {
 /// Evidence-bearing text extraction (empty-text units are skipped, so an
 /// empty group produces no invocation):
 ///   - text_block  -> body.text
-///   - table_cell  -> body.text, else body.normalizedText
+///   - table_cell  -> body.text
 ///   - caption     -> body.text
 ///   - code_block  -> body.code
 ///
@@ -510,48 +510,41 @@ fn owning_section<'units>(
 }
 
 /// Extract the evidence-bearing text for the content types the producers read,
-/// returning `None` for every other type (pages, sections, tables, rows,
-/// figures, image regions carry no direct producer text). The extracted text
-/// is the pure producer input (ruling 2); no normalization or metadata is
-/// mixed in beyond selecting the body's text-bearing field.
+/// returning `None` for every other type (document, pages, sections, lists,
+/// list items, asides, tables, rows, and figures carry no direct producer
+/// text). The extracted text is the pure producer input (ruling 2); no
+/// normalization or metadata is mixed in beyond selecting the body's
+/// text-bearing field.
 ///
-/// Keep field selection aligned with `projections::multivector::evidence_text`
-/// and `assembly::evidence::evidence_text`, including TableCell's normalizedText
-/// fallback. Query passages use the assembly extractor, so these three readers
-/// must agree on canonical text when a content type changes.
+/// One of five synchronized readers of the SPEC-epub §2.1 evidence-bearing
+/// types (`text` for text_block, caption, table_cell; `code` for code_block;
+/// no normalized-text fallback). Keep field selection aligned with
+/// `assembly::evidence::evidence_text`,
+/// `projections::chunk::extract_targeting_text`,
+/// `projections::multivector::evidence_text`, and `projections::view`'s
+/// `render_document`. Query passages use the assembly extractor, so these
+/// readers must agree on canonical text when a content type changes.
 fn evidence_text(unit: &ContentUnit) -> Option<String> {
     match unit.content_type {
-        ContentType::TextBlock => unit
+        ContentType::TextBlock | ContentType::Caption | ContentType::TableCell => unit
             .body
             .get("text")
             .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::Caption => unit
-            .body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::TableCell => unit
-            .body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                unit.body
-                    .get("normalizedText")
-                    .and_then(|value| value.as_str())
-            })
             .map(str::to_string),
         ContentType::CodeBlock => unit
             .body
             .get("code")
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        ContentType::Page
+        ContentType::Document
+        | ContentType::Page
         | ContentType::TextSection
+        | ContentType::List
+        | ContentType::ListItem
+        | ContentType::Aside
         | ContentType::Table
         | ContentType::TableRow
-        | ContentType::Figure
-        | ContentType::ImageRegion => None,
+        | ContentType::Figure => None,
     }
 }
 

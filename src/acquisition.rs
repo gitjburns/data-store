@@ -1421,23 +1421,25 @@ fn sql_integer(value: u64, what: &'static str) -> Result<i64, ApiError> {
     })
 }
 
-/// Stored mime type for PDF sources. Single source of the routing
-/// vocabulary: the scheduler's parse dispatch routes on exactly these
-/// constants, so acquisition-time typing and dispatch-time routing cannot
-/// drift apart.
-pub(crate) const MIME_TYPE_PDF: &str = "application/pdf";
-/// Stored mime type for plain-text sources (see `MIME_TYPE_PDF`).
+/// Stored mime type for plain-text sources. Single source of the routing
+/// vocabulary: the scheduler's parse dispatch routes on exactly the MIME
+/// constants defined here, so acquisition-time typing and dispatch-time
+/// routing cannot drift apart.
 pub(crate) const MIME_TYPE_PLAIN_TEXT: &str = "text/plain";
 
+/// Stored mime type for EPUB sources (SPEC-epub §3.1); the second routed
+/// MIME, sharing the single-source rule of `MIME_TYPE_PLAIN_TEXT`.
+pub(crate) const MIME_TYPE_EPUB: &str = "application/epub+zip";
+
 /// Infer the stored mime type from the native URI's filename extension. The
-/// closed .pdf/.txt mapping mirrors the corpus the fabric currently ingests;
-/// everything else is honestly opaque bytes rather than a guessed type.
+/// closed .txt/.epub mapping (case-insensitive) mirrors the routed parser
+/// set; everything else is honestly opaque bytes rather than a guessed type.
 fn mime_type_for_native_uri(native_uri: &str) -> &'static str {
     let lowered = native_uri.to_ascii_lowercase();
-    if lowered.ends_with(".pdf") {
-        MIME_TYPE_PDF
-    } else if lowered.ends_with(".txt") {
+    if lowered.ends_with(".txt") {
         MIME_TYPE_PLAIN_TEXT
+    } else if lowered.ends_with(".epub") {
+        MIME_TYPE_EPUB
     } else {
         "application/octet-stream"
     }

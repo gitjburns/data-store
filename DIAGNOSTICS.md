@@ -82,7 +82,8 @@ Subsystem boundaries that must not pass generic errors upward include:
 - HTTP request and operation dispatch;
 - request validation;
 - source resolution;
-- Docling conversion and other external process calls;
+- EPUB parsing, by stage: `archive`, `container`, `package`, `navigation`,
+  `document:<href>`, `caps`;
 - unit splitting;
 - dense embedding;
 - ColBERT embedding and scoring;
@@ -125,12 +126,22 @@ and configured limits. Keep model payloads out of the service log.
 and metadata failures before readiness. Distinguish serving capacity from window
 limits and existing application prefix handling; server-side truncation is disabled.
 
-Every external process call must log executable identity, purpose, start,
-configured timeout, process ID when available, completion status or timeout,
-elapsed milliseconds, and bounded stdout/stderr diagnostics on failure.
-`docling.sample.started`, `.spawned`, and `.completed`/`.failed` record optional
-sampling PIDs, elapsed time, capture counts, timeout/truncation flags, and cleanup
-outcome. Partial telemetry is not a complete sample; raw sample text is not logged.
+The EPUB worker runs in-process and emits these events:
+
+| Event | Level | Fields |
+| --- | --- | --- |
+| `parse.epub_worker.started` | INFO | source_id, source_path |
+| `epub.archive.opened` | INFO | member_count, total_member_bytes |
+| `epub.package.read` | INFO | package_version, spine_count, manifest_count, navigation_source |
+| `epub.document.mapped` | DEBUG | href, unit_count, dropped_blocks, unresolved_links, page_markers |
+| `epub.mapping.completed` | INFO | unit_count, relationship_count, section_count, page_count, table_count, figure_count, code_block_count, image_count, image_bytes, warning_count, elapsed_ms |
+| `parse.epub_worker.completed` | INFO | bundle_dir, elapsed_ms |
+| `parse.epub_worker.parse_failed_recorded` | WARN | detail, stage, elapsed_ms |
+| `parse.epub_worker.worker_faulted` | ERROR | error, elapsed_ms |
+
+`stage` is one of `archive`, `container`, `package`, `navigation`,
+`document:<href>`, `caps`. A recorded parse failure is a source-caused outcome
+sealed into a failure bundle; a worker fault is a staging error.
 
 Every spawned task must have durable visibility for start or acceptance, normal
 completion, normal error, panic when detectable, and cancellation or join
@@ -206,7 +217,7 @@ include:
 | Operation | request/work identity, operation ID when assigned, target, trigger, stage, elapsed time |
 | Request validation | request ID, route/path, rejected field, safe limit/value, status, error kind |
 | Source resolution | requested source, relative source, resolved path on success, elapsed time |
-| Docling/process | executable path, source reference, output directory, timeout, exit status, elapsed time, bounded failure diagnostics |
+| EPUB parse | source ID and path, stage, member/unit/relationship counts, bundle directory, failure detail, elapsed time |
 | Model call | parent work and call IDs, role, purpose, input shape/limits, measured usage when supplied, finish reason when supplied, elapsed time, error on failure |
 | Storage | source path, version label, document ID when available, phase, counts, commit/publish state |
 | Active publish | source path, version label, vector count, published timestamp, phase |

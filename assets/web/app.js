@@ -676,14 +676,10 @@ function queryPassageMarkup(result, rank) {
   const section = Array.isArray(result.sectionPath) && result.sectionPath.length > 0
     ? `<div>${result.sectionPath.map(esc).join(' › ')}</div>`
     : '';
-  // Physical PDF page numbers are authoritative; printed page labels can differ.
-  const pages = Array.isArray(result.pageNumbers) && result.pageNumbers.length > 0
-    ? `<div>PDF pages: ${result.pageNumbers.map(esc).join(', ')}</div>`
-    : '<div class="absent">Page information unavailable</div>';
   const truncated = result.truncated === true ? '<p class="field-note">[Passage truncated]</p>' : '';
   return `<article class="evidence">
     <div class="evidence-head"><span class="evidence-rank">#${esc(rank)}</span>${source}</div>
-    ${section}${pages}
+    ${section}
     <div class="evidence-text">${esc(result.text)}</div>${truncated}
     ${retrievalProvenanceMarkup(result.retrievalProvenance)}
   </article>`;
@@ -954,14 +950,32 @@ function derivedBodyMarkup(unit) {
 
 /**
  * Per-content-type extraction behind derivedBodyMarkup(): pick the
- * human-useful fields out of a §18 body (PROTOCOL.md body shapes). Types with
- * a server-side text projection never reach this switch in practice; they and
- * unknown types return no parts, triggering the caller's fallback line.
+ * human-useful fields out of a SPEC-epub §2.2 typed body (PROTOCOL.md body
+ * shapes). Only the non-evidence types are listed: the evidence-bearing types
+ * (`text_block`, `caption`, `table_cell`, `code_block`) carry a server-side
+ * text projection and never reach this switch in practice; they and unknown
+ * types return no parts, triggering the caller's fallback line. Optional
+ * fields are omitted when absent, so each is guarded before rendering.
  */
 function derivedBodyParts(contentType, body) {
   const parts = [];
   switch (contentType) {
+    case 'document':
+      if (body.title) parts.push(derivedLine('title', esc(body.title)));
+      if (Array.isArray(body.creators) && body.creators.length > 0) {
+        parts.push(derivedLine('creators', body.creators.map(esc).join(' · ')));
+      }
+      if (body.publisher) parts.push(derivedLine('publisher', esc(body.publisher)));
+      if (body.date) parts.push(derivedLine('date', esc(body.date)));
+      if (body.language) parts.push(derivedLine('language', esc(body.language)));
+      break;
+    case 'page':
+      // `ordinal` is the parse's own page-marker position; `label` is the
+      // printed folio and may differ from it, so both are shown when present.
+      parts.push(derivedLine('page', `${esc(body.ordinal)}${body.label ? ` (${esc(body.label)})` : ''}`));
+      break;
     case 'text_section':
+      parts.push(derivedLine('kind', `${esc(body.kind)}${body.label ? ` ${esc(body.label)}` : ''}`));
       // sectionPath is the full heading ancestry and subsumes the bare
       // heading, so prefer it when present.
       if (Array.isArray(body.sectionPath) && body.sectionPath.length > 0) {
@@ -970,7 +984,16 @@ function derivedBodyParts(contentType, body) {
         const level = body.headingLevel === undefined ? '' : ` (h${esc(body.headingLevel)})`;
         parts.push(derivedLine('heading', `${esc(body.headingText)}${level}`));
       }
-      if (body.normalizedText) parts.push(derivedText(body.normalizedText));
+      break;
+    case 'list':
+      parts.push(derivedLine('kind', `${esc(body.kind)}${body.start === undefined ? '' : ` from ${esc(body.start)}`}`));
+      break;
+    case 'list_item':
+      parts.push(derivedLine('item', `${esc(body.ordinal)}${body.label ? ` (${esc(body.label)})` : ''}`));
+      break;
+    case 'aside':
+      parts.push(derivedLine('kind', esc(body.kind)));
+      if (body.title) parts.push(derivedLine('title', esc(body.title)));
       break;
     case 'table':
       if (body.caption) parts.push(derivedLine('caption', esc(body.caption)));
@@ -978,26 +1001,20 @@ function derivedBodyParts(contentType, body) {
       if (Array.isArray(body.headers) && body.headers.length > 0) {
         parts.push(derivedLine('headers', body.headers.map((header) => esc(header.text)).join(' · ')));
       }
-      if (body.normalizedMarkdown) {
-        parts.push(`<pre class="derived-pre">${esc(body.normalizedMarkdown)}</pre>`);
-      }
       break;
     case 'table_row':
       parts.push(derivedLine('row', `${esc(body.rowIndex)}${body.role ? ` (${esc(body.role)})` : ''}`));
       break;
     case 'figure':
-      if (body.figureType) parts.push(derivedLine('type', esc(body.figureType)));
       if (body.caption) parts.push(derivedLine('caption', esc(body.caption)));
       if (body.altText) parts.push(derivedLine('alt text', esc(body.altText)));
-      if (body.ocrText) parts.push(derivedText(body.ocrText));
-      break;
-    case 'image_region':
-      if (body.label) parts.push(derivedLine('label', esc(body.label)));
-      if (body.confidence !== undefined) parts.push(derivedLine('confidence', esc(body.confidence)));
-      if (body.ocrText) parts.push(derivedText(body.ocrText));
-      break;
-    case 'page':
-      parts.push(derivedLine('page', esc(body.pageNumber)));
+      // The image itself lives in the artifact store keyed by `imageHash`
+      // (SPEC-epub §2.7); the console shows the key, not the blob.
+      if (body.imageHash) {
+        const size = body.imageSizeBytes === undefined ? '' : `, ${esc(body.imageSizeBytes)} bytes`;
+        const mediaType = body.imageMediaType ? ` ${esc(body.imageMediaType)}` : '';
+        parts.push(derivedLine('image', `<code>${esc(body.imageHash)}</code>${mediaType}${size}`));
+      }
       break;
     default:
       break;
@@ -1008,11 +1025,6 @@ function derivedBodyParts(contentType, body) {
 /** One "key: value" line of a derived-body summary; `html` is pre-escaped. */
 function derivedLine(label, html) {
   return `<div class="derived-line"><span class="derived-key">${esc(label)}</span> ${html}</div>`;
-}
-
-/** Free-form derived text (OCR, normalized text), whitespace preserved. */
-function derivedText(text) {
-  return `<div class="evidence-text">${esc(text)}</div>`;
 }
 
 /**
@@ -1246,20 +1258,16 @@ registerView('query', {
  */
 const unitRelationshipFilters = { direction: '', relationshipType: '' };
 
-/** The closed `relationshipType` wire set (PROTOCOL.md); offered as suggestions,
- *  not enforced, so a type added by a later service version is still filterable. */
+/** The closed `relationshipType` wire set (SPEC-epub §2.4, PROTOCOL.md);
+ *  offered as suggestions, not enforced, so a type added by a later service
+ *  version is still filterable. */
 const RELATIONSHIP_TYPES = [
   'contains',
-  'physically_contains',
-  'logically_contains',
   'precedes',
-  'follows',
   'appears_on',
   'caption_of',
   'has_caption',
   'references',
-  'continues_on',
-  'derived_from',
 ];
 
 /**

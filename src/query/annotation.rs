@@ -781,18 +781,28 @@ fn same_target(left: &RetrievalHit, right: &RetrievalHit) -> bool {
         && left.source_excerpt == right.source_excerpt
 }
 
-/// Enforce the same canonical role exclusions as ordinary source retrieval.
+/// Confirm the annotation target still exists in the captured parse. v0.4 has
+/// no furniture roles (SPEC-epub §2.2), so existence is the only eligibility
+/// rule, matching ordinary source retrieval in `channels.rs`.
 fn eligible_unit(
     conn: &Connection,
     source_id: &str,
     parse_id: &str,
     unit_id: &str,
 ) -> Result<bool, ApiError> {
-    let (kind, role): (String, Option<String>) = conn.query_row(
-        "SELECT content_type, json_extract(body_json, '$.blockRole') FROM content_units WHERE id=?1 AND source_id=?2 AND parse_id=?3",
-        params![unit_id, source_id, parse_id], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|source| failure(format!("validate annotation target {unit_id} in {parse_id}: {source}")))?;
-    Ok(!(kind == "text_block" && matches!(role.as_deref(), Some("header" | "footer"))))
+    // A missing row surfaces as `QueryReturnedNoRows` and is an error, never
+    // `Ok(false)`: a target absent from its captured parse is corrupt state.
+    conn.query_row(
+        "SELECT 1 FROM content_units WHERE id=?1 AND source_id=?2 AND parse_id=?3",
+        params![unit_id, source_id, parse_id],
+        |_| Ok(()),
+    )
+    .map_err(|source| {
+        failure(format!(
+            "validate annotation target {unit_id} in {parse_id}: {source}"
+        ))
+    })?;
+    Ok(true)
 }
 
 /// Preserve source context through the existing query error envelope.

@@ -36,7 +36,12 @@
 //! belongs to the dispatch pipeline (C5); failure bundles stay inspectable
 //! per spec §12.2.
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use crate::limits::{DiagnosticLimits, RuntimeLimits};
 use crate::runtime::StorageContext;
@@ -52,14 +57,14 @@ use crate::events::{append_event, entry, new_system_event};
 use crate::hot_plane;
 use crate::ids::{content_unit_id, new_parse_run_id, unit_relationship_id};
 use crate::model::{
-    CaptionBody, ConformanceReport, ContentType, ContentUnit, ParseMetrics, ParseRun,
-    ParseRunStatus, ParseWarning, ParserCapabilityProfile, ProducerType, Provenance,
-    SystemEventType, TableCellBody, TextBlockBody, TextSectionBody, UnitRelationship,
-    content_type_body_matches,
+    CaptionBody, CodeBlockBody, ConformanceReport, ContentType, ContentUnit, ParseMetrics,
+    ParseRun, ParseRunStatus, ParseWarning, ParserCapabilityProfile, ProducerType, Provenance,
+    SystemEventType, TableCellBody, TextBlockBody, UnitRelationship, content_type_body_matches,
 };
 use crate::parse::bundle::{
-    BUNDLE_MANIFEST_FILE_NAME, BundleReadError, CandidateWarning, ParserExecutionStatus,
-    ParserOutputBundle, ParserOutputManifest, read_bundle, read_capped_bytes,
+    BUNDLE_ARTIFACTS_DIR_NAME, BUNDLE_MANIFEST_FILE_NAME, BundleReadError, CandidateWarning,
+    ParserExecutionStatus, ParserOutputBundle, ParserOutputManifest, read_bundle,
+    read_capped_bytes,
 };
 use crate::parse::conformance;
 use crate::primitives::utc_now;
@@ -79,7 +84,8 @@ const CANONICAL_PARSE_BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// so the bundle never needs to re-establish source identity;
 /// retrieval_projections.jsonl — projection producers arrive at C6, which
 /// owns their archival; semantic_annotations.jsonl — annotations are
-/// post-MVP per §36; artifacts/ — no large parser binaries are imported yet.
+/// post-MVP per §36. Staged `artifacts/<hash>` image files are listed under
+/// their staged path with artifact type `image` (SPEC-epub §2.7).
 const CANONICAL_PARSE_RUN_FILE_NAME: &str = "parse_run.json";
 const CANONICAL_CONFORMANCE_FILE_NAME: &str = "conformance_report.json";
 const CANONICAL_UNITS_FILE_NAME: &str = "content_units.jsonl";
@@ -450,6 +456,21 @@ fn run_attributed_import(
             started,
         );
     }
+    // SPEC-epub §2.7 rule 1: every staged image is named by the SHA-256 of
+    // its bytes. A mismatch is a producer contract breach recorded exactly
+    // like a §13.1 gate failure; it runs before any image reaches the store.
+    if let Some(detail) = validate_image_artifact_names(&bundle.artifact_files)? {
+        return fail_parse_run(
+            connection,
+            parse_run_id,
+            &bundle.manifest.source_id,
+            &detail,
+            raw_archive
+                .as_ref()
+                .map(|archive| archive.manifest.uri.as_str()),
+            started,
+        );
+    }
     info!(
         event = "parse.validation_succeeded",
         parse_run_id,
@@ -457,6 +478,7 @@ fn run_attributed_import(
         unit_count = bundle.candidate_units.len() as u64,
         relationship_count = bundle.candidate_relationships.len() as u64,
         warning_count = bundle.warnings.len() as u64,
+        image_count = bundle.artifact_files.len() as u64,
         elapsed_ms = gates_started.elapsed().as_millis() as u64,
         "hard-gate validation passed"
     );
@@ -524,6 +546,10 @@ fn run_attributed_import(
     run_snapshot.parser_raw_output_uri = raw_archive
         .as_ref()
         .map(|archive| archive.manifest.uri.clone());
+    // Images are stored only for a parse that passed every gate: their
+    // store key is `FigureBody.imageHash`, which is already the verified file
+    // name, so bodies are never rewritten (SPEC-epub §2.7 rule 3).
+    let image_artifacts = archive_bundle_images(&store, parse_run_id, &bundle.artifact_files)?;
     let bundle_ref = write_canonical_parse_bundle(
         &store,
         &run_snapshot,
@@ -531,7 +557,10 @@ fn run_attributed_import(
         &rows,
         &warnings,
         &bundle.metrics,
-        raw_archive.as_ref(),
+        ArchivedBinaries {
+            raw: raw_archive.as_ref(),
+            images: &image_artifacts,
+        },
     )?;
 
     commit_ready(
@@ -901,9 +930,8 @@ fn validate_hard_gates(
 /// remapped to the canonical IDs. Typed bodies are copied verbatim: refs
 /// embedded INSIDE a body are never remapped, because bodyHash must stay
 /// purely content-derived (§16.1) and canonical unit IDs embed the parseId.
-/// Workers must therefore omit body fields that would carry unit
-/// references (e.g. `captionForUnitIds`, `headerRefs`) and express pairing
-/// as UnitRelationship edges instead. Unit-level parser provenance lives on
+/// Workers must therefore never put unit references in a body (§2.2) and
+/// express pairing and containment as UnitRelationship edges instead. Unit-level parser provenance lives on
 /// the ParseRun itself (spec §15 defines no per-unit provenance field);
 /// relationships carry a full §20 Provenance naming the parser from the
 /// verified manifest.
@@ -1018,14 +1046,16 @@ fn resolve_local_id(
         })
 }
 
-/// Compute the §16.1 `textHash` for bodies with a natural text projection:
-/// the normalized text when present, else the raw text field. Exactly the
-/// spec §18 `text`/`normalizedText` fields qualify (text_block, caption,
-/// table_cell, and text_section's normalizedText); code, OCR text, and
-/// captions embedded in other bodies are not text projections of THIS unit.
-/// The hash is the canonical SHA-256 of the projection as a JSON string
-/// (NFC-normalized per §16.2). The body was already gate-validated, so a
-/// typed deserialization failure here is an internal invariant breach.
+/// Compute the §16.1 `textHash` for bodies with a text projection
+/// (SPEC-epub §2.2): `text` for text_block, caption, and table_cell (absent
+/// when a cell has no text), `code` for code_block, and nothing for every
+/// other type. Captions embedded in other bodies (`TableBody.caption`,
+/// `FigureBody.caption`) are not text projections of THIS unit. This is the
+/// same field selection the five evidence readers use, starting with
+/// `assembly::evidence::evidence_text`. The hash is the canonical SHA-256 of
+/// the projection as a JSON string (NFC-normalized per §16.2). The body was
+/// already gate-validated, so a typed deserialization failure here is an
+/// internal invariant breach.
 fn text_projection_hash(
     content_type: ContentType,
     body: &Value,
@@ -1033,26 +1063,29 @@ fn text_projection_hash(
     let projection: Option<String> = match content_type {
         ContentType::TextBlock => {
             let typed: TextBlockBody = validated_body(body, "text_block")?;
-            Some(typed.normalized_text.unwrap_or(typed.text))
+            Some(typed.text)
         }
         ContentType::Caption => {
             let typed: CaptionBody = validated_body(body, "caption")?;
-            Some(typed.normalized_text.unwrap_or(typed.text))
+            Some(typed.text)
         }
         ContentType::TableCell => {
             let typed: TableCellBody = validated_body(body, "table_cell")?;
-            typed.normalized_text.or(typed.text)
+            typed.text
         }
-        ContentType::TextSection => {
-            let typed: TextSectionBody = validated_body(body, "text_section")?;
-            typed.normalized_text
+        ContentType::CodeBlock => {
+            let typed: CodeBlockBody = validated_body(body, "code_block")?;
+            Some(typed.code)
         }
-        ContentType::Page
+        ContentType::Document
+        | ContentType::Page
+        | ContentType::TextSection
+        | ContentType::List
+        | ContentType::ListItem
+        | ContentType::Aside
         | ContentType::Table
         | ContentType::TableRow
-        | ContentType::Figure
-        | ContentType::ImageRegion
-        | ContentType::CodeBlock => None,
+        | ContentType::Figure => None,
     };
     projection
         .map(|text| crate::canonical::canonical_sha256_hex_of(&text))
@@ -1178,6 +1211,107 @@ fn archive_parser_raw(
     }
 }
 
+/// Binary evidence archived before the canonical bundle is written: raw
+/// parser output (absent for bundles without `parser_raw/`) and the staged
+/// images keyed by their `artifacts/<hash>` path.
+struct ArchivedBinaries<'a> {
+    raw: Option<&'a ArchivedParserRaw>,
+    images: &'a BTreeMap<String, ArtifactRef>,
+}
+
+/// The `<hash>` part of a staged `artifacts/<hash>` path. `None` for a path
+/// not directly under the artifacts directory; the reader lists only such
+/// paths, so the caller treats `None` as a name mismatch too.
+fn staged_image_hash(path: &str) -> Option<&str> {
+    path.strip_prefix(BUNDLE_ARTIFACTS_DIR_NAME)?
+        .strip_prefix('/')
+}
+
+/// SPEC-epub §2.7 rule 1: each staged image's name must equal the lowercase
+/// SHA-256 hex of its bytes. `Ok(Some(detail))` names the first violation
+/// (a recorded parse failure, like a §13.1 gate); `Err` is a canonical-side
+/// read fault of a file the reader already verified. Reads one file at a
+/// time and stores nothing, so a breach leaves no orphan blobs.
+fn validate_image_artifact_names(
+    artifact_files: &BTreeMap<String, PathBuf>,
+) -> Result<Option<String>, ApiError> {
+    for (name, path) in artifact_files {
+        let bytes = read_staged_image(name, path)?;
+        let actual = crate::canonical::sha256_hex_bytes(&bytes);
+        if staged_image_hash(name) != Some(actual.as_str()) {
+            return Ok(Some(format!(
+                "image artifact name gate: {name} is not named by the SHA-256 of its bytes ({actual})"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Read one staged image the reader already verified; a failure here is an
+/// importer-side fault, never a producer breach.
+fn read_staged_image(name: &str, path: &Path) -> Result<Vec<u8>, ApiError> {
+    fs::read(path).map_err(|source| ApiError::InternalIo {
+        message: format!(
+            "failed to read staged image {name} at {}: {source}",
+            path.display()
+        ),
+    })
+}
+
+/// Store every gate-passed image (SPEC-epub §2.7 rule 2), keyed by its
+/// staged `artifacts/<hash>` path for the canonical manifest. Runs only
+/// after `validate_image_artifact_names`, so the store key `put_bytes`
+/// derives equals the file name. Faults are infrastructure errors; nothing
+/// dangles because the manifest that references these blobs is written last.
+fn archive_bundle_images(
+    store: &ArtifactStore,
+    parse_run_id: &str,
+    artifact_files: &BTreeMap<String, PathBuf>,
+) -> Result<BTreeMap<String, ArtifactRef>, ApiError> {
+    let mut images = BTreeMap::new();
+    // Bundles without images (plain text) skip the lifecycle logs entirely.
+    if artifact_files.is_empty() {
+        return Ok(images);
+    }
+    let started = Instant::now();
+    info!(
+        event = "parse.image_archive_started",
+        parse_run_id,
+        image_count = artifact_files.len() as u64,
+        "staged image archival started"
+    );
+    let mut image_bytes: u64 = 0;
+    for (name, path) in artifact_files {
+        let bytes = read_staged_image(name, path)?;
+        let artifact = store.put_bytes(&bytes).map_err(|source| {
+            error!(
+                event = "parse.image_archive_failed",
+                parse_run_id,
+                image = name,
+                error = %source,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "staged image archival failed"
+            );
+            ApiError::InternalIo {
+                message: format!(
+                    "failed to archive image {name} for parse {parse_run_id}: {source}"
+                ),
+            }
+        })?;
+        image_bytes += artifact.size_bytes;
+        images.insert(name.clone(), artifact);
+    }
+    info!(
+        event = "parse.image_archive_completed",
+        parse_run_id,
+        image_count = images.len() as u64,
+        image_bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "staged image archival completed"
+    );
+    Ok(images)
+}
+
 /// One artifact entry in the canonical bundle manifest: content-addressed
 /// reference plus the artifact type, and — for JSONL record sets — the
 /// record ordering rule the hash depends on (§16.3 requires ordering to be
@@ -1244,7 +1378,7 @@ fn write_canonical_parse_bundle(
     rows: &CanonicalRows,
     warnings: &[ParseWarning],
     metrics: &ParseMetrics,
-    raw_archive: Option<&ArchivedParserRaw>,
+    binaries: ArchivedBinaries<'_>,
 ) -> Result<ArtifactRef, ApiError> {
     let started = Instant::now();
     info!(
@@ -1311,7 +1445,7 @@ fn write_canonical_parse_bundle(
     // List every raw blob directly as well as its manifest so the canonical
     // bundle is a complete reference index. Snapshot refs keep this bundle
     // reachable; their current verifier does not recursively hash these children.
-    if let Some(raw) = raw_archive {
+    if let Some(raw) = binaries.raw {
         for (path, artifact) in &raw.files {
             files.insert(
                 path.clone(),
@@ -1322,6 +1456,12 @@ fn write_canonical_parse_bundle(
             CANONICAL_PARSER_RAW_MANIFEST_FILE_NAME.to_owned(),
             bundle_file("parser_raw_manifest", &raw.manifest, None),
         );
+    }
+
+    // Images keep their staged `artifacts/<hash>` path as the manifest key;
+    // the entry's hash equals that name (enforced by the importer's gate).
+    for (path, artifact) in binaries.images {
+        files.insert(path.clone(), bundle_file("image", artifact, None));
     }
 
     let artifact_count = files.len();

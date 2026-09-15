@@ -8,10 +8,6 @@
 pub(crate) mod bundle;
 pub(crate) mod cleanup;
 pub(crate) mod conformance;
+pub(crate) mod epub;
 pub(crate) mod importer;
-pub(crate) mod mupdf_cleanup;
-pub(crate) mod mupdf_worker;
-pub(crate) mod native_pdf;
-pub(crate) mod pdf;
-pub(crate) mod pdf_worker;
 pub(crate) mod text_worker;

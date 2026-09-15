@@ -10,7 +10,7 @@
 //!
 //! Canonical-boundary invariant (design fact 5, spec §22 rule 3): a
 //! `derived_view` renders EXCLUSIVELY from canonical `content_units` — never
-//! from Docling output or any parser-native artifact — and its Markdown-ish
+//! from any parser-native artifact — and its Markdown-ish
 //! payload maps back to those canonical records; it is never itself canonical
 //! parsed state. The summary projection likewise reads only the durable CA
 //! `summary` annotations (already canonical-boundary-clean by construction),
@@ -347,7 +347,7 @@ struct RenderedDocument {
 
 /// Render the ordered canonical units into a Markdown-ish document (spec §22
 /// rule 3). This is the ONLY place canonical content becomes rendered bytes,
-/// and it reads ONLY the units passed in (design fact 5 — never Docling).
+/// and it reads ONLY the units passed in (design fact 5 — never parser output).
 ///
 /// Which unit types render, and how (the renderable carriers named in the
 /// brief; every other type is a structural container carrying no direct
@@ -360,9 +360,19 @@ struct RenderedDocument {
 ///     structural (heading) level, not as body text.
 ///   - text_block   -> `body.text` as a paragraph.
 ///   - caption      -> `body.text` as an italic caption line.
-///   - table_cell   -> `body.text`, else `body.normalizedText`, as a
-///     paragraph. (Full table reconstruction is out of scope; each cell's
-///     text renders in reading order so its content is not dropped.)
+///   - table_cell   -> `body.text` as a paragraph. (Full table
+///     reconstruction is out of scope; each cell's text renders in reading
+///     order so its content is not dropped.)
+///   - code_block   -> `body.code` as a fenced code block, so the code is
+///     reproduced verbatim rather than interpreted as Markdown.
+///
+/// The text-field selection (`text` for text_block, caption, table_cell;
+/// `code` for code_block; no normalized-text fallback) is one of five
+/// synchronized readers of the SPEC-epub §2.1 evidence-bearing types and
+/// must stay aligned with `assembly::evidence::evidence_text`,
+/// `projections::chunk::extract_targeting_text`,
+/// `projections::multivector::evidence_text`, and
+/// `annotations::producer::evidence_text`.
 ///
 /// The tree is walked in READING ORDER (the SELECT ordering), not by
 /// re-deriving structure from `primary_parent_id`: reading order already
@@ -383,19 +393,24 @@ fn render_document(units: &[RenderUnit]) -> RenderedDocument {
             ContentType::TextSection => render_section_heading(&unit.body),
             ContentType::TextBlock => text_field(&unit.body, "text").map(str::to_owned),
             ContentType::Caption => text_field(&unit.body, "text").map(|text| format!("*{text}*")),
-            ContentType::TableCell => text_field(&unit.body, "text")
-                .or_else(|| text_field(&unit.body, "normalizedText"))
-                .map(str::to_owned),
-            // Structural / non-text carriers: pages, tables, rows, figures,
-            // image regions, and code blocks are not rendered by this view
-            // (code blocks carry `code`, not `text`; a fenced-code renderer is
-            // out of the approved scope). They scope no rendered line.
-            ContentType::Page
+            ContentType::TableCell => text_field(&unit.body, "text").map(str::to_owned),
+            // `text_field` already rejects whitespace-only code, so an empty
+            // code block emits no fence and is not claimed as an input.
+            ContentType::CodeBlock => {
+                text_field(&unit.body, "code").map(|code| format!("```\n{code}\n```"))
+            }
+            // Structural containers and markers: the document root, pages,
+            // lists, list items, asides, tables, rows, and figures carry no
+            // direct text and are not rendered by this view. They scope no
+            // rendered line.
+            ContentType::Document
+            | ContentType::Page
+            | ContentType::List
+            | ContentType::ListItem
+            | ContentType::Aside
             | ContentType::Table
             | ContentType::TableRow
-            | ContentType::Figure
-            | ContentType::ImageRegion
-            | ContentType::CodeBlock => None,
+            | ContentType::Figure => None,
         };
 
         if let Some(line) = rendered_line {

@@ -86,24 +86,28 @@ pub(crate) const BUNDLE_WARNINGS_FILE_NAME: &str = "warnings.jsonl";
 /// Parser-reported metrics (`crate::model::ParseMetrics`) file name.
 pub(crate) const BUNDLE_METRICS_FILE_NAME: &str = "metrics.json";
 
-/// Captured external-process stdout log file name (bounded, see
-/// [`BUNDLE_STREAM_LOG_CAP_BYTES`]).
+/// Captured process stdout log file name (bounded, see
+/// [`PROCESS_LOG_CAPTURE_BYTES`]).
 pub(crate) const BUNDLE_STDOUT_LOG_FILE_NAME: &str = "stdout.log";
 
-/// Captured external-process stderr log file name (bounded, see
-/// [`BUNDLE_STREAM_LOG_CAP_BYTES`]).
+/// Captured process stderr log file name (bounded, see
+/// [`PROCESS_LOG_CAPTURE_BYTES`]).
 pub(crate) const BUNDLE_STDERR_LOG_FILE_NAME: &str = "stderr.log";
+
+/// Upper bound on captured process output retained per stdout/stderr log in
+/// the bundle contract; bytes beyond it are dropped, never a failure. The
+/// stdout/stderr logs remain part of the contract as empty files: in-process
+/// workers pass empty slices to `BundleWriter::finish`.
+pub(crate) const PROCESS_LOG_CAPTURE_BYTES: usize = 65536;
 
 /// Optional subdirectory for preserved parser raw output (spec §12.1 rule
 /// 6): diagnostic evidence only, never canonical unless imported.
 pub(crate) const BUNDLE_PARSER_RAW_DIR_NAME: &str = "parser_raw";
 
 /// Optional subdirectory for large binary artifacts referenced by hash from
-/// candidate records (spec §12.2).
-// Consumed (with artifacts_dir below) by the first worker that stages large
-// binary artifacts — no cluster is assigned yet; neither MVP worker (C4c
-// PDF, C4d text) emits any.
-#[allow(dead_code)]
+/// candidate records (spec §12.2). The EPUB worker stages image bytes here
+/// as `artifacts/<sha256>`; the importer enforces the name-equals-hash
+/// contract (SPEC-epub §2.7).
 pub(crate) const BUNDLE_ARTIFACTS_DIR_NAME: &str = "artifacts";
 
 /// Files every promoted bundle must contain and list in its manifest. The
@@ -134,8 +138,7 @@ pub(crate) const BUNDLE_DIR_NAME_PREFIX: &str = "bundle-";
 pub(crate) const BUNDLE_TEMP_DIR_SUFFIX: &str = ".tmp";
 
 /// Process-unique sequence for bundle directory names, so many bundles
-/// created in the same millisecond stay distinct (same pattern as the
-/// Docling conversion-directory counter).
+/// created in the same millisecond stay distinct.
 static BUNDLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Staging root for parser output bundles under the service-owned index
@@ -223,8 +226,8 @@ pub(crate) struct ParserResult {
     pub(crate) completed_at: String,
     pub(crate) elapsed_ms: u64,
 
-    /// External-tool identity facts observed during execution (e.g.
-    /// `"docling_version" -> "2.x"`). Free-form claims for diagnostics and
+    /// Tool identity facts observed during execution (e.g.
+    /// `"parser_version" -> "2.x"`). Free-form claims for diagnostics and
     /// provenance; BTreeMap keeps serialization deterministic.
     pub(crate) tool_identity: BTreeMap<String, String>,
 }
@@ -328,6 +331,12 @@ pub(crate) struct ParserOutputBundle {
     /// Original parser output and cleanup reports, keyed by bundle-relative path.
     /// These are the exact bytes already checked against the staged manifest.
     pub(crate) parser_raw_files: BTreeMap<String, Vec<u8>>,
+    /// Staged binary artifacts (`artifacts/<name>`), keyed by bundle-relative
+    /// path to the verified on-disk file. Paths, not bytes: images can be
+    /// large, so the importer reads and stores them one at a time. Every
+    /// listed file already passed digest and size verification against the
+    /// staged manifest; the name-equals-hash contract is the importer's gate.
+    pub(crate) artifact_files: BTreeMap<String, PathBuf>,
 }
 
 /// Why a bundle read failed, discriminated by which side of the trust
@@ -432,8 +441,8 @@ impl JsonlStream {
 /// complete, never partial — the same promotion invariant as the C3
 /// acquisition staging.
 ///
-/// Bundle names are worker-chosen and unique (`bundle-{epoch_ms}-{seq}`,
-/// like Docling conversion directories); they carry no canonical meaning.
+/// Bundle names are worker-chosen and unique (`bundle-{epoch_ms}-{seq}`);
+/// they carry no canonical meaning.
 /// If the process crashes before `finish`, the leftover `.tmp` directory is
 /// inert: its name never matches a promoted bundle name, so no consumer
 /// will ever read it, and the scheduler removes such orphans at thread
@@ -471,7 +480,7 @@ impl BundleWriter {
         })?;
 
         // Worker-chosen unique name: epoch-millisecond timestamp plus a
-        // process-unique counter (same scheme as Docling conversion dirs).
+        // process-unique counter.
         let timestamp_ms = current_time_ms()?;
         let sequence = BUNDLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let bundle_dir =
@@ -536,7 +545,11 @@ impl BundleWriter {
             .append(relationship, BUNDLE_CANDIDATE_RELATIONSHIPS_FILE_NAME)
     }
 
-    /// Stream one warning to `warnings.jsonl`.
+    /// Stream one parse warning to `warnings.jsonl`. Like the unit and
+    /// relationship appenders, this does not enforce the `[parsing]` record
+    /// caps; the worker checks `max_candidate_warnings` once against its
+    /// aggregated (code, document) count before streaming them at finish,
+    /// and the reader re-checks at import.
     pub(crate) fn append_warning(&mut self, warning: &CandidateWarning) -> Result<(), ApiError> {
         self.warnings.append(warning, BUNDLE_WARNINGS_FILE_NAME)
     }
@@ -550,10 +563,8 @@ impl BundleWriter {
 
     /// Directory for large binary artifacts referenced from candidate
     /// records (created on first use); files inside are digested into the
-    /// manifest at `finish`.
-    // Consumed by the first worker that stages large binary artifacts (see
-    // BUNDLE_ARTIFACTS_DIR_NAME); neither MVP worker emits any.
-    #[allow(dead_code)]
+    /// manifest at `finish`. The EPUB worker writes images here; the
+    /// plain-text worker emits none.
     pub(crate) fn artifacts_dir(&self) -> Result<PathBuf, ApiError> {
         self.optional_dir(BUNDLE_ARTIFACTS_DIR_NAME)
     }
@@ -670,12 +681,12 @@ impl BundleWriter {
         write_bounded_log(
             &self.temp_dir.join(BUNDLE_STDOUT_LOG_FILE_NAME),
             stdout_log,
-            self.limits.parsing.process_log_bytes,
+            PROCESS_LOG_CAPTURE_BYTES,
         )?;
         write_bounded_log(
             &self.temp_dir.join(BUNDLE_STDERR_LOG_FILE_NAME),
             stderr_log,
-            self.limits.parsing.process_log_bytes,
+            PROCESS_LOG_CAPTURE_BYTES,
         )?;
 
         // Digest the exact bytes on disk (read back after flush) so every
@@ -876,6 +887,7 @@ pub(crate) fn read_bundle(
                 unit_count = bundle.candidate_units.len(),
                 relationship_count = bundle.candidate_relationships.len(),
                 warning_count = bundle.warnings.len(),
+                artifact_count = bundle.artifact_files.len(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "parser output bundle read and verified"
             );
@@ -966,6 +978,7 @@ fn read_bundle_inner(
         |_| Ok(()),
     )?;
     let mut parser_raw_files = BTreeMap::new();
+    let mut artifact_files = BTreeMap::new();
     for name in manifest.files.keys() {
         if matches!(
             name.as_str(),
@@ -993,6 +1006,11 @@ fn read_bundle_inner(
         } else {
             let actual = file_digest(path, limits.resources.embedding_read_buffer_bytes)?;
             verify_digest(name, expected, actual.size_bytes, &actual.sha256)?;
+            // Binary artifacts stay on disk: the importer reads each one when
+            // it enforces the name-equals-hash contract and stores it.
+            if is_artifacts_path(name) {
+                artifact_files.insert(name.clone(), path.to_path_buf());
+            }
         }
     }
 
@@ -1022,6 +1040,7 @@ fn read_bundle_inner(
         warnings: warnings.records,
         metrics,
         parser_raw_files,
+        artifact_files,
     })
 }
 
@@ -1090,7 +1109,18 @@ fn listed_files(
 
 /// Match only descendants of the dedicated raw-output directory, not sibling names.
 fn is_parser_raw_path(path: &str) -> bool {
-    path.strip_prefix(BUNDLE_PARSER_RAW_DIR_NAME)
+    is_under_bundle_dir(path, BUNDLE_PARSER_RAW_DIR_NAME)
+}
+
+/// Match only descendants of the binary artifacts directory, not sibling names.
+fn is_artifacts_path(path: &str) -> bool {
+    is_under_bundle_dir(path, BUNDLE_ARTIFACTS_DIR_NAME)
+}
+
+/// True when `path` is `<dir_name>/…`; a bare `<dir_name>` or a sibling
+/// sharing the prefix (`parser_raw_x`) does not match.
+fn is_under_bundle_dir(path: &str, dir_name: &str) -> bool {
+    path.strip_prefix(dir_name)
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 

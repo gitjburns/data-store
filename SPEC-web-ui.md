@@ -66,9 +66,9 @@ original status codes.
 - **Query console** (the primary view): query text, constraints (`sourceIds`,
   `governanceDomains`), `maxFinalEvidenceUnits`, evidence-policy toggles, debug
   toggle. Primary results are ranked server-supplied passages (`results`), with
-  source locations and status, section path, physical PDF page numbers, full
-  passage text, and an explicit marker when the server truncated the passage.
-  Missing source or page information is labelled unavailable.
+  source locations and status, section path, full passage text, and an
+  explicit marker when the server truncated the passage. Missing source
+  information is labelled unavailable.
 - **Retrieval provenance** appears on each passage without requiring debug.
   Server-supplied channels are labelled Semantic search, Keyword search, and
   Annotations. Annotation contribution distinguishes no annotation matches,
@@ -87,14 +87,16 @@ original status codes.
 - **Evidence and diagnostics** expands the evidence pack, assembly trace, debug
   diagnostics when requested, and complete response JSON. Evidence units retain
   role/content-type badges, scores for anchors, context inclusion reasons,
-  text projections or labelled body-derived summaries, and raw body/provenance
-  details. Unit and source IDs link to their respective views. The assembly
-  trace shows policy id/version/hash, rules grouped by anchor, rejected
-  hits/units, and budget. Debug diagnostics show per-stage latency, complete
-  eligible channel membership (`channelHits`), the fused candidate pool labelled
+  text projections or labelled summaries derived from the typed bodies
+  (SPEC-epub.md §2.2), and raw body/provenance details. Unit and source IDs
+  link to their respective views. The assembly trace shows policy
+  id/version/hash, rules grouped by anchor, rejected hits/units, and budget.
+  Debug diagnostics show per-stage latency, complete eligible channel
+  membership (`channelHits`), the fused candidate pool labelled
   with its single **representative channel**, MaxSim, and reranker scores.
-- **Unit explorer**: unit detail plus relationships with direction/type
-  filters; related units are click-through links.
+- **Unit explorer**: unit detail (typed body per SPEC-epub.md §2.2, `dom_path`
+  or `char_range` locators) plus relationships with direction/type filters;
+  related units are click-through links.
 - **Source view**: locations, freshness, active parse.
 - **Health dashboard**: readiness, per-component details, and counts each
   shown with its `as_of` label.

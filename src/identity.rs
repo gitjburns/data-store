@@ -18,17 +18,17 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::canonical;
-use crate::config::{PdfEngine, ServiceConfig};
+use crate::config::ServiceConfig;
 use crate::error::ApiError;
 use crate::limits::{
-    DiagnosticLimits, IndexingLimits, ParsingLimits, ResourceLimits, RetrievalLimits,
+    DiagnosticLimits, EpubLimits, IndexingLimits, ParsingLimits, ResourceLimits, RetrievalLimits,
     SchedulingLimits, SqliteLimits, WorkerLimits,
 };
 
 /// Spec version this build implements, stamped into every `ForensicSnapshot`
 /// as `specVersion` (§30.3). A constant, not derived from the spec file: the
 /// running binary asserts which contract revision it honors.
-pub(crate) const SPEC_VERSION: &str = "0.3";
+pub(crate) const SPEC_VERSION: &str = "0.4";
 
 /// The captured §30.2 "Application identity": the code-and-config half of an
 /// isolated replay environment (§30.7), assembled ONCE at startup and threaded
@@ -161,6 +161,7 @@ struct ConfigurationIdentity {
     workers: WorkerLimits,
     sqlite: SqliteLimits,
     parsing: ParsingLimits,
+    epub: EpubLimits,
     scheduling: SchedulingLimits,
     diagnostics: DiagnosticLimits,
 
@@ -174,9 +175,6 @@ struct ConfigurationIdentity {
 
     filesystem_governance_domain: String,
 
-    pdf: PdfIdentity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    docling: Option<DoclingIdentity>,
     models: ModelIdentity,
 
     /// PATHS of the operator-editable policy documents (D3 amendment, CA2).
@@ -185,30 +183,6 @@ struct ConfigurationIdentity {
     /// content is operator-mutable state outside this config projection.
     policy_entity_match_file_path: String,
     policy_annotator_naming_file_path: String,
-}
-
-/// The PDF engine and shared execution limit are captured once, regardless of
-/// whether the optional Docling section is present.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PdfIdentity {
-    engine: PdfEngine,
-    document_timeout_seconds: u64,
-}
-
-/// Docling execution settings that affect conversion output and therefore
-/// replay fidelity. Paths are captured as strings; no secret values exist in
-/// this section.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DoclingIdentity {
-    python_path: String,
-    docling_path: String,
-    pdf_backend: String,
-    ocr_mode: String,
-    device: String,
-    num_threads: u32,
-    page_batch_size: u32,
 }
 
 /// Model runtime settings that affect embedding/ranking output and therefore
@@ -306,6 +280,7 @@ impl ConfigurationIdentity {
             workers: config.workers,
             sqlite: config.sqlite,
             parsing: config.parsing,
+            epub: config.epub,
             scheduling: config.scheduling,
             diagnostics: config.diagnostics,
             logging_level: format!("{:?}", config.logging.level),
@@ -314,19 +289,6 @@ impl ConfigurationIdentity {
             corpus_root: path_string(&config.storage.corpus_root),
             index_root: path_string(&config.storage.index_root),
             filesystem_governance_domain: config.connectors.filesystem.governance_domain.clone(),
-            pdf: PdfIdentity {
-                engine: config.pdf.engine,
-                document_timeout_seconds: config.pdf.document_timeout_seconds,
-            },
-            docling: config.docling.as_ref().map(|docling| DoclingIdentity {
-                python_path: path_string(&docling.python_path),
-                docling_path: path_string(&docling.docling_path),
-                pdf_backend: docling.pdf_backend.clone(),
-                ocr_mode: docling.ocr_mode.clone(),
-                device: docling.device.clone(),
-                num_threads: docling.num_threads,
-                page_batch_size: docling.page_batch_size,
-            }),
             models: ModelIdentity {
                 // Input capacity is shared; optional connection/model paths
                 // identify only the selected backend. No secret values enter here.

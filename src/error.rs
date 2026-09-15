@@ -29,12 +29,6 @@ pub enum ApiError {
     SourceResolution { message: String },
 
     #[error("{message}")]
-    DoclingUnavailable { message: String },
-
-    #[error("{message}")]
-    DoclingConversion { message: String },
-
-    #[error("{message}")]
     InternalIo { message: String },
 
     // Constructed during chunk token counting (chunk::build_chunks ->
@@ -123,13 +117,11 @@ impl ApiError {
             Self::Unauthorized { .. } => 401,
             Self::NotFound { .. } => 404,
             Self::ServiceUnavailable { .. } | Self::CutoverBarrierActive { .. } => 503,
-            Self::DoclingConversion { .. } => 422,
             Self::ConfigRead { .. }
             | Self::ConfigParse { .. }
             | Self::InvalidConfig { .. }
             | Self::InvalidCli { .. }
             | Self::InferenceInit { .. }
-            | Self::DoclingUnavailable { .. }
             | Self::InternalIo { .. }
             | Self::UnitSplitting { .. }
             | Self::StorageInit { .. }
@@ -149,8 +141,6 @@ impl ApiError {
             Self::InvalidCli { .. } => "invalid_cli",
             Self::InferenceInit { .. } => "inference_init",
             Self::SourceResolution { .. } => "source_resolution",
-            Self::DoclingUnavailable { .. } => "docling_unavailable",
-            Self::DoclingConversion { .. } => "docling_conversion",
             Self::InternalIo { .. } => "internal_io",
             Self::UnitSplitting { .. } => "unit_splitting",
             Self::StorageInit { .. } => "storage_init",

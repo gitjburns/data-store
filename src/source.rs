@@ -1,8 +1,7 @@
-// Fabric substrate: `ResolvedSource` is consumed by the Docling engine and
-// the PDF parser worker; the corpus path-safety resolution functions are
-// consumed by the scheduler's parse dispatch (C5c), and the lexical
-// URI-mapping/prescreen helpers additionally by the HTTP ingest route
-// (ruled 2026-07-17).
+// Fabric substrate: `ResolvedSource` and the corpus path-safety resolution
+// functions are consumed by the scheduler's parse dispatch (C5c), and the
+// lexical URI-mapping/prescreen helpers additionally by the HTTP ingest
+// route (ruled 2026-07-17).
 
 use std::{
     fs,
@@ -11,31 +10,11 @@ use std::{
 
 use crate::{config::StorageConfig, error::ApiError};
 
+/// A source reference proven to resolve to one file inside the corpus root
+/// (see `resolve_contained_source`); `absolute_path` is canonicalized.
 #[derive(Debug, Clone)]
 pub struct ResolvedSource {
-    pub requested: String,
-    pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
-}
-
-/// Resolve a corpus-relative source reference to one contained PDF file.
-pub fn resolve_source_reference(
-    storage: &StorageConfig,
-    source: &str,
-) -> Result<ResolvedSource, ApiError> {
-    let resolved = resolve_contained_source(storage, source)?;
-    if resolved
-        .absolute_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("pdf"))
-    {
-        return Err(ApiError::SourceResolution {
-            message: "source must reference a PDF file for Docling conversion".to_string(),
-        });
-    }
-
-    Ok(resolved)
 }
 
 /// Resolve a corpus-relative source reference to one contained file of any
@@ -59,11 +38,7 @@ pub fn resolve_contained_source(
         });
     }
 
-    Ok(ResolvedSource {
-        requested: trimmed.to_string(),
-        relative_path,
-        absolute_path,
-    })
+    Ok(ResolvedSource { absolute_path })
 }
 
 /// Derive the corpus-relative form of a native URI. The filesystem

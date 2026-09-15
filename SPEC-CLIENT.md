@@ -443,9 +443,9 @@ via serde_json (never string-formatted). It does not accept a raw JSON
 envelope; a full-envelope query is curl's job.
 
 Renders each server-selected passage once, in rank order, with readable source
-locations, section headings, and physical PDF page references. A truncated
-passage is labeled; unavailable source locations retain their status. Canonical
-IDs, scores, bodies, and assembly traces are not printed in the default view.
+locations and section headings. A truncated passage is labeled; unavailable
+source locations retain their status. Canonical IDs, scores, bodies, and
+assembly traces are not printed in the default view.
 
 Both clients show server-provided retrieval provenance beneath each passage:
 channel names, annotation contribution, direct entity matches, and directed
@@ -481,7 +481,7 @@ pretty JSON.
 Renders one content unit: `id`, `sourceId`/`parseId`, `contentType`,
 `bodyHash`, optional `textHash`/`structureHash`/`primaryParentId`/
 `sequenceIndex`, a `locators` count with full locator detail, timestamps,
-and the arbitrary `body` in full as pretty JSON.
+and the typed `body` (SPEC-epub.md §2.2) in full as pretty JSON.
 
 A **`404`** on `unit` or `relationships` is annotated: *"a 404 means the
 unit is absent OR belongs to a non-active parse — the service makes these
