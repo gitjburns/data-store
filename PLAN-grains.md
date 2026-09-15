@@ -23,7 +23,7 @@ retained).
 
 | Grain | Key | Cap | Members | Persisted | Consumers |
 | --- | --- | --- | --- | --- | --- |
-| Fine | `indexing.fine_max_tokens` | 256 | evidence units | `chunk_projections` | fine dense vectors, lexical index |
+| Fine | `indexing.fine_max_tokens` | 250 | evidence units | `chunk_projections` | fine dense vectors, lexical index |
 | ColBERT | `indexing.colbert_max_tokens` | 512 | fine chunks | `colbert_windows` | MaxSim |
 | Context | `indexing.context_max_tokens` | 768 | fine chunks | section-dense artifact | context dense vectors, annotation source windows, annotation cohorts |
 | Excerpt | `indexing.excerpt_windows` | 4 context windows | context windows | provenance only | annotation calls |
@@ -88,7 +88,7 @@ because those subsystems consume grains, not units.
 ```toml
 [indexing]
 # ColBERT-token cap for fine chunks (paragraph grain): fine dense vectors and lexical index.
-fine_max_tokens = 256
+fine_max_tokens = 250
 # ColBERT-token cap for ColBERT windows; must equal the ColBERT model's document limit.
 colbert_max_tokens = 512
 # ColBERT-token cap for context windows (page grain): context dense vectors and annotation source windows.

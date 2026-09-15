@@ -308,10 +308,12 @@ transcript group may remain below 100%. Health and existing service-log commit
 entries reflect subsequent commits. Use `Progress: unavailable` without a measured
 document context; add no transcript entries for progress.
 
-`annotation_stage.entity_decisions` records candidate, accepted, and rejected
-counts after exact candidate accounting passes. Rejection is a successful model
-decision; only accepted entities contribute to the stage's output-item count.
-Rejected names and reasons remain in the transcript response.
+`annotation_stage.entity_grounding` (INFO) records `returned`, `grounded`,
+`dropped_ungrounded`, and `collapsed_duplicates` for one entity response;
+`grounded` is the retained count after collapse, so `returned` equals the sum
+of the other three. A name that does not ground in the excerpt is dropped,
+never a stage failure; only retained entities contribute to the stage's
+output-item count.
 
 ## Implementation Guidance
 

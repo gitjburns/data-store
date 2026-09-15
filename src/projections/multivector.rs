@@ -359,6 +359,17 @@ struct WindowBudget {
     fine_max_tokens: usize,
 }
 
+/// Startup guard: fail before serving when the configured grains cannot pack
+/// ColBERT windows without splitting a fine chunk, using the overhead measured
+/// by the initialized ColBERT backend. The build repeats the same derivation so
+/// an ingest can never reach a configuration startup would have refused.
+pub(crate) fn validate_colbert_window_budget(
+    indexing: &IndexingLimits,
+    format_overhead: usize,
+) -> Result<(), ApiError> {
+    window_budget(indexing, format_overhead).map(|_| ())
+}
+
 /// Derive the build's `WindowBudget` and reject a configuration under which
 /// packing could not honor it: a fine chunk may measure up to
 /// `indexing.fine_max_tokens`, and packing needs every chunk to fit the

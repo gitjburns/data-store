@@ -504,6 +504,27 @@ async fn run_http_service(
         }
     };
 
+    // The ColBERT window budget depends on the document prompt overhead the
+    // backend measured at initialization, so this grain check can only run
+    // here, after inference is ready and before anything is served. A failure
+    // is fatal: the same derivation would otherwise fail every source at ingest.
+    if let Err(source) = crate::projections::multivector::validate_colbert_window_budget(
+        &storage.limits().indexing,
+        inference.colbert.document_format_overhead(),
+    ) {
+        error!(
+            event = "startup.fatal",
+            stage = "colbert_window_budget",
+            %bind_address,
+            error = %source,
+            elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+            "startup failed: indexing grains cannot pack ColBERT windows"
+        );
+        reporter.report(format!("data-store startup fatal=\"{source}\""))?;
+        admin_token_file.cleanup_if_current();
+        return Err(source.into());
+    }
+
     // Read-only schema preflight is not readiness. The startup hold stays closed
     // until delayed initialization; the scheduler then validates and owns health.
     // Missing or invalid storage remains a health-visible setup condition.

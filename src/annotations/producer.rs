@@ -198,7 +198,7 @@ impl ProducerKind {
     /// Ordered single-goal contracts contributing to this producer's identity.
     pub(crate) fn stages(self) -> &'static [Stage] {
         match self {
-            Self::Entity => &[Stage::EntityNames, Stage::EntityTypes],
+            Self::Entity => &[Stage::Entities],
             Self::Relation => &[Stage::Statements, Stage::Relations, Stage::Evidence],
             Self::Summary => &[Stage::Summary],
         }

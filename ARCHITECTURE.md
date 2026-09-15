@@ -527,14 +527,14 @@ nothing.
 `src/annotations/stages.rs` defines the prompts and schemas;
 `src/annotations/chains.rs` runs one goal per call:
 
-- Entity candidate names → accepted types or explicit rejections.
+- Named entities with types, in one request, grounded against the excerpt.
 - Source statements → relationships per selected statement → supporting
   quotations in bounded candidate batches.
 - One summary per excerpt.
 
 Later requests use the source excerpt and prior outputs from that chain.
 Intermediate candidate arrays are bounded by the excerpt's character count.
-Shape checks validate required fields, name mappings, and receipt indexes.
+Shape checks validate required fields, entity grounding, and receipt indexes.
 Statements and supporting quotations share `producer::source_text_matches`.
 Both inputs undergo Unicode lowercasing via `char::to_lowercase`, then filtering
 to alphanumeric characters. Word boundaries are ignored because extracted text
@@ -560,13 +560,13 @@ retain the model's `evidenceQuotes`. Fuzzy acceptance permits repairs and shorte
 quotations but can also admit meaning-changing edits or omissions. Semantic
 verification is not implemented.
 
-Entity typing requires both `entities` (`name`, `entityType`) and `rejected`
-(`name`, `reason`) arrays. Their combined names must match the supplied candidate
-multiset exactly. Only accepted items become annotations; rejected names and
-reasons remain in the call transcript. Empty names skip typing, and all-rejected
-output uses existing successful empty coverage. Rejection is not a retryable
-failure. Missing/excess names, empty required text, and an accepted
-`NOT_AN_ENTITY` type are malformed outputs.
+The entity stage returns one `entities` array of `name`/`entityType`. Each
+name must satisfy `producer::source_text_matches` against the excerpt; an
+ungrounded name is dropped and counted (`annotation_stage.entity_grounding`),
+not a failure. Exact `name`/`entityType` repeats collapse to one annotation; the
+same name under two types keeps both, and the graph normalizes names later. An
+empty or fully ungrounded result uses existing successful empty coverage. Empty
+required text and an accepted `NOT_AN_ENTITY` type are malformed outputs.
 
 A completed chain commits its output set and any memo entry in one worker
 transaction. Empty results record fresh coverage without a memo entry.

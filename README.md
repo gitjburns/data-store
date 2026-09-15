@@ -112,13 +112,12 @@ relation, and summary work use separate chains. Within a chain, model requests
 run sequentially; the server validates each response before passing its output
 to the next request.
 
-- **Entities:** extract candidate names from the excerpt, then send the same
-  excerpt and bounded batches of those names for classification or rejection.
-  Typing returns `entities` entries with `name`/`entityType` and `rejected`
-  entries with `name`/`reason`. Together, the lists must account for every
-  supplied name occurrence exactly once. Unknown names, omissions, excess
-  duplicates, empty required text, and accepted `NOT_AN_ENTITY` types fail
-  validation. Only accepted entries become entity annotations.
+- **Entities:** one request returns `entities` entries with `name`/`entityType`
+  taken directly from the excerpt, names as written. Each name must ground in
+  the excerpt under the shared fuzzy matcher; a name that does not is dropped
+  and counted, never a chain failure. Exact `name`/`entityType` repeats collapse
+  to one entry; the same name under two types keeps both. Empty required text
+  and an accepted `NOT_AN_ENTITY` type fail validation.
 - **Relations:** select source statements, form relationship triples for each
   selected statement, then request supporting quotations for bounded batches of
   those relationships. Later calls include the original excerpt. Statements and
@@ -135,11 +134,10 @@ it: an entity keeps the fragments matching its name, a relation keeps the
 fragments matching any of its evidence quotes, and a summary keeps every
 fragment. An item that matches no fragment keeps every fragment.
 
-Empty name extraction skips typing. An entirely rejected candidate set also
-produces no entities. Both are successful empty results: the worker records fresh
-coverage so the excerpt is not retried merely because it has no annotations.
-Rejection reasons remain in `logs/annotator.log`; rejected candidates produce no
-entity rows. Model judgments are not independently verified for semantic accuracy.
+An empty `entities` array, or one whose every name fails grounding, is a
+successful empty result: the worker records fresh coverage so the excerpt is not
+retried merely because it has no annotations. Model judgments are not
+independently verified for semantic accuracy.
 
 Intermediate results stay in memory. A completed chain commits its annotation set
 and any memo entry together; a failed chain restarts without intermediate

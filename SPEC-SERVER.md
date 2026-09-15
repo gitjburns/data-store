@@ -1326,7 +1326,9 @@ empty).
   matching any evidence quote; summaries keep every fragment; an item that
   matches no fragment keeps every fragment. Matching runs per fragment, so a
   quote spanning two fragments matches neither.
-- **Single-goal chains.** Entity discovery precedes entity typing; statement
+- **Single-goal chains.** Entities are one request returning names with
+  types, each name grounded against the excerpt by `source_text_matches`
+  (ungrounded names are dropped, exact repeats collapse); statement
   selection precedes per-statement relationship formation and supporting
   quotation selection; summaries cover individual excerpts. Downstream requests
   receive that excerpt and prior-stage outputs from the same chain, with
@@ -1342,8 +1344,8 @@ empty).
   `timeout_seconds` applies to each call, including thinking.
   One choice at index zero, `finish_reason = stop`, and nonempty message
   content are required before stage parsing. The endpoint is exclusive, with no fallback.
-- **Structural validation.** Required fields, source substrings, name mappings,
-  and receipt indexes are checked. Relation bodies retain `evidenceQuotes`.
+- **Structural validation.** Required fields, source substrings, entity
+  grounding, and receipt indexes are checked. Relation bodies retain `evidenceQuotes`.
   Semantic verification is not implemented; structural acceptance does not
   establish factual correctness.
 - **Freshness and atomic completion.** `building` → `fresh`, with `failed`

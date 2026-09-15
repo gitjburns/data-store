@@ -171,7 +171,7 @@ endpoint = "http://127.0.0.1:8000/v1/chat/completions"
 # Model name sent in request bodies.
 model = "annotator-model-name"
 # Whole-request timeout for one producer call, in seconds.
-timeout_seconds = 120
+timeout_seconds = 240
 # Optional owner-only file containing the API key sent as a bearer token.
 # Relative paths resolve from this config file's directory.
 #api_key_file_path = ".annotator-api-key"
@@ -254,7 +254,9 @@ prefix_min_token_chars = 3
 
 [indexing]
 # ColBERT-token cap for fine chunks (paragraph grain): fine dense vectors and lexical index.
-fine_max_tokens = 256
+# Must leave headroom under the ColBERT window: at most colbert_max_tokens less the
+# ColBERT document prompt overhead, less the window's minimum fill.
+fine_max_tokens = 250
 # ColBERT-token cap for ColBERT windows; must equal the ColBERT model's document limit.
 colbert_max_tokens = 512
 # ColBERT-token cap for context windows (page grain): context dense vectors and annotation source windows.

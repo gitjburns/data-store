@@ -2,20 +2,13 @@
 
 use crate::error::ApiError;
 
-const ENTITY_NAMES_SCHEMA: &str = r#"{
-  "type":"object","properties":{"names":{"type":"array","items":{"type":"string","minLength":1}}},
-  "required":["names"],"additionalProperties":false
-}"#;
-// Classification accounts for all candidates even when none become annotations.
-const ENTITY_TYPES_PROMPT: &str = "Classify each supplied candidate using the passage. If it is a named entity in this passage, return its name and entityType in entities. Otherwise, return its name and a brief reason in rejected. Preserve names exactly as supplied. Account for every supplied candidate occurrence exactly once across the two lists. Either list may be empty; if no candidates are valid entities, return an empty entities list and reject every candidate. Use rejected for negative decisions, never an entity type as a rejection label.";
-const ENTITY_TYPES_SCHEMA: &str = r#"{
+// One entity stage: names and types come straight from the passage, and the
+// chain grounds each returned name in the passage.
+const ENTITIES_SCHEMA: &str = r#"{
   "type":"object","properties":{"entities":{"type":"array","items":{
     "type":"object","properties":{"name":{"type":"string","minLength":1},"entityType":{"type":"string","minLength":1}},
     "required":["name","entityType"],"additionalProperties":false
-  }},"rejected":{"type":"array","items":{
-    "type":"object","properties":{"name":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1}},
-    "required":["name","reason"],"additionalProperties":false
-  }}},"required":["entities","rejected"],"additionalProperties":false
+  }}},"required":["entities"],"additionalProperties":false
 }"#;
 const STATEMENTS_SCHEMA: &str = r#"{
   "type":"object","properties":{"sentences":{"type":"array","items":{"type":"string","minLength":1}}},
@@ -40,8 +33,7 @@ const SUMMARY_SCHEMA: &str = r#"{
 
 // Prose makes each existing schema's final-answer shape explicit to the model;
 // these instructions do not add generation goals or alter schema validation.
-const ENTITY_NAMES_FORMAT: &str = r#"Return a JSON object with exactly one field, "names", containing an array of nonempty strings. If no named entities are present, return {"names":[]}."#;
-const ENTITY_TYPES_FORMAT: &str = r#"Return a JSON object with exactly two fields, "entities" and "rejected", both arrays. Each entities item must have exactly "name" and "entityType", both nonempty strings. Each rejected item must have exactly "name" and "reason", both nonempty strings. Include both arrays even when one is empty."#;
+const ENTITIES_FORMAT: &str = r#"Return a JSON object with exactly one field, "entities", containing an array of objects. Each object must have exactly "name" and "entityType", both nonempty strings. If no named entities are present, return {"entities":[]}."#;
 const STATEMENTS_FORMAT: &str = r#"Return a JSON object with exactly one field, "sentences", containing an array of nonempty strings. If no sentence qualifies, return {"sentences":[]}."#;
 const RELATIONS_FORMAT: &str = r#"Return a JSON object with exactly one field, "relations", containing an array of objects. Each object must have exactly "subject", "predicate", and "object", all nonempty strings. If there are no relationships, return {"relations":[]}."#;
 const EVIDENCE_FORMAT: &str = r#"Return a JSON object with exactly one field, "evidence", containing an array of objects. Each object must have exactly "relationship_index", a nonnegative integer identifying the supplied relationship, and "quotes", an array of nonempty strings. Include an entry for every supplied relationship index; use an empty quotes array when no supporting quotation is found."#;
@@ -57,8 +49,7 @@ const SECTION_CONTEXT_NOTE: &str = "The input may begin with a line starting \"S
 /// Each stage has one semantic goal; schemas constrain representation only.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Stage {
-    EntityNames,
-    EntityTypes,
+    Entities,
     Statements,
     Relations,
     Evidence,
@@ -69,8 +60,7 @@ impl Stage {
     /// Stable stage labels correlate HTTP activity and intermediate validation.
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::EntityNames => "entity_names",
-            Self::EntityTypes => "entity_types",
+            Self::Entities => "entities",
             Self::Statements => "statements",
             Self::Relations => "relations",
             Self::Evidence => "evidence",
@@ -83,10 +73,9 @@ impl Stage {
     /// prompt change.
     pub(crate) fn prompt(self) -> String {
         let task = match self {
-            Self::EntityNames => {
-                "List the named entities mentioned in the passage, using the names as written. Return an empty names array if no named entities are present."
+            Self::Entities => {
+                "List the named entities mentioned in the passage with the type of each, using the names as written in the passage. Return an empty entities array if no named entities are present."
             }
-            Self::EntityTypes => ENTITY_TYPES_PROMPT,
             Self::Statements => {
                 "Copy only declarative sentences that explicitly assert a relationship between entities in the passage. Exclude questions. Return an empty list if no sentence qualifies."
             }
@@ -99,8 +88,7 @@ impl Stage {
             Self::Summary => "Write a concise summary of the passage.",
         };
         let output_format = match self {
-            Self::EntityNames => ENTITY_NAMES_FORMAT,
-            Self::EntityTypes => ENTITY_TYPES_FORMAT,
+            Self::Entities => ENTITIES_FORMAT,
             Self::Statements => STATEMENTS_FORMAT,
             Self::Relations => RELATIONS_FORMAT,
             Self::Evidence => EVIDENCE_FORMAT,
@@ -113,8 +101,7 @@ impl Stage {
     /// never a rejected model output or reason to retry inference.
     pub(crate) fn schema(self) -> Result<serde_json::Value, ApiError> {
         let source = match self {
-            Self::EntityNames => ENTITY_NAMES_SCHEMA,
-            Self::EntityTypes => ENTITY_TYPES_SCHEMA,
+            Self::Entities => ENTITIES_SCHEMA,
             Self::Statements => STATEMENTS_SCHEMA,
             Self::Relations => RELATIONS_SCHEMA,
             Self::Evidence => EVIDENCE_SCHEMA,

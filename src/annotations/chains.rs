@@ -25,20 +25,8 @@ use crate::types::AnnotationProgressCount;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NamesResponse {
-    names: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StatementsResponse {
     sentences: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct EntityTypesInput<'input> {
-    passage: &'input str,
-    names: &'input [String],
 }
 
 #[derive(Serialize)]
@@ -103,8 +91,9 @@ pub(crate) fn run(
     }
 }
 
-/// Find candidates, then classify or explicitly reject them. Both decision lists
-/// must account for the exact input multiset before any entity is produced.
+/// One call returns the passage's named entities with their types. Validation
+/// is grounding, not accounting: nothing was supplied for the model to recite,
+/// so the only question per returned name is whether the passage contains it.
 fn entities(
     client: &AnnotatorClient,
     passage: &str,
@@ -112,81 +101,53 @@ fn entities(
     temperature: f64,
     progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
-    let names = run_stage(
-        Stage::EntityNames,
+    run_stage(
+        Stage::Entities,
         client,
         passage,
         section,
         temperature,
         progress,
         |raw| {
-            let response: NamesResponse = strict_from_str(raw, Stage::EntityNames.name(), raw)?;
-            for name in &response.names {
-                validate_non_empty(name, "names[]", raw)?;
+            let response = entity::parse_output(raw)?;
+            let returned = response.entities.len();
+            let mut dropped_ungrounded = 0usize;
+            let mut collapsed_duplicates = 0usize;
+            let mut grounded: Vec<entity::EntityItem> = Vec::with_capacity(returned);
+            for item in response.entities {
+                // Grounding rule: a name must occur in the passage under the same
+                // fuzzy matcher statements and quotations use. An ungrounded name
+                // is a model invention over an otherwise valid response, so it is
+                // dropped and counted rather than failing the chain: retrying
+                // would only resample the same passage for the same reason.
+                if !source_text_matches(passage, &item.name) {
+                    dropped_ungrounded += 1;
+                    continue;
+                }
+                // Exact (name, entityType) repeats collapse to one row. The same
+                // name under two types keeps both: the graph normalizes names
+                // later, and choosing a winner here would invent a tie-break.
+                if grounded
+                    .iter()
+                    .any(|kept| kept.name == item.name && kept.entity_type == item.entity_type)
+                {
+                    collapsed_duplicates += 1;
+                    continue;
+                }
+                grounded.push(item);
             }
-            Ok(response.names)
+            info!(
+                event = "annotation_stage.entity_grounding",
+                returned,
+                grounded = grounded.len(),
+                dropped_ungrounded,
+                collapsed_duplicates,
+                "entity names grounded against the passage; ungrounded names produce no annotations"
+            );
+            Ok(entity::EntityResponse { entities: grounded }.into_annotations())
         },
         Vec::len,
-    )?;
-    let mut annotations = Vec::new();
-    for batch in bounded_batches(&names, batch_limit(passage), Stage::EntityTypes)? {
-        let input = serialize_input(&EntityTypesInput {
-            passage,
-            names: batch,
-        })?;
-        let mut typed = run_stage(
-            Stage::EntityTypes,
-            client,
-            &input,
-            section,
-            temperature,
-            progress,
-            |raw| {
-                let typed = entity::parse_output(raw)?;
-                let mut remaining = BTreeMap::<&str, usize>::new();
-                for name in batch {
-                    *remaining.entry(name.as_str()).or_default() += 1;
-                }
-                // Rejections satisfy candidate accounting but never become
-                // annotations. Duplicated input names still require one decision
-                // per occurrence, across both lists rather than independently.
-                let decided_names = typed
-                    .entities
-                    .iter()
-                    .map(|entity| entity.name.as_str())
-                    .chain(typed.rejected.iter().map(|rejected| rejected.name.as_str()));
-                for name in decided_names {
-                    let count = remaining.get_mut(name).ok_or_else(|| {
-                        output_error(
-                            Stage::EntityTypes,
-                            "returned a name absent from its input batch",
-                        )
-                    })?;
-                    if *count == 0 {
-                        return Err(output_error(
-                            Stage::EntityTypes,
-                            "returned an extra duplicate name",
-                        ));
-                    }
-                    *count -= 1;
-                }
-                if remaining.values().any(|count| *count != 0) {
-                    return Err(output_error(Stage::EntityTypes, "omitted a supplied name"));
-                }
-                info!(
-                    event = "annotation_stage.entity_decisions",
-                    candidates = batch.len(),
-                    accepted = typed.entities.len(),
-                    rejected = typed.rejected.len(),
-                    "entity candidate accounting passed; rejected candidates produce no annotations"
-                );
-                Ok(typed.into_annotations())
-            },
-            Vec::len,
-        )?;
-        annotations.append(&mut typed);
-    }
-    Ok(annotations)
+    )
 }
 
 /// Select statements before forming triples, then attach receipts separately.
