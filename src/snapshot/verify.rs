@@ -2363,10 +2363,11 @@ fn verify_chunk_plane(
 /// them byte-and-value against the live `chunk_dense_vectors` rows for the
 /// subject parse — never re-embeds (§38). The archived
 /// `chunk_dense_vectors_metadata` JSONL carries each row's scalar columns plus
-/// the `vector_blobHash` pointing at the archived blob; the live row carries the
-/// blob bytes. Both are decoded via `primitives::codec::decode_vector_blob`
-/// under the row's recorded dimension and the decoded vectors are compared, and
-/// the raw blob bytes are compared directly.
+/// the archived payload's address (`ArchivedBlobPlane` resolves it per manifest
+/// layout); the live row carries the blob bytes. Both are decoded via
+/// `primitives::codec::decode_vector_blob` under the row's recorded dimension
+/// and the decoded vectors are compared, and the raw blob bytes are compared
+/// directly.
 fn verify_dense_plane(
     store: &ArtifactStore,
     connection: &Connection,
@@ -2375,9 +2376,11 @@ fn verify_dense_plane(
     subject_parse_id: &str,
 ) -> Result<usize, ApiError> {
     let metadata = load_archived_jsonl(store, snapshot, manifest, "chunk_dense_vectors_metadata")?;
+    let plane = ArchivedBlobPlane::open(store, manifest, "dense_vector_blob", "vector_blob")
+        .map_err(|message| verification_failure(format!("snapshot {}: {message}", snapshot.id)))?;
 
-    // Counts only the subject-parse rows actually compared (the corpus-wide
-    // archive is filtered to the subject parse below).
+    // Counts only the subject-parse rows actually compared. Manifests minted
+    // before per-subject scoping archived the whole corpus, so the filter stays.
     let mut compared = 0usize;
     for record in &metadata {
         let object = as_object(record, snapshot, "chunk_dense_vectors_metadata")?;
@@ -2391,21 +2394,13 @@ fn verify_dense_plane(
             snapshot,
             "chunk_dense_vectors_metadata",
         )? as usize;
-        let blob_hash = required_str(
-            object,
-            "vector_blobHash",
-            snapshot,
-            "chunk_dense_vectors_metadata",
-        )?;
 
-        // Archived blob bytes (re-hash-verified by get_bytes) and the live row's
-        // blob bytes for the same chunk.
-        let archived_blob = store.get_bytes(&blob_hash).map_err(|source| {
+        // Archived payload bytes (integrity-verified by the plane reader) and
+        // the live row's blob bytes for the same chunk.
+        let archived_blob = plane.bytes_for(store, object).map_err(|message| {
             verification_failure(format!(
-                "snapshot {}: dense vector blob {} for chunk {} failed to load: {source}",
-                snapshot.id,
-                hash_prefix(&blob_hash, &store.limits().diagnostics),
-                chunk_id
+                "snapshot {}: dense vector for chunk {chunk_id}: {message}",
+                snapshot.id
             ))
         })?;
         let (hot_dimension, hot_blob) = load_hot_dense_row(connection, snapshot, &chunk_id)?;
@@ -2469,9 +2464,11 @@ fn verify_multivector_plane(
         manifest,
         "unit_multivector_projections_metadata",
     )?;
+    let plane = ArchivedBlobPlane::open(store, manifest, "multivector_blob", "matrix_blob")
+        .map_err(|message| verification_failure(format!("snapshot {}: {message}", snapshot.id)))?;
 
-    // Counts only the subject-parse rows actually compared (the corpus-wide
-    // archive is filtered to the subject parse below).
+    // Counts only the subject-parse rows actually compared. Manifests minted
+    // before per-subject scoping archived the whole corpus, so the filter stays.
     let mut compared = 0usize;
     for record in &metadata {
         let object = as_object(record, snapshot, "unit_multivector_projections_metadata")?;
@@ -2502,19 +2499,11 @@ fn verify_multivector_plane(
             snapshot,
             "unit_multivector_projections_metadata",
         )? as usize;
-        let blob_hash = required_str(
-            object,
-            "matrix_blobHash",
-            snapshot,
-            "unit_multivector_projections_metadata",
-        )?;
 
-        let archived_blob = store.get_bytes(&blob_hash).map_err(|source| {
+        let archived_blob = plane.bytes_for(store, object).map_err(|message| {
             verification_failure(format!(
-                "snapshot {}: multivector blob {} for row {} failed to load: {source}",
-                snapshot.id,
-                hash_prefix(&blob_hash, &store.limits().diagnostics),
-                row_id
+                "snapshot {}: multivector row {row_id}: {message}",
+                snapshot.id
             ))
         })?;
         let (hot_token_count, hot_dimension, hot_blob) =
@@ -2956,6 +2945,132 @@ fn find_ref_by_type<'m>(
         .into_iter()
         .flat_map(|(_, refs)| refs.iter())
         .find(|artifact| artifact.artifact_type == artifact_type)
+}
+
+/// How a manifest laid out its binary planes; see
+/// `ForensicSnapshotManifest::format_version`.
+enum BlobPlaneLayout {
+    /// One content-addressed blob per vector row, named by `<blob_column>Hash`.
+    PerRow,
+    /// One blob per plane; rows addressed by `<blob_column>Offset`/`Length`.
+    /// Holds the plane bytes, loaded once and re-hash-verified by `get_bytes`;
+    /// `None` when the plane archived no rows and therefore has no blob ref.
+    Plane(Option<Vec<u8>>),
+}
+
+/// Reader for one archived binary plane's row payloads that hides the manifest
+/// layout from verification and restore. Both callers iterate the plane's
+/// metadata records and need each record's payload bytes; this resolves them
+/// per layout so the rebuild check and the re-import stay layout-agnostic and
+/// every existing snapshot remains readable. Errors are plain messages so each
+/// caller wraps them in its own error kind.
+pub(crate) struct ArchivedBlobPlane {
+    blob_column: String,
+    hash_key: String,
+    offset_key: String,
+    length_key: String,
+    layout: BlobPlaneLayout,
+}
+
+impl ArchivedBlobPlane {
+    /// Select the layout from `manifest.format_version` and, for the per-plane
+    /// layout, load the plane blob of `blob_artifact_type` once. An unknown
+    /// version is refused rather than guessed: the archive was written by a
+    /// newer layout this binary cannot interpret.
+    pub(crate) fn open(
+        store: &ArtifactStore,
+        manifest: &ForensicSnapshotManifest,
+        blob_artifact_type: &str,
+        blob_column: &str,
+    ) -> Result<Self, String> {
+        let layout = match manifest.format_version {
+            None => BlobPlaneLayout::PerRow,
+            Some(crate::model::MANIFEST_FORMAT_VERSION) => {
+                let plane = match find_ref_by_type(manifest, blob_artifact_type) {
+                    Some(artifact) => Some(store.get_bytes(&artifact.hash).map_err(|source| {
+                        format!(
+                            "archived {blob_artifact_type} plane {} failed to load: {source}",
+                            hash_prefix(&artifact.hash, &store.limits().diagnostics)
+                        )
+                    })?),
+                    None => None,
+                };
+                BlobPlaneLayout::Plane(plane)
+            }
+            Some(version) => {
+                return Err(format!(
+                    "manifest format version {version} is not supported by this build"
+                ));
+            }
+        };
+        Ok(Self {
+            blob_column: blob_column.to_owned(),
+            hash_key: format!("{blob_column}Hash"),
+            offset_key: format!("{blob_column}Offset"),
+            length_key: format!("{blob_column}Length"),
+            layout,
+        })
+    }
+
+    /// True for the metadata keys that stand in for the blob column in this
+    /// layout, so a re-import can drop them and bind the real column instead.
+    pub(crate) fn is_archive_key(&self, key: &str) -> bool {
+        match self.layout {
+            BlobPlaneLayout::PerRow => key == self.hash_key,
+            BlobPlaneLayout::Plane(_) => key == self.offset_key || key == self.length_key,
+        }
+    }
+
+    /// The payload bytes of one metadata record. Per-row: fetched by hash, so
+    /// `get_bytes` re-hash-verifies them. Per-plane: sliced from the verified
+    /// plane blob with explicit bounds checks, since the offsets are archived
+    /// data and a corrupt record must fail here, not panic.
+    pub(crate) fn bytes_for(
+        &self,
+        store: &ArtifactStore,
+        object: &Map<String, Value>,
+    ) -> Result<Vec<u8>, String> {
+        let blob_column = &self.blob_column;
+        match &self.layout {
+            BlobPlaneLayout::PerRow => {
+                let hash = json_str(object, &self.hash_key)
+                    .ok_or_else(|| format!("record is missing `{}`", self.hash_key))?;
+                store.get_bytes(hash).map_err(|source| {
+                    format!(
+                        "{blob_column} blob {} failed to load: {source}",
+                        hash_prefix(hash, &store.limits().diagnostics)
+                    )
+                })
+            }
+            BlobPlaneLayout::Plane(plane) => {
+                let plane = plane.as_deref().ok_or_else(|| {
+                    format!("record references a {blob_column} plane the manifest does not carry")
+                })?;
+                let offset = object
+                    .get(&self.offset_key)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("record is missing `{}`", self.offset_key))?;
+                let length = object
+                    .get(&self.length_key)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("record is missing `{}`", self.length_key))?;
+                let start = usize::try_from(offset).map_err(|_| {
+                    format!("{blob_column} offset {offset} exceeds addressable memory")
+                })?;
+                let end = usize::try_from(length)
+                    .ok()
+                    .and_then(|length| start.checked_add(length))
+                    .filter(|end| *end <= plane.len())
+                    .ok_or_else(|| {
+                        format!(
+                            "{blob_column} range {offset}+{length} exceeds the {}-byte plane blob",
+                            plane.len()
+                        )
+                    })?;
+                Ok(plane[start..end].to_vec())
+            }
+        }
+    }
 }
 
 /// Compare two keyed sets (archived-derived vs hot) and run `on_match` for each

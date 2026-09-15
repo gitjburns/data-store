@@ -142,6 +142,10 @@ pub(crate) enum ChannelReplayMode {
     NotSupported,
 }
 
+/// Manifest layout written by every new snapshot; see
+/// `ForensicSnapshotManifest::format_version` for what each version means.
+pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 2;
+
 /// Spec §30.4 `ForensicSnapshotManifest`. The archived object a
 /// `ForensicSnapshot` references by hash: one list of `SnapshotArtifactRef`
 /// per artifact category the snapshot immutably captures (§30.2). Optional
@@ -155,6 +159,14 @@ pub(crate) enum ChannelReplayMode {
 pub(crate) struct ForensicSnapshotManifest {
     pub(crate) snapshot_id: String,
     pub(crate) created_at: String,
+    /// Layout of the archived binary planes. Absent on manifests minted before
+    /// the field existed: those archive one blob per vector row, addressed by a
+    /// `<blob_column>Hash` key on each metadata record. `MANIFEST_FORMAT_VERSION`
+    /// archives one blob per plane, addressed by `<blob_column>Offset` and
+    /// `<blob_column>Length` keys. Readers dispatch on this field so every
+    /// existing snapshot stays verifiable and restorable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) format_version: Option<u32>,
 
     pub(crate) source_objects: Vec<SnapshotArtifactRef>,
     pub(crate) acquisition_records: Vec<SnapshotArtifactRef>,

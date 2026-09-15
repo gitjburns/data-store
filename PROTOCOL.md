@@ -1079,8 +1079,11 @@ curl -s -X POST http://localhost:PORT/snapshots \
 
 ### `POST /restore`
 
-Rollback-as-restore (detached async task): restore a source's archived parse from
-its snapshot, then reactivate the source. Writes a `pending` Operation
+Rollback-as-restore (detached async task): restore a deactivated source's parse
+from that parse's `pre_deactivation` snapshot, then reactivate the source. The
+request names the parse, not a snapshot; the snapshot is located by
+`(sourceId, parseId, pre_deactivation)`. Manual and incident snapshots are not
+restorable through this route. Writes a `pending` Operation
 (`operationType: restore`, target `source`, `targetObjectId` = the request's
 `sourceId`) and returns `202`.
 
@@ -1090,7 +1093,7 @@ both required:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `sourceId` | string | The source to restore/reactivate. |
-| `parseId` | string | The archived parse to restore. |
+| `parseId` | string | The parse to restore; must have a `pre_deactivation` snapshot. |
 
 A failure on the restore path surfaces on the polled Operation as `failed` with
 error kind `restore_failed` (`500`).

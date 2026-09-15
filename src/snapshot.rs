@@ -66,7 +66,8 @@ use crate::identity;
 use crate::identity::ApplicationIdentity;
 use crate::model::{
     EvidenceReplayMode, ForensicSnapshot, ForensicSnapshotManifest, GenerationReplayMode,
-    ReplayProfile, RetrievalReplayMode, SnapshotArtifactRef, SnapshotType, SystemEventType,
+    MANIFEST_FORMAT_VERSION, ReplayProfile, RetrievalReplayMode, SnapshotArtifactRef, SnapshotType,
+    SystemEventType,
 };
 use crate::primitives::utc_now;
 
@@ -268,6 +269,100 @@ struct SnapshotScope {
     notes: Option<String>,
 }
 
+impl SnapshotScope {
+    /// Derive the row filter every archived plane applies from the subject
+    /// columns. Lifecycle snapshots set both subjects and archive the whole
+    /// subject SOURCE (every parse it currently holds, not only the subject
+    /// parse); manual/incident snapshots set neither and archive the corpus.
+    /// One subject without the other is a caller-contract error, not a silent
+    /// widening to the corpus.
+    ///
+    /// Source scope, not parse scope, is deliberate: the activation-supersession
+    /// deletion gate verifies over the SUCCESSOR's `post_activation` snapshot and
+    /// then deletes the PREDECESSOR's rows (`restore::SupersededCleanupMode`).
+    /// The predecessor's final state, including annotations committed after its
+    /// own activation, is archived only because that snapshot still contains
+    /// every parse of the source at mint time.
+    fn plane_scope(&self) -> Result<PlaneScope<'_>, ApiError> {
+        match (&self.subject_source_id, &self.subject_parse_id) {
+            (Some(source_id), Some(_)) => Ok(PlaneScope::Source { source_id }),
+            (None, None) => Ok(PlaneScope::Corpus),
+            _ => Err(ApiError::StorageOperation {
+                message: format!(
+                    "snapshot scope for {} names a subject source or parse without the other",
+                    snapshot_type_wire_name(self.snapshot_type)
+                ),
+            }),
+        }
+    }
+}
+
+/// Which rows a snapshot's plane reads select. The scope drives the SQL so the
+/// archived planes can never disagree with the subject the header declares.
+#[derive(Clone, Copy)]
+enum PlaneScope<'a> {
+    /// Every row of every plane (operator-requested manual/incident snapshots).
+    Corpus,
+    /// One source with every parse it holds (every lifecycle snapshot).
+    Source { source_id: &'a str },
+}
+
+/// One `column = value` equality applied to a plane read.
+struct Condition<'a> {
+    column: &'static str,
+    value: &'a str,
+}
+
+impl<'a> PlaneScope<'a> {
+    /// The equality condition that confines `table` to this scope. Every
+    /// archived table carries the source id under one of three column names;
+    /// the readers narrow further to their subject parse by `parse_id`.
+    fn condition(self, table: &str) -> Option<Condition<'a>> {
+        let PlaneScope::Source { source_id } = self else {
+            return None;
+        };
+        let column = match table {
+            "source_objects" => "id",
+            "acquisition_records" => "source_object_id",
+            _ => "source_id",
+        };
+        Some(Condition {
+            column,
+            value: source_id,
+        })
+    }
+}
+
+/// Compose `SELECT * FROM <table> WHERE … <order_by>` from the scope condition
+/// and an optional fixed predicate, returning the SQL and its bound parameters
+/// in order. Table, column, and predicate text are code-controlled constants;
+/// only the scope value is bound, so there is no injection surface.
+fn scoped_select<'a>(
+    table: &str,
+    scope: PlaneScope<'a>,
+    fixed_predicate: Option<&str>,
+    order_by: &str,
+) -> (String, Vec<&'a str>) {
+    let mut predicates = Vec::new();
+    let mut parameters = Vec::new();
+    if let Some(condition) = scope.condition(table) {
+        parameters.push(condition.value);
+        predicates.push(format!("{} = ?{}", condition.column, parameters.len()));
+    }
+    if let Some(predicate) = fixed_predicate {
+        predicates.push(predicate.to_owned());
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", predicates.join(" AND "))
+    };
+    (
+        format!("SELECT * FROM {table} {where_clause}{order_by}"),
+        parameters,
+    )
+}
+
 /// Archive one consistent SQLite view before publishing its metadata. Scope
 /// resolution and every manifest read share a read-only transaction; independent
 /// write transactions retain started/failed audit events and atomically publish
@@ -355,7 +450,7 @@ fn mint(
                 "snapshot scope captured; archiving its consistent database view"
             );
             archive_stage = "archive";
-            build_and_archive_manifest(&tx, &store, identity, &snapshot_id, &created_at)
+            build_and_archive_manifest(&tx, &store, identity, &snapshot_id, &created_at, &scope)
                 .map(|(manifest_ref, counts)| (scope, manifest_ref, counts))
         });
         // No database writes occur on this connection. Drop both handles on
@@ -485,8 +580,8 @@ fn fail_snapshot(
 /// Per-plane cardinalities of what a snapshot actually archived, surfaced on the
 /// `snapshot.completed` log so an operator can see each plane's size without
 /// fetching the manifest. JSONL planes carry their archived record count; the
-/// two blob planes carry their archived blob count (one blob per row). Counts
-/// only — no contents.
+/// two blob planes carry the number of vector rows folded into their single
+/// plane blob. Counts only — no contents.
 struct ArchivedCounts {
     source_objects: usize,
     acquisition_records: usize,
@@ -531,69 +626,84 @@ fn build_and_archive_manifest(
     identity: &ApplicationIdentity,
     snapshot_id: &str,
     created_at: &str,
+    snapshot_scope: &SnapshotScope,
 ) -> Result<(ArtifactRef, ArchivedCounts), ApiError> {
+    // Every plane read below is confined to the subject source (or the whole
+    // corpus for manual/incident snapshots), so archived volume scales with one
+    // source rather than the corpus.
+    let scope = snapshot_scope.plane_scope()?;
+
     // --- Hot relational planes archived as canonical JSONL record-set
     // projections (§30.2 "or its exact artifact projection"). Each plane is one
     // ordered record set; order is fixed by the query so the archived bytes are
     // reproducible.
-    let source_objects = archive_plane(store, connection, "source_objects", ORDER_BY_ID)?;
-    let acquisition_records = archive_plane(store, connection, "acquisition_records", ORDER_BY_ID)?;
-    let parse_runs = archive_plane(store, connection, "parse_runs", ORDER_BY_ID)?;
-    let content_units = archive_plane(store, connection, "content_units", ORDER_BY_ID)?;
-    let unit_relationships = archive_plane(store, connection, "unit_relationships", ORDER_BY_ID)?;
-    let semantic_annotations =
-        archive_plane(store, connection, "semantic_annotations", ORDER_BY_ID)?;
+    let source_objects = archive_plane(store, connection, "source_objects", scope)?;
+    let acquisition_records = archive_plane(store, connection, "acquisition_records", scope)?;
+    let parse_runs = archive_plane(store, connection, "parse_runs", scope)?;
+    let content_units = archive_plane(store, connection, "content_units", scope)?;
+    let unit_relationships = archive_plane(store, connection, "unit_relationships", scope)?;
+    let semantic_annotations = archive_plane(store, connection, "semantic_annotations", scope)?;
 
     // Retrieval projection metadata + chunk payloads archived as JSONL; the
     // binary vector planes are archived below as raw content-addressed blobs.
+    // The envelope rows are read once and shared by the three reference passes
+    // instead of re-reading the table per pass.
     let mut retrieval_projections = Vec::new();
-    retrieval_projections.push(archive_plane_ref(
-        store,
+    let envelope_records = read_table_as_json(
         connection,
         "retrieval_projections",
+        scope,
+        None,
         ORDER_BY_ID,
+    )?;
+    let stored_envelopes = store.put_jsonl(&envelope_records)?;
+    retrieval_projections.push(jsonl_ref(
         "retrieval_projections",
-    )?);
-    retrieval_projections.push(archive_plane_ref(
+        &stored_envelopes,
+        envelope_records.len(),
+    ));
+    retrieval_projections.push(archive_plane(
         store,
         connection,
         "chunk_projections",
-        ORDER_BY_ID,
-        "chunk_projections",
+        scope,
     )?);
-    retrieval_projections.extend(reference_chunk_policies(connection, store)?);
+    retrieval_projections.extend(reference_chunk_policies(&envelope_records, store)?);
 
     // --- Dense/multivector blobs archived as raw bytes so restore RE-IMPORTS
     // them (§31.3) rather than re-embedding: they are byte-reproducible ONLY
-    // from the stored blobs. Each row contributes one metadata record (its
-    // scalar columns) referencing the archived blob's hash, and one blob ref.
-    let (dense_meta, mut retrieval_indexes) = archive_blob_plane(
+    // from the stored blobs. Each plane is one archived blob; each row
+    // contributes one metadata record (its scalar columns) carrying the row's
+    // byte range within that blob.
+    let mut retrieval_indexes = Vec::new();
+    let dense = archive_blob_plane(
         store,
         connection,
+        scope,
         "chunk_dense_vectors",
         "chunk_id",
         "vector_blob",
         "dense_vector_blob",
     )?;
-    retrieval_projections.push(dense_meta);
-    // One archived blob per dense-vector row; captured before the multivector
-    // blobs are folded into the same section.
-    let dense_blob_count = retrieval_indexes.len();
-    let (multivector_meta, multivector_blobs) = archive_blob_plane(
+    retrieval_projections.push(dense.metadata);
+    retrieval_indexes.extend(dense.plane);
+    let dense_blob_count = dense.row_count;
+    let multivector = archive_blob_plane(
         store,
         connection,
+        scope,
         "unit_multivector_projections",
         "id",
         "matrix_blob",
         "multivector_blob",
     )?;
-    retrieval_projections.push(multivector_meta);
-    let multivector_blob_count = multivector_blobs.len();
-    retrieval_indexes.extend(multivector_blobs);
-    let section_payloads = reference_section_dense_payloads(connection, store)?;
+    retrieval_projections.push(multivector.metadata);
+    retrieval_indexes.extend(multivector.plane);
+    let multivector_blob_count = multivector.row_count;
+    let section_payloads = reference_section_dense_payloads(&envelope_records, connection, store)?;
     let section_dense_payloads = section_payloads.len();
     retrieval_indexes.extend(section_payloads);
-    retrieval_indexes.extend(reference_annotation_payloads(connection, store)?);
+    retrieval_indexes.extend(reference_annotation_payloads(&envelope_records, store)?);
 
     // --- Sealed policies/profiles serialized at snapshot time (§30.4
     // assemblyPolicies/retrievalProfiles/capabilityProfiles). These are
@@ -634,7 +744,7 @@ fn build_and_archive_manifest(
     // --- Deletion evidence for the interval (§30.2 "Deletion evidence
     // records"). Deletion evidence lives on source_locations.deletion_evidence_json;
     // the archived record set is the source_locations rows carrying evidence.
-    let deletion_records = archive_deletion_evidence(store, connection)?;
+    let deletion_records = archive_deletion_evidence(store, connection, scope)?;
 
     // --- Runtime artifacts (§30.2 "Application identity"): the COMPLETE
     // replay-environment identity (§30.7) — systemVersion, specVersion,
@@ -647,12 +757,13 @@ fn build_and_archive_manifest(
     let mut manifest = ForensicSnapshotManifest {
         snapshot_id: snapshot_id.to_owned(),
         created_at: created_at.to_owned(),
+        format_version: Some(MANIFEST_FORMAT_VERSION),
         source_objects: vec![source_objects],
         acquisition_records: vec![acquisition_records],
         parse_runs: vec![parse_runs],
         // Sealed §12.3 canonical parse bundles are REFERENCED by their existing
         // parse_runs.artifact_bundle_uri/_hash, never re-archived.
-        canonical_parse_bundles: reference_canonical_parse_bundles(connection)?,
+        canonical_parse_bundles: reference_canonical_parse_bundles(connection, scope)?,
         // Parser output bundles are staging-only today (spec-optional §30.4);
         // absent, not empty.
         parser_output_bundles: None,
@@ -739,12 +850,11 @@ fn build_and_archive_manifest(
 /// Pin construction descriptors separately so restore can authenticate the original
 /// chunk semantics after operators change indexing limits.
 fn reference_chunk_policies(
-    connection: &Connection,
+    envelope_records: &[Value],
     store: &ArtifactStore,
 ) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
-    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
     let mut refs = Vec::new();
-    for record in records {
+    for record in envelope_records {
         if record.get("projection_type").and_then(Value::as_str) != Some("chunk") {
             continue;
         }
@@ -783,13 +893,13 @@ fn reference_chunk_policies(
 /// Pin immutable section payloads explicitly: envelope URIs alone are not a
 /// manifest dependency and would otherwise escape completeness/hash checks.
 fn reference_section_dense_payloads(
+    envelope_records: &[Value],
     connection: &Connection,
     store: &ArtifactStore,
 ) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
     use crate::projections::section_dense::{SECTION_DENSE_INDEX_NAME, SectionDensePlane};
-    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
     let mut refs = Vec::new();
-    for record in records {
+    for record in envelope_records {
         if record.get("index_name").and_then(Value::as_str) != Some(SECTION_DENSE_INDEX_NAME) {
             continue;
         }
@@ -851,15 +961,14 @@ fn reference_section_dense_payloads(
 /// blobs. Paired envelopes share one manifest; repeated model payloads are
 /// referenced once by content hash without losing their per-manifest shapes.
 fn reference_annotation_payloads(
-    connection: &Connection,
+    envelope_records: &[Value],
     store: &ArtifactStore,
 ) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
     use crate::projections::annotation::{
         INDEX_NAME, PAYLOAD_TYPE, VECTOR_PAYLOAD_TYPE, read_manifest,
     };
-    let records = read_table_as_json(connection, "retrieval_projections", ORDER_BY_ID)?;
     let mut refs = BTreeMap::new();
-    for record in records {
+    for record in envelope_records {
         if record.get("index_name").and_then(Value::as_str) != Some(INDEX_NAME) {
             continue;
         }
@@ -941,46 +1050,37 @@ fn retrieval_projection_count(manifest: &ForensicSnapshotManifest, artifact_type
 /// primary key. Fixed here so the archived JSONL bytes are reproducible.
 const ORDER_BY_ID: &str = "ORDER BY id";
 
-/// Archive one hot-plane table as a canonical JSONL record set and return its
-/// `SnapshotArtifactRef`, using the table name as the artifact type. Thin
-/// wrapper over `archive_plane_ref` for the common case where the artifact type
-/// equals the table name.
+/// Archive the in-scope rows of one hot-plane table as a canonical JSONL record
+/// set, ordered by primary key, and return its `SnapshotArtifactRef` using the
+/// table name as the artifact type. This is the "exact artifact projection" of
+/// hot relational state (§30.2): lossless (every column captured) and
+/// deterministic (fixed column names, fixed row order), so the archived bytes
+/// re-hash stably.
 fn archive_plane(
     store: &ArtifactStore,
     connection: &Connection,
     table: &str,
-    order_by: &str,
+    scope: PlaneScope<'_>,
 ) -> Result<SnapshotArtifactRef, ApiError> {
-    archive_plane_ref(store, connection, table, order_by, table)
-}
-
-/// Read every row of `table` (in `order_by` order) as a canonical JSON object
-/// keyed by column name, archive the ordered set as one JSONL blob, and return
-/// a typed manifest ref. This is the "exact artifact projection" of hot
-/// relational state (§30.2): lossless (every column captured) and deterministic
-/// (fixed column names, fixed row order), so the archived bytes re-hash stably.
-fn archive_plane_ref(
-    store: &ArtifactStore,
-    connection: &Connection,
-    table: &str,
-    order_by: &str,
-    artifact_type: &str,
-) -> Result<SnapshotArtifactRef, ApiError> {
-    let records = read_table_as_json(connection, table, order_by)?;
+    let records = read_table_as_json(connection, table, scope, None, ORDER_BY_ID)?;
     let stored = store.put_jsonl(&records)?;
-    Ok(jsonl_ref(artifact_type, &stored, records.len()))
+    Ok(jsonl_ref(table, &stored, records.len()))
 }
 
-/// Read every row of `table` as a JSON object. The SQL is a bare
-/// `SELECT * FROM <table> <order_by>` built from a code-controlled table name
-/// (never user input), so there is no injection surface; column values are read
-/// generically via `ValueRef` so this one reader serves every archived plane.
+/// Read the in-scope rows of `table` as JSON objects. The SQL comes from
+/// `scoped_select` (code-controlled table, column, and predicate text; only the
+/// scope value is bound); column values are read generically via `ValueRef` so
+/// this one reader serves every archived plane. The statement is fully
+/// consumed and dropped before this returns, so the SQL execution budget covers
+/// only the row reads.
 fn read_table_as_json(
     connection: &Connection,
     table: &str,
+    scope: PlaneScope<'_>,
+    fixed_predicate: Option<&str>,
     order_by: &str,
 ) -> Result<Vec<Value>, ApiError> {
-    let sql = format!("SELECT * FROM {table} {order_by}");
+    let (sql, parameters) = scoped_select(table, scope, fixed_predicate, order_by);
     let mut statement = connection
         .prepare(&sql)
         .map_err(|source| ApiError::StorageOperation {
@@ -992,7 +1092,7 @@ fn read_table_as_json(
         .map(str::to_owned)
         .collect();
     let mut rows = statement
-        .query([])
+        .query(rusqlite::params_from_iter(parameters))
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query {table} for snapshot: {source}"),
         })?;
@@ -1059,22 +1159,37 @@ fn column_value_to_json(
     }
 }
 
-/// Archive a binary plane (dense vectors, multivector matrices): each row's
-/// binary payload column is stored as a raw content-addressed blob (`put_bytes`)
-/// and referenced by hash; the row's scalar columns become one metadata record
-/// in a JSONL set that carries the blob hash. Returns the metadata ref plus one
-/// blob ref per row. Blobs are archived as bytes so restore RE-IMPORTS them
-/// (§31.3) without re-embedding — they are byte-reproducible only this way.
+/// One archived binary plane: its metadata JSONL ref, the single plane blob ref
+/// (absent when the plane had no in-scope rows, so the manifest never points at
+/// an empty blob), and the number of rows folded into that blob.
+struct BlobPlaneArchive {
+    metadata: SnapshotArtifactRef,
+    plane: Option<SnapshotArtifactRef>,
+    row_count: usize,
+}
+
+/// Archive a binary plane (dense vectors, multivector matrices) in the
+/// `MANIFEST_FORMAT_VERSION` layout: every in-scope row's binary payload is
+/// concatenated, in primary-key order, into ONE content-addressed blob, and each
+/// row's scalar columns become one metadata record carrying the row's byte
+/// range within that blob. Blobs are archived as bytes so restore RE-IMPORTS
+/// them (§31.3) without re-embedding — they are byte-reproducible only this way.
+///
+/// Rows are read completely and the statement dropped BEFORE any artifact
+/// write: the SQL execution budget covers open row iteration, so filesystem
+/// work between rows would be charged to SQLite and could interrupt the read.
+/// The whole plane is therefore held in memory between the read and the write.
 fn archive_blob_plane(
     store: &ArtifactStore,
     connection: &Connection,
+    scope: PlaneScope<'_>,
     table: &str,
     key_column: &str,
     blob_column: &str,
     blob_artifact_type: &str,
-) -> Result<(SnapshotArtifactRef, Vec<SnapshotArtifactRef>), ApiError> {
+) -> Result<BlobPlaneArchive, ApiError> {
     // Order by primary key for a reproducible metadata record set.
-    let sql = format!("SELECT * FROM {table} ORDER BY {key_column}");
+    let (sql, parameters) = scoped_select(table, scope, None, &format!("ORDER BY {key_column}"));
     let mut statement = connection
         .prepare(&sql)
         .map_err(|source| ApiError::StorageOperation {
@@ -1093,17 +1208,17 @@ fn archive_blob_plane(
         })?;
 
     let mut rows = statement
-        .query([])
+        .query(rusqlite::params_from_iter(parameters))
         .map_err(|source| ApiError::StorageOperation {
             message: format!("failed to query {table} for snapshot: {source}"),
         })?;
 
+    // Phase 1 (under the SQL budget): scalar columns and payload bytes, no I/O.
     let mut metadata_records = Vec::new();
-    let mut blob_refs = Vec::new();
+    let mut plane_bytes: Vec<u8> = Vec::new();
     while let Some(row) = rows.next().map_err(|source| ApiError::StorageOperation {
         message: format!("failed to read a {table} row for snapshot: {source}"),
     })? {
-        // Archive the raw blob bytes content-addressed.
         let blob = row
             .get_ref(blob_index)
             .map_err(|source| ApiError::StorageOperation {
@@ -1120,40 +1235,52 @@ fn archive_blob_plane(
                 });
             }
         };
-        let blob_ref = store.put_bytes(blob_bytes)?;
-        blob_refs.push(SnapshotArtifactRef {
-            artifact_type: blob_artifact_type.to_owned(),
-            uri: blob_ref.uri.clone(),
-            format: Some("bytes".to_owned()),
-            hash: blob_ref.hash.clone(),
-            created_at: None,
-            metadata: None,
-        });
+        let offset = plane_bytes.len() as u64;
+        let length = blob_bytes.len() as u64;
+        plane_bytes.extend_from_slice(blob_bytes);
 
-        // Build the scalar metadata record, replacing the binary column with a
-        // reference to its archived blob hash so the record set stays JSON and
-        // the row's identity → blob mapping is preserved.
+        // Build the scalar metadata record, replacing the binary column with the
+        // row's byte range in the plane blob so the record set stays JSON and the
+        // row's identity → bytes mapping is preserved.
         let mut object = Map::new();
         for (index, name) in column_names.iter().enumerate() {
             if index == blob_index {
-                object.insert(
-                    format!("{blob_column}Hash"),
-                    Value::String(blob_ref.hash.clone()),
-                );
+                object.insert(format!("{blob_column}Offset"), Value::from(offset));
+                object.insert(format!("{blob_column}Length"), Value::from(length));
                 continue;
             }
             object.insert(name.clone(), column_value_to_json(row, index, table, name)?);
         }
         metadata_records.push(Value::Object(object));
     }
+    drop(rows);
+    drop(statement);
 
+    // Phase 2 (outside any statement): one plane blob, then the metadata set.
+    let row_count = metadata_records.len();
+    let plane = if row_count == 0 {
+        None
+    } else {
+        let plane_ref = store.put_bytes(&plane_bytes)?;
+        Some(SnapshotArtifactRef {
+            artifact_type: blob_artifact_type.to_owned(),
+            uri: plane_ref.uri,
+            format: Some("bytes".to_owned()),
+            hash: plane_ref.hash,
+            created_at: None,
+            metadata: Some(BTreeMap::from([(
+                "rowCount".to_owned(),
+                Value::from(row_count as u64),
+            )])),
+        })
+    };
     let stored = store.put_jsonl(&metadata_records)?;
-    let metadata_ref = jsonl_ref(
-        &format!("{table}_metadata"),
-        &stored,
-        metadata_records.len(),
-    );
-    Ok((metadata_ref, blob_refs))
+    let metadata = jsonl_ref(&format!("{table}_metadata"), &stored, row_count);
+    Ok(BlobPlaneArchive {
+        metadata,
+        plane,
+        row_count,
+    })
 }
 
 /// Archive the deletion-evidence record set (§30.2). Deletion evidence lives on
@@ -1163,11 +1290,14 @@ fn archive_blob_plane(
 fn archive_deletion_evidence(
     store: &ArtifactStore,
     connection: &Connection,
+    scope: PlaneScope<'_>,
 ) -> Result<Option<Vec<SnapshotArtifactRef>>, ApiError> {
     let records = read_table_as_json(
         connection,
         "source_locations",
-        "WHERE deletion_evidence_json IS NOT NULL ORDER BY id",
+        scope,
+        Some("deletion_evidence_json IS NOT NULL"),
+        ORDER_BY_ID,
     )?;
     if records.is_empty() {
         return Ok(None);
@@ -1186,27 +1316,29 @@ fn archive_deletion_evidence(
 /// keeps the reference list deterministic.
 fn reference_canonical_parse_bundles(
     connection: &Connection,
+    scope: PlaneScope<'_>,
 ) -> Result<Vec<SnapshotArtifactRef>, ApiError> {
-    const SELECT_BUNDLES_SQL: &str = "
-SELECT artifact_bundle_uri, artifact_bundle_hash
-FROM parse_runs
-WHERE artifact_bundle_uri IS NOT NULL AND artifact_bundle_hash IS NOT NULL
-ORDER BY id";
-    let mut statement =
-        connection
-            .prepare(SELECT_BUNDLES_SQL)
-            .map_err(|source| ApiError::StorageOperation {
-                message: format!(
-                    "failed to prepare canonical parse bundle reference read: {source}"
-                ),
-            })?;
+    // The bundle columns are read from the same scoped parse_runs rows the
+    // parse_runs plane archives, so referenced bundles and archived runs agree.
+    let (sql, parameters) = scoped_select(
+        "parse_runs",
+        scope,
+        Some("artifact_bundle_uri IS NOT NULL AND artifact_bundle_hash IS NOT NULL"),
+        ORDER_BY_ID,
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|source| ApiError::StorageOperation {
+            message: format!("failed to prepare canonical parse bundle reference read: {source}"),
+        })?;
     let refs = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(parameters), |row| {
             Ok(SnapshotArtifactRef {
                 artifact_type: "canonical_parse_bundle".to_owned(),
-                uri: row.get::<_, String>(0)?,
+                // Named access: the scoped SELECT projects every column.
+                uri: row.get::<_, String>("artifact_bundle_uri")?,
                 format: Some("json".to_owned()),
-                hash: row.get::<_, String>(1)?,
+                hash: row.get::<_, String>("artifact_bundle_hash")?,
                 created_at: None,
                 metadata: None,
             })

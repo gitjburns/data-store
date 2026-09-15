@@ -996,8 +996,8 @@ source), gate an existing un-held `ready` run (crash-recovery idempotence), or
 skip. Only new content or a new parser identity licenses a re-parse; each
 worker's identity is its name, version, and configuration hash (§10.8 for
 plain text, §10.9 for EPUB), and `[epub]` budgets are not part of it (§2.8).
-An archived parse can instead be restored through the existing snapshot
-lifecycle.
+Restore (§1.4) reinstates only a deactivated source's parse from its
+`pre_deactivation` snapshot; superseded parses are not restorable.
 
 ### 10.7 Pre-worker content-identity check
 

@@ -408,8 +408,9 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   not identity, and there is no dependency-lock hash. Identity changes permit a
   new candidate through the §13.5 guard. Explicit reparsing uses the existing
   projection and activation path, including held candidates; returning to a
-  previously used identity remains subject to the no-repeat guard, and archived
-  parses can be restored through the snapshot lifecycle.
+  previously used identity remains subject to the no-repeat guard. Restore
+  (Section 5.4) reinstates only a deactivated source's parse from its
+  `pre_deactivation` snapshot; superseded parses are not restorable.
 
 - **Build projections.** Between import and gate, `build_content_derived_projections`
   builds the content-derived projections in **one transaction**
@@ -767,7 +768,8 @@ survives supersession.
 ### 5.4 Rollback-as-restore (`src/restore.rs::restore_source_from_snapshot`)
 
 Restore **re-imports** a source's canonical rows and projection payloads from
-its ForensicSnapshot's archived artifacts, **preserving IDs**; vectors are
+the target parse's `pre_deactivation` snapshot, located by
+`(source_id, parse_id, snapshot_type)`, **preserving IDs**; vectors are
 byte-reproduced from the archived blobs. The non-archived planes — the FTS5
 lexical index and the graph tables — are **deterministically rebuilt** from
 the restored rows. The dense-cache publish happens **under the held per-source

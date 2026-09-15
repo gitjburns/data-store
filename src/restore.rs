@@ -56,7 +56,7 @@ use crate::model::{
 use crate::primitives::utc_now;
 use crate::projections::dense_cache::DenseCache;
 use crate::projections::envelope;
-use crate::snapshot::verify::{verify_deletion_gate, verify_mechanical};
+use crate::snapshot::verify::{ArchivedBlobPlane, verify_deletion_gate, verify_mechanical};
 use crate::state::CutoverRegistry;
 use crate::util::hash_prefix;
 
@@ -1029,25 +1029,10 @@ fn restore_body(
 
     // Binary planes: re-import the raw blob bytes (byte-reproduced, NEVER
     // re-embedded — §31.3/§38) back into their BLOB columns, keyed by the
-    // metadata JSONL that carries each row's scalar columns plus the blob hash.
-    let dense = reimport_blob_plane(
-        tx,
-        store,
-        manifest,
-        "chunk_dense_vectors_metadata",
-        "chunk_dense_vectors",
-        "vector_blob",
-        parse_id,
-    )?;
-    let multivector = reimport_blob_plane(
-        tx,
-        store,
-        manifest,
-        "unit_multivector_projections_metadata",
-        "unit_multivector_projections",
-        "matrix_blob",
-        parse_id,
-    )?;
+    // metadata JSONL that carries each row's scalar columns plus its payload
+    // address.
+    let dense = reimport_blob_plane(tx, store, manifest, &DENSE_PLANE, parse_id)?;
+    let multivector = reimport_blob_plane(tx, store, manifest, &MULTIVECTOR_PLANE, parse_id)?;
 
     // FTS5 uses the restored chunks. Graph payload uses only the verified
     // published envelope's exact inputs; all completed annotations were restored
@@ -1140,44 +1125,68 @@ fn reimport_plane(
 }
 
 /// Re-import one archived BINARY plane for the subject parse. The archived
-/// metadata JSONL carries each row's scalar columns plus a `<blob_column>Hash`
-/// key naming the archived blob; this reconstructs the real row by fetching the
-/// blob bytes (re-hash-verified by `get_bytes`) and re-inserting them into the
-/// BLOB column. The vectors are byte-reproduced from the stored blobs, NEVER
-/// re-embedded (§31.3/§38). Returns the number of rows re-imported.
+/// metadata JSONL carries each row's scalar columns plus the archived payload's
+/// address, which `ArchivedBlobPlane` resolves per manifest layout; this
+/// reconstructs the real row by fetching the integrity-verified payload bytes
+/// and re-inserting them into the BLOB column. The vectors are byte-reproduced
+/// from the stored blobs, NEVER re-embedded (§31.3/§38). Returns the number of
+/// rows re-imported.
 fn reimport_blob_plane(
     tx: &Transaction<'_>,
     store: &ArtifactStore,
     manifest: &ForensicSnapshotManifest,
-    metadata_artifact_type: &str,
-    table: &str,
-    blob_column: &str,
+    spec: &BinaryPlaneSpec,
     parse_id: &str,
 ) -> Result<usize, ApiError> {
-    let records = load_archived_jsonl(store, manifest, metadata_artifact_type)?;
-    let hash_key = format!("{blob_column}Hash");
+    let table = spec.table;
+    let records = load_archived_jsonl(store, manifest, spec.metadata_artifact_type)?;
+    let plane = ArchivedBlobPlane::open(store, manifest, spec.blob_artifact_type, spec.blob_column)
+        .map_err(|message| ApiError::RestoreFailed {
+            message: format!("restore of {table}: {message}"),
+        })?;
     let mut imported = 0usize;
     for record in &records {
-        let object = as_object(record, metadata_artifact_type)?;
+        let object = as_object(record, spec.metadata_artifact_type)?;
         if json_str(object, "parse_id") != Some(parse_id) {
             continue;
         }
-        // Fetch the archived blob bytes named by the metadata record; get_bytes
-        // re-hashes them to their address, so a corrupt blob fails here.
-        let blob_hash = required_str(object, &hash_key, metadata_artifact_type)?;
-        let blob = store
-            .get_bytes(&blob_hash)
-            .map_err(|source| ApiError::RestoreFailed {
-                message: format!(
-                    "restore of {table}: archived blob {} failed to load: {source}",
-                    hash_prefix(&blob_hash, &store.limits().diagnostics)
-                ),
+        let blob = plane
+            .bytes_for(store, object)
+            .map_err(|message| ApiError::RestoreFailed {
+                message: format!("restore of {table}: {message}"),
             })?;
-        insert_blob_row_from_object(tx, table, object, blob_column, &hash_key, &blob)?;
+        insert_blob_row_from_object(tx, table, object, spec.blob_column, &plane, &blob)?;
         imported += 1;
     }
     Ok(imported)
 }
+
+/// The names that tie one binary plane's hot table to its archived artifacts:
+/// the metadata JSONL artifact type, the plane blob artifact type, the table,
+/// and its BLOB column. Both values must match what `snapshot::archive_blob_plane`
+/// wrote for that plane.
+struct BinaryPlaneSpec {
+    metadata_artifact_type: &'static str,
+    blob_artifact_type: &'static str,
+    table: &'static str,
+    blob_column: &'static str,
+}
+
+/// Dense passage vectors (`chunk_dense_vectors.vector_blob`).
+const DENSE_PLANE: BinaryPlaneSpec = BinaryPlaneSpec {
+    metadata_artifact_type: "chunk_dense_vectors_metadata",
+    blob_artifact_type: "dense_vector_blob",
+    table: "chunk_dense_vectors",
+    blob_column: "vector_blob",
+};
+
+/// ColBERT token matrices (`unit_multivector_projections.matrix_blob`).
+const MULTIVECTOR_PLANE: BinaryPlaneSpec = BinaryPlaneSpec {
+    metadata_artifact_type: "unit_multivector_projections_metadata",
+    blob_artifact_type: "multivector_blob",
+    table: "unit_multivector_projections",
+    blob_column: "matrix_blob",
+};
 
 /// Reconstruct and execute an `INSERT INTO <table> (cols…) VALUES (…)` from one
 /// archived column-projection object. The object's keys are the exact column
@@ -1200,25 +1209,31 @@ fn insert_row_from_object(
 }
 
 /// Reconstruct and execute an INSERT for a binary-plane row: every scalar column
-/// verbatim EXCEPT the archived `<blob_column>Hash` key, which is replaced by the
-/// real `blob_column` holding the fetched bytes. This is the exact inverse of
-/// `archive_blob_plane`, which dropped the BLOB column and inserted a `…Hash`
-/// key in its place.
+/// verbatim EXCEPT the archive-only address keys (`<blob_column>Hash`, or
+/// `<blob_column>Offset`/`Length`, per layout), which are replaced by the real
+/// `blob_column` holding the fetched bytes. This is the exact inverse of
+/// `archive_blob_plane`, which dropped the BLOB column and inserted the address
+/// keys in its place.
 fn insert_blob_row_from_object(
     tx: &Transaction<'_>,
     table: &str,
     object: &Map<String, Value>,
     blob_column: &str,
-    hash_key: &str,
+    plane: &ArchivedBlobPlane,
     blob: &[u8],
 ) -> Result<(), ApiError> {
     let mut columns: Vec<String> = Vec::with_capacity(object.len());
     let mut values: Vec<SqlValue> = Vec::with_capacity(object.len());
+    // The blob column is bound exactly once even though the per-plane layout
+    // carries two address keys.
+    let mut blob_bound = false;
     for (name, value) in object {
-        if name == hash_key {
-            // Replace the archived hash placeholder with the real blob column.
-            columns.push(blob_column.to_owned());
-            values.push(SqlValue::Blob(blob.to_vec()));
+        if plane.is_archive_key(name) {
+            if !blob_bound {
+                columns.push(blob_column.to_owned());
+                values.push(SqlValue::Blob(blob.to_vec()));
+                blob_bound = true;
+            }
             continue;
         }
         columns.push(name.clone());
@@ -1458,15 +1473,6 @@ fn as_object<'v>(record: &'v Value, plane: &str) -> Result<&'v Map<String, Value
 /// Read an object's field as `&str` if present and a string.
 fn json_str<'v>(object: &'v Map<String, Value>, key: &str) -> Option<&'v str> {
     object.get(key).and_then(Value::as_str)
-}
-
-/// Read a required string field from an archived record.
-fn required_str(object: &Map<String, Value>, key: &str, plane: &str) -> Result<String, ApiError> {
-    json_str(object, key)
-        .map(str::to_owned)
-        .ok_or_else(|| ApiError::RestoreFailed {
-            message: format!("restore: archived {plane} record is missing string field `{key}`"),
-        })
 }
 
 /// Decode a canonical JSON string-array TEXT value into `Vec<String>`. The

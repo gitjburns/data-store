@@ -62,7 +62,8 @@ pub(crate) use {
     // falling out of use is a visible warning.
     snapshot::{
         EvidenceReplayMode, ForensicSnapshot, ForensicSnapshotManifest, GenerationReplayMode,
-        ReplayProfile, RetrievalReplayMode, SnapshotArtifactRef, SnapshotType,
+        MANIFEST_FORMAT_VERSION, ReplayProfile, RetrievalReplayMode, SnapshotArtifactRef,
+        SnapshotType,
     },
     source::{DeletionEvidence, DeletionSignal},
     sync::{SyncQueueEntry, SyncQueueState},

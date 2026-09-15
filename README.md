@@ -192,7 +192,7 @@ PROTOCOL.md is the contract of record. This is the map.
 | `POST /parses/{parseId}/accept` | Accept a held parse (async Operation). |
 | `POST /parses/{parseId}/discard` | Discard a held parse (async Operation). |
 | `POST /snapshots` | Create a forensic snapshot (async Operation). |
-| `POST /restore` | Restore a source from a snapshot (async Operation). |
+| `POST /restore` | Restore a deactivated source's parse from its `pre_deactivation` snapshot and reactivate the source (async Operation). |
 | `POST /rebuild-all` | Clear indexed corpus state and schedule automatic rebuilding (async Operation). |
 | `POST /clear-failures` | Unblock failed background work while preserving successful work and failure history (async Operation). |
 | `POST /shutdown` | Graceful shutdown (immediate confirmation, then signal). |
@@ -358,7 +358,7 @@ Operator verbs (CLI flag / REPL name):
 | `--accept` | `<parseId>` | Accept a held parse. |
 | `--discard` | `<parseId>` | Discard a held parse. |
 | `--snapshot` | `[requestJson]` | Create a snapshot. |
-| `--restore` | `<sourceId> <parseId>` | Restore from a snapshot. |
+| `--restore` | `<sourceId> <parseId>` | Restore a deactivated source's parse from its `pre_deactivation` snapshot and reactivate it. |
 | `--rebuild-all` | — | Clear indexed state and artifacts, then automatically reingest the corpus. Available during the startup delay. |
 | `--clear-failures` | — | Requeue failed work and reset annotation retry budgets without rebuilding successful work. |
 | `--held-parses` | — | List held parses awaiting disposition. |
@@ -373,6 +373,9 @@ Operator verbs (CLI flag / REPL name):
 For admin verbs the CLI submits the request, then polls the returned Operation
 until it terminates, and points you at the parse run / held-parses for the domain
 verdict.
+
+`--monitor` and `--serve` are startup modes of the same binary, not verbs: see
+"Ingestion monitor" and "Web UI" below.
 
 ### Example: query the fabric
 
