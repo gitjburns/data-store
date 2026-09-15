@@ -231,9 +231,11 @@ operations                  §34.6 Operation records (status-guarded)
 semantic_annotations        entity/relation/summary annotations
 annotation_memo             §21.2 producer-output memo cache
 system_events               in-plane event log
-chunk_projections           chunk grain for retrieval targeting
-chunk_dense_vectors         dense embeddings per chunk
-unit_multivector_projections ColBERT token matrices per unit
+chunk_projections           fine chunks: fragments, section path, chunk_index
+chunk_dense_vectors         dense embeddings per fine chunk
+colbert_windows             ColBERT token matrices per ColBERT window (run of
+                            fine chunks): chunk_ids_json, fragments_json,
+                            window_index, token_count, dimension, matrix_blob
 graph_entity_mentions       normalized entity → unit_ids (D9 entry)
 graph_entity_edges          normalized name-pair relation edges, relation_type
                             (predicate) stored normalized too (D9 traversal)
@@ -255,7 +257,7 @@ live here, referenced from the hot plane by `ArtifactRef` (`uri` + `hash` +
 
 Annotation manifests reference separate dense-vector and ColBERT-matrix blobs.
 The paired `retrieval_projections` envelopes publish one immutable manifest URI
-per excerpt cohort and model/input version.
+per context-window cohort and model/input version.
 
 Vector query reads retain bounded working buffers and use operating-system file
 caching. Chunk mappings and canonical metadata remain corpus-proportional;
@@ -420,24 +422,61 @@ detect ──▶ acquire ──▶ parse ──▶ build projections ──▶ g
   `multivector::build_multivectors` → `view::build_derived_view`. Each carries a
   `retrieval_projections` envelope with a freshness status.
 
-  The fine chunker (`src/projections/chunk.rs`) measures normalized targeting
-  text with a per-build ColBERT tokenizer copy, disabling truncation and padding
-  while retaining special tokens. Oversized words split at measured UTF-8
-  boundaries; their final suffix can join following words. Every retained chunk
-  is recounted and checked against `indexing.chunk_max_tokens` (shipped value:
-  512) before persistence. The `indexing.min_search_unit_chars` minimum (shipped
-  value: 400) applies to normalized fragments, including split remainders. The
+  **Grains.** Three persisted grains are built here, each a run of consecutive
+  members of the grain below it in reading order, packed greedily under a
+  ColBERT-token cap from `[indexing]`; a fourth, the annotation excerpt, is
+  formed at annotation time (Section 3.1). Tokens are measured with a per-build
+  ColBERT tokenizer copy, truncation and padding disabled, special tokens
+  retained. Every run has canonical text (member texts joined by one blank
+  line) and model input (`chunk::model_input`: the section path of the run's
+  first member joined by " / ", a blank line, then the canonical text).
+  Canonical text feeds hashes, provenance ranges, the annotation source matcher,
+  and citations; model input feeds embedding calls, annotation calls receive
+  the section path as a separate context line, and the prefix is never
+  part of any range, hash, or stored text. Runs never consult section
+  boundaries. Every run records `fragments`, an ordered list of
+  `{ unitId, startChar, endChar }` in Unicode scalar offsets over each unit's
+  evidence text, end exclusive; byte offsets are stored nowhere.
+
+  The **fine chunker** (`src/projections/chunk.rs`) applies evidence derivation
+  once, and every higher grain inherits it: evidence-bearing units are
+  `text_block`, `caption`, `table_cell`, `code_block`; a `text_block` with role
+  `heading` is not evidence and contributes to the section path only; all cells
+  of one `table_row` form one member whose text is the cell texts joined by a
+  tab and whose fragments list every cell with its range in its own cell text;
+  everything else is one member per unit. Members pack under
+  `indexing.fine_max_tokens`. When the next member would overflow the cap and
+  the open run is below `indexing.min_fill_ratio` of the cap, that member is
+  split at a measured boundary (sentence, then word) so the open run reaches the
+  minimum and the remainder continues as the next member; a member that alone
+  exceeds the cap splits the same way. At document end a final run below the
+  minimum merges into its predecessor when the combined run fits, otherwise it
+  stays as the one permitted sub-minimum run. Each chunk row stores its
+  canonical `targeting_text` (indexed as-is by the lexical channel and embedded
+  behind the prefix by the dense channel), `input_unit_ids`, `fragments`,
+  `section_path`, and `chunk_index` — assigned by the chunker, unique per
+  parse, and the only reading-order authority for every higher grain. The
   chunker name, version, and limits determine `chunkerConfigHash`.
 
-  Section windows retain the existing passage vectors and add heading-prefixed
-  canonical text, capped at `indexing.section_max_tokens` (shipped value: 2,048)
-  measured with the local ColBERT tokenizer. Unsectioned text uses explicit
-  document-scoped windows. The
-  self-contained artifact records exact text fragments, canonical membership,
-  model/tokenizer identity, window-policy hash, and vectors. Its `dense_vector`
-  envelope uses `index_name = section_dense_v1`; the passage envelope retains
-  a null index name. Both must be fresh before activation. No schema migration
-  is involved; existing corpora require the explicit rebuild-all operation.
+  **Context windows** (`src/projections/section_dense.rs`) pack fine chunks in
+  `chunk_index` order under `indexing.context_max_tokens`; **ColBERT windows**
+  (`src/projections/multivector.rs`) pack them under
+  `indexing.colbert_max_tokens` less the backend's document format overhead.
+  Neither grain splits a chunk: startup validation requires
+  `fine_max_tokens <= cap - floor(cap * min_fill_ratio)` for both caps, which
+  makes the split case unreachable there, and a chunk that does not fit fails
+  the build. Both apply the end-of-document minimum-fill merge. Each window
+  records its member `chunk_ids` in order, `fragments` as the concatenation of
+  its chunks' fragments, and the section path of its first chunk. The
+  context-window artifact is self-contained: exact text fragments, canonical
+  membership, model/tokenizer identity, window-policy hash, and vectors; its
+  `dense_vector` envelope uses `index_name = section_dense_v1`, while the
+  fine-chunk envelope retains a null index name. Both must be fresh before
+  activation. ColBERT windows persist to `colbert_windows` with the matrix row
+  count as `token_count`; because the ColBERT document limit is hard, a window
+  whose prefixed input would exceed it is embedded without the prefix
+  (`multivector_build.prefix_dropped`, DEBUG). Context windows also serve as
+  the annotation source windows and cohort keys (Section 3.1).
 
 - **Gate / activate.** `activation::gate_and_activate` enforces a **single active
   parse per source** with dominance gating. A non-dominant but valid parse takes
@@ -465,13 +504,25 @@ The annotation worker (`src/annotations/worker.rs`) is one dedicated
 `std::thread`. It discovers work for active parses using the sealed policy's
 `post_activation_types` (`src/annotations/policy.rs`).
 
-**Excerpts and stages.** `producer::build_invocation_plan` and
-`excerpt::split_text` partition each evidence-bearing unit without dropping
-text. Each invocation contains one fragment bounded by `max_input_chars`.
-Splitting prefers paragraph, sentence, then whitespace boundaries, with a
-Unicode-character cut when necessary. Provenance `inputRefs[].textRange`
-records start/end Unicode scalar offsets (end-exclusive) and an exact UTF-8
-text hash. Section ownership groups discovery; it does not enlarge requests.
+**Excerpts and stages.** `producer::build_invocation_plan` reads the active
+parse's context windows from the section-dense artifact in order and groups
+runs of `indexing.excerpt_windows` consecutive windows (the final run may be
+shorter); each run is one excerpt, one `InvocationKind::Excerpt { index }`
+shared by all three producers, and its targets are the excerpt's fragments.
+Excerpts exist only in provenance. A parse without published context windows
+yields an empty plan and `annotator_plan.windows_unpublished` (WARN). The model
+receives the excerpt's canonical text as its only source text and the section
+path as a separate prompt field; it never borrows unrelated corpus context.
+Provenance `inputRefs[].textRange` records start/end Unicode scalar offsets
+(end-exclusive) and an exact UTF-8 text hash.
+
+Attribution (`producer::attribute`): an entity row keeps the excerpt fragments
+whose text matches its name via `source_text_matches`; a relation row keeps the
+fragments matching any of its evidence quotes; a summary keeps every fragment.
+Matching runs over each fragment's text alone, so a quote spanning two
+fragments matches neither; an item that matches nothing keeps every fragment,
+because the excerpt is still its true input and coverage never narrows to
+nothing.
 
 `src/annotations/stages.rs` defines the prompts and schemas;
 `src/annotations/chains.rs` runs one goal per call:
@@ -482,7 +533,7 @@ text hash. Section ownership groups discovery; it does not enlarge requests.
 - One summary per excerpt.
 
 Later requests use the source excerpt and prior outputs from that chain.
-Intermediate candidate arrays are also bounded by the configured excerpt cap.
+Intermediate candidate arrays are bounded by the excerpt's character count.
 Shape checks validate required fields, name mappings, and receipt indexes.
 Statements and supporting quotations share `producer::source_text_matches`.
 Both inputs undergo Unicode lowercasing via `char::to_lowercase`, then filtering
@@ -533,12 +584,12 @@ annotation type:
 - `memoization_key_hash` excludes target unit IDs and includes producer identity,
   allowing equal source content at different locations to reuse output with
   their own annotation references. Producer identity covers ordered stage
-  prompts/schemas, model/endpoint, excerpt cap, and generation controls.
+  prompts/schemas, model/endpoint, excerpt sizing (`indexing.excerpt_windows`
+  and `indexing.context_max_tokens`), and generation controls.
   Completion stamps the running producer's memo key onto its annotation rows.
 
 The worker flushes a pending duplicate memo key before preparing another request
-for it, so the next lookup can reuse the committed result. Legacy whole-group
-annotations remain intact; their keys cannot satisfy new fragment coverage.
+for it, so the next lookup can reuse the committed result.
 
 **Projection publication.** `src/projections/worker.rs` owns graph, summary, and
 annotation embedding publication. Graph and summary commit independently when
@@ -547,10 +598,15 @@ Graph names, types, and predicates use `normalize_entity_name`; source annotatio
 retain their producer output.
 
 The worker embeds individual entities, relationships, summaries, combined
-annotations per excerpt, and complete canonical source windows using dense and
-ColBERT backends. It archives bounded batches before opening a publication write
-transaction. Paired dense/multivector envelopes share a cohort partition, manifest
-URI, model/input identity, exact annotation IDs, and canonical target unit.
+annotations per context window, and the context windows themselves as source
+representations, using dense and ColBERT backends. Cohorts are keyed by context
+window id (`src/projections/annotation.rs`): an annotation joins the cohort of
+every window whose fragments intersect one of its attributed `inputRefs`; the
+cohort's source representation is the window's canonical text and its coverage
+is the window's fragments. It archives bounded batches before opening a
+publication write transaction. Paired dense/multivector envelopes share a
+cohort partition, manifest URI, model/input identity, exact annotation IDs, and
+canonical target units.
 Publication rechecks active parse, deactivation, and declared inputs inside the
 transaction. New annotations leave older valid subsets usable until refreshed;
 staling an annotation atomically stales dependent projections. Source/cohort
@@ -597,8 +653,8 @@ identity, not producer memo identity.
 skipped; the next cycle wakes for the earliest encountered retry or ordinary
 discovery interval, whichever is sooner. A call failure ends the cycle after
 the current wave's results are recorded. Failure logs retain source errors,
-both counters and limits, the delay, remaining wait, and next action. See
-README's annotation settings for shipped values.
+both counters and limits, the delay, remaining wait, and next action.
+`config.example.toml` is the reference for the retry settings.
 
 The worker loads its client inside the thread. A client-load failure parks it
 for the run; annotation health is diagnostic-only and never gates readiness.
@@ -729,11 +785,16 @@ probe/tolerance machinery is post-MVP — see Section 9).
 
 The verifier returns only a verdict; the caller owns the consequences.
 
-New chunks pin a typed construction descriptor through their envelope. Section
-and annotation payloads record versioned construction settings; explicit v1
-readers preserve prior chunk, 2,048-token section, and annotation formats.
-Validation uses recorded settings, while current read/memory guards can refuse
-an artifact as a resource-limit failure. Restore invokes no models. `[parsing]`
+Chunks pin a typed construction descriptor through their envelope. Context
+window and annotation payloads record versioned construction settings; the
+readers admit only the construction version they consume. Validation uses
+recorded settings, while current read/memory guards can refuse an artifact as
+a resource-limit failure. Context-window validation re-keys every window to
+chunk rows without a tokenizer: chunk ids consecutive in `chunk_index` order,
+every chunk covered exactly once, fragments and canonical text equal to the
+members' concatenation, and the recorded token count within the recorded cap.
+ColBERT windows are compared on `chunk_ids_json`, `fragments_json`, position,
+and the decoded matrix. Restore invokes no models. `[parsing]`
 resource/observation budgets retain successful parser identities and do not trigger reparsing.
 
 ### 5.3 Archive-verify-delete (`src/restore.rs::complete_superseded_parse`)
@@ -757,8 +818,8 @@ A **failed gate halts before any write transaction**: no deletion, the
 superseded state is retained, there is no auto-retry, and the verification
 error propagates. On a pass, the hot rows of the superseded parse are deleted
 in one transaction in **derived-before-source order** — FTS5 lexical rows
-(scoped through the chunk subselect), graph mentions and edges, dense and
-multivector vectors, chunk projections, semantic annotations, unit
+(scoped through the chunk subselect), graph mentions and edges, dense vectors
+and `colbert_windows`, chunk projections, semantic annotations, unit
 relationships, content units, and the projection envelopes. Two row classes
 deliberately survive: **`parse_runs` rows are never deleted** (the durable
 lifecycle record), and **`annotation_memo` is never touched** — the memo is
@@ -833,13 +894,13 @@ Missing persisted passage/section representations still require an explicit rebu
 ```
 open read-only transaction → capture scoped active parses → cutover-barrier probe
        ↓
-source dense: passages + sections + source windows ┐
+source dense: fine chunks + context windows ──────┐
 lexical chunks ───────────────────────────────────┼→ grouped RRF (`colbert_candidate_pool_size` targets)
 graph + semantic annotation matches ──────────────┘
        ↓
-ColBERT MaxSim (persisted unit, annotation, and source-window matrices)
+ColBERT MaxSim (persisted ColBERT-window and annotation matrices, keyed by window)
        ↓
-bounded same-section passages → final passage reranker → requested result count
+passages from window fragments → final passage reranker → requested result count
        ↓
 citations + full canonical constituents → { results, evidencePack, diagnostics? }
 ```
@@ -856,7 +917,7 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   made during retrieval.
 
   `src/query/annotation.rs` searches individual entities, relationships, summaries,
-  combined annotations, and canonical source windows. Semantic entity matches can
+  combined annotations, and context windows. Semantic entity matches can
   seed the graph; relation and summary matches nominate supporting excerpts directly.
   Outer RRF has three contributions: source dense, lexical, and grouped graph plus
   semantic annotations. Discovery and final pool depths use the sealed runtime
@@ -885,19 +946,24 @@ citations + full canonical constituents → { results, evidencePack, diagnostics
   enumeration; semantic entry remains available. Traversal stays within one parse.
   Enable flags live in the entity-match policy document; numeric matching limits
   live in `config.toml` and the sealed `RetrievalProfile`.
-- **MaxSim** (`src/query/rerank.rs`, `src/query/annotation.rs`). Score admitted
-  whole units and exact excerpts using persisted matrices. Each excerpt takes
-  the best source or matched-annotation MaxSim score, never their sum. Queries
-  embed the query only; document matrices are loaded in bounded buffers.
-- **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked units and excerpts,
-  construct same-section passages in canonical reading order, bounded by
-  `passage_max_tokens` and `max_passage_units`. Merge overlapping passages when they
-  fit; preserve structured-content boundaries and retrieved source ranges.
+- **MaxSim** (`src/query/rerank.rs`, `src/query/annotation.rs`). MaxSim keys
+  are ColBERT window ids: fused chunk hits map to the windows that contain
+  their chunks, graph and annotation hits map to windows through shared
+  fine-chunk membership, and exact-window annotation matches key by context
+  window and map to ColBERT windows the same way. Each candidate takes the best
+  source or matched-annotation MaxSim score, never their sum. Queries embed the
+  query only; document matrices are loaded in bounded buffers from
+  `colbert_windows`.
+- **Passages** (`src/query/passages.rs`). Starting from MaxSim-ranked windows
+  and exact excerpts, build passages from window fragments in canonical reading
+  order, bounded by `passage_max_tokens` and `max_passage_units`. Merge
+  overlapping passages when they fit; preserve structured-content boundaries
+  and retrieved source ranges.
   Candidate IDs describe source ranges separately from canonical anchor IDs.
-  Legacy oversized whole-unit prefixes carry `truncated: true`; exact retrieved
-  windows remain complete and raw evidence retains full canonical bodies.
+  A passage clipped by the passage caps carries `truncated: true`; raw
+  evidence retains full canonical bodies.
 - **Reranker** (`src/query/rerank.rs`). Scores `reranker_candidate_pool_size`
-  passages (shipped value: 100), raised for larger valid result requests within
+  passages, raised for larger valid result requests within
   the ColBERT pool cap, with source text, headings, and separately labeled
   matched annotation/graph context. Graph context has no separate token cutoff;
   the reranker enforces its total input capacity through the
@@ -934,7 +1000,7 @@ only when requested with `debug: true` (`POST /query`).
 `queryExecutionRecordId` is **omitted** — a recorded narrowing pending the QER
 audit tier (Section 9), addable additively. `QueryStageLatencies` records
 per-stage timings, including passage construction and the duration the WAL read
-snapshot was held. Diagnostics retain `channelHits`, `fusedPool`, whole-unit
+snapshot was held. Diagnostics retain `channelHits`, `fusedPool`, window-keyed
 `maxsim`, exact-window `annotationMaxsim`, `passageCandidates`, and `reranked`.
 
 ## 7. Health and admission internals
@@ -1035,8 +1101,8 @@ holds the three selected retrieval backends and an optional local accelerator:
   endpoint with `task = token_embed`. Both use the same local formatting and
   tokenization contract. The HTTP backend loads a matching `tokenizer.json` but
   no local model weights, validates indexed 128-dimensional token matrices, and
-  normalizes their rows. Document matrices are persisted in
-  `unit_multivector_projections`. With the HTTP backend, queries embed only the
+  normalizes their rows. Document matrices are persisted per ColBERT window in
+  `colbert_windows`. With the HTTP backend, queries embed only the
   query and perform MaxSim against stored matrices on the CPU; startup checks
   batched remote embedding and CPU scoring. Backend selection is exclusive,
   with no fallback or implicit HTTP retry.
@@ -1046,11 +1112,13 @@ holds the three selected retrieval backends and an optional local accelerator:
   Exactly one instance exists and the variants are **exclusive — there is no
   cross-backend fallback**.
 
-`models.*.max_tokens` declares model capacity; indexing windows and ColBERT
-query/document limits are separate. HTTP initialization checks the configured
-capacity against `/v1/models`; requests disable server-side truncation and expose
-overlength rejections. Existing local-model prefix allocation and ColBERT token-ID
-prefix handling remain unchanged. Annotation representations use complete windows.
+`models.*.max_tokens` declares model capacity; the `[indexing]` grain caps and
+ColBERT query/document limits are separate. Startup requires
+`indexing.colbert_max_tokens` to equal the ColBERT document limit and a context
+window plus its section-path prefix budget to fit the dense and reranker
+capacities. HTTP initialization checks the configured capacity against
+`/v1/models`; requests disable server-side truncation and expose overlength
+rejections. Annotation representations use complete context windows.
 
 **Accelerator initialization is conditional.** If any retrieval backend is local,
 `[inference]` selects its CUDA or Metal device and the binary must include the
@@ -1094,8 +1162,8 @@ completed/failed logs.
 on scoped OS threads while keeping **every SQLite write serial on the owning
 thread** (rusqlite `Transaction`/`Connection` is not `Sync`, and the atomicity
 contract requires one writer). The dense builder (`src/projections/dense.rs`)
-packs `models.dense.http_batch_size` passage windows and dispatches up to
-`models.dense.http_concurrent_requests` at a time; all windows join, then vectors
+packs `models.dense.http_batch_size` fine chunks and dispatches up to
+`models.dense.http_concurrent_requests` at a time; all batches join, then vectors
 persist serially in chunk order, byte-identical to the local path. Honest
 caveat, documented in `dense.rs`: because the builder runs on the **caller's**
 transaction, the scheduler's `projection_build` writer lock is held **across the
@@ -1171,7 +1239,7 @@ Post-MVP Horizon (plan §5) holds the seams already built for each.
   scan was measured infeasible on the target corpus/hardware. ColBERT MaxSim is
   therefore retained only as a **rerank/scoring stage over the already-fused
   pool**, not as a candidate-generation channel. The C6e token matrices are still
-  built and persisted (`unit_multivector_projections`), so the future channel is
+  built and persisted (`colbert_windows`), so the future channel is
   an index-push path plus a channel client with no re-embedding.
 
 - **Guarantee-4 gap (accepted).** The annotation producers make external

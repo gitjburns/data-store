@@ -805,6 +805,7 @@ async fn run_http_service(
                     annotation_index_root,
                     annotation_annotator,
                     annotation_config_root,
+                    state.config.models.dense.dimension as usize,
                     Arc::clone(&shutdown_signal),
                     Arc::clone(&maintenance),
                     annotation_health,
@@ -1279,6 +1280,7 @@ async fn run_annotation_dry_run_mode(
         governance_domain: config.connectors.filesystem.governance_domain.clone(),
         annotator: config.models.annotator.clone(),
         config_root: config.config_root().to_path_buf(),
+        dense_dimension: config.models.dense.dimension as usize,
         groups_per_source,
     };
 

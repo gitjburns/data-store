@@ -30,7 +30,7 @@
 //!
 //! NO MODEL CALL ANYWHERE IN THIS MODULE (§38, hard invariant). The deletion
 //! gate's rebuild check RE-IMPORTS archived bytes and RE-DERIVES from archived
-//! rows; it never re-embeds, re-parses, or re-scores. Dense/multivector vectors
+//! rows; it never re-embeds, re-parses, or re-scores. Dense/ColBERT-window vectors
 //! are byte-reproducible only from their stored blobs (§31.3), so they are
 //! decoded via `primitives::codec` and compared, not regenerated. A grep for
 //! `embed|InferenceRuntime|score_` over this file must stay empty.
@@ -60,12 +60,13 @@ use crate::model::{
     SemanticAnnotation, SemanticAnnotationType, SnapshotArtifactRef,
 };
 use crate::projections::ChunkerConfig;
+use crate::projections::chunk::{Fragment, ordered_unit_ids};
 use crate::projections::graph::{CapturedGraph, DerivedEdge};
 use crate::projections::section_dense::{
     SECTION_DENSE_INDEX_NAME, SectionDensePlane, read_section_payload,
 };
 use crate::projections::{annotation, annotation_io};
-use crate::query::provenance::{AnnotationRepresentation, SourceExcerpt};
+use crate::query::provenance::AnnotationRepresentation;
 use crate::util::hash_prefix;
 
 /// Log-event namespace for this module's verification boundary logs, so every
@@ -319,36 +320,57 @@ struct ArchivedAnnotationEnvelope {
     deleted_at: Option<String>,
 }
 
-/// A provenance target remains exact even when a later cohort uses a finer range.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct ExpectedAnnotationTarget {
-    unit_id: String,
-    range: Option<SourceExcerpt>,
-}
-
 /// Compact expectations are merged across historical and current publications.
+/// `cohorts` names every cohort window the annotation was published under; the
+/// archived annotation must intersect each of them (`ExpectedCohortWindows`).
 struct ExpectedAnnotationInput {
     source_id: String,
     parse_id: String,
     fingerprint: String,
     representation: AnnotationRepresentation,
     require_fresh: bool,
-    targets: BTreeSet<ExpectedAnnotationTarget>,
+    cohorts: BTreeSet<String>,
     nonempty: bool,
     windows: BTreeSet<ExpectedTextWindow>,
     full_text_lengths: BTreeSet<usize>,
     combined_inputs: Vec<usize>,
 }
 
-/// Source verification retains hashes and scalar offsets instead of source bodies.
+/// Cohort window fragments keyed by cohort id, retained past each manifest so
+/// the streamed annotation pass can apply the producer's membership rule.
+/// Historical versions of one cohort must agree on the window.
+type ExpectedCohortWindows = BTreeMap<String, Vec<Fragment>>;
+
+/// Source verification retains hashes and scalar offsets instead of source
+/// bodies: one hashed range per window fragment on the unit it cites.
 struct ExpectedSourceInput {
     source_id: String,
     parse_id: String,
-    ranges: BTreeSet<SourceExcerpt>,
-    whole_unit_lengths: BTreeSet<usize>,
+    ranges: BTreeSet<ExpectedTextWindow>,
 }
 
-/// Model-input windows are verified by scalar offsets and exact-byte hashes.
+/// One archived `chunk_projections` row's window-membership fields, retained
+/// only for parses that publish annotation cohorts. Cohort windows are checked
+/// against these rows, not against the manifest's own copy of the layout.
+#[derive(serde::Deserialize)]
+struct ArchivedChunkMember {
+    id: String,
+    parse_id: String,
+    chunk_index: u64,
+    fragments_json: String,
+}
+
+/// Decoded membership of one archived chunk: its reading-order index and
+/// fragments, the two facts a cohort window is verified against.
+struct ChunkMember {
+    parse_id: String,
+    chunk_index: u64,
+    fragments: Vec<Fragment>,
+}
+
+/// A hashed scalar range of some text. Model-input windows are verified this
+/// way against rendered annotation text; cohort window fragments the same way
+/// against canonical unit text.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct ExpectedTextWindow {
     start_char: usize,
@@ -462,10 +484,23 @@ pub(crate) fn verified_annotation_publications(
     let mut fresh_cohorts = BTreeSet::new();
     let mut used_blobs = BTreeSet::new();
     let mut checked_shapes = BTreeSet::new();
+    let mut expected_windows = ExpectedCohortWindows::new();
+    // Cohort windows are verified against archived chunk rows while each
+    // manifest is resident, so the rows stream first, scoped by the envelopes'
+    // parse ids to the parses that publish cohorts.
+    let publishing_parses: BTreeSet<&str> = by_payload
+        .values()
+        .flatten()
+        .map(|row| row.parse_id.as_str())
+        .collect();
+    let chunks = collect_chunk_members(store, snapshot_id, manifest, &publishing_parses)?;
     for (hash, rows) in by_payload {
         let reference = manifest_refs.get(&hash).ok_or_else(|| {
             annotation_snapshot_failure(snapshot_id, "missing annotation manifest reference")
         })?;
+        // `read_manifest` applies `annotation::validate_manifest`: identities,
+        // source-window partition of the canonical text, its hash against the
+        // window hash, and coalesced fragment coverage of the window fragments.
         let publication = annotation::read_manifest(store, &reference.uri).map_err(|source| {
             annotation_snapshot_failure(
                 snapshot_id,
@@ -478,6 +513,8 @@ pub(crate) fn verified_annotation_publications(
             snapshot_id,
             &publication,
             require_fresh,
+            &chunks,
+            &mut expected_windows,
             &mut expected_annotations,
             &mut expected_sources,
             &mut expected_combined,
@@ -534,6 +571,7 @@ pub(crate) fn verified_annotation_publications(
         store,
         snapshot_id,
         manifest,
+        &expected_windows,
         expected_annotations,
         expected_combined,
     )?;
@@ -541,12 +579,59 @@ pub(crate) fn verified_annotation_publications(
     Ok(result)
 }
 
+/// Stream the archived `chunk_projections` once, decoding membership only for
+/// rows of the given parses. Every retained row is keyed by chunk id; a
+/// repeated id is a malformed archive, not a later version.
+fn collect_chunk_members(
+    store: &ArtifactStore,
+    snapshot_id: &str,
+    manifest: &ForensicSnapshotManifest,
+    parse_ids: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, ChunkMember>, ApiError> {
+    let mut chunks = BTreeMap::new();
+    visit_annotation_archive::<ArchivedChunkMember>(
+        store,
+        snapshot_id,
+        manifest,
+        "chunk_projections",
+        |row| {
+            if !parse_ids.contains(row.parse_id.as_str()) {
+                return Ok(());
+            }
+            let fragments = serde_json::from_str(&row.fragments_json).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("archived chunk {} fragments: {source}", row.id),
+                )
+            })?;
+            let member = ChunkMember {
+                parse_id: row.parse_id,
+                chunk_index: row.chunk_index,
+                fragments,
+            };
+            if chunks.insert(row.id.clone(), member).is_some() {
+                return Err(annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("duplicate archived chunk {}", row.id),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(chunks)
+}
+
 /// Reduce one bounded manifest to fingerprint and window-hash expectations. Its
 /// annotation-ID order is also the stream order used to hash combined inputs.
+/// The cohort window is bound to the archived chunk rows here, and each window
+/// fragment becomes a hashed range on its unit for the source pass.
+#[allow(clippy::too_many_arguments)] // one call site; the maps are the pass's accumulators
 fn collect_annotation_expectations(
     snapshot_id: &str,
     publication: &annotation::AnnotationProjection,
     require_fresh: bool,
+    chunks: &BTreeMap<String, ChunkMember>,
+    cohort_windows: &mut ExpectedCohortWindows,
     annotations: &mut BTreeMap<String, ExpectedAnnotationInput>,
     sources: &mut BTreeMap<String, ExpectedSourceInput>,
     combined_inputs: &mut Vec<ExpectedCombinedInput>,
@@ -562,28 +647,22 @@ fn collect_annotation_expectations(
             "annotation manifest inputs are not in producer order",
         ));
     }
-    let source = sources
-        .entry(plan.target.unit_id.clone())
-        .or_insert_with(|| ExpectedSourceInput {
-            source_id: plan.source_id.clone(),
-            parse_id: plan.parse_id.clone(),
-            ranges: BTreeSet::new(),
-            whole_unit_lengths: BTreeSet::new(),
-        });
-    if source.source_id != plan.source_id || source.parse_id != plan.parse_id {
-        return Err(annotation_snapshot_failure(
-            snapshot_id,
-            "annotation manifests disagree on canonical unit ownership",
-        ));
-    }
-    let target_range = plan.target.range.as_ref().map(|range| SourceExcerpt {
-        unit_id: plan.target.unit_id.clone(),
-        start_char: range.start_char,
-        end_char: range.end_char,
-        text_hash: range.text_hash.clone(),
-    });
-    if let Some(range) = &target_range {
-        source.ranges.insert(range.clone());
+    let layout = verify_window_members(snapshot_id, plan, chunks)?;
+    match cohort_windows.get(&plan.cohort_id) {
+        Some(fragments) if *fragments != plan.target.fragments => {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!(
+                    "publications disagree on cohort window {}",
+                    plan.target.window_id
+                ),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            // Retained past this manifest for the streamed annotation pass.
+            cohort_windows.insert(plan.cohort_id.clone(), plan.target.fragments.clone());
+        }
     }
     let mut groups: BTreeMap<
         (AnnotationRepresentation, Vec<String>),
@@ -603,22 +682,6 @@ fn collect_annotation_expectations(
         }
         dimensions = Some(shape);
         let input = &representation.input;
-        if let Some(excerpt) = &input.source_excerpt {
-            let base = plan
-                .target
-                .range
-                .as_ref()
-                .map_or(0, |range| range.start_char);
-            if base.checked_add(input.input_start_char) != Some(excerpt.start_char)
-                || base.checked_add(input.input_end_char) != Some(excerpt.end_char)
-            {
-                return Err(annotation_snapshot_failure(
-                    snapshot_id,
-                    "source window model-input and canonical offsets disagree",
-                ));
-            }
-            source.ranges.insert(excerpt.clone());
-        }
         groups
             .entry((input.representation, input.annotation_ids.clone()))
             .or_default()
@@ -626,6 +689,10 @@ fn collect_annotation_expectations(
     }
     let mut individual = BTreeMap::new();
     let mut combined = None;
+    // The window's canonical text, rebuilt from its source windows in order;
+    // resident only while this manifest is, then reduced to fragment hashes.
+    let mut canonical = String::new();
+    let mut canonical_length = None;
     for ((kind, ids), mut windows) in groups {
         windows.sort_by_key(|window| window.input_start_char);
         let mut next = 0;
@@ -638,6 +705,9 @@ fn collect_annotation_expectations(
                 ));
             }
             next = window.input_end_char;
+            if kind == AnnotationRepresentation::Source {
+                canonical.push_str(&window.text);
+            }
             expected_windows.push(ExpectedTextWindow {
                 start_char: window.input_start_char,
                 end_char: window.input_end_char,
@@ -646,8 +716,11 @@ fn collect_annotation_expectations(
         }
         match kind {
             AnnotationRepresentation::Source => {
-                if plan.target.range.is_none() {
-                    source.whole_unit_lengths.insert(next);
+                if canonical_length.replace(next).is_some() {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        "annotation manifest has more than one source window set",
+                    ));
                 }
             }
             AnnotationRepresentation::Combined => {
@@ -677,6 +750,51 @@ fn collect_annotation_expectations(
             }
         }
     }
+    // Coverage invariant: the window fragments laid out per the chunker's join
+    // rule span exactly the canonical text, so every fragment's slice of that
+    // text is the slice the unit's evidence text must reproduce. The hash of
+    // each slice is what the source pass checks against the archived unit.
+    let layout_length = layout.last().map(|span| span.1);
+    if layout_length.is_none() || canonical_length != layout_length {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!(
+                "cohort window {} canonical text length disagrees with its fragment layout",
+                plan.target.window_id
+            ),
+        ));
+    }
+    for (fragment, (start_char, end_char)) in plan.target.fragments.iter().zip(&layout) {
+        let source =
+            sources
+                .entry(fragment.unit_id.clone())
+                .or_insert_with(|| ExpectedSourceInput {
+                    source_id: plan.source_id.clone(),
+                    parse_id: plan.parse_id.clone(),
+                    ranges: BTreeSet::new(),
+                });
+        if source.source_id != plan.source_id || source.parse_id != plan.parse_id {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                "annotation manifests disagree on canonical unit ownership",
+            ));
+        }
+        let slice =
+            annotation::slice_chars(&canonical, *start_char, *end_char).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!(
+                        "cohort window {} fragment layout: {source}",
+                        plan.target.window_id
+                    ),
+                )
+            })?;
+        source.ranges.insert(ExpectedTextWindow {
+            start_char: fragment.start_char,
+            end_char: fragment.end_char,
+            text_hash: crate::canonical::sha256_hex_bytes(slice.as_bytes()),
+        });
+    }
     let mut nonempty_ids = Vec::new();
     for signature in &plan.inputs {
         let detail = individual.remove(&signature.annotation_id);
@@ -689,7 +807,7 @@ fn collect_annotation_expectations(
                 fingerprint: signature.fingerprint.clone(),
                 representation: signature.representation,
                 require_fresh,
-                targets: BTreeSet::new(),
+                cohorts: BTreeSet::new(),
                 nonempty,
                 windows: BTreeSet::new(),
                 full_text_lengths: BTreeSet::new(),
@@ -710,10 +828,7 @@ fn collect_annotation_expectations(
             ));
         }
         expected.require_fresh |= require_fresh;
-        expected.targets.insert(ExpectedAnnotationTarget {
-            unit_id: plan.target.unit_id.clone(),
-            range: target_range.clone(),
-        });
+        expected.cohorts.insert(plan.cohort_id.clone());
         if let Some((kind, windows, length)) = detail {
             if kind != signature.representation {
                 return Err(annotation_snapshot_failure(
@@ -762,6 +877,70 @@ fn collect_annotation_expectations(
         }
     }
     Ok(())
+}
+
+/// Bind a cohort window to the archived chunk rows it names: every member
+/// exists in the plan's parse, members carry consecutive `chunk_index`, and the
+/// window's fragments are the members' fragments concatenated in that order.
+/// Returns each window fragment's `[start, end)` span in the canonical text
+/// under the chunker's layout: fragments of one member joined by one tab,
+/// members by one blank line (`chunk::join_text`).
+fn verify_window_members(
+    snapshot_id: &str,
+    plan: &annotation::CohortPlan,
+    chunks: &BTreeMap<String, ChunkMember>,
+) -> Result<Vec<(usize, usize)>, ApiError> {
+    let window_id = &plan.target.window_id;
+    let mut layout = Vec::with_capacity(plan.target.fragments.len());
+    let mut rebuilt: Vec<&Fragment> = Vec::with_capacity(plan.target.fragments.len());
+    let mut next_index = None;
+    let mut offset = 0_usize;
+    for chunk_id in &plan.target.chunk_ids {
+        let member = chunks
+            .get(chunk_id)
+            .filter(|member| member.parse_id == plan.parse_id)
+            .ok_or_else(|| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("cohort window {window_id} member chunk {chunk_id} is not archived for its parse"),
+                )
+            })?;
+        if next_index.is_some_and(|expected| expected != Some(member.chunk_index)) {
+            return Err(annotation_snapshot_failure(
+                snapshot_id,
+                format!("cohort window {window_id} members are not consecutive chunks"),
+            ));
+        }
+        next_index = Some(member.chunk_index.checked_add(1));
+        if !rebuilt.is_empty() {
+            offset += 2;
+        }
+        for (index, fragment) in member.fragments.iter().enumerate() {
+            if index > 0 {
+                offset += 1;
+            }
+            let end_char = fragment
+                .end_char
+                .checked_sub(fragment.start_char)
+                .and_then(|length| offset.checked_add(length))
+                .ok_or_else(|| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("archived chunk {chunk_id} has an inverted fragment range"),
+                    )
+                })?;
+            layout.push((offset, end_char));
+            rebuilt.push(fragment);
+            offset = end_char;
+        }
+    }
+    if !rebuilt.iter().copied().eq(plan.target.fragments.iter()) {
+        return Err(annotation_snapshot_failure(
+            snapshot_id,
+            format!("cohort window {window_id} fragments differ from its archived member chunks"),
+        ));
+    }
+    Ok(layout)
 }
 
 /// Streamed SQLite annotation columns are decoded into the shared semantic model
@@ -823,12 +1002,13 @@ impl ArchivedAnnotationInput {
     }
 }
 
-/// Verify fingerprints, provenance targets, and framed model inputs in one
-/// annotation pass. Combined windows receive only streaming digest updates.
+/// Verify fingerprints, cohort window membership, and framed model inputs in
+/// one annotation pass. Combined windows receive only streaming digest updates.
 fn verify_archived_annotation_inputs(
     store: &ArtifactStore,
     snapshot_id: &str,
     manifest: &ForensicSnapshotManifest,
+    cohort_windows: &ExpectedCohortWindows,
     mut expected: BTreeMap<String, ExpectedAnnotationInput>,
     mut combined: Vec<ExpectedCombinedInput>,
 ) -> Result<(), ApiError> {
@@ -871,8 +1051,25 @@ fn verify_archived_annotation_inputs(
                     ),
                 ));
             }
-            for target in &input.targets {
-                verify_annotation_target(snapshot_id, &annotation, target)?;
+            // Membership invariant, as the producer's `current_inputs` applies
+            // it: the annotation's attributed `inputRefs` intersect the window
+            // fragments of every cohort that published it.
+            for cohort_id in &input.cohorts {
+                let fragments = cohort_windows.get(cohort_id).ok_or_else(|| {
+                    annotation_snapshot_failure(
+                        snapshot_id,
+                        format!("cohort {cohort_id} window expectation is missing"),
+                    )
+                })?;
+                if !annotation::intersects_window(&annotation, fragments) {
+                    return Err(annotation_snapshot_failure(
+                        snapshot_id,
+                        format!(
+                            "annotation {} does not intersect the window of cohort {cohort_id}",
+                            annotation.id
+                        ),
+                    ));
+                }
             }
             let rendered = annotation::render_annotation(&annotation).map_err(|source| {
                 annotation_snapshot_failure(
@@ -966,45 +1163,6 @@ fn verify_archived_annotation_inputs(
     Ok(())
 }
 
-/// Match the producer's range-discovery rule, including old whole-unit inputs
-/// whose provenance contained no reference for the target unit.
-fn verify_annotation_target(
-    snapshot_id: &str,
-    annotation: &SemanticAnnotation,
-    expected: &ExpectedAnnotationTarget,
-) -> Result<(), ApiError> {
-    let refs: Vec<_> = annotation
-        .provenance
-        .input_refs
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|input| input.id == expected.unit_id)
-        .collect();
-    let matches_range = refs
-        .iter()
-        .any(|input| match (&input.text_range, &expected.range) {
-            (None, None) => true,
-            (Some(actual), Some(expected)) => {
-                actual.start_char == expected.start_char
-                    && actual.end_char == expected.end_char
-                    && actual.text_hash == expected.text_hash
-            }
-            _ => false,
-        })
-        || (refs.is_empty() && expected.range.is_none());
-    if !annotation.target_unit_ids.contains(&expected.unit_id) || !matches_range {
-        return Err(annotation_snapshot_failure(
-            snapshot_id,
-            format!(
-                "annotation {} does not declare the manifest target/range on {}",
-                annotation.id, expected.unit_id
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Hash only window intersections with the next rendered fragment. Completed
 /// windows are skipped thereafter, so verification does not rescan prior text.
 fn feed_combined_window_hashes(
@@ -1065,8 +1223,9 @@ struct ArchivedSourceIdentity {
     id: String,
 }
 
-/// Check exact canonical text hashes and complete whole-unit coverage, then
-/// confirm parse/source bindings without retaining source contents between rows.
+/// Check that every window fragment's slice of the archived unit's evidence
+/// text hashes as the manifest's canonical text says, then confirm
+/// parse/source bindings without retaining source contents between rows.
 fn verify_archived_annotation_sources(
     store: &ArtifactStore,
     snapshot_id: &str,
@@ -1133,20 +1292,6 @@ fn verify_archived_annotation_sources(
                         ),
                     )
                 })?;
-            let length = text.chars().count();
-            if input
-                .whole_unit_lengths
-                .iter()
-                .any(|expected_length| *expected_length != length)
-            {
-                return Err(annotation_snapshot_failure(
-                    snapshot_id,
-                    format!(
-                        "whole-unit annotation source {} is not completely covered by its windows",
-                        row.id
-                    ),
-                ));
-            }
             for range in input.ranges {
                 let slice = annotation::slice_chars(&text, range.start_char, range.end_char)
                     .map_err(|source| {
@@ -1159,7 +1304,7 @@ fn verify_archived_annotation_sources(
                     return Err(annotation_snapshot_failure(
                         snapshot_id,
                         format!(
-                            "annotation source window hash differs from canonical unit {}",
+                            "cohort window fragment text differs from canonical unit {}",
                             row.id
                         ),
                     ));
@@ -1372,7 +1517,7 @@ fn verify_annotation_envelope_pair(
                 .iter()
                 .map(String::as_str)
                 .eq(plan.inputs.iter().map(|input| input.annotation_id.as_str()))
-            || units.as_slice() != std::slice::from_ref(&plan.target.unit_id)
+            || units != ordered_unit_ids(&plan.target.fragments)
             || crate::canonical::canonical_json_bytes_of(&producer)? != expected_producer
         {
             return Err(annotation_snapshot_failure(
@@ -1703,16 +1848,16 @@ fn archived_unit_owners(
 }
 
 /// Cross-check immutable section payloads against their archived envelopes and
-/// canonical ownership without opening or modifying the live database. Unfinished
-/// incoming parses need no section payload until they own a completed dense plane.
+/// the archived chunk rows they are runs of, without opening or modifying the
+/// live database. Unfinished incoming parses need no section payload until
+/// they own a completed dense plane.
 pub(crate) fn verified_section_planes(
     store: &ArtifactStore,
     snapshot: &ForensicSnapshot,
     manifest: &ForensicSnapshotManifest,
 ) -> Result<Vec<(String, SectionDensePlane)>, ApiError> {
     let envelopes = load_archived_jsonl(store, snapshot, manifest, "retrieval_projections")?;
-    let units = load_archived_jsonl(store, snapshot, manifest, "content_units")?;
-    let relationships = load_archived_jsonl(store, snapshot, manifest, "unit_relationships")?;
+    let chunks = load_archived_jsonl(store, snapshot, manifest, "chunk_projections")?;
     let mut refs = BTreeMap::new();
     for artifact in &manifest.retrieval_indexes {
         if artifact.artifact_type != super::SECTION_DENSE_PAYLOAD_TYPE {
@@ -1839,12 +1984,7 @@ pub(crate) fn verified_section_planes(
                 snapshot.id
             )));
         }
-        crate::projections::section_dense::validate_archived_plane(
-            &units,
-            &relationships,
-            &plane,
-            store.limits(),
-        )?;
+        crate::projections::section_dense::validate_archived_plane(&chunks, &plane)?;
         if completed {
             completed_section_parses.insert(parse_id);
         }
@@ -2287,7 +2427,7 @@ fn manifest_ref_sections(
 /// or the exact frozen v1 identity for snapshots predating descriptors.
 ///
 /// DELIBERATELY NOT CHECKED: this does NOT re-run the chunker's text splitter.
-/// `chunk.rs::split_units_into_chunks` requires a caller-supplied ColBERT
+/// `chunk.rs::pack_members` requires a caller-supplied ColBERT
 /// `Tokenizer` (a model runtime handle), and §38 forbids any model call here.
 /// The deterministic-rebuild guarantee is instead established by (a) proving the
 /// archived and live chunk sets agree byte-for-byte on the deterministic
@@ -2349,7 +2489,7 @@ fn verify_chunk_plane(
             if archived != hot {
                 return Err(verification_failure(format!(
                     "snapshot {}: chunk {} archived/hot mismatch on a deterministic field \
-                     (input_unit_ids, targeting_text, or chunker_config_hash)",
+                     (input_unit_ids, targeting_text, fragments, section_path, or chunker_config_hash)",
                     snapshot.id, id
                 )));
             }
@@ -2445,12 +2585,16 @@ fn verify_dense_plane(
     Ok(compared)
 }
 
-/// MULTIVECTOR PLANE (§30.5). RE-IMPORTS the archived ColBERT matrix blobs and
-/// compares them byte-and-value against the live `unit_multivector_projections`
-/// rows for the subject parse — never re-embeds (§38). Same re-import shape as
-/// the dense plane, decoded via
+/// COLBERT WINDOW PLANE (§30.5). RE-IMPORTS the archived ColBERT window matrix
+/// blobs and compares them byte-and-value against the live `colbert_windows`
+/// rows for the subject parse — never re-embeds (§38). Rows are keyed by `id`;
+/// the window's reading-order position and membership (`window_index`,
+/// `chunk_ids_json`, `fragments_json`) are compared alongside the shape
+/// columns and the matrix decoded via
 /// `primitives::codec::decode_colbert_document_vector_blob` under the row's
-/// recorded (token_count, dimension).
+/// recorded (token_count, dimension). Membership is compared as archived, not
+/// re-derived from `chunk_projections`: the archived record is the row the
+/// builder wrote, so any drift between archive and hot plane is a verdict.
 fn verify_multivector_plane(
     store: &ArtifactStore,
     connection: &Connection,
@@ -2458,90 +2602,96 @@ fn verify_multivector_plane(
     manifest: &ForensicSnapshotManifest,
     subject_parse_id: &str,
 ) -> Result<usize, ApiError> {
-    let metadata = load_archived_jsonl(
-        store,
-        snapshot,
-        manifest,
-        "unit_multivector_projections_metadata",
-    )?;
-    let plane = ArchivedBlobPlane::open(store, manifest, "multivector_blob", "matrix_blob")
+    const PLANE: &str = "colbert_windows_metadata";
+    let metadata = load_archived_jsonl(store, snapshot, manifest, PLANE)?;
+    let plane = ArchivedBlobPlane::open(store, manifest, "colbert_window_blob", "matrix_blob")
         .map_err(|message| verification_failure(format!("snapshot {}: {message}", snapshot.id)))?;
 
     // Counts only the subject-parse rows actually compared. Manifests minted
     // before per-subject scoping archived the whole corpus, so the filter stays.
     let mut compared = 0usize;
     for record in &metadata {
-        let object = as_object(record, snapshot, "unit_multivector_projections_metadata")?;
+        let object = as_object(record, snapshot, PLANE)?;
         if json_str(object, "parse_id") != Some(subject_parse_id) {
             continue;
         }
-        let row_id = required_str(
-            object,
-            "id",
+        let row_id = required_str(object, "id", snapshot, PLANE)?;
+        let window_index = required_u64(object, "window_index", snapshot, PLANE)?;
+        let chunk_ids = decode_json_string_array(
+            required_str(object, "chunk_ids_json", snapshot, PLANE)?.as_str(),
             snapshot,
-            "unit_multivector_projections_metadata",
+            "colbert_windows.chunk_ids_json",
         )?;
-        let unit_id = required_str(
-            object,
-            "unit_id",
+        let fragments: Vec<Fragment> = decode_json_array(
+            required_str(object, "fragments_json", snapshot, PLANE)?.as_str(),
             snapshot,
-            "unit_multivector_projections_metadata",
+            "colbert_windows.fragments_json",
         )?;
-        let token_count = required_u64(
-            object,
-            "token_count",
-            snapshot,
-            "unit_multivector_projections_metadata",
-        )? as usize;
-        let dimension = required_u64(
-            object,
-            "dimension",
-            snapshot,
-            "unit_multivector_projections_metadata",
-        )? as usize;
+        let token_count = required_u64(object, "token_count", snapshot, PLANE)? as usize;
+        let dimension = required_u64(object, "dimension", snapshot, PLANE)? as usize;
 
         let archived_blob = plane.bytes_for(store, object).map_err(|message| {
             verification_failure(format!(
-                "snapshot {}: multivector row {row_id}: {message}",
+                "snapshot {}: ColBERT window row {row_id}: {message}",
                 snapshot.id
             ))
         })?;
-        let (hot_token_count, hot_dimension, hot_blob) =
-            load_hot_multivector_row(connection, snapshot, &row_id)?;
+        let hot = load_hot_multivector_row(connection, snapshot, &row_id)?;
 
-        if (hot_token_count, hot_dimension) != (token_count, dimension) {
+        // Membership and position first (cheapest exact checks), then shape,
+        // bytes, and finally the decoded matrices.
+        if hot.window_index != window_index {
             return Err(verification_failure(format!(
-                "snapshot {}: multivector row {} archived shape ({token_count},{dimension}) != \
-                 hot shape ({hot_token_count},{hot_dimension})",
+                "snapshot {}: ColBERT window row {} archived window_index {} != hot window_index {}",
+                snapshot.id, row_id, window_index, hot.window_index
+            )));
+        }
+        if hot.chunk_ids != chunk_ids {
+            return Err(verification_failure(format!(
+                "snapshot {}: ColBERT window row {} member chunk ids differ between archive and hot plane",
                 snapshot.id, row_id
             )));
         }
-        if archived_blob != hot_blob {
+        if hot.fragments != fragments {
             return Err(verification_failure(format!(
-                "snapshot {}: multivector bytes for row {} differ between archive and hot plane",
+                "snapshot {}: ColBERT window row {} fragments differ between archive and hot plane",
                 snapshot.id, row_id
             )));
         }
-        // Decode both (validates the matrices too) and value-compare.
+        if (hot.token_count, hot.dimension) != (token_count, dimension) {
+            return Err(verification_failure(format!(
+                "snapshot {}: ColBERT window row {} archived shape ({token_count},{dimension}) != \
+                 hot shape ({},{})",
+                snapshot.id, row_id, hot.token_count, hot.dimension
+            )));
+        }
+        if archived_blob != hot.matrix_blob {
+            return Err(verification_failure(format!(
+                "snapshot {}: ColBERT window bytes for row {} differ between archive and hot plane",
+                snapshot.id, row_id
+            )));
+        }
+        // Decode both (validates the matrices too) and value-compare. The
+        // codec's label argument only names the row in decode errors.
         let archived_matrix = crate::primitives::codec::decode_colbert_document_vector_blob(
-            &unit_id,
+            &row_id,
             &archived_blob,
             token_count,
             dimension,
             dimension,
         )
-        .map_err(|message| decode_failure(snapshot, "multivector", &row_id, &message))?;
+        .map_err(|message| decode_failure(snapshot, "ColBERT window", &row_id, &message))?;
         let hot_matrix = crate::primitives::codec::decode_colbert_document_vector_blob(
-            &unit_id,
-            &hot_blob,
-            hot_token_count,
-            hot_dimension,
+            &row_id,
+            &hot.matrix_blob,
+            hot.token_count,
+            hot.dimension,
             dimension,
         )
-        .map_err(|message| decode_failure(snapshot, "multivector", &row_id, &message))?;
+        .map_err(|message| decode_failure(snapshot, "ColBERT window", &row_id, &message))?;
         if archived_matrix != hot_matrix {
             return Err(verification_failure(format!(
-                "snapshot {}: multivector values for row {} differ after decode",
+                "snapshot {}: ColBERT window values for row {} differ after decode",
                 snapshot.id, row_id
             )));
         }
@@ -2648,14 +2798,19 @@ fn verify_lexical_plane(_snapshot: &ForensicSnapshot) -> Result<(), ApiError> {
 // ---------------------------------------------------------------------------
 
 /// The deterministic comparison projection of one chunk row (archived or hot):
-/// the fields `chunk.rs` derives deterministically. `PartialEq` is the whole
-/// archived-vs-hot equality the chunk sub-check rests on.
+/// the fields `chunk.rs` derives deterministically, including the membership
+/// fragments, the section path, and the reading-order `chunk_index`.
+/// `PartialEq` is the whole archived-vs-hot equality the chunk sub-check rests
+/// on.
 #[derive(Debug, PartialEq, Eq)]
 struct ChunkComparison {
     id: String,
     input_unit_ids: Vec<String>,
     targeting_text: String,
     chunker_config_hash: String,
+    fragments: Vec<Fragment>,
+    section_path: Vec<String>,
+    chunk_index: u64,
 }
 
 /// Project one archived `chunk_projections` JSON record into its deterministic
@@ -2675,11 +2830,35 @@ fn chunk_comparison(
     let targeting_text = required_str(object, "targeting_text", snapshot, "chunk_projections")?;
     let chunker_config_hash =
         required_str(object, "chunker_config_hash", snapshot, "chunk_projections")?;
+    let fragments = decode_json_array(
+        required_str(object, "fragments_json", snapshot, "chunk_projections")?.as_str(),
+        snapshot,
+        "chunk_projections.fragments_json",
+    )?;
+    let section_path = decode_json_array(
+        required_str(object, "section_path_json", snapshot, "chunk_projections")?.as_str(),
+        snapshot,
+        "chunk_projections.section_path_json",
+    )?;
+    // INTEGER columns archive as JSON numbers; a missing or negative index is
+    // a malformed record, not an absent optional field.
+    let chunk_index = object
+        .get("chunk_index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            verification_failure(format!(
+                "snapshot {}: chunk_projections record {id} has a missing or invalid chunk_index",
+                snapshot.id
+            ))
+        })?;
     Ok(ChunkComparison {
         id,
         input_unit_ids,
         targeting_text,
         chunker_config_hash,
+        fragments,
+        section_path,
+        chunk_index,
     })
 }
 
@@ -2690,7 +2869,8 @@ fn load_hot_chunks(
     connection: &Connection,
     parse_id: &str,
 ) -> Result<BTreeMap<String, ChunkComparison>, ApiError> {
-    const SQL: &str = "SELECT id, input_unit_ids_json, targeting_text, chunker_config_hash \
+    const SQL: &str = "SELECT id, input_unit_ids_json, targeting_text, chunker_config_hash, \
+                       fragments_json, section_path_json, chunk_index \
                        FROM chunk_projections WHERE parse_id = ?1 ORDER BY id";
     let mut statement = prepare(connection, SQL, "hot chunk_projections")?;
     let rows = statement
@@ -2700,17 +2880,36 @@ fn load_hot_chunks(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(|source| query_failure("hot chunk_projections", source))?;
 
     let mut chunks = BTreeMap::new();
     for row in rows {
-        let (id, input_unit_ids_json, targeting_text, chunker_config_hash) =
-            row.map_err(|source| query_failure("hot chunk_projections row", source))?;
+        let (
+            id,
+            input_unit_ids_json,
+            targeting_text,
+            chunker_config_hash,
+            fragments_json,
+            section_path_json,
+            chunk_index,
+        ) = row.map_err(|source| query_failure("hot chunk_projections row", source))?;
+        let chunk_index = u64::try_from(chunk_index).map_err(|_| ApiError::StorageOperation {
+            message: format!("hot chunk {id} has a negative stored chunk_index {chunk_index}"),
+        })?;
         let input_unit_ids = decode_json_string_array_untied(
             &input_unit_ids_json,
             "hot chunk_projections.input_unit_ids_json",
+        )?;
+        let fragments =
+            decode_json_array_untied(&fragments_json, "hot chunk_projections.fragments_json")?;
+        let section_path = decode_json_array_untied(
+            &section_path_json,
+            "hot chunk_projections.section_path_json",
         )?;
         chunks.insert(
             id.clone(),
@@ -2719,6 +2918,9 @@ fn load_hot_chunks(
                 input_unit_ids,
                 targeting_text,
                 chunker_config_hash,
+                fragments,
+                section_path,
+                chunk_index,
             },
         );
     }
@@ -2748,31 +2950,58 @@ fn load_hot_dense_row(
     Ok((row.0 as usize, row.1))
 }
 
-/// Load one live multivector row's (token_count, dimension, blob) by row id. A
-/// missing row is a verification failure for the same reason as the dense case.
+/// One live `colbert_windows` row's comparison columns: position, decoded
+/// membership, shape, and the raw matrix bytes.
+struct HotColbertWindowRow {
+    window_index: u64,
+    chunk_ids: Vec<String>,
+    fragments: Vec<Fragment>,
+    token_count: usize,
+    dimension: usize,
+    matrix_blob: Vec<u8>,
+}
+
+/// Load one live ColBERT window row by row id. A missing row is a verification
+/// failure for the same reason as the dense case; an undecodable membership
+/// column is a hot-plane integrity error rather than a verdict.
 fn load_hot_multivector_row(
     connection: &Connection,
     snapshot: &ForensicSnapshot,
     row_id: &str,
-) -> Result<(usize, usize, Vec<u8>), ApiError> {
-    const SQL: &str = "SELECT token_count, dimension, matrix_blob \
-                       FROM unit_multivector_projections WHERE id = ?1";
-    let row = connection
-        .query_row(SQL, params![row_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .map_err(|source| match source {
-            rusqlite::Error::QueryReturnedNoRows => verification_failure(format!(
-                "snapshot {}: multivector row {} is archived but absent from the hot plane",
-                snapshot.id, row_id
-            )),
-            other => query_failure("hot unit_multivector_projections", other),
-        })?;
-    Ok((row.0 as usize, row.1 as usize, row.2))
+) -> Result<HotColbertWindowRow, ApiError> {
+    const SQL: &str = "SELECT window_index, chunk_ids_json, fragments_json, token_count, \
+                       dimension, matrix_blob FROM colbert_windows WHERE id = ?1";
+    let (window_index, chunk_ids_json, fragments_json, token_count, dimension, matrix_blob) =
+        connection
+            .query_row(SQL, params![row_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(|source| match source {
+                rusqlite::Error::QueryReturnedNoRows => verification_failure(format!(
+                    "snapshot {}: ColBERT window row {} is archived but absent from the hot plane",
+                    snapshot.id, row_id
+                )),
+                other => query_failure("hot colbert_windows", other),
+            })?;
+    let chunk_ids =
+        decode_json_string_array_untied(&chunk_ids_json, "hot colbert_windows.chunk_ids_json")?;
+    let fragments =
+        decode_json_array_untied(&fragments_json, "hot colbert_windows.fragments_json")?;
+    Ok(HotColbertWindowRow {
+        window_index: window_index as u64,
+        chunk_ids,
+        fragments,
+        token_count: token_count as usize,
+        dimension: dimension as usize,
+        matrix_blob,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2934,7 +3163,7 @@ fn load_archived_jsonl(
 }
 
 /// Find the first manifest ref of a given artifactType across every section.
-/// The rebuild-check planes (chunk/dense/multivector metadata,
+/// The rebuild-check planes (chunk/dense/ColBERT-window metadata,
 /// semantic_annotations) each contribute exactly one ref, so first-match is the
 /// intended one.
 fn find_ref_by_type<'m>(
@@ -3193,6 +3422,33 @@ fn decode_json_string_array(
 fn decode_json_string_array_untied(json: &str, field: &str) -> Result<Vec<String>, ApiError> {
     serde_json::from_str(json).map_err(|source| ApiError::StorageOperation {
         message: format!("{field} is not a JSON string array: {source}"),
+    })
+}
+
+/// Decode a canonical JSON array TEXT value into a typed vector (the chunk
+/// `fragments_json` and `section_path_json` columns), with snapshot + field
+/// context on failure.
+fn decode_json_array<T: serde::de::DeserializeOwned>(
+    json: &str,
+    snapshot: &ForensicSnapshot,
+    field: &str,
+) -> Result<Vec<T>, ApiError> {
+    serde_json::from_str(json).map_err(|source| {
+        verification_failure(format!(
+            "snapshot {}: {field} is not the expected JSON array: {source}",
+            snapshot.id
+        ))
+    })
+}
+
+/// Typed-array counterpart of `decode_json_string_array_untied` for the
+/// hot-plane chunk readers.
+fn decode_json_array_untied<T: serde::de::DeserializeOwned>(
+    json: &str,
+    field: &str,
+) -> Result<Vec<T>, ApiError> {
+    serde_json::from_str(json).map_err(|source| ApiError::StorageOperation {
+        message: format!("{field} is not the expected JSON array: {source}"),
     })
 }
 

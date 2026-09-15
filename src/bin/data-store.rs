@@ -2493,11 +2493,21 @@ fn annotation_match_description(matched: &AnnotationMatch) -> String {
     } else {
         " · legacy scope: whole unit"
     };
+    let fragments = matched
+        .excerpt
+        .fragments
+        .iter()
+        .map(|fragment| {
+            format!(
+                "{} [{}, {})",
+                fragment.unit_id, fragment.start_char, fragment.end_char
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "{origin} ({}) · source characters [{}, {}){legacy_scope}",
+        "{origin} ({}) · source fragments {fragments}{legacy_scope}",
         matched.representation.label(),
-        matched.excerpt.start_char,
-        matched.excerpt.end_char,
     )
 }
 

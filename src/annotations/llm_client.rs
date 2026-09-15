@@ -64,7 +64,6 @@ pub(crate) struct AnnotatorClient {
     endpoint: String,
     model: String,
     timeout_seconds: u64,
-    max_input_chars: usize,
     // Thinking and final output share this configured provider allowance.
     max_completion_tokens: u64,
     diagnostics: DiagnosticLimits,
@@ -390,7 +389,6 @@ impl AnnotatorClient {
             endpoint,
             model,
             timeout_seconds,
-            max_input_chars: config.max_input_chars,
             max_completion_tokens: config.max_completion_tokens,
             diagnostics,
             api_key,
@@ -434,12 +432,6 @@ impl AnnotatorClient {
     /// Expose the same maintenance signal used by HTTP calls to stop worker dispatch.
     pub(crate) fn cancellation(&self) -> &AnnotationCancellation {
         &self.cancellation
-    }
-
-    /// Intermediate batches use the configured excerpt cap, so a short passage
-    /// still has room for JSON syntax and relationship field names.
-    pub(crate) fn max_input_chars(&self) -> usize {
-        self.max_input_chars
     }
 
     /// Run one chat-completions call and return the first choice's message

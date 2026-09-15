@@ -1,4 +1,9 @@
 //! Annotation-derived retrieval records retain exact source identity and immutable model inputs.
+//!
+//! Cohorts are keyed by context window (PLAN-grains Section 2, Phase 6): an
+//! annotation joins the cohort of every window whose fragments intersect one of
+//! its attributed `inputRefs`; the cohort's source representation is the
+//! window's canonical text, and its coverage is the window's fragments.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,22 +15,28 @@ use serde_json::Value;
 use crate::{
     annotations::store,
     artifact_store::{ArtifactRef, ArtifactStore},
-    assembly::evidence::evidence_text,
     canonical::{canonical_json_bytes_of, canonical_sha256_hex_of, sha256_hex_bytes},
     error::ApiError,
     inference::ColbertBackend,
     model::provenance::ProvenanceTextRange,
-    model::{ContentType, Provenance, SemanticAnnotation, SemanticAnnotationType},
-    query::provenance::{AnnotationRepresentation, SourceExcerpt},
+    model::{Provenance, SemanticAnnotation, SemanticAnnotationType},
+    query::provenance::{AnnotationRepresentation, SourceExcerpt, SourceFragment},
 };
 
-use super::annotation_io::{EmbeddingRef, validate_ref};
+use super::{
+    annotation_io::{EmbeddingRef, validate_ref},
+    chunk::{Fragment, join_text, ordered_unit_ids},
+    section_dense::{
+        CONSTRUCTION_VERSION as CONTEXT_WINDOW_CONSTRUCTION_VERSION, load_section_dense_reference,
+        visit_section_dense,
+    },
+};
 
 pub(crate) const INDEX_NAME: &str = "annotation_retrieval_v1";
 pub(crate) const PAYLOAD_TYPE: &str = "annotation_retrieval_manifest";
 pub(crate) const VECTOR_PAYLOAD_TYPE: &str = "annotation_embedding_blob";
-const FORMAT_VERSION: u32 = 2;
-const FORMAT_POLICY: &str = "annotation_retrieval_v1;entity_name_type;relation_triple;summary_text;combined_by_excerpt;complete_colbert_windows;unicode_scalar_ranges;canonical_source_separate";
+const FORMAT_VERSION: u32 = 3;
+const FORMAT_POLICY: &str = "annotation_retrieval_v1;entity_name_type;relation_triple;summary_text;combined_by_window;source_by_context_window;complete_colbert_windows;fragments_scalar_offsets;canonical_source_separate";
 const PUBLICATIONS_SQL: &str = "WITH scoped AS (
  SELECT *, length(CAST(producer_json AS BLOB))
    + coalesce(length(CAST(input_annotation_ids_json AS BLOB)), 0)
@@ -55,9 +66,11 @@ const INPUT_SQL: &str = "WITH raw_input AS (
  'confidence', confidence, 'freshnessStatus', freshness_status,
  'createdAt', created_at, 'deletedAt', deleted_at) END AS annotation_json FROM raw_input)
  SELECT input_bytes, CASE WHEN length(CAST(annotation_json AS BLOB)) <= ?4 THEN annotation_json END FROM encoded";
-const SOURCE_SQL: &str = "SELECT content_type,
- CASE WHEN length(CAST(body_json AS BLOB)) <= ?4 THEN body_json END
- FROM content_units WHERE id = ?1 AND source_id = ?2 AND parse_id = ?3";
+// One member fine chunk of the cohort window; the text cell is guarded before
+// rusqlite copies it, so an oversized member is an explicit error.
+const CHUNK_SQL: &str = "SELECT fragments_json,
+ CASE WHEN length(CAST(targeting_text AS BLOB)) <= ?4 THEN targeting_text END
+ FROM chunk_projections WHERE id = ?1 AND source_id = ?2 AND parse_id = ?3";
 
 /// Small discovery identity; bodies are fetched only for a cohort requiring publication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,15 +81,20 @@ pub(crate) struct InputSignature {
     pub(crate) representation: AnnotationRepresentation,
 }
 
-/// One canonical target. Missing ranges explicitly preserve historical whole-unit targeting.
+/// The context window a cohort is keyed by: its identity, member fine chunks in
+/// chunk order, fragments (scalar offsets, end exclusive), section path, and
+/// the hash of its canonical text (member texts joined by one blank line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct InputTarget {
-    pub(crate) unit_id: String,
-    pub(crate) range: Option<ProvenanceTextRange>,
+pub(crate) struct WindowTarget {
+    pub(crate) window_id: String,
+    pub(crate) chunk_ids: Vec<String>,
+    pub(crate) fragments: Vec<Fragment>,
+    pub(crate) section_path: Vec<String>,
+    pub(crate) text_hash: String,
 }
 
-/// The complete declared input set for one excerpt publication, including empty markers.
+/// The complete declared input set for one window publication, including empty markers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CohortPlan {
@@ -85,11 +103,9 @@ pub(crate) struct CohortPlan {
     pub(crate) cohort_id: String,
     pub(crate) input_hash: String,
     pub(crate) model_identity: String,
-    pub(crate) target: InputTarget,
+    pub(crate) target: WindowTarget,
     pub(crate) inputs: Vec<InputSignature>,
-    /// Absent only for the frozen v1 format; new publications seal their window budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) construction: Option<AnnotationConstruction>,
+    pub(crate) construction: AnnotationConstruction,
 }
 
 /// Construction policy is archived so configuration changes cannot reinterpret old windows.
@@ -97,7 +113,25 @@ pub(crate) struct CohortPlan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AnnotationConstruction {
     pub(crate) version: u32,
+    /// ColBERT content cap each representation text is partitioned under.
     pub(crate) window_max_tokens: u32,
+    /// The context-window construction the cohort window was built under.
+    pub(crate) context_window_version: u32,
+}
+
+/// Where one fragment's slice lies in the window's canonical text, so a
+/// ColBERT partition of that text maps back to exact fragment ranges.
+struct FragmentSpan {
+    fragment: Fragment,
+    start_char: usize,
+    end_char: usize,
+}
+
+/// The cohort window's canonical text rebuilt from its member chunk rows, with
+/// the layout of every fragment inside it.
+struct WindowText {
+    canonical: String,
+    spans: Vec<FragmentSpan>,
 }
 
 /// A complete bounded model input, with source coordinates only for canonical source text.
@@ -138,14 +172,50 @@ pub(crate) struct PreparedProjection {
     pub(crate) texts: Vec<RepresentationText>,
 }
 
-/// Discover input identities without retaining annotation bodies across a source scan.
+/// Discover input identities without retaining annotation bodies across a source
+/// scan. The parse's context windows are streamed once from the captured
+/// section-dense artifact; only window metadata (no vectors, no text) is
+/// retained while annotations are visited. No windows means no cohorts this
+/// cycle: the section plane is built first and discovery runs again.
 pub(crate) fn plan_for_parse(
     conn: &Connection,
+    store: &ArtifactStore,
     source_id: &str,
     parse_id: &str,
+    dense_dimension: usize,
     model_identity: &str,
 ) -> Result<Vec<CohortPlan>, ApiError> {
     let limits = &conn.limits().resources;
+    let Some(reference) = load_section_dense_reference(conn, store, parse_id, dense_dimension)?
+    else {
+        return Ok(Vec::new());
+    };
+    if reference.source_id != source_id {
+        return Err(failure(format!(
+            "section windows of parse {parse_id} belong to source {}, not {source_id}",
+            reference.source_id
+        )));
+    }
+    let mut windows: Vec<WindowTarget> = Vec::new();
+    let mut windows_by_unit: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    visit_section_dense(conn, store, &reference, |window| {
+        let index = windows.len();
+        for unit_id in &window.input_unit_ids {
+            windows_by_unit
+                .entry(unit_id.clone())
+                .or_default()
+                .push(index);
+        }
+        // The visitor lends each streamed window; the plan owns its target.
+        windows.push(WindowTarget {
+            window_id: window.window_id.clone(),
+            chunk_ids: window.chunk_ids.clone(),
+            fragments: window.fragments.clone(),
+            section_path: window.section_path.clone(),
+            text_hash: sha256_hex_bytes(window.targeting_text.as_bytes()),
+        });
+        Ok(())
+    })?;
     let mut cohorts: BTreeMap<String, CohortPlan> = BTreeMap::new();
     store::visit_fresh_for_active_parse(
         conn,
@@ -159,71 +229,57 @@ pub(crate) fn plan_for_parse(
                 return Ok(());
             };
             let fingerprint = input_fingerprint(&annotation)?;
-            for unit_id in annotation.target_unit_ids.iter().collect::<BTreeSet<_>>() {
-                let ranges: Vec<Option<ProvenanceTextRange>> = annotation
-                    .provenance
-                    .input_refs
-                    .as_deref()
-                    .unwrap_or(&[])
+            let mut members = BTreeSet::new();
+            for (unit_id, range) in attributed_refs(&annotation) {
+                for index in windows_by_unit.get(unit_id).into_iter().flatten() {
+                    if intersects(&windows[*index].fragments, unit_id, range) {
+                        members.insert(*index);
+                    }
+                }
+            }
+            for index in members {
+                let window = &windows[index];
+                let cohort_id = cohort_id(source_id, parse_id, &window.window_id)?;
+                if !cohorts.contains_key(&cohort_id)
+                    && cohorts.len() >= limits.max_cohorts_per_parse
+                {
+                    return Err(failure(format!(
+                        "resource limit: parse {parse_id} exceeds {} annotation cohorts",
+                        limits.max_cohorts_per_parse
+                    )));
+                }
+                let cohort = cohorts
+                    .entry(cohort_id.clone())
+                    .or_insert_with(|| CohortPlan {
+                        source_id: source_id.to_owned(),
+                        parse_id: parse_id.to_owned(),
+                        cohort_id,
+                        input_hash: String::new(),
+                        model_identity: model_identity.to_owned(),
+                        // The discovery index outlives no cohort; each plan owns its window.
+                        target: window.clone(),
+                        inputs: Vec::new(),
+                        construction: AnnotationConstruction {
+                            version: FORMAT_VERSION,
+                            window_max_tokens: conn.limits().indexing.colbert_max_tokens,
+                            context_window_version: CONTEXT_WINDOW_CONSTRUCTION_VERSION,
+                        },
+                    });
+                if !cohort
+                    .inputs
                     .iter()
-                    .filter(|input| input.id == *unit_id)
-                    .map(|input| input.text_range.clone())
-                    .collect();
-                // Old producers did not record extraction offsets. Keep their declared
-                // whole-unit target instead of pretending the annotation names a precise slice.
-                let ranges = if ranges.is_empty() {
-                    vec![None]
-                } else {
-                    ranges
-                };
-                for range in ranges {
-                    let target = InputTarget {
-                        unit_id: unit_id.clone(),
-                        range,
-                    };
-                    let cohort_id = cohort_id(source_id, parse_id, &target)?;
-                    if !cohorts.contains_key(&cohort_id)
-                        && cohorts.len() >= limits.max_cohorts_per_parse
-                    {
-                        return Err(failure(format!(
-                            "resource limit: parse {parse_id} exceeds {} annotation cohorts",
-                            limits.max_cohorts_per_parse
-                        )));
+                    .any(|input| input.annotation_id == annotation.id)
+                {
+                    if cohort.inputs.len() >= limits.max_annotations_per_cohort {
+                        return Err(failure(
+                            "resource limit: annotation cohort input ceiling exceeded",
+                        ));
                     }
-                    let cohort = cohorts
-                        .entry(cohort_id.clone())
-                        .or_insert_with(|| CohortPlan {
-                            source_id: source_id.to_owned(),
-                            parse_id: parse_id.to_owned(),
-                            cohort_id,
-                            input_hash: String::new(),
-                            model_identity: model_identity.to_owned(),
-                            target,
-                            inputs: Vec::new(),
-                            construction: Some(AnnotationConstruction {
-                                version: FORMAT_VERSION,
-                                window_max_tokens: conn
-                                    .limits()
-                                    .indexing
-                                    .annotation_window_max_tokens,
-                            }),
-                        });
-                    if !cohort
-                        .inputs
-                        .iter()
-                        .any(|input| input.annotation_id == annotation.id)
-                    {
-                        if cohort.inputs.len() >= limits.max_annotations_per_cohort {
-                            return Err(failure(
-                                "resource limit: annotation cohort input ceiling exceeded",
-                            ));
-                        }
-                        cohort.inputs.push(InputSignature {
-                            annotation_id: annotation.id.clone(),
-                            fingerprint: fingerprint.clone(),
-                            representation,
-                        });
-                    }
+                    cohort.inputs.push(InputSignature {
+                        annotation_id: annotation.id.clone(),
+                        fingerprint: fingerprint.clone(),
+                        representation,
+                    });
                 }
             }
             Ok(())
@@ -248,19 +304,7 @@ pub(crate) fn prepare(
     let Some(annotations) = current_inputs(conn, plan)? else {
         return Ok(None);
     };
-    let source = source_text(conn, &plan.source_id, &plan.parse_id, &plan.target.unit_id)?;
-    let (source_slice, start_char) = match &plan.target.range {
-        Some(range) => {
-            let text = slice_chars(&source, range.start_char, range.end_char)?;
-            if sha256_hex_bytes(text.as_bytes()) != range.text_hash {
-                return Err(failure(
-                    "annotation source range hash differs from canonical text",
-                ));
-            }
-            (text, range.start_char)
-        }
-        None => (source.as_str(), 0),
-    };
+    let source = window_text(conn, plan)?;
     let mut texts = Vec::new();
     append_windows(
         &mut texts,
@@ -268,8 +312,8 @@ pub(crate) fn prepare(
         plan,
         AnnotationRepresentation::Source,
         &[],
-        source_slice,
-        Some(start_char),
+        &source.canonical,
+        Some(&source.spans),
         max_manifest_bytes,
     )?;
     let mut combined = String::new();
@@ -381,6 +425,15 @@ pub(crate) fn current_inputs(
                 input.annotation_id
             )));
         }
+        // Membership invariant: a declared input's attributed refs intersect the
+        // cohort window. The fingerprint covers provenance, so a fresh input
+        // that fails this was never a member; the plan is not this window's.
+        if !intersects_window(&annotation, &plan.target.fragments) {
+            return Err(failure(format!(
+                "annotation {} does not intersect cohort window {}",
+                input.annotation_id, plan.target.window_id
+            )));
+        }
         inputs.push(annotation);
     }
     Ok(Some(inputs))
@@ -429,19 +482,14 @@ pub(crate) fn read_manifest(
     Ok(projection)
 }
 
-/// Projection metadata pins declared inputs; model configuration is captured separately in the manifest.
+/// Projection metadata pins declared inputs; model configuration is captured
+/// separately in the manifest. Unit refs carry no text range: the exact
+/// fragments are the plan target, archived with the manifest.
 pub(crate) fn producer(plan: &CohortPlan) -> Provenance {
     Provenance {
         producer_type: crate::model::ProducerType::System,
         producer_name: INDEX_NAME.to_owned(),
-        producer_version: Some(
-            if plan.construction.is_some() {
-                FORMAT_VERSION
-            } else {
-                1
-            }
-            .to_string(),
-        ),
+        producer_version: Some(FORMAT_VERSION.to_string()),
         config_hash: Some(plan.input_hash.clone()),
         model_name: None,
         model_version: None,
@@ -452,21 +500,23 @@ pub(crate) fn producer(plan: &CohortPlan) -> Provenance {
         memoized_from: None,
         memoization_key_hash: None,
         input_refs: Some(
-            std::iter::once(crate::model::ProvenanceInputRef {
-                object_type: crate::model::ProvenanceObjectType::ContentUnit,
-                id: plan.target.unit_id.clone(),
-                text_range: plan.target.range.clone(),
-            })
-            .chain(
-                plan.inputs
-                    .iter()
-                    .map(|input| crate::model::ProvenanceInputRef {
-                        object_type: crate::model::ProvenanceObjectType::SemanticAnnotation,
-                        id: input.annotation_id.clone(),
-                        text_range: None,
-                    }),
-            )
-            .collect(),
+            ordered_unit_ids(&plan.target.fragments)
+                .into_iter()
+                .map(|unit_id| crate::model::ProvenanceInputRef {
+                    object_type: crate::model::ProvenanceObjectType::ContentUnit,
+                    id: unit_id,
+                    text_range: None,
+                })
+                .chain(
+                    plan.inputs
+                        .iter()
+                        .map(|input| crate::model::ProvenanceInputRef {
+                            object_type: crate::model::ProvenanceObjectType::SemanticAnnotation,
+                            id: input.annotation_id.clone(),
+                            text_range: None,
+                        }),
+                )
+                .collect(),
         ),
     }
 }
@@ -623,7 +673,8 @@ fn validate_publication_pair(
     })?;
     if annotation_ids.is_empty()
         || annotation_ids.iter().collect::<BTreeSet<_>>().len() != annotation_ids.len()
-        || unit_ids.len() != 1
+        || unit_ids.is_empty()
+        || unit_ids.iter().collect::<BTreeSet<_>>().len() != unit_ids.len()
     {
         return Err(failure(format!(
             "annotation publication {} has invalid annotation/canonical lineage membership",
@@ -655,7 +706,7 @@ pub(crate) fn validate_publication_lineage(
         .iter()
         .map(|input| input.annotation_id.as_str())
         .collect();
-    let unit_ids = [plan.target.unit_id.as_str()];
+    let unit_ids = ordered_unit_ids(&plan.target.fragments);
     let expected = canonical_sha256_hex_of(&(producer(plan), annotation_ids, unit_ids))?;
     if publication.cohort_id != plan.cohort_id
         || publication.input_hash != plan.input_hash
@@ -669,22 +720,25 @@ pub(crate) fn validate_publication_lineage(
     Ok(())
 }
 
-/// Validate manifest identities without requiring the embedding provider to be available.
+/// Validate manifest identities and source coverage without the embedding
+/// provider or the database. Input-membership checks that need annotation
+/// bodies run in `current_inputs`.
 pub(crate) fn validate_manifest(projection: &AnnotationProjection) -> Result<(), ApiError> {
     let plan = &projection.plan;
-    let valid_policy = match (projection.format_version, &plan.construction) {
-        (1, None) => true,
-        (FORMAT_VERSION, Some(policy)) => {
-            policy.version == FORMAT_VERSION && policy.window_max_tokens > 0
-        }
-        _ => false,
-    };
+    let policy = &plan.construction;
+    let valid_policy = projection.format_version == FORMAT_VERSION
+        && policy.version == FORMAT_VERSION
+        && policy.window_max_tokens > 0
+        && policy.context_window_version == CONTEXT_WINDOW_CONSTRUCTION_VERSION;
     if !valid_policy
         || plan.model_identity.is_empty()
         || plan.source_id.is_empty()
         || plan.parse_id.is_empty()
         || plan.inputs.is_empty()
-        || plan.cohort_id != cohort_id(&plan.source_id, &plan.parse_id, &plan.target)?
+        || plan.target.window_id.is_empty()
+        || plan.target.chunk_ids.is_empty()
+        || !valid_fragments(&wire_fragments(&plan.target.fragments))
+        || plan.cohort_id != cohort_id(&plan.source_id, &plan.parse_id, &plan.target.window_id)?
         || plan.input_hash != plan_hash(plan)?
         || projection.representations.is_empty()
     {
@@ -734,15 +788,13 @@ pub(crate) fn validate_manifest(projection: &AnnotationProjection) -> Result<(),
         }
         match (&input.source_excerpt, input.representation) {
             (Some(excerpt), AnnotationRepresentation::Source) => {
-                if excerpt.unit_id != plan.target.unit_id
-                    || excerpt.end_char <= excerpt.start_char
-                    || excerpt.end_char - excerpt.start_char != input.text.chars().count()
+                if !valid_fragments(&excerpt.fragments)
                     || excerpt.text_hash != sha256_hex_bytes(input.text.as_bytes())
                     || !input.annotation_ids.is_empty()
                 {
                     return Err(failure("canonical annotation source window is invalid"));
                 }
-                source_windows.push(excerpt);
+                source_windows.push(input);
             }
             (None, kind)
                 if kind != AnnotationRepresentation::Source && !input.annotation_ids.is_empty() => {
@@ -754,67 +806,237 @@ pub(crate) fn validate_manifest(projection: &AnnotationProjection) -> Result<(),
             }
         }
     }
-    source_windows.sort_by_key(|window| window.start_char);
-    let mut next = plan
-        .target
-        .range
-        .as_ref()
-        .map_or(0, |range| range.start_char);
+    // Coverage invariant: the source windows partition the cohort window's
+    // canonical text from offset 0 without gap or overlap, their texts compose
+    // exactly that text, and their fragments compose exactly the window's
+    // fragments. Adjacent same-unit ranges are coalesced on both sides because
+    // a ColBERT boundary may split one fragment and a window may already hold a
+    // unit split across two member chunks.
+    source_windows.sort_by_key(|window| window.input_start_char);
+    let mut next = 0;
+    let mut canonical = String::new();
+    let mut covered = Vec::new();
     for window in &source_windows {
-        if window.start_char != next {
+        if window.input_start_char != next {
             return Err(failure("annotation source windows have a gap or overlap"));
         }
-        next = window.end_char;
+        next = window.input_end_char;
+        canonical.push_str(&window.text);
+        if let Some(excerpt) = &window.source_excerpt {
+            covered.extend(excerpt.fragments.iter().cloned());
+        }
     }
     if source_windows.is_empty()
-        || plan
-            .target
-            .range
-            .as_ref()
-            .is_some_and(|range| next != range.end_char)
+        || sha256_hex_bytes(canonical.as_bytes()) != plan.target.text_hash
+        || coalesce_fragments(&covered)
+            != coalesce_fragments(&wire_fragments(&plan.target.fragments))
     {
         return Err(failure(
-            "annotation source windows do not cover their declared target",
+            "annotation source windows do not cover their cohort window",
         ));
     }
     Ok(())
 }
 
-/// Resolve the canonical evidence field and reject oversized or foreign source data.
-pub(crate) fn source_text(
-    conn: &Connection,
-    source_id: &str,
-    parse_id: &str,
-    unit_id: &str,
-) -> Result<String, ApiError> {
+/// The wire form of grain fragments; the two types are the same record.
+fn wire_fragments(fragments: &[Fragment]) -> Vec<SourceFragment> {
+    fragments
+        .iter()
+        .map(|fragment| SourceFragment {
+            unit_id: fragment.unit_id.clone(),
+            start_char: fragment.start_char,
+            end_char: fragment.end_char,
+        })
+        .collect()
+}
+
+/// Every range is nonempty with end exclusive; an empty list covers nothing.
+fn valid_fragments(fragments: &[SourceFragment]) -> bool {
+    !fragments.is_empty()
+        && fragments
+            .iter()
+            .all(|fragment| fragment.start_char < fragment.end_char)
+}
+
+/// Merge adjacent fragments of one unit whose ranges abut, in order, so two
+/// fragment lists covering the same ranges compare equal regardless of where
+/// either was split.
+fn coalesce_fragments(fragments: &[SourceFragment]) -> Vec<SourceFragment> {
+    let mut merged: Vec<SourceFragment> = Vec::new();
+    for fragment in fragments {
+        if let Some(last) = merged.last_mut()
+            && last.unit_id == fragment.unit_id
+            && last.end_char == fragment.start_char
+        {
+            last.end_char = fragment.end_char;
+        } else {
+            merged.push(fragment.clone());
+        }
+    }
+    merged
+}
+
+/// The attributed refs of one annotation: each target unit with the ranges its
+/// `inputRefs` name on that unit, or `None` when it names the whole unit
+/// (records without extraction offsets keep their declared whole-unit target).
+fn attributed_refs(annotation: &SemanticAnnotation) -> Vec<(&str, Option<&ProvenanceTextRange>)> {
+    let mut refs = Vec::new();
+    for unit_id in annotation.target_unit_ids.iter().collect::<BTreeSet<_>>() {
+        let before = refs.len();
+        refs.extend(
+            annotation
+                .provenance
+                .input_refs
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|input| input.id == *unit_id)
+                .map(|input| (unit_id.as_str(), input.text_range.as_ref())),
+        );
+        if refs.len() == before {
+            refs.push((unit_id.as_str(), None));
+        }
+    }
+    refs
+}
+
+/// Intersection rule: a ref intersects a window when some fragment cites the
+/// same unit and, if the ref has a range, the scalar ranges overlap
+/// (`start < other.end && other.start < end`); a ref without a range is the
+/// whole unit and intersects any fragment of that unit.
+fn intersects(fragments: &[Fragment], unit_id: &str, range: Option<&ProvenanceTextRange>) -> bool {
+    fragments.iter().any(|fragment| {
+        fragment.unit_id == unit_id
+            && range.is_none_or(|range| {
+                range.start_char < fragment.end_char && fragment.start_char < range.end_char
+            })
+    })
+}
+
+/// Whether every attributed ref names an extraction range; false for records
+/// produced before attribution recorded offsets, which target whole units.
+pub(crate) fn has_exact_ranges(annotation: &SemanticAnnotation) -> bool {
+    attributed_refs(annotation)
+        .iter()
+        .all(|(_, range)| range.is_some())
+}
+
+/// Whether any attributed ref of the annotation intersects the window.
+pub(crate) fn intersects_window(annotation: &SemanticAnnotation, fragments: &[Fragment]) -> bool {
+    attributed_refs(annotation)
+        .into_iter()
+        .any(|(unit_id, range)| intersects(fragments, unit_id, range))
+}
+
+/// Rebuild the cohort window's canonical text from its member chunk rows in
+/// the caller's snapshot and lay out every fragment inside it. Layout is the
+/// chunker's: fragments of one member are joined by one tab (a table row's
+/// cells), members by one blank line. The rebuilt fragments must equal the
+/// plan's and the text must hash to the plan's, or the window has changed.
+fn window_text(conn: &Connection, plan: &CohortPlan) -> Result<WindowText, ApiError> {
     let max_source_bytes = conn.limits().resources.max_source_body_bytes;
-    let (kind, body): (String, Option<String>) = conn
-        .query_row(
-            SOURCE_SQL,
-            params![unit_id, source_id, parse_id, max_source_bytes],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|source| {
+    let mut statement = conn
+        .prepare(CHUNK_SQL)
+        .map_err(|source| failure(format!("prepare cohort window member read: {source}")))?;
+    let mut canonical = String::new();
+    let mut spans = Vec::new();
+    for chunk_id in &plan.target.chunk_ids {
+        let (fragments_json, text): (String, Option<String>) = statement
+            .query_row(
+                params![chunk_id, plan.source_id, plan.parse_id, max_source_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|source| {
+                failure(format!(
+                    "read cohort window member {chunk_id} in {}: {source}",
+                    plan.parse_id
+                ))
+            })?;
+        let text = text.ok_or_else(|| {
             failure(format!(
-                "read canonical source {unit_id} in {parse_id}: {source}"
+                "resource limit: cohort window member {chunk_id} exceeds {max_source_bytes} bytes"
             ))
         })?;
-    let body = body.ok_or_else(|| {
-        failure(format!(
-            "resource limit: canonical source {unit_id} exceeds {max_source_bytes} bytes"
-        ))
-    })?;
-    let kind: ContentType = serde_json::from_value(Value::String(kind))
-        .map_err(|source| failure(format!("decode source type {unit_id}: {source}")))?;
-    let body: Value = serde_json::from_str(&body)
-        .map_err(|source| failure(format!("decode source body {unit_id}: {source}")))?;
-    evidence_text(kind, &body)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            failure(format!(
-                "annotation target {unit_id} has no canonical evidence text"
-            ))
-        })
+        let fragments: Vec<Fragment> = serde_json::from_str(&fragments_json)
+            .map_err(|source| failure(format!("decode fragments of {chunk_id}: {source}")))?;
+        if !valid_fragments(&wire_fragments(&fragments)) {
+            return Err(failure(format!("member {chunk_id} has no valid fragments")));
+        }
+        let base = if canonical.is_empty() {
+            0
+        } else {
+            canonical.chars().count() + 2
+        };
+        let mut offset = base;
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            if index > 0 {
+                offset += 1;
+            }
+            let end_char = offset + (fragment.end_char - fragment.start_char);
+            spans.push(FragmentSpan {
+                fragment,
+                start_char: offset,
+                end_char,
+            });
+            offset = end_char;
+        }
+        if offset - base != text.chars().count() {
+            return Err(failure(format!(
+                "member {chunk_id} text length disagrees with its fragment layout"
+            )));
+        }
+        canonical = if canonical.is_empty() {
+            text
+        } else {
+            join_text(&canonical, &text)
+        };
+        if canonical.len() > max_source_bytes {
+            return Err(failure(format!(
+                "resource limit: cohort window {} exceeds {max_source_bytes} bytes",
+                plan.target.window_id
+            )));
+        }
+    }
+    let rebuilt: Vec<&Fragment> = spans.iter().map(|span| &span.fragment).collect();
+    if rebuilt.len() != plan.target.fragments.len()
+        || rebuilt
+            .iter()
+            .zip(&plan.target.fragments)
+            .any(|(left, right)| *left != right)
+        || sha256_hex_bytes(canonical.as_bytes()) != plan.target.text_hash
+    {
+        return Err(failure(format!(
+            "cohort window {} differs from its member chunks",
+            plan.target.window_id
+        )));
+    }
+    Ok(WindowText { canonical, spans })
+}
+
+/// The fragments a ColBERT partition `[start, end)` of the canonical text
+/// displays, clipped to the partition. Whitespace of a join that the boundary
+/// cut through belongs to no fragment; the partition text still hashes whole.
+fn clip_spans(
+    spans: &[FragmentSpan],
+    start: usize,
+    end: usize,
+) -> Result<Vec<SourceFragment>, ApiError> {
+    let mut fragments = Vec::new();
+    for span in spans {
+        let from = span.start_char.max(start);
+        let to = span.end_char.min(end);
+        if from < to {
+            fragments.push(SourceFragment {
+                unit_id: span.fragment.unit_id.clone(),
+                start_char: span.fragment.start_char + (from - span.start_char),
+                end_char: span.fragment.start_char + (to - span.start_char),
+            });
+        }
+    }
+    if fragments.is_empty() {
+        return Err(failure("source window displays no fragment text"));
+    }
+    Ok(fragments)
 }
 
 /// Translate Unicode-scalar coordinates to UTF-8 boundaries without altering source bytes.
@@ -894,16 +1116,12 @@ fn append_windows(
     representation: AnnotationRepresentation,
     annotation_ids: &[String],
     text: &str,
-    source_start: Option<usize>,
+    source_spans: Option<&[FragmentSpan]>,
     max_manifest_bytes: usize,
 ) -> Result<(), ApiError> {
     let mut retained_bytes: usize = texts.iter().map(retained_text_bytes).sum();
-    // Only the legacy format used the frozen 512-token window. New plans carry
-    // their own construction limit, so changed settings require new identities.
-    let window_tokens = plan
-        .construction
-        .as_ref()
-        .map_or(512, |policy| policy.window_max_tokens) as usize;
+    // Plans carry their own construction limit, so changed settings require new identities.
+    let window_tokens = plan.construction.window_max_tokens as usize;
     for window in colbert.document_windows(text, window_tokens)? {
         // Bound retained input records before cloning repeated combined-input IDs.
         let added = window
@@ -923,12 +1141,13 @@ fn append_windows(
                 representation.label()
             )));
         }
-        let source_excerpt = source_start.map(|start| SourceExcerpt {
-            unit_id: plan.target.unit_id.clone(),
-            start_char: start + window.start_char,
-            end_char: start + window.end_char,
-            text_hash: sha256_hex_bytes(window.text.as_bytes()),
-        });
+        let source_excerpt = match source_spans {
+            Some(spans) => Some(SourceExcerpt {
+                fragments: clip_spans(spans, window.start_char, window.end_char)?,
+                text_hash: sha256_hex_bytes(window.text.as_bytes()),
+            }),
+            None => None,
+        };
         let id = representation_id(
             plan,
             representation,
@@ -966,29 +1185,24 @@ fn retained_text_bytes(input: &RepresentationText) -> usize {
         .saturating_add(512)
 }
 
-/// Model identity and rendering policy participate in freshness without changing annotations.
+/// Model identity, rendering policy, and the window's membership participate in
+/// freshness: a rebuilt section plane that reuses a window id with different
+/// members must republish, so the target is hashed here, not only its id.
 fn plan_hash(plan: &CohortPlan) -> Result<String, ApiError> {
-    if let Some(policy) = &plan.construction {
-        return canonical_sha256_hex_of(&(
-            FORMAT_POLICY,
-            policy,
-            &plan.model_identity,
-            &plan.cohort_id,
-            &plan.inputs,
-        ));
-    }
-    // Preserve the exact v1 tuple, including its absence of construction fields.
     canonical_sha256_hex_of(&(
         FORMAT_POLICY,
+        &plan.construction,
         &plan.model_identity,
         &plan.cohort_id,
+        &plan.target,
         &plan.inputs,
     ))
 }
 
-/// Cohort identity excludes annotation type so completed types can enrich one shared excerpt.
-fn cohort_id(source_id: &str, parse_id: &str, target: &InputTarget) -> Result<String, ApiError> {
-    canonical_sha256_hex_of(&(INDEX_NAME, source_id, parse_id, target))
+/// Cohort identity is the window's; annotation type is excluded so completed
+/// types enrich one shared window.
+fn cohort_id(source_id: &str, parse_id: &str, window_id: &str) -> Result<String, ApiError> {
+    canonical_sha256_hex_of(&(INDEX_NAME, source_id, parse_id, window_id))
 }
 
 /// Exact targeting text bytes remain identity-bearing even when Unicode forms differ.
@@ -1001,20 +1215,8 @@ fn representation_id(
     start: usize,
     end: usize,
 ) -> Result<String, ApiError> {
-    if let Some(policy) = &plan.construction {
-        return canonical_sha256_hex_of(&(
-            policy,
-            &plan.cohort_id,
-            &plan.model_identity,
-            kind,
-            ids,
-            sha256_hex_bytes(text.as_bytes()),
-            excerpt,
-            start,
-            end,
-        ));
-    }
     canonical_sha256_hex_of(&(
+        &plan.construction,
         &plan.cohort_id,
         &plan.model_identity,
         kind,

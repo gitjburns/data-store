@@ -62,7 +62,7 @@ Sample-annotate before paying for full annotation, then author the two policy
 documents from observed vocabulary:
 
 ```sh
-data-store-service --config config.toml --annotation-dry-run 5   # parses corpus, samples 5 groups/source/type, serves for inspection
+data-store-service --config config.toml --annotation-dry-run 5   # parses corpus, samples 5 excerpts/source/type, serves for inspection
 data-store --config config.toml --vocabulary entity all          # inspect observed entity vocabulary
 data-store --config config.toml --vocabulary relation all        # inspect observed predicates
 $EDITOR policies/annotator-naming.toml policies/entity-match.toml
@@ -70,6 +70,8 @@ data-store --config config.toml --shutdown                       # end dry-run m
 ```
 
 `ready=false` health is expected during a dry-run (no inference runtime).
+The mode currently cannot sample: excerpts are runs of context windows, which
+the dry-run pass does not build, so its plans are empty (SPEC-SERVER.md §4.7).
 Scope `all` is required — sampled parses are never active. Editing the naming
 document changes producer identity; the entity-match document is
 query-time-only. The next normal start adopts the dry-run's parses without

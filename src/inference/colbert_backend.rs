@@ -20,7 +20,8 @@ use crate::{
         colbert::{
             ColbertCandidateScore, ColbertDocumentEmbedding, ColbertRuntime, PreparedColbertQuery,
             SMOKE_BATCH_SHORT, SMOKE_DOCUMENT, SMOKE_QUERY, format_document, format_query,
-            maxsim_score, tokenize_formatted, validate_colbert_config,
+            maxsim_score, measure_document_format_overhead, tokenize_formatted,
+            validate_colbert_config,
         },
         http_models::{ServedModel, failure_excerpt, verify_capacity},
     },
@@ -109,6 +110,17 @@ impl ColbertBackend {
         match self {
             Self::Local(_) => None,
             Self::Http(client) => Some(&client.served),
+        }
+    }
+
+    /// Tokens the document prompt and marker add over bare text under the
+    /// selected backend's tokenizer. Window packers subtract this from their
+    /// cap so a window measured as bare text still fits `document_max_tokens`
+    /// once formatted, and is never truncated.
+    pub fn document_format_overhead(&self) -> usize {
+        match self {
+            Self::Local(runtime) => runtime.document_format_overhead(),
+            Self::Http(client) => client.document_format_overhead,
         }
     }
 
@@ -336,6 +348,9 @@ pub struct HttpColbertClient {
     dimension: usize,
     query_max_tokens: usize,
     document_max_tokens: usize,
+    /// Tokens `format_document` adds over bare text under THIS tokenizer; the
+    /// HTTP path formats and truncates documents exactly as the local runtime.
+    document_format_overhead: usize,
     document_batch_size: usize,
     local_batch_max_tokens: usize,
     served: ServedModel,
@@ -416,6 +431,7 @@ impl HttpColbertClient {
             ))
         })?;
         progress("colbert_http_tokenizer_ready")?;
+        let document_format_overhead = measure_document_format_overhead(&tokenizer)?;
         let api_key = config
             .resolved_http_api_key_file_path(config_root)
             .as_deref()
@@ -452,6 +468,7 @@ impl HttpColbertClient {
             dimension: config.dimension as usize,
             query_max_tokens: config.query_max_tokens as usize,
             document_max_tokens: config.document_max_tokens as usize,
+            document_format_overhead,
             document_batch_size: config.document_batch_size,
             local_batch_max_tokens: config.local_batch_max_tokens,
             served,

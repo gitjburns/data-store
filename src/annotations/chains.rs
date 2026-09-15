@@ -1,7 +1,9 @@
-//! Single-goal annotation chains over bounded excerpts. Intermediate work remains
+//! Single-goal annotation chains over one excerpt's canonical text. The section
+//! path rides along as separate prompt context (`Section: a / b / c`) and never
+//! enters the passage the stages match against. Intermediate work remains
 //! local to one invocation; only a fully completed chain reaches persistence.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -75,20 +77,24 @@ struct EvidenceItem {
 /// Run dependencies sequentially inside the worker's existing bounded invocation
 /// concurrency. A later failure discards all local results, never partial writes.
 /// Every stage retains the wave's committed coverage snapshot until persistence.
+/// `section` is the excerpt's section path already joined for display; it is
+/// prepended to every stage message as context and is never source text.
 pub(crate) fn run(
     kind: ProducerKind,
     client: &AnnotatorClient,
     passage: &str,
+    section: Option<&str>,
     temperature: f64,
     progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
     match kind {
-        ProducerKind::Entity => entities(client, passage, temperature, progress),
-        ProducerKind::Relation => relations(client, passage, temperature, progress),
+        ProducerKind::Entity => entities(client, passage, section, temperature, progress),
+        ProducerKind::Relation => relations(client, passage, section, temperature, progress),
         ProducerKind::Summary => run_stage(
             Stage::Summary,
             client,
             passage,
+            section,
             temperature,
             progress,
             summary::parse_output,
@@ -102,6 +108,7 @@ pub(crate) fn run(
 fn entities(
     client: &AnnotatorClient,
     passage: &str,
+    section: Option<&str>,
     temperature: f64,
     progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
@@ -109,6 +116,7 @@ fn entities(
         Stage::EntityNames,
         client,
         passage,
+        section,
         temperature,
         progress,
         |raw| {
@@ -121,7 +129,7 @@ fn entities(
         Vec::len,
     )?;
     let mut annotations = Vec::new();
-    for batch in bounded_batches(&names, client.max_input_chars(), Stage::EntityTypes)? {
+    for batch in bounded_batches(&names, batch_limit(passage), Stage::EntityTypes)? {
         let input = serialize_input(&EntityTypesInput {
             passage,
             names: batch,
@@ -130,6 +138,7 @@ fn entities(
             Stage::EntityTypes,
             client,
             &input,
+            section,
             temperature,
             progress,
             |raw| {
@@ -186,6 +195,7 @@ fn entities(
 fn relations(
     client: &AnnotatorClient,
     passage: &str,
+    section: Option<&str>,
     temperature: f64,
     progress: Option<AnnotationProgressCount>,
 ) -> Result<Vec<ProducedAnnotation>, InvocationFailure> {
@@ -193,6 +203,7 @@ fn relations(
         Stage::Statements,
         client,
         passage,
+        section,
         temperature,
         progress,
         |raw| {
@@ -222,12 +233,13 @@ fn relations(
             Stage::Relations,
             client,
             &input,
+            section,
             temperature,
             progress,
             relation::parse_output,
             Vec::len,
         )?;
-        attach_evidence(client, passage, temperature, &mut formed, progress)?;
+        attach_evidence(client, passage, section, temperature, &mut formed, progress)?;
         annotations.append(&mut formed);
     }
     Ok(annotations)
@@ -238,6 +250,7 @@ fn relations(
 fn attach_evidence(
     client: &AnnotatorClient,
     passage: &str,
+    section: Option<&str>,
     temperature: f64,
     annotations: &mut [ProducedAnnotation],
     progress: Option<AnnotationProgressCount>,
@@ -256,7 +269,7 @@ fn attach_evidence(
         .collect::<Result<Vec<_>, ApiError>>()
         .map_err(InvocationFailure::Internal)?;
     let mut receipts = BTreeMap::new();
-    for batch in bounded_batches(&relationships, client.max_input_chars(), Stage::Evidence)? {
+    for batch in bounded_batches(&relationships, batch_limit(passage), Stage::Evidence)? {
         let input = serialize_input(&EvidenceInput {
             passage,
             relationships: batch,
@@ -265,6 +278,7 @@ fn attach_evidence(
             Stage::Evidence,
             client,
             &input,
+            section,
             temperature,
             progress,
             |raw| {
@@ -341,15 +355,26 @@ fn attach_evidence(
 
 /// Own each request/validation boundary with its single stage identity. The
 /// maintenance signal wins before submission and before consuming a response.
+/// When `section` is present the user message is the `Section:` line, one
+/// blank line, then `input`; the passage and every validator still see `input`
+/// alone, so the section line can never be quoted or matched as source text.
+// The section context joins the stage's existing explicit inputs; a wrapper
+// struct would only hide which of them the model message is built from.
+#[allow(clippy::too_many_arguments)]
 fn run_stage<T>(
     stage: Stage,
     client: &AnnotatorClient,
     input: &str,
+    section: Option<&str>,
     temperature: f64,
     progress: Option<AnnotationProgressCount>,
     parse: impl FnOnce(&str) -> Result<T, ApiError>,
     item_count: impl FnOnce(&T) -> usize,
 ) -> Result<T, InvocationFailure> {
+    let message: Cow<'_, str> = match section {
+        Some(section) => Cow::Owned(format!("Section: {section}\n\n{input}")),
+        None => Cow::Borrowed(input),
+    };
     let (mut call, context) = client.start_call(stage.name(), progress);
     // The synchronous stage owns this context through HTTP and validation. The
     // HTTP future is polled on this same producer thread, never on a Tokio worker.
@@ -366,7 +391,7 @@ fn run_stage<T>(
         // includes structural validation without claiming annotation persistence.
         monitor_call = client.monitor_call(stage.name());
         let (completion, received_usage) =
-            client.complete(&mut call, &context, &prompt, input, &schema, temperature);
+            client.complete(&mut call, &context, &prompt, &message, &schema, temperature);
         // Usage belongs to the received exchange even when HTTP or subsequent
         // validation fails; preserve it before propagating either result.
         usage = received_usage;
@@ -453,8 +478,15 @@ fn serialize_input<T: Serialize + ?Sized>(input: &T) -> Result<String, Invocatio
     })
 }
 
+/// The intermediate batch bound is the passage's own character count
+/// (PLAN-grains Section 4): candidate payloads never outgrow the source text
+/// they were drawn from, whatever the configured grain sizes.
+fn batch_limit(passage: &str) -> usize {
+    passage.chars().count()
+}
+
 /// Bound serialized candidate arrays, including escaping and separators, to the
-/// configured excerpt cap. Oversized individual items fail explicitly;
+/// passage's character count. Oversized individual items fail explicitly;
 /// truncating a model-produced name or relationship would change its meaning.
 fn bounded_batches<T: Serialize>(
     items: &[T],

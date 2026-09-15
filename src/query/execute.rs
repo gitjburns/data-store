@@ -49,7 +49,7 @@ use crate::assembly::evidence::{EvidenceOptions, PassageEvidence, build_evidence
 use crate::assembly::model::EvidencePack;
 use crate::assembly::policy::CapturedParseRef;
 use crate::error::ApiError;
-use crate::inference::{ColbertCandidateScore, InferenceRuntime};
+use crate::inference::InferenceRuntime;
 use crate::policy::EntityMatchPolicy;
 use crate::projections::dense_cache::DenseCache;
 use crate::query::annotation::{self as annotation_query, ScoredExcerpt};
@@ -59,7 +59,7 @@ use crate::query::passages::{PassageCandidate, SearchResult, build_passages};
 use crate::query::profile::RetrievalProfile;
 use crate::query::request::EvidenceOptions as RequestEvidenceOptions;
 use crate::query::rerank::{
-    PassageScore, RerankStageContext, run_maxsim_stage, run_reranker_stage,
+    ColbertWindowScore, PassageScore, RerankStageContext, run_maxsim_stage, run_reranker_stage,
 };
 use crate::state::{CutoverRegistry, ExclusiveGate, acquire_model_call_gate_on};
 
@@ -138,9 +138,9 @@ pub(crate) struct QueryPipelineOutcome {
     /// Complete passage candidates offered to the final reranker, including those
     /// outside the requested final result count.
     pub(crate) passage_candidates: Vec<PassageCandidate>,
-    /// ColBERT MaxSim scores over the fused pool, best-first (empty when the pool
-    /// had no unit with a persisted ColBERT matrix). `debug`-only.
-    pub(crate) maxsim: Vec<ColbertCandidateScore>,
+    /// ColBERT MaxSim scores over the windows the fused pool reaches, best-first
+    /// (empty when no pool hit resolves to a persisted ColBERT window). `debug`-only.
+    pub(crate) maxsim: Vec<ColbertWindowScore>,
     /// Final passage scores, best-first, including candidates beyond the result cap.
     pub(crate) reranked: Vec<PassageScore>,
     /// Exact source-window scores and the retained model-input context.
@@ -483,14 +483,8 @@ fn run_pipeline_body(
 
     *stage = "retrieval_fusion";
     let grouped_started = Instant::now();
-    let fusion = annotation_query::fuse(conn, annotation_scan, source_channels, profile, query_id)?;
+    let fusion = annotation_query::fuse(annotation_scan, source_channels, profile, query_id)?;
     latencies.fusion_ms = grouped_started.elapsed().as_millis() as u64;
-
-    // === Build the parse-of-unit index passage construction needs to resolve unit
-    // content parse-scoped. A pool can span several active parses (a query in
-    // scope over several sources), so each hit's units map to that hit's parse.
-    // First writer wins per unit (a unit belongs to one active parse). ===
-    let parse_of_unit = build_parse_of_unit(&fusion.pool);
 
     // Scoring stages borrow this transaction and acquire their own local-model
     // permits after storage reads. Query embedding below has a separate permit
@@ -528,7 +522,6 @@ fn run_pipeline_body(
     )?;
     let annotation_scoring_started = Instant::now();
     let annotation_maxsim = annotation_query::score_excerpts(
-        conn,
         &store,
         &fusion,
         inference,
@@ -551,7 +544,6 @@ fn run_pipeline_body(
         conn,
         &maxsim,
         &annotation_maxsim,
-        &parse_of_unit,
         inference.colbert.tokenizer(),
         passage_limit,
         query_id,
@@ -975,22 +967,4 @@ fn clone_dense_planes(
             })
         })
         .collect()
-}
-
-/// Map each candidate unit id in the pool to its originating `parse_id`, so the
-/// passage builder can resolve unit content parse-scoped even when the pool spans
-/// several active parses. First writer wins per unit: a unit belongs to exactly
-/// one active parse (the captured active set has one active parse per source and
-/// unit ids are parse-unique), so contention is not expected.
-fn build_parse_of_unit(pool: &[RetrievalHit]) -> std::collections::BTreeMap<String, String> {
-    let mut parse_of_unit: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for hit in pool {
-        for unit_id in &hit.unit_ids {
-            parse_of_unit
-                .entry(unit_id.clone())
-                .or_insert_with(|| hit.parse_id.clone());
-        }
-    }
-    parse_of_unit
 }

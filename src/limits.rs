@@ -53,10 +53,16 @@ pub struct FuzzyLimits {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingLimits {
-    pub min_search_unit_chars: usize,
-    pub chunk_max_tokens: u32,
-    pub annotation_window_max_tokens: u32,
-    pub section_max_tokens: u32,
+    /// ColBERT-token cap for fine chunks (paragraph grain).
+    pub fine_max_tokens: u32,
+    /// ColBERT-token cap for ColBERT windows; must equal the model's document limit.
+    pub colbert_max_tokens: u32,
+    /// ColBERT-token cap for context windows (page grain).
+    pub context_max_tokens: u32,
+    /// Consecutive context windows forming one annotation excerpt.
+    pub excerpt_windows: u32,
+    /// Minimum fill of any run as a fraction of its cap, strictly inside (0, 1).
+    pub min_fill_ratio: f64,
 }
 
 /// Allocation and scan guards; exceeding one is an explicit resource-limit failure.
@@ -234,16 +240,10 @@ impl RuntimeLimits {
                 "retrieval.raw_evidence_max_tokens",
                 r.raw_evidence_max_tokens as u128,
             ),
-            (
-                "indexing.min_search_unit_chars",
-                i.min_search_unit_chars as u128,
-            ),
-            ("indexing.chunk_max_tokens", i.chunk_max_tokens as u128),
-            (
-                "indexing.annotation_window_max_tokens",
-                i.annotation_window_max_tokens as u128,
-            ),
-            ("indexing.section_max_tokens", i.section_max_tokens as u128),
+            ("indexing.fine_max_tokens", i.fine_max_tokens as u128),
+            ("indexing.colbert_max_tokens", i.colbert_max_tokens as u128),
+            ("indexing.context_max_tokens", i.context_max_tokens as u128),
+            ("indexing.excerpt_windows", i.excerpt_windows as u128),
             (
                 "resources.max_source_body_bytes",
                 m.max_source_body_bytes as u128,
@@ -496,6 +496,31 @@ impl RuntimeLimits {
                 "scheduling.inter_change_ema_weight must be finite, greater than 0, and at most 1"
                     .into(),
             );
+        }
+        // A ratio of 0 disables merging and a ratio of 1 demands full runs;
+        // neither describes a minimum fill, so both endpoints are excluded.
+        if !i.min_fill_ratio.is_finite() || i.min_fill_ratio <= 0.0 || i.min_fill_ratio >= 1.0 {
+            return Err(
+                "indexing.min_fill_ratio must be finite and strictly between 0 and 1".into(),
+            );
+        }
+        // Higher grains pack whole fine chunks and never split one
+        // (PLAN-grains.md Section 2). A run below its minimum can always absorb
+        // the next chunk only when one chunk fits beside a sub-minimum run, so
+        // the fine cap must leave at least the minimum free under each higher cap.
+        for (name, cap) in [
+            ("indexing.colbert_max_tokens", i.colbert_max_tokens),
+            ("indexing.context_max_tokens", i.context_max_tokens),
+        ] {
+            let minimum = (f64::from(cap) * i.min_fill_ratio).floor() as u32;
+            let room = cap.saturating_sub(minimum);
+            if i.fine_max_tokens > room {
+                return Err(format!(
+                    "indexing.fine_max_tokens ({}) must be at most {name} minus its minimum fill \
+                     ({cap} - {minimum} = {room}) so higher grains never split a fine chunk",
+                    i.fine_max_tokens
+                ));
+            }
         }
         Ok(())
     }

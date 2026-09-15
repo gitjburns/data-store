@@ -4,6 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One cited range of a unit's evidence text, Unicode scalar offsets, end
+/// exclusive: the wire form of a grain fragment (PLAN-grains Section 2). It
+/// is declared here rather than reusing `projections::chunk::Fragment` because
+/// the CLI binary path-includes this module and has no `projections` tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SourceFragment {
+    pub(crate) unit_id: String,
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+}
+
 /// Discovery mechanism recorded for a hit. Graph and semantic share the final
 /// annotation fusion contribution, while their attribution remains distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,13 +140,17 @@ pub(crate) struct GraphRelationship {
     pub(crate) supporting_unit_ids: Vec<String>,
 }
 
-/// Canonical Unicode-scalar slice, independent of model tokenization or projection version.
+/// Exact canonical text, independent of model tokenization or projection version:
+/// the fragments (PLAN-grains Section 2 membership records, Unicode scalar
+/// offsets, end exclusive) in reading order, and the hash of the exact UTF-8
+/// text they compose. Invariant: the text is the fragment slices in order, and
+/// the only characters between, before, or after them are whitespace (the tab
+/// or blank-line join of the grain, or the remnant of one at a model-window
+/// boundary). A displayed unit range is one single-fragment excerpt.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SourceExcerpt {
-    pub(crate) unit_id: String,
-    pub(crate) start_char: usize,
-    pub(crate) end_char: usize,
+    pub(crate) fragments: Vec<SourceFragment>,
     pub(crate) text_hash: String,
 }
 

@@ -175,9 +175,6 @@ timeout_seconds = 120
 # Optional owner-only file containing the API key sent as a bearer token.
 # Relative paths resolve from this config file's directory.
 #api_key_file_path = ".annotator-api-key"
-# Maximum source-excerpt length in Unicode characters. Oversized units are
-# split without dropping text; prompts and intermediate results are additional.
-max_input_chars = 2000
 # Maximum provider completion tokens, including reasoning; a length stop fails
 # the annotation call instead of publishing partial output.
 max_completion_tokens = 150000
@@ -233,8 +230,8 @@ max_entity_name_tokens = 6
 # Unicode-character minimum for normalized terms admitted to the strict lexical query.
 # Broad OR matching retains shorter terms and stopwords; every term is quoted.
 min_fts_term_chars = 3
-# ColBERT-token budget per displayed source passage; legacy whole-unit text may
-# use a prefix, while exact windows remain complete. Reranker context is separate.
+# ColBERT-token budget per displayed source passage; a window's parts beyond it
+# are clipped and the passage is marked truncated. Reranker context is separate.
 passage_max_tokens = 512
 # Maximum canonical units assembled into one source passage; further neighbors are omitted.
 max_passage_units = 64
@@ -256,14 +253,16 @@ acronym_min_name_tokens = 2
 prefix_min_token_chars = 3
 
 [indexing]
-# Minimum Unicode characters in a searchable merged source chunk; shorter units are combined.
-min_search_unit_chars = 400
-# Complete-text ColBERT-token budget for source chunks; larger text is split into windows.
-chunk_max_tokens = 512
-# Complete-text ColBERT-token budget for annotation views; all windows are embedded.
-annotation_window_max_tokens = 512
-# Complete-text ColBERT-token budget for dense section windows; larger sections are split.
-section_max_tokens = 2048
+# ColBERT-token cap for fine chunks (paragraph grain): fine dense vectors and lexical index.
+fine_max_tokens = 256
+# ColBERT-token cap for ColBERT windows; must equal the ColBERT model's document limit.
+colbert_max_tokens = 512
+# ColBERT-token cap for context windows (page grain): context dense vectors and annotation source windows.
+context_max_tokens = 768
+# Consecutive context windows forming one annotation excerpt.
+excerpt_windows = 4
+# Minimum fill of any run as a fraction of its cap; shorter runs merge with a neighbor.
+min_fill_ratio = 0.5
 
 [resources]
 # Bytes per canonical body used by annotation/section readers and builders; excess fails that work.

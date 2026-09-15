@@ -438,8 +438,9 @@ struct SectionFineMatches {
 
 /// Rank section windows globally, then nominate only canonical units actually
 /// inside each window using their strongest fine-chunk match. All reads retain
-/// the captured transaction; crossing a section through a shared fine chunk
-/// cannot nominate the chunk's other units.
+/// the captured transaction. A chunk belongs to exactly one window, but a unit
+/// split across two chunks can straddle a window boundary; the ownership check
+/// keeps a window from nominating units it does not contain.
 fn section_nominations(
     conn: &Connection,
     store: &ArtifactStore,
@@ -581,8 +582,8 @@ fn section_nominations(
 }
 
 /// Rescore fine rows only for shortlisted section memberships, retaining one best
-/// match per member. A chunk shared across a window boundary cannot nominate units
-/// outside that window; section_nominations checks canonical ownership afterward.
+/// match per member. A unit split across chunks in two windows cannot be nominated
+/// by a window that lacks it; section_nominations checks canonical ownership afterward.
 fn best_section_chunks(
     conn: &Connection,
     parses: &[CapturedParse],

@@ -20,7 +20,6 @@ use crate::util::LogContext;
 use crate::{limits::DiagnosticLimits, runtime::StorageContext};
 
 use crate::assembly::model::EvidencePack;
-use crate::inference::ColbertCandidateScore;
 use crate::model::SnapshotType;
 use crate::model::{
     ContentUnit, DeletionEvidence, Operation, ParseRun, SourceLocation, SourceLocationStatus,
@@ -32,7 +31,7 @@ use crate::query::model::RetrievalHit;
 use crate::query::passages::{PassageCandidate, SearchResult};
 use crate::query::profile::{ScopeInput, resolve_scope};
 use crate::query::request::{QueryRequest, ValidatedQuery};
-use crate::query::rerank::PassageScore;
+use crate::query::rerank::{ColbertWindowScore, PassageScore};
 
 // Axum is confined to this transport module: it owns routing, bearer auth,
 // request-body limits, and the spawn_blocking seams that keep synchronous
@@ -682,7 +681,7 @@ struct QueryResponse {
 
 /// Raw per-stage retrieval diagnostics, attached only under `debug`. Projects the
 /// pipeline's stage outputs into the client contract. Score views distinguish
-/// whole-unit MaxSim from exact-window scoring and final passage candidate IDs.
+/// ColBERT-window MaxSim from exact-window scoring and final passage candidate IDs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryDiagnostics {
@@ -692,7 +691,7 @@ struct QueryDiagnostics {
     passage_candidates: Vec<PassageCandidate>,
     /// The pool selected by source dense, lexical, and grouped annotation fusion.
     fused_pool: Vec<RetrievalHit>,
-    /// ColBERT MaxSim scores over the fused pool, best-first.
+    /// ColBERT MaxSim scores over the windows the fused pool reaches, best-first.
     maxsim: Vec<MaxsimScoreView>,
     /// Exact-window MaxSim and annotation attribution; annotation bodies are not serialized here.
     annotation_maxsim: Vec<ScoredExcerpt>,
@@ -702,11 +701,13 @@ struct QueryDiagnostics {
     latencies: StageLatencyView,
 }
 
-/// Serializable projection of one ColBERT MaxSim candidate score (§debug).
+/// Serializable projection of one ColBERT MaxSim window score (§debug): the
+/// window id with its member chunk ids, never the fragments or the matrix.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MaxsimScoreView {
-    unit_id: String,
+    window_id: String,
+    chunk_ids: Vec<String>,
     score: f32,
     rank: usize,
 }
@@ -752,8 +753,9 @@ impl QueryDiagnostics {
         let maxsim = outcome
             .maxsim
             .iter()
-            .map(|score: &ColbertCandidateScore| MaxsimScoreView {
-                unit_id: score.unit_id.clone(),
+            .map(|score: &ColbertWindowScore| MaxsimScoreView {
+                window_id: score.window_id.clone(),
+                chunk_ids: score.chunk_ids.clone(),
                 score: score.score,
                 rank: score.rank,
             })

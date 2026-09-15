@@ -367,12 +367,10 @@ struct RenderedDocument {
 ///     reproduced verbatim rather than interpreted as Markdown.
 ///
 /// The text-field selection (`text` for text_block, caption, table_cell;
-/// `code` for code_block; no normalized-text fallback) is one of five
+/// `code` for code_block; no normalized-text fallback) is one of three
 /// synchronized readers of the SPEC-epub §2.1 evidence-bearing types and
-/// must stay aligned with `assembly::evidence::evidence_text`,
-/// `projections::chunk::extract_targeting_text`,
-/// `projections::multivector::evidence_text`, and
-/// `annotations::producer::evidence_text`.
+/// must stay aligned with `assembly::evidence::evidence_text` and
+/// `projections::chunk`'s member derivation, which feeds every higher grain.
 ///
 /// The tree is walked in READING ORDER (the SELECT ordering), not by
 /// re-deriving structure from `primary_parent_id`: reading order already

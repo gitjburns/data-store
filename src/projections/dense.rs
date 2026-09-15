@@ -5,8 +5,10 @@
 //!
 //! Granularity (approved design fact 2): one `chunk_dense_vectors` row per
 //! `chunk_projections` row — the dense channel shares chunk targeting
-//! granularity with the lexical channel, so a chunk's `targeting_text` is the
-//! exact passage embedded.
+//! granularity with the lexical channel. The passage embedded is the chunk's
+//! model input (`chunk::model_input`: section-path prefix, blank line,
+//! canonical `targeting_text`; PLAN-grains Section 2), while the lexical
+//! channel indexes the canonical text alone.
 //!
 //! Atomicity: the build path takes the CALLER's `&Transaction` and drives the
 //! whole per-parse build (envelope open → per-chunk insert → envelope
@@ -65,6 +67,7 @@ use crate::primitives::codec::{decode_vector_blob, encode_vector_blob};
 use crate::primitives::utc_now;
 use crate::primitives::validate::validate_vector;
 use crate::projections::StoredChunk;
+use crate::projections::chunk::model_input;
 use crate::projections::envelope::{self, NewProjection, ProjectionType};
 use crate::state::ModelCallPermit;
 
@@ -86,18 +89,18 @@ const DENSE_PRODUCER_VERSION: &str = "1";
 const DENSE_MODEL_ROLE: &str = "dense";
 const DENSE_CALL_PURPOSE: &str = "passage_embedding";
 
-/// Ordered SELECT of a parse's chunks. Ordering by `id` keeps the per-parse
-/// build and its logs deterministic across runs; the dense channel does not
-/// depend on chunk order for correctness (each chunk embeds independently), but
-/// a total order makes the batch reproducible.
+/// Ordered SELECT of a parse's chunks in reading order (`chunk_index`, the
+/// only reading-order authority for chunks). The dense channel does not depend
+/// on chunk order for correctness (each chunk embeds independently), but the
+/// total order makes the batch and its logs reproducible.
 const SELECT_PARSE_CHUNKS_SQL: &str = "
 SELECT
   id, projection_id, source_id, parse_id, input_unit_ids_json,
   targeting_text, token_count, chunker_name, chunker_version,
-  chunker_config_hash
+  chunker_config_hash, fragments_json, section_path_json, chunk_index
 FROM chunk_projections
 WHERE parse_id = ?1
-ORDER BY id";
+ORDER BY chunk_index";
 
 /// Delete every dense vector of a parse ahead of a rebuild (idempotent
 /// rebuild). Runs inside the caller's transaction so a rebuild that fails
@@ -158,7 +161,8 @@ pub(crate) struct DenseBuildOutcome {
 }
 
 /// Build the per-parse dense plane: open a `dense_vector` envelope, embed each
-/// chunk's `targeting_text` as a passage through the config-selected dense
+/// chunk's model input (section-path prefix plus canonical text) as a passage
+/// through the config-selected dense
 /// backend, validate and persist each vector, then complete the envelope — all
 /// on the caller's transaction.
 ///
@@ -375,7 +379,10 @@ fn build_all_chunks(
         DenseEmbeddingBackend::Local(runtime) => {
             for (index, chunk) in chunks.iter().enumerate() {
                 let call = dense_backend.monitor_call(monitor, "passage embedding");
-                let result = runtime.embed_passage_vector(&chunk.targeting_text);
+                // Model input carries the section-path prefix; the persisted
+                // row keeps the canonical text (PLAN-grains Section 2).
+                let input = model_input(&chunk.section_path, &chunk.targeting_text);
+                let result = runtime.embed_passage_vector(&input);
                 if let Some(call) = call {
                     call.finish_result(&result);
                 }
@@ -403,10 +410,13 @@ fn build_all_chunks(
         // per-window vectors in window order, so window order == chunk order.
         DenseEmbeddingBackend::Http(client) => {
             let windows: Vec<&[StoredChunk]> = chunks.chunks(client.batch_size()).collect();
-            let texts: Vec<&str> = chunks
+            // Model input carries the section-path prefix; the persisted row
+            // keeps the canonical text (PLAN-grains Section 2).
+            let inputs: Vec<String> = chunks
                 .iter()
-                .map(|chunk| chunk.targeting_text.as_str())
+                .map(|chunk| model_input(&chunk.section_path, &chunk.targeting_text))
                 .collect();
+            let texts: Vec<&str> = inputs.iter().map(String::as_str).collect();
             let text_windows: Vec<&[&str]> = texts.chunks(client.batch_size()).collect();
             let window_vectors = embed_windows_concurrently(
                 client,
@@ -791,6 +801,9 @@ fn read_parse_chunks(tx: &Transaction<'_>, parse_id: &str) -> Result<Vec<StoredC
                 chunker_name: row.get(7)?,
                 chunker_version: row.get(8)?,
                 chunker_config_hash: row.get(9)?,
+                fragments_json: row.get(10)?,
+                section_path_json: row.get(11)?,
+                chunk_index: row.get(12)?,
             })
         })
         .map_err(|source| ApiError::StorageOperation {
@@ -807,8 +820,9 @@ fn read_parse_chunks(tx: &Transaction<'_>, parse_id: &str) -> Result<Vec<StoredC
     Ok(chunks)
 }
 
-/// One `chunk_projections` row as read from SQLite, before its
-/// `input_unit_ids_json` is decoded and its nullable `token_count` is re-typed.
+/// One `chunk_projections` row as read from SQLite, before its JSON columns
+/// (`input_unit_ids_json`, `fragments_json`, `section_path_json`) are decoded
+/// and its nullable `token_count` and INTEGER `chunk_index` are re-typed.
 struct ChunkRawRow {
     id: String,
     projection_id: String,
@@ -820,21 +834,19 @@ struct ChunkRawRow {
     chunker_name: String,
     chunker_version: String,
     chunker_config_hash: String,
+    fragments_json: String,
+    section_path_json: String,
+    chunk_index: i64,
 }
 
-/// Re-type one persisted chunk row into `super::StoredChunk`, decoding the
-/// `input_unit_ids_json` array. A stored value that no longer parses is a
-/// corruption surfaced with the chunk's identity, never silently dropped.
+/// Re-type one persisted chunk row into `super::StoredChunk`, decoding its
+/// canonical JSON columns. A stored value that no longer parses, or a negative
+/// `chunk_index`, is a corruption surfaced with the chunk's identity, never
+/// silently dropped.
 fn chunk_from_raw(row: ChunkRawRow) -> Result<StoredChunk, ApiError> {
-    let input_unit_ids: Vec<String> =
-        serde_json::from_str(&row.input_unit_ids_json).map_err(|source| {
-            ApiError::StorageOperation {
-                message: format!(
-                    "persisted input unit ids of chunk {} are unparseable: {source}",
-                    row.id
-                ),
-            }
-        })?;
+    let input_unit_ids = decode_json_column(&row.input_unit_ids_json, &row.id, "input unit ids")?;
+    let fragments = decode_json_column(&row.fragments_json, &row.id, "fragments")?;
+    let section_path = decode_json_column(&row.section_path_json, &row.id, "section path")?;
     // token_count is a nonnegative count; a negative stored value is corruption.
     let token_count = row
         .token_count
@@ -844,6 +856,12 @@ fn chunk_from_raw(row: ChunkRawRow) -> Result<StoredChunk, ApiError> {
             })
         })
         .transpose()?;
+    let chunk_index = usize::try_from(row.chunk_index).map_err(|_| ApiError::StorageOperation {
+        message: format!(
+            "chunk {} has an invalid stored chunk_index {}",
+            row.id, row.chunk_index
+        ),
+    })?;
 
     Ok(StoredChunk {
         id: row.id,
@@ -856,6 +874,21 @@ fn chunk_from_raw(row: ChunkRawRow) -> Result<StoredChunk, ApiError> {
         chunker_name: row.chunker_name,
         chunker_version: row.chunker_version,
         chunker_config_hash: row.chunker_config_hash,
+        fragments,
+        section_path,
+        chunk_index,
+    })
+}
+
+/// Decode one canonical JSON column of a chunk row, naming the chunk and the
+/// column on failure so corruption is attributable.
+fn decode_json_column<T: serde::de::DeserializeOwned>(
+    json: &str,
+    chunk_id: &str,
+    what: &str,
+) -> Result<T, ApiError> {
+    serde_json::from_str(json).map_err(|source| ApiError::StorageOperation {
+        message: format!("persisted {what} of chunk {chunk_id} are unparseable: {source}"),
     })
 }
 

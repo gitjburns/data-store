@@ -1,4 +1,6 @@
 //! Semantic annotation discovery, grouped fusion, and bounded source-window scoring.
+//! Candidates are keyed by the cohort's context window; a candidate displays
+//! the best-scoring ColBERT partition of that window's canonical text.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,13 +9,12 @@ use std::{
 };
 
 use crate::sqlite::Connection;
-use rusqlite::params;
 use serde::Serialize;
 use tracing::{error, info};
 
 use crate::{
     artifact_store::ArtifactStore,
-    canonical::{canonical_sha256_hex_of, sha256_hex_bytes},
+    canonical::sha256_hex_bytes,
     error::ApiError,
     inference::{InferenceRuntime, PreparedColbertQuery},
     primitives::fusion::fuse_ranked_lists,
@@ -39,7 +40,8 @@ struct MatchPointer {
     exact_annotation_range: bool,
 }
 
-/// One bounded dense nomination. Text and matrices remain in verified artifact files.
+/// One bounded dense nomination of a cohort window, displayed through the
+/// source partition `excerpt`. Text and matrices remain in verified artifact files.
 #[derive(Debug, Clone)]
 struct WindowMatch {
     key: String,
@@ -53,10 +55,22 @@ struct WindowMatch {
     entity_name: Option<String>,
 }
 
+/// One parse's context-window membership, read once per query from the
+/// section-dense reference captured in the query transaction.
+#[derive(Default)]
+struct WindowIndex {
+    /// Member chunk ids per window id, for checking a cohort's window still exists unchanged.
+    chunk_ids_by_window: BTreeMap<String, Vec<String>>,
+    /// The single window citing a unit; `None` when the unit is split across windows.
+    window_of_unit: BTreeMap<String, Option<String>>,
+}
+
 /// Per-representation lists are independently capped before their ranks are grouped.
 pub(crate) struct AnnotationScan {
     lists: BTreeMap<AnnotationRepresentation, Vec<WindowMatch>>,
     pub(crate) semantic_names: Vec<(String, String)>,
+    /// Membership of every parse that has annotation publications, keyed by parse id.
+    windows: BTreeMap<String, WindowIndex>,
 }
 
 /// The scoring handoff keeps file references only for candidates admitted by final fusion.
@@ -114,10 +128,15 @@ pub(crate) fn scan(
         "searching published annotation and source representations"
     );
     let result = (|| {
+        let mut windows: BTreeMap<String, WindowIndex> = BTreeMap::new();
         for parse in parses {
-            for publication in
-                annotation::published_for_parse(conn, &parse.source_id, &parse.parse_id)?
-            {
+            let published =
+                annotation::published_for_parse(conn, &parse.source_id, &parse.parse_id)?;
+            if published.is_empty() {
+                continue;
+            }
+            let index = window_index(conn, store, parse)?;
+            for publication in published {
                 let manifest = annotation::read_manifest(store, &publication.payload_uri)?;
                 annotation::validate_publication_lineage(&publication, &manifest.plan)?;
                 if manifest.plan.source_id != parse.source_id
@@ -138,12 +157,11 @@ pub(crate) fn scan(
                     stale += 1;
                     continue;
                 };
-                if !eligible_unit(
-                    conn,
-                    &parse.source_id,
-                    &parse.parse_id,
-                    &manifest.plan.target.unit_id,
-                )? {
+                // The cohort window must still exist with the same members in
+                // the captured section plane; a rebuilt plane can reuse an id.
+                let target = &manifest.plan.target;
+                if index.chunk_ids_by_window.get(&target.window_id) != Some(&target.chunk_ids) {
+                    stale += 1;
                     continue;
                 }
                 let mut best: BTreeMap<AnnotationRepresentation, (f32, usize)> = BTreeMap::new();
@@ -187,7 +205,12 @@ pub(crate) fn scan(
                                 representation_id: input.id.clone(),
                                 representation: kind,
                                 annotation_ids: input.annotation_ids.clone(),
-                                exact_annotation_range: manifest.plan.target.range.is_some(),
+                                exact_annotation_range: inputs
+                                    .iter()
+                                    .filter(|annotation| {
+                                        input.annotation_ids.contains(&annotation.id)
+                                    })
+                                    .all(annotation::has_exact_ranges),
                             }),
                         )
                     })
@@ -198,7 +221,7 @@ pub(crate) fn scan(
                     };
                     let source_score = annotation_io::cosine(store, &representation.dense, query)?;
                     vectors += 1;
-                    let key = excerpt_key(&parse.parse_id, excerpt)?;
+                    let key = window_key(&parse.parse_id, &target.window_id);
                     let source = WindowMatch {
                         key,
                         source_id: parse.source_id.clone(),
@@ -211,7 +234,8 @@ pub(crate) fn scan(
                             representation_id: representation.input.id.clone(),
                             representation: AnnotationRepresentation::Source,
                             annotation_ids: Vec::new(),
-                            exact_annotation_range: manifest.plan.target.range.is_some(),
+                            // A source partition is always an exact canonical range.
+                            exact_annotation_range: true,
                         }),
                         score: source_score,
                         source_score,
@@ -231,6 +255,7 @@ pub(crate) fn scan(
                     }
                 }
             }
+            windows.insert(parse.parse_id.clone(), index);
         }
         let semantic_names = lists
             .get(&AnnotationRepresentation::Entity)
@@ -247,6 +272,7 @@ pub(crate) fn scan(
         Ok(AnnotationScan {
             lists,
             semantic_names,
+            windows,
         })
     })();
     match &result {
@@ -269,7 +295,6 @@ pub(crate) fn scan(
 
 /// Own final fusion diagnostics after every source and annotation shortlist is available.
 pub(crate) fn fuse(
-    conn: &Connection,
     scan: AnnotationScan,
     source: ChannelCandidates,
     profile: &RetrievalProfile,
@@ -286,7 +311,7 @@ pub(crate) fn fuse(
         rrf_k = profile.limits.rrf_k,
         "fusing source dense, lexical, and grouped annotation rankings"
     );
-    let result = fuse_candidates(conn, scan, source, profile);
+    let result = fuse_candidates(scan, source, profile);
     match &result {
         Ok(fusion) => info!(
             event = "query.fusion.completed",
@@ -309,7 +334,6 @@ pub(crate) fn fuse(
 
 /// Combine graph and semantic annotation lists into one vote before the three-way fusion.
 fn fuse_candidates(
-    conn: &Connection,
     scan: AnnotationScan,
     source: ChannelCandidates,
     profile: &RetrievalProfile,
@@ -336,42 +360,30 @@ fn fuse_candidates(
             representation_lists.push(keys);
         }
     }
-    // A whole-unit hit and an exact window covering that entire unit identify
-    // the same evidence. Partial windows remain distinct; they must not inherit
-    // an unrelated chunk's match merely because they share a parent unit.
-    let mut whole_units = BTreeMap::new();
-    for matches in pointers.values() {
-        let Some(first) = matches.first() else {
-            continue;
-        };
-        if first.excerpt.start_char != 0 {
-            continue;
-        }
-        let text = annotation::source_text(
-            conn,
-            &first.source_id,
-            &first.parse_id,
-            &first.excerpt.unit_id,
-        )?;
-        if text.chars().count() == first.excerpt.end_char
-            && sha256_hex_bytes(text.as_bytes()) == first.excerpt.text_hash
-        {
-            whole_units.insert(
-                (first.parse_id.clone(), first.excerpt.unit_id.clone()),
-                first.key.clone(),
-            );
-        }
-    }
+    // Consolidation rule: a source channel hit on unit `u` identifies the same
+    // evidence as the annotation window whose member chunks hold every chunk
+    // of `u`, that is, the single window citing `u` in the parse's membership.
+    // A unit split across windows stays a distinct unit candidate; it must not
+    // inherit a window's match for text the window only partly holds. Only
+    // windows nominated by annotation retrieval are consolidation targets.
     let mut dense = Vec::new();
     let mut lexical = Vec::new();
     let mut graph = Vec::new();
     let mut base_hits = Vec::new();
     for mut hit in source.channel_hits {
-        let key = whole_units
-            .get(&(hit.parse_id.clone(), hit.hit_id.clone()))
-            .cloned()
+        let key = scan
+            .windows
+            .get(&hit.parse_id)
+            .and_then(|index| index.window_of_unit.get(&hit.hit_id))
+            .and_then(|window| window.as_deref())
+            .map(|window_id| window_key(&hit.parse_id, window_id))
+            .filter(|key| records.contains_key(key))
             .unwrap_or_else(|| unit_key(&hit.parse_id, &hit.hit_id));
         if let Some(existing) = records.get(&key) {
+            // The hit adopts the window's identity so later same-target joins
+            // and passage attribution see one candidate, not a unit and a window.
+            hit.hit_id = existing.hit_id.clone();
+            hit.unit_ids = existing.unit_ids.clone();
             hit.source_excerpt = existing.source_excerpt.clone();
         }
         match hit.channel {
@@ -533,7 +545,6 @@ fn fuse_candidates(
 
 /// Score only admitted exact windows, loading one bounded cohort/matrix at a time.
 pub(crate) fn score_excerpts(
-    conn: &Connection,
     store: &ArtifactStore,
     fusion: &AnnotationFusion,
     runtime: &InferenceRuntime,
@@ -552,22 +563,9 @@ pub(crate) fn score_excerpts(
         let mut output = Vec::new();
         for (key, selected) in &fusion.selected {
             let first = &selected.source;
-            let canonical = annotation::source_text(
-                conn,
-                &first.source_id,
-                &first.parse_id,
-                &first.excerpt.unit_id,
-            )?;
-            let text = annotation::slice_chars(
-                &canonical,
-                first.excerpt.start_char,
-                first.excerpt.end_char,
-            )?;
-            if sha256_hex_bytes(text.as_bytes()) != first.excerpt.text_hash {
-                return Err(failure(
-                    "retrieved source window differs from canonical evidence",
-                ));
-            }
+            // The displayed text is the archived partition text; the passage
+            // builder verifies it against canonical units under its snapshot.
+            let mut text = None;
             let mut score = f32::NEG_INFINITY;
             let mut source_score = f32::NEG_INFINITY;
             let mut context = BTreeSet::new();
@@ -599,6 +597,16 @@ pub(crate) fn score_excerpts(
                                 "retained annotation representation is missing from its manifest",
                             )
                         })?;
+                    if is_source && text.is_none() {
+                        if sha256_hex_bytes(representation.input.text.as_bytes())
+                            != first.excerpt.text_hash
+                        {
+                            return Err(failure(
+                                "retrieved source window differs from its archived text",
+                            ));
+                        }
+                        text = Some(representation.input.text.clone());
+                    }
                     let values = annotation_io::load_embedding(store, &representation.colbert)?;
                     // Storage I/O is finished before a local accelerator permit is taken.
                     let permit = if runtime.colbert.uses_local_model_gate() {
@@ -634,12 +642,14 @@ pub(crate) fn score_excerpts(
             if !score.is_finite() || !source_score.is_finite() {
                 return Err(failure("annotation candidate has no finite source score"));
             }
+            let text =
+                text.ok_or_else(|| failure("annotation candidate scored no source partition"))?;
             output.push(ScoredExcerpt {
                 candidate_id: key.clone(),
                 source_id: first.source_id.clone(),
                 parse_id: first.parse_id.clone(),
                 excerpt: first.excerpt.clone(),
-                text: text.to_owned(),
+                text,
                 score,
                 source_score,
                 annotation_context: context.into_iter().collect(),
@@ -691,24 +701,78 @@ fn match_order(left: &WindowMatch, right: &WindowMatch) -> std::cmp::Ordering {
         .then_with(|| left.key.cmp(&right.key))
 }
 
-/// Address a canonical source slice independently of which annotation representation found it.
-pub(crate) fn excerpt_key(parse_id: &str, excerpt: &SourceExcerpt) -> Result<String, ApiError> {
-    canonical_sha256_hex_of(&(parse_id, excerpt))
+/// Unit ids an excerpt cites, in first-occurrence order without duplicates:
+/// the rule every grain derives its unit ids by (`chunk::ordered_unit_ids`).
+pub(crate) fn excerpt_unit_ids(excerpt: &SourceExcerpt) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for fragment in &excerpt.fragments {
+        if !ids.iter().any(|id| id == &fragment.unit_id) {
+            ids.push(fragment.unit_id.clone());
+        }
+    }
+    ids
 }
 
-/// Whole-unit candidates remain distinct from partial excerpts until passage overlap resolution.
+/// Whether any fragment of the excerpt cites the unit.
+pub(crate) fn excerpt_cites_unit(excerpt: &SourceExcerpt, unit_id: &str) -> bool {
+    excerpt
+        .fragments
+        .iter()
+        .any(|fragment| fragment.unit_id == unit_id)
+}
+
+/// Address a cohort window independently of which annotation representation found it.
+fn window_key(parse_id: &str, window_id: &str) -> String {
+    format!("window:{parse_id}:{window_id}")
+}
+
+/// Whole-unit candidates remain distinct from window excerpts until passage overlap resolution.
 fn unit_key(parse_id: &str, unit_id: &str) -> String {
     format!("unit:{parse_id}:{unit_id}")
 }
 
-/// Preserve the canonical hit ID while recording the more precise source target separately.
+/// Read one parse's window membership from its captured section reference.
+/// Retains chunk ids and unit-to-window membership only; vectors and text are
+/// streamed past. The dense plane is required for every captured parse.
+fn window_index(
+    conn: &Connection,
+    store: &ArtifactStore,
+    parse: &CapturedParse,
+) -> Result<WindowIndex, ApiError> {
+    let plane = parse.dense_plane.as_ref().ok_or_else(|| {
+        failure(format!(
+            "captured parse {} has no dense plane for annotation windows",
+            parse.parse_id
+        ))
+    })?;
+    let mut index = WindowIndex::default();
+    plane.visit_sections(conn, store, |window| {
+        for unit_id in &window.input_unit_ids {
+            index
+                .window_of_unit
+                .entry(unit_id.clone())
+                .and_modify(|owner| *owner = None)
+                .or_insert_with(|| Some(window.window_id.clone()));
+        }
+        // The visitor lends each streamed window; the index outlives the stream.
+        index
+            .chunk_ids_by_window
+            .insert(window.window_id.clone(), window.chunk_ids.clone());
+        Ok(())
+    })?;
+    Ok(index)
+}
+
+/// The hit anchors on the excerpt's first cited unit and resolves to every
+/// cited unit, with the exact source target recorded separately.
 fn window_hit(matched: &WindowMatch) -> RetrievalHit {
+    let unit_ids = excerpt_unit_ids(&matched.excerpt);
     RetrievalHit {
         hit_type: RetrievalHitType::ContentUnit,
-        hit_id: matched.excerpt.unit_id.clone(),
+        hit_id: unit_ids.first().cloned().unwrap_or_default(),
         source_id: matched.source_id.clone(),
         parse_id: matched.parse_id.clone(),
-        unit_ids: vec![matched.excerpt.unit_id.clone()],
+        unit_ids,
         channel: if matched.matched.representation == AnnotationRepresentation::Source {
             RetrievalChannel::Dense
         } else {
@@ -779,30 +843,6 @@ fn same_target(left: &RetrievalHit, right: &RetrievalHit) -> bool {
     left.parse_id == right.parse_id
         && left.hit_id == right.hit_id
         && left.source_excerpt == right.source_excerpt
-}
-
-/// Confirm the annotation target still exists in the captured parse. v0.4 has
-/// no furniture roles (SPEC-epub §2.2), so existence is the only eligibility
-/// rule, matching ordinary source retrieval in `channels.rs`.
-fn eligible_unit(
-    conn: &Connection,
-    source_id: &str,
-    parse_id: &str,
-    unit_id: &str,
-) -> Result<bool, ApiError> {
-    // A missing row surfaces as `QueryReturnedNoRows` and is an error, never
-    // `Ok(false)`: a target absent from its captured parse is corrupt state.
-    conn.query_row(
-        "SELECT 1 FROM content_units WHERE id=?1 AND source_id=?2 AND parse_id=?3",
-        params![unit_id, source_id, parse_id],
-        |_| Ok(()),
-    )
-    .map_err(|source| {
-        failure(format!(
-            "validate annotation target {unit_id} in {parse_id}: {source}"
-        ))
-    })?;
-    Ok(true)
 }
 
 /// Preserve source context through the existing query error envelope.

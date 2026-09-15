@@ -453,7 +453,7 @@ when the request set `debug: true`:
       "sourceId": "...",
       "parseId": "...",
       "unitIds": ["..."],
-      "sourceExcerpts": [{"unitId": "...", "startChar": 0, "endChar": 23, "textHash": "..."}],
+      "sourceExcerpts": [{"fragments": [{"unitId": "...", "startChar": 0, "endChar": 23}], "textHash": "..."}],
       "sourceLocations": [{"nativeUri": "...", "status": "current"}],
       "sectionPath": ["Section heading"],
       "score": 0.87,
@@ -501,11 +501,11 @@ when the request set `debug: true`:
 | `text` | string | Passage text in canonical reading order, bounded to `retrieval.passage_max_tokens` ColBERT tokens. |
 | `sourceId`, `parseId` | string | Captured source and active parse. |
 | `unitIds` | array of string | Canonical units contributing to the passage, in reading order. |
-| `sourceExcerpts` | array | Displayed canonical ranges, in passage order: `unitId`, `startChar`, `endChar`, `textHash`. Offsets are Unicode-scalar positions; `endChar` is exclusive and the hash covers the excerpt's UTF-8 bytes. |
+| `sourceExcerpts` | array | Displayed canonical ranges, in passage order. Each is a `SourceExcerpt`: `fragments` (array of `unitId`, `startChar`, `endChar`, in reading order) and `textHash`. Offsets are Unicode-scalar positions; `endChar` is exclusive; the hash covers the UTF-8 bytes of the fragment slices in order, with only whitespace between them. A displayed unit range is a one-fragment excerpt. |
 | `sourceLocations` | array of object | Recorded locations, each with `nativeUri` and availability `status`. |
 | `sectionPath` | array of string | Section headings, or an empty array when unavailable. |
 | `score` | number | Final passage reranker score. |
-| `truncated` | bool | A legacy whole-unit candidate was clipped to fit the passage limit. Retrieved exact windows remain complete; full canonical bodies remain in `evidencePack`. |
+| `truncated` | bool | A window part was dropped or clipped by the passage caps. Full canonical bodies remain in `evidencePack`. |
 | `retrievalProvenance` | object | Server-computed candidate attribution, present independently of `debug` and evidence toggles. |
 
 `results` is rank-ordered. `evidencePack` retains exactly their canonical
@@ -635,7 +635,7 @@ serializable projection of the pipeline's in-memory stage outputs.
 |-------|------|---------|
 | `channelHits` | array of `RetrievalHit` | Dense, lexical, graph, and semantic attribution before outer fusion. |
 | `fusedPool` | array of `RetrievalHit` | Candidates admitted by the three grouped contributions, retaining exact excerpts where available. |
-| `maxsim` | array | ColBERT scores for whole-unit candidates, best-first: `unitId`, `score`, `rank`. |
+| `maxsim` | array | ColBERT MaxSim scores for the ColBERT windows reached from the fused pool's source hits, best-first: `windowId`, `chunkIds` (member fine chunks in reading order), `score`, `rank`. Ties break on `windowId`. |
 | `annotationMaxsim` | array | Exact-window scores: `candidateId`, `sourceId`, `parseId`, `excerpt`, canonical `text`, `score`, `sourceScore`, `annotationMatches`. `score` is the best source or matched-annotation MaxSim, not their sum. Derived annotation text is omitted. |
 | `passageCandidates` | array | Passages offered to final reranking: `candidateId`, `anchorUnitId`, `sourceId`, `parseId`, `unitIds`, `text`, `sectionPath`, `truncated`. Candidate IDs distinguish different ranges within one canonical anchor. |
 | `reranked` | array | Final passage scores, best-first: `candidateId`, `score`, `rank`, optional `logit`, optional `tokenCount`. |

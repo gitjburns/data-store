@@ -58,10 +58,15 @@ INSERT INTO semantic_annotations (
 /// content key is identity-invariant. Completion is the earliest point the
 /// running identity is known (the reopen transition cannot know which producer
 /// will run), so the re-stamp lives here, not at `retry_failed`.
+///
+/// `target_unit_ids_json` (?6) is rewritten as well: the building row was
+/// opened with the whole excerpt's units before any output existed, and the
+/// completed item is attributed to the fragments that support it
+/// (`producer::attribute`), which may be a subset.
 const COMPLETE_FRESH_SQL: &str = "
 UPDATE semantic_annotations
 SET body_json = ?2, confidence = ?3, provenance_json = ?4,
-    memoization_key_hash = ?5,
+    memoization_key_hash = ?5, target_unit_ids_json = ?6,
     freshness_status = 'fresh'
 WHERE id = ?1 AND freshness_status = 'building'";
 
@@ -329,6 +334,10 @@ pub(crate) fn insert_fresh(
 /// content-scoped reopen may have adopted a row minted under a different
 /// producer identity, so the memo CACHE key must key on the completing
 /// identity. `content_key_hash` is unchanged by construction (same content).
+///
+/// `target_unit_ids` are the completed item's attributed units, replacing the
+/// whole-excerpt list the building row was opened with; they must agree with
+/// `final_provenance.input_refs`, which the caller derives from the same targets.
 pub(crate) fn complete_fresh(
     tx: &Transaction<'_>,
     annotation_id: &str,
@@ -336,12 +345,17 @@ pub(crate) fn complete_fresh(
     confidence: Option<f64>,
     final_provenance: &Provenance,
     memoization_key_hash: &str,
+    target_unit_ids: &[String],
 ) -> Result<(), ApiError> {
     let body_json =
         canonical_json_string_of(body, &format!("body for annotation {annotation_id}"))?;
     let provenance_json = canonical_json_string_of(
         final_provenance,
         &format!("final provenance for annotation {annotation_id}"),
+    )?;
+    let target_unit_ids_json = canonical_json_string_of(
+        &target_unit_ids,
+        &format!("target unit ids for annotation {annotation_id}"),
     )?;
 
     let updated = tx
@@ -352,7 +366,8 @@ pub(crate) fn complete_fresh(
                 body_json,
                 confidence,
                 provenance_json,
-                memoization_key_hash
+                memoization_key_hash,
+                target_unit_ids_json
             ],
         )
         .map_err(|source| ApiError::StorageOperation {

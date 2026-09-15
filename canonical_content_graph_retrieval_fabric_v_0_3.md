@@ -979,9 +979,11 @@ textual evidence unit; `list`, `list_item`, and `aside` are containers;
 `figure` is a visual object; `caption` is an independent caption unit;
 `code_block` is a code fragment.
 
-Evidence-bearing types, whose text feeds chunking, multi-vector projections,
-annotation, and passages: `text_block`, `caption`, `table_cell`,
-`code_block`. All other types carry no evidence text.
+Evidence-bearing types, whose text feeds the fine chunks from which
+multi-vector projections, annotation excerpts, and passages derive:
+`text_block`, `caption`, `table_cell`, `code_block`. All other types carry no
+evidence text. A `text_block` with role `heading` contributes only to the
+section path, and the cells of one `table_row` form one chunking member.
 
 Text projection for `textHash`: `text` for `text_block`, `caption`, and
 `table_cell`; `code` for `code_block`; absent for every other type.

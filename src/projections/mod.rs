@@ -9,12 +9,13 @@
 //!   metadata rows (`retrieval_projections`) and their freshness lifecycle,
 //!   consumed by every builder below.
 //! - `lexical` (C6a): FTS5 lexical channel over `chunk_text_index`.
-//! - `chunk` (C6b): the chunk builder — splits (text, unit-id context) into
-//!   `chunk_projections` rows carrying the chunker identity and config hash.
+//! - `chunk` (C6b): the fine chunker — packs evidence members into
+//!   `chunk_projections` rows (PLAN-grains Section 2 fine grain) carrying the
+//!   chunker identity, config hash, fragments, and section path.
 //! - `dense` (C6c): per-chunk dense vectors (`chunk_dense_vectors`).
 //! - `view` (C6d): derived-view and summary projections.
-//! - `multivector` (C6e): per-unit ColBERT matrices
-//!   (`unit_multivector_projections`, D4).
+//! - `multivector` (C6e): ColBERT matrices per window of consecutive fine
+//!   chunks (`colbert_windows`, PLAN-grains Section 2 ColBERT grain).
 //! - `graph` (C6f): entity-mention and entity-edge projections (D9).
 //!
 //! This module owns the SHARED contract the packages consume: the banked
@@ -53,7 +54,7 @@ pub(crate) const CHUNKER_NAME: &str = "fabric-chunker";
 /// when the splitting algorithm changes in a way that alters chunk boundaries,
 /// so a version change is a visible rebuild trigger rather than a silent
 /// change in what got indexed.
-pub(crate) const CHUNKER_VERSION: &str = "2";
+pub(crate) const CHUNKER_VERSION: &str = "3";
 pub(crate) const CHUNK_CONFIG_PAYLOAD_TYPE: &str = "chunk_construction_policy";
 
 /// The identity-bearing chunker configuration whose canonical hash is the
@@ -61,16 +62,20 @@ pub(crate) const CHUNK_CONFIG_PAYLOAD_TYPE: &str = "chunk_construction_policy";
 /// struct keeps it the single source of the hashed shape; camelCase matches
 /// the §16.2 wire convention used across the model. Two chunkers that would
 /// produce different chunk boundaries must never share this hash, so every
-/// boundary-affecting parameter belongs here.
+/// boundary-affecting parameter belongs here: the token cap and, since
+/// version 3, the PLAN-grains Section 2 minimum-fill ratio.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ChunkerConfig {
     pub(crate) chunker_name: String,
     pub(crate) chunker_version: String,
-    pub(crate) min_search_unit_chars: usize,
     pub(crate) max_unit_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tokenizer_hash: Option<String>,
+    /// Minimum fill of a run as a fraction of `max_unit_tokens`; absent only
+    /// in the frozen pre-version-3 shapes, which had no minimum-fill rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_fill_ratio: Option<f64>,
 }
 
 impl ChunkerConfig {
@@ -88,20 +93,22 @@ impl ChunkerConfig {
         Ok(Self {
             chunker_name: CHUNKER_NAME.to_owned(),
             chunker_version: CHUNKER_VERSION.to_owned(),
-            min_search_unit_chars: limits.min_search_unit_chars,
-            max_unit_tokens: limits.chunk_max_tokens,
+            max_unit_tokens: limits.fine_max_tokens,
             tokenizer_hash: Some(crate::canonical::sha256_hex_bytes(tokenizer.as_bytes())),
+            min_fill_ratio: Some(limits.min_fill_ratio),
         })
     }
 
     /// Legacy artifacts have no descriptor and must match this exact frozen v1 shape.
+    /// The v1 character floor (400) is no longer part of the descriptor; v1
+    /// artifacts are matched by name and version only.
     pub(crate) fn legacy() -> Self {
         ChunkerConfig {
             chunker_name: CHUNKER_NAME.to_owned(),
             chunker_version: "1".to_owned(),
-            min_search_unit_chars: 400,
             max_unit_tokens: 512,
             tokenizer_hash: None,
+            min_fill_ratio: None,
         }
     }
 
@@ -109,14 +116,16 @@ impl ChunkerConfig {
     pub(crate) fn validate(&self) -> Result<(), ApiError> {
         let valid = self.chunker_name == CHUNKER_NAME
             && self.chunker_version == CHUNKER_VERSION
-            && self.min_search_unit_chars > 0
             && self.max_unit_tokens > 0
             && self.tokenizer_hash.as_ref().is_some_and(|hash| {
                 hash.len() == 64
                     && hash
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            });
+            })
+            && self
+                .min_fill_ratio
+                .is_some_and(|ratio| ratio.is_finite() && ratio > 0.0 && ratio < 1.0);
         if !valid {
             return Err(ApiError::StorageOperation {
                 message: "invalid or unsupported chunk construction policy".to_owned(),
@@ -138,10 +147,15 @@ impl ChunkerConfig {
 /// (C6a lexical indexing, C6c dense embedding). Fields mirror the schema
 /// columns: `input_unit_ids` is the decoded `input_unit_ids_json` array (the
 /// canonical ContentUnit IDs the chunk targets, §23 rule 2), `targeting_text`
-/// is the exact text indexed by both the lexical and dense channels, and the
-/// chunker identity/config hash pin the producing chunker (§22). `token_count`
-/// is optional because it is measured by a caller-supplied tokenizer and may
-/// be absent (§22 ChunkPayload.tokenCount).
+/// is the canonical text the lexical channel indexes as-is and the dense
+/// channel embeds behind `chunk::model_input`'s section-path prefix,
+/// `fragments` and `section_path` are the decoded membership records and
+/// first-member section path (PLAN-grains Section 2), and the chunker
+/// identity/config hash pin the producing chunker (§22). `token_count` is
+/// optional because it is measured by a caller-supplied tokenizer and may be
+/// absent (§22 ChunkPayload.tokenCount). `chunk_index` is the chunk's 0-based
+/// reading-order position within its parse, the only reading-order authority
+/// for chunks; readers return chunks ordered by it.
 #[derive(Debug, Clone)]
 pub(crate) struct StoredChunk {
     pub(crate) id: String,
@@ -154,4 +168,7 @@ pub(crate) struct StoredChunk {
     pub(crate) chunker_name: String,
     pub(crate) chunker_version: String,
     pub(crate) chunker_config_hash: String,
+    pub(crate) fragments: Vec<chunk::Fragment>,
+    pub(crate) section_path: Vec<String>,
+    pub(crate) chunk_index: usize,
 }

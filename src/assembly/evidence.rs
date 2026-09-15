@@ -575,12 +575,11 @@ fn reason_wire_name(reason: &AssemblyReason) -> &'static str {
 /// container/structural types that carry no direct text.
 ///
 /// Shared by passage construction so displayed content and retained evidence
-/// use the same canonical text fields. This is one of five synchronized
+/// use the same canonical text fields. This is one of three synchronized
 /// readers of the SPEC-epub §2.1 evidence-bearing types (`text` for
 /// text_block, caption, table_cell; `code` for code_block; nothing else, no
-/// normalized-text fallback): `projections::chunk::extract_targeting_text`,
-/// `projections::multivector::evidence_text`,
-/// `annotations::producer::evidence_text`, and `projections::view`'s
+/// normalized-text fallback): `projections::chunk`'s member derivation (the
+/// fine grain every higher grain inherits) and `projections::view`'s
 /// `render_document` must select the same fields when content types evolve.
 /// The importer's `text_projection_hash` follows the same rule (§2.2).
 pub(crate) fn evidence_text(content_type: ContentType, body: &Value) -> Option<String> {

@@ -158,7 +158,7 @@ pub(crate) fn memoization_key_hash(
     invocation: &Invocation,
 ) -> Result<String, ApiError> {
     let material = key_material(conn, kind, invocation)?;
-    let producer_identity_hash = kind.identity_hash(config)?;
+    let producer_identity_hash = kind.identity_hash(config, &conn.limits().indexing)?;
 
     // Repeated identical text at different offsets remains separate coverage.
     // Legacy whole-group keys cannot satisfy or reuse a new fragment's output.

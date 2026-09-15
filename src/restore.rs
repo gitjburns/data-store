@@ -256,7 +256,7 @@ pub(crate) enum SupersededCleanupMode {
     /// the candidate's OWN `pre_activation` snapshot — subject parse = the held
     /// candidate itself — because a pre_activation snapshot sets its subject to
     /// that candidate and archives the vector planes whole-table, so the
-    /// candidate's dense/multivector blobs (its only model-dependent state) are
+    /// candidate's dense/ColBERT-window blobs (its only model-dependent state) are
     /// provably archived. This exit is TERMINAL: like `ActivationSupersession`
     /// (and UNLIKE `Deactivation`), it completes the candidate's
     /// `archiving → archived` transition with `parse.archived`, because a
@@ -479,9 +479,9 @@ DELETE FROM graph_entity_edges WHERE parse_id = ?1";
 const DELETE_DENSE_SQL: &str = "
 DELETE FROM chunk_dense_vectors WHERE parse_id = ?1";
 
-/// Multi-vector rows of this parse (self-scoped by parse_id).
+/// ColBERT window rows of this parse (self-scoped by parse_id).
 const DELETE_MULTIVECTOR_SQL: &str = "
-DELETE FROM unit_multivector_projections WHERE parse_id = ?1";
+DELETE FROM colbert_windows WHERE parse_id = ?1";
 
 /// Chunk projection rows of this parse. Runs AFTER `chunk_text_index` (whose
 /// scoping subselect reads these rows) is emptied.
@@ -555,12 +555,7 @@ fn delete_superseded_body(
     )?;
     let graph_edges = execute_delete(tx, DELETE_GRAPH_EDGES_SQL, parse_id, "graph_entity_edges")?;
     let dense = execute_delete(tx, DELETE_DENSE_SQL, parse_id, "chunk_dense_vectors")?;
-    let multivector = execute_delete(
-        tx,
-        DELETE_MULTIVECTOR_SQL,
-        parse_id,
-        "unit_multivector_projections",
-    )?;
+    let multivector = execute_delete(tx, DELETE_MULTIVECTOR_SQL, parse_id, "colbert_windows")?;
     let chunk_projections = execute_delete(
         tx,
         DELETE_CHUNK_PROJECTIONS_SQL,
@@ -748,7 +743,7 @@ fn cleanup_flow_label(mode: &SupersededCleanupMode) -> &'static str {
 /// Restore a source from its archived snapshot (§11.4 same-hash reappearance /
 /// §31.3 rollback-is-restore): re-import the canonical rows and projection
 /// payloads for archived `parse_id` of `source_id`, byte-reproduce the dense and
-/// multivector planes from the archived blobs, and deterministically rebuild the
+/// ColBERT-window planes from the archived blobs, and deterministically rebuild the
 /// non-archived planes (FTS5 lexical index, graph tables). Ok means the DURABLE
 /// hot state for the parse is fully restored.
 ///
@@ -1180,11 +1175,14 @@ const DENSE_PLANE: BinaryPlaneSpec = BinaryPlaneSpec {
     blob_column: "vector_blob",
 };
 
-/// ColBERT token matrices (`unit_multivector_projections.matrix_blob`).
+/// ColBERT window token matrices (`colbert_windows.matrix_blob`). The metadata
+/// records carry the window's membership columns (`window_index`,
+/// `chunk_ids_json`, `fragments_json`), so re-import reproduces every column
+/// through the generic reconstructor without re-deriving runs from chunks.
 const MULTIVECTOR_PLANE: BinaryPlaneSpec = BinaryPlaneSpec {
-    metadata_artifact_type: "unit_multivector_projections_metadata",
-    blob_artifact_type: "multivector_blob",
-    table: "unit_multivector_projections",
+    metadata_artifact_type: "colbert_windows_metadata",
+    blob_artifact_type: "colbert_window_blob",
+    table: "colbert_windows",
     blob_column: "matrix_blob",
 };
 
@@ -1337,9 +1335,10 @@ fn sql_value_from_json(value: &Value, table: &str, column: &str) -> Result<SqlVa
 
 /// Deterministically rebuild the FTS5 `chunk_text_index` for the parse from its
 /// just-re-imported `chunk_projections` rows. Mirrors `lexical`'s deterministic
-/// producer: one `(chunk_id, targeting_text)` row per chunk, in `ORDER BY id`
-/// (the FTS5 insert order is not identity-bearing, but a fixed order keeps the
-/// rebuild reproducible). The lexical builder itself cannot be reused — it opens
+/// producer: one `(chunk_id, targeting_text)` row per chunk. The builder inserts
+/// in `chunk_index` order; this rebuild uses `ORDER BY id`, which is fine because
+/// FTS5 insert order is not identity-bearing and a fixed order keeps the rebuild
+/// reproducible. The lexical builder itself cannot be reused — it opens
 /// an envelope and requires the whole build tx shape — so the pure index insert
 /// is mirrored here and MUST STAY IN STEP with `lexical::INSERT_INDEX_ROW_SQL`.
 /// No prior-index clear is needed: cleanup deleted the parse's index rows, and a

@@ -99,6 +99,14 @@ with the local facts known at that boundary.
 
 ## Required Lifecycle Coverage
 
+`--setup-storage` emits `hot_plane.setup_started`, `hot_plane.setup_completed`
+(mode `created`, `validated_existing`, or `recreated`), and
+`hot_plane.setup_failed`. An incompatible existing database additionally emits,
+before deletion, `storage_setup.incompatible_database` (WARN; db_path, reason),
+`storage_setup.rows_to_be_lost` (WARN; db_path, content_units,
+semantic_annotations, annotation_memo, each a count or `unavailable`), and
+`storage_setup.recreated` (WARN; deleted_path, db_path).
+
 Startup must log mode, bind address, config path when known, admin token file
 publication status without the token, inference initialization, model-role
 boundaries, smoke checks, storage/cache initialization, HTTP bind attempt and
@@ -151,6 +159,19 @@ Projection publication uses `projection_worker.*` lifecycle records with source,
 parse, and applicable cohort/input identities. Archived embeddings are not yet
 published; report publication only after commit. Preserve separate failure-audit,
 retirement, cancellation, and join outcomes.
+
+Grain construction and annotation planning emit these events:
+
+| Event | Level | Fields |
+| --- | --- | --- |
+| `multivector_build.prefix_dropped` | DEBUG | parse_id, window_id, window_index, prefixed_tokens, canonical_tokens, max_tokens |
+| `annotator_plan.windows_unpublished` | WARN | parse_id |
+
+`prefix_dropped` records a ColBERT window embedded without its section-path
+prefix because the prefixed input would exceed the document limit; the
+canonical text is unchanged. `windows_unpublished` records an empty annotation
+plan because the parse has no published context windows; discovery waits for
+publication instead of annotating nothing silently.
 
 Query stages remain distinct: `query.channels.*` collects source/graph candidates,
 `query.annotation.*` scans annotation representations, `query.fusion.*` records

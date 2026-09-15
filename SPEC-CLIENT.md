@@ -39,8 +39,11 @@ request timeout from the `[client]` section:
   loop (§4) — and nothing more: the poll loop as a whole is
   **unbounded** and runs until a terminal status is observed (§4), so a
   never-terminal operation polls forever. It is **not** a stream
-  timeout — the client does no streaming. Default `3600`; must be
-  greater than zero.
+  timeout — the client does no streaming. Must be greater than zero.
+- `[client].operation_poll_interval_ms` — the wait between operation polls
+  (§4).
+- `[client].provenance_preview_items` — attribution entries the web view
+  expands initially (§5.3).
 
 Relative paths in the config (e.g. the token file) resolve against the
 config file's directory, matching the server's resolution rule.
@@ -317,8 +320,8 @@ runs asynchronously. The client:
 2. Receives `202` with an acceptance body `{operationId}` and prints
    `Accepted: operationId=<id>`.
 3. Polls `GET /operations/{operationId}` every
-   **`OPERATION_POLL_INTERVAL` = 1 second** (a code constant) until the
-   operation reaches a terminal status (`succeeded` or `failed`).
+   `[client].operation_poll_interval_ms` until the operation reaches a
+   terminal status (`succeeded` or `failed`).
 4. Renders the terminal operation record (§5.2).
 
 `rebuild-all` first prints `Waiting for current storage work to finish before
@@ -455,8 +458,9 @@ Dense matches distinguish direct passages, section-guided matches with their
 heading hierarchy, and document-scoped context. Web details retain the section,
 window, and fine-chunk references per matched unit.
 The CLI deduplicates repeated paths for display; raw output preserves unit
-mappings. The web view previews three distinct explanations and retains all
-matches, support references, and context units in expandable retrieval details.
+mappings. The web view previews `[client].provenance_preview_items` distinct
+explanations and retains all matches, support references, and context units in
+expandable retrieval details.
 
 `query-raw` / `--query-raw` takes the same bare query text and sends the same
 request. It prints the complete original response JSON, including unknown

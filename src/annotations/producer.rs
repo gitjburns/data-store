@@ -1,44 +1,40 @@
-//! Bounded annotation excerpts, single-goal producer chains, and source lineage.
+//! Annotation excerpts over the active parse's context windows, single-goal
+//! producer chains, and source lineage.
 //!
-//! Each invocation consumes one exact source fragment. Later requests may use
-//! that fragment and earlier outputs from the same chain; they never borrow
-//! unrelated corpus context. The final output set commits atomically through
-//! the existing worker. Interrupted chains restart as a whole.
+//! Each invocation consumes one excerpt: a run of consecutive context windows
+//! read from the section-dense artifact. The model receives the excerpt's
+//! canonical text as its only source text, with the section path as separate
+//! context. Later requests in a chain may use that text and earlier outputs;
+//! they never borrow unrelated corpus context. The final output set commits
+//! atomically through the existing worker. Interrupted chains restart as a whole.
 //!
-//! Source-unit hashes, fragment offsets, and exact text hashes identify coverage;
-//! the ordered stage contracts additionally identify reusable producer output.
+//! Source-unit hashes, fragment offsets, and exact text hashes identify
+//! coverage; the ordered stage contracts additionally identify reusable
+//! producer output. Each produced item is attributed to the excerpt fragments
+//! whose text supports it (`attribute`).
 
 use crate::sqlite::Connection;
-use serde_json::json;
-use tracing::debug;
+use serde_json::{Value, json};
+use tracing::{debug, warn};
 
 use crate::annotations::{
-    chains, excerpt,
+    chains,
     llm_client::{AnnotatorClient, ENABLE_THINKING},
     stages::Stage,
 };
+use crate::artifact_store::ArtifactStore;
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
+use crate::limits::IndexingLimits;
 use crate::maintenance::AnnotationCancelReason;
 use crate::model::{
-    self, ContentType, ContentUnit, ProducerType, ProvenanceInputRef, ProvenanceObjectType,
-    SemanticAnnotationType,
+    self, ProducerType, ProvenanceInputRef, ProvenanceObjectType, SemanticAnnotationType,
+};
+use crate::projections::{
+    chunk,
+    section_dense::{self, SectionDenseWindow},
 };
 use crate::types::AnnotationProgressCount;
-
-/// Ordered SELECT of a parse's content units in reading order. Producer input
-/// purity depends on this exact ordering: the sequence the units come back in
-/// is the sequence their text is joined in, and thus the sequence recorded as
-/// `targetUnitIds`. `sequence_index` is nullable in the schema; NULLs sort
-/// last under SQLite ordering, and a tiebreak on `id` keeps the order total
-/// and deterministic across runs. No deleted-row filter: content_units rows
-/// are hard-deleted by hot cleanup (§31.2), never soft-deleted — the table
-/// has no deleted_at column.
-const SELECT_PARSE_UNITS_SQL: &str = "
-SELECT id, content_type, primary_parent_id, body_json
-FROM content_units
-WHERE parse_id = ?1
-ORDER BY sequence_index IS NULL, sequence_index, id";
 
 /// Exact input slice of an immutable canonical unit. Offsets are Unicode scalar
 /// positions, end-exclusive; they distinguish fragments even when text repeats.
@@ -61,27 +57,40 @@ impl InvocationTarget {
     }
 }
 
-/// What a single invocation covers. `split_index` distinguishes the
-/// deterministic pieces of an oversized group/document (0 when the unit set
-/// fit under `max_input_chars` and was not split).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InvocationKind {
-    /// Entity/relation scope: the evidence-bearing descendants of one
-    /// `text_section` (or a leading synthetic group; see `build_invocation_plan`).
-    SectionGroup {
-        section_unit_id: String,
-        split_index: u32,
-    },
-    /// Summary scope: one excerpt in the document's reading order.
-    Document { split_index: u32 },
+/// Unit ids of a target list in first-occurrence order without duplicates: a
+/// unit split across two fragments of one excerpt is one target unit. This is
+/// the rule `chunk::ordered_unit_ids` applies to fragments, restated over
+/// targets so a row's `targetUnitIds` never lists a unit twice.
+pub(crate) fn target_unit_ids(targets: &[InvocationTarget]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for target in targets {
+        if !ids.iter().any(|id| id == &target.unit_id) {
+            ids.push(target.unit_id.clone());
+        }
+    }
+    ids
 }
 
-/// One atomic producer chain. The planner supplies exactly one source fragment;
-/// all outputs retain its unit reference and precise range in their provenance.
+/// What a single invocation covers: one excerpt, the `index`-th run of up to
+/// `indexing.excerpt_windows` consecutive context windows in the active
+/// parse's window order. All three producers consume every excerpt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InvocationKind {
+    Excerpt { index: u32 },
+}
+
+/// One atomic producer chain over one excerpt. `targets` lists the excerpt's
+/// fragments in reading order, each with its text sliced from the window
+/// canonical text. `canonical_text` is the window canonical texts joined by one
+/// blank line and is the only source text the model sees. `section_path` is
+/// the first window's path; it reaches the model as separate context and is
+/// never part of any range, hash, or attribution.
 #[derive(Debug, Clone)]
 pub(crate) struct Invocation {
     pub(crate) kind: InvocationKind,
     pub(crate) targets: Vec<InvocationTarget>,
+    pub(crate) section_path: Vec<String>,
+    pub(crate) canonical_text: String,
 }
 
 impl Invocation {
@@ -92,25 +101,12 @@ impl Invocation {
             "annotation_invocation",
             &crate::util::diagnostic_id("invocation"),
         );
+        let InvocationKind::Excerpt { index } = &self.kind;
+        context.record("excerpt_index", *index);
         context.record("target_units", self.targets.len() as u64);
+        context.record("excerpt_chars", self.canonical_text.chars().count() as u64);
         if let Some(target) = self.targets.first() {
             context.record("unit_id", target.unit_id.as_str());
-            context.record("excerpt_start_char", target.start_char as u64);
-            context.record("excerpt_end_char", target.end_char as u64);
-            context.record("excerpt_chars", target.text.chars().count() as u64);
-        }
-        match &self.kind {
-            InvocationKind::SectionGroup {
-                section_unit_id,
-                split_index,
-            } => {
-                context.record("section_id", section_unit_id.as_str());
-                context.record("split_index", *split_index);
-            }
-            InvocationKind::Document { split_index } => {
-                // Document summaries have no section ID; do not invent one.
-                context.record("split_index", *split_index);
-            }
         }
         context
     }
@@ -193,9 +189,10 @@ impl ProducerKind {
         }
     }
 
-    /// Version 2 identifies excerpt-scoped, single-goal chains and their receipts.
+    /// Version 3 identifies context-window excerpts with the section path as
+    /// separate prompt context and per-item fragment attribution.
     pub(crate) fn producer_version(self) -> &'static str {
-        "2"
+        "3"
     }
 
     /// Ordered single-goal contracts contributing to this producer's identity.
@@ -209,7 +206,13 @@ impl ProducerKind {
 
     /// Hash every generation-affecting contract, including schemas and output limits.
     /// Naming policy is intentionally not composed into these single-goal prompts.
-    pub(crate) fn identity_hash(self, config: &AnnotatorModelConfig) -> Result<String, ApiError> {
+    /// Excerpt sizing (`excerpt_windows` context windows of `context_max_tokens`)
+    /// shapes every passage, so grain changes change this identity.
+    pub(crate) fn identity_hash(
+        self,
+        config: &AnnotatorModelConfig,
+        indexing: &IndexingLimits,
+    ) -> Result<String, ApiError> {
         let schemas = self
             .stages()
             .iter()
@@ -222,7 +225,8 @@ impl ProducerKind {
             "promptHash": self.prompt_hash()?,
             "outputSchemas": schemas,
             "endpoint": config.endpoint,
-            "maxInputChars": config.max_input_chars,
+            "excerptWindows": indexing.excerpt_windows,
+            "contextMaxTokens": indexing.context_max_tokens,
             "maxCompletionTokens": config.max_completion_tokens,
             "enableThinking": ENABLE_THINKING,
         }))
@@ -239,143 +243,195 @@ impl ProducerKind {
     }
 }
 
-/// Plan one bounded fragment per invocation for all three producer kinds.
-/// Section ownership groups discovery/dry-run work; it never enlarges a request.
-///
-/// Section grouping. Each `text_section` unit owns the evidence-bearing units
-/// contained beneath it, where containment is the `primary_parent_id` chain
-/// (transitive: a unit belongs to the nearest ancestor section). Units that
-/// precede the first section — or every evidence-bearing unit in a sectionless
-/// document — form a single leading synthetic group keyed by the FIRST such
-/// unit's id, so those units are still covered without inventing a fake
-/// section unit.
-///
-/// Evidence-bearing text extraction (empty-text units are skipped, so an
-/// empty group produces no invocation):
-///   - text_block  -> body.text
-///   - table_cell  -> body.text
-///   - caption     -> body.text
-///   - code_block  -> body.code
-///
-/// Large units are partitioned losslessly before section/document enumeration.
-/// Entity/relation and summary plans share exactly the same fragment boundaries.
+/// Plan one invocation per excerpt for all three producer kinds: the active
+/// parse's published context windows, in window order, grouped into runs of
+/// `indexing.excerpt_windows` (the final run may be shorter). Every producer
+/// plan shares exactly the same excerpt boundaries.
 pub(crate) fn build_invocation_plan(
     conn: &Connection,
+    store: &ArtifactStore,
     parse_id: &str,
-    max_input_chars: usize,
+    dense_dimension: usize,
+    indexing: &IndexingLimits,
 ) -> Result<Vec<Invocation>, ApiError> {
-    invocation_plan(conn, parse_id, max_input_chars, true)
+    invocation_plan(conn, store, parse_id, dense_dimension, indexing, true)
 }
 
 /// Measure the dispatch plan without adding a second preparation log during
 /// the worker's inventory pass. Errors still reach the owning source boundary.
 pub(super) fn measure_invocation_plan(
     conn: &Connection,
+    store: &ArtifactStore,
     parse_id: &str,
-    max_input_chars: usize,
+    dense_dimension: usize,
+    indexing: &IndexingLimits,
 ) -> Result<Vec<Invocation>, ApiError> {
-    invocation_plan(conn, parse_id, max_input_chars, false)
+    invocation_plan(conn, store, parse_id, dense_dimension, indexing, false)
 }
 
 /// Keep measurement and dispatch on identical excerpt boundaries. Only dispatch
 /// emits the existing preparation record; health measurement adds no log entry.
 fn invocation_plan(
     conn: &Connection,
+    store: &ArtifactStore,
     parse_id: &str,
-    max_input_chars: usize,
+    dense_dimension: usize,
+    indexing: &IndexingLimits,
     log_preparation: bool,
 ) -> Result<Vec<Invocation>, ApiError> {
-    let units = read_parse_units(conn, parse_id)?;
+    let Some(reference) =
+        section_dense::load_section_dense_reference(conn, store, parse_id, dense_dimension)?
+    else {
+        // Context windows are built by the scheduler's content-derived
+        // projection build before activation, so an active parse without a
+        // section-dense reference is a parse whose build was skipped or is a
+        // dry-run parse. The plan is empty and discovery visibly waits instead
+        // of annotating nothing silently; the WARN names the waiting parse.
+        warn!(
+            event = "annotator_plan.windows_unpublished",
+            parse_id, "annotation plan is empty: the parse has no published context windows yet"
+        );
+        return Ok(Vec::new());
+    };
+    // Startup validation keeps `excerpt_windows` positive; a zero here would
+    // never close a run, so it is rejected rather than trusted.
+    let run_length = usize::try_from(indexing.excerpt_windows)
+        .ok()
+        .filter(|length| *length > 0)
+        .ok_or_else(|| ApiError::AnnotationProducer {
+            message: format!(
+                "indexing.excerpt_windows must be positive, got {}",
+                indexing.excerpt_windows
+            ),
+        })?;
 
-    // Resolve each evidence-bearing unit to its owning section id via the
-    // primary_parent_id chain, in one pass over the ordered units. `None`
-    // means the unit precedes any section (leading synthetic group).
-    let section_ids: std::collections::HashSet<&str> = units
-        .iter()
-        .filter(|unit| unit.content_type == ContentType::TextSection)
-        .map(|unit| unit.id.as_str())
-        .collect();
-    let parent_of: std::collections::HashMap<&str, &str> = units
-        .iter()
-        .filter_map(|unit| {
-            unit.primary_parent_id
-                .as_deref()
-                .map(|parent| (unit.id.as_str(), parent))
-        })
-        .collect();
-
-    // Section groups keyed by section id, in first-seen order; plus the
-    // leading synthetic group for pre-section / sectionless units.
-    let mut section_order: Vec<String> = Vec::new();
-    let mut section_targets: std::collections::HashMap<String, Vec<InvocationTarget>> =
-        std::collections::HashMap::new();
-    let mut leading: Vec<InvocationTarget> = Vec::new();
-    // Document composite: every evidence-bearing target in reading order.
-    let mut document: Vec<InvocationTarget> = Vec::new();
-
-    for unit in &units {
-        let Some(text) = evidence_text(unit) else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            // Empty-text units carry no evidence; skipping them keeps input
-            // pure and avoids blank invocation inputs.
-            continue;
+    let mut invocations: Vec<Invocation> = Vec::new();
+    let mut open = ExcerptRun::default();
+    section_dense::visit_section_dense(conn, store, &reference, |window| {
+        open.push(window)?;
+        if open.window_count == run_length {
+            let index = checked_excerpt_index(invocations.len())?;
+            invocations.push(std::mem::take(&mut open).into_invocation(index));
         }
-        for fragment in excerpt::split_text(&text, max_input_chars)? {
-            let target = InvocationTarget {
-                unit_id: unit.id.clone(),
-                text: fragment.text,
-                start_char: fragment.start_char,
-                end_char: fragment.end_char,
-            };
-            // Both producer routes own their fragment until worker discovery consumes it.
-            document.push(target.clone());
-
-            match owning_section(unit.id.as_str(), &parent_of, &section_ids) {
-                Some(section_id) => {
-                    let key = section_id.to_string();
-                    section_targets
-                        .entry(key.clone())
-                        .or_insert_with(|| {
-                            section_order.push(key.clone());
-                            Vec::new()
-                        })
-                        .push(target);
-                }
-                None => leading.push(target),
-            }
-        }
+        Ok(())
+    })?;
+    if open.window_count > 0 {
+        // The final run may be shorter than `excerpt_windows`.
+        let index = checked_excerpt_index(invocations.len())?;
+        invocations.push(open.into_invocation(index));
     }
-
-    let mut invocations = Vec::new();
-
-    // The leading synthetic group is keyed by its first unit's id (there is no
-    // section unit to name it), and is emitted before the section groups so
-    // the plan follows reading order.
-    if let Some(first) = leading.first() {
-        let group_key = first.unit_id.clone();
-        push_section_splits(&mut invocations, &group_key, leading)?;
-    }
-    for section_id in section_order {
-        let targets = section_targets.remove(&section_id).unwrap_or_default();
-        push_section_splits(&mut invocations, &section_id, targets)?;
-    }
-
-    // Summary remains excerpt-scoped; no request reconstructs the large document.
-    push_document_splits(&mut invocations, document)?;
 
     if log_preparation {
         debug!(
             event = "annotator_plan.completed",
             parse_id,
             invocations = invocations.len(),
-            max_input_chars,
-            "bounded annotation excerpt plan prepared"
+            excerpt_windows = indexing.excerpt_windows,
+            "annotation excerpt plan prepared from published context windows"
         );
     }
 
     Ok(invocations)
+}
+
+/// An open run of consecutive context windows being packed into one excerpt.
+#[derive(Default)]
+struct ExcerptRun {
+    window_count: usize,
+    section_path: Vec<String>,
+    canonical_text: String,
+    targets: Vec<InvocationTarget>,
+}
+
+impl ExcerptRun {
+    /// Append one window: its fragments become targets and its canonical text
+    /// joins after one blank line, the same join the grains below use. The
+    /// first window's section path names the run. The window is borrowed from
+    /// the artifact stream, so its path and text are copied into the run.
+    fn push(&mut self, window: &SectionDenseWindow) -> Result<(), ApiError> {
+        if self.window_count == 0 {
+            self.section_path = window.section_path.clone();
+            self.canonical_text = window.targeting_text.clone();
+        } else {
+            self.canonical_text = chunk::join_text(&self.canonical_text, &window.targeting_text);
+        }
+        self.targets.extend(fragment_targets(window)?);
+        self.window_count += 1;
+        Ok(())
+    }
+
+    /// Close the run as the excerpt at `index`.
+    fn into_invocation(self, index: u32) -> Invocation {
+        Invocation {
+            kind: InvocationKind::Excerpt { index },
+            targets: self.targets,
+            section_path: self.section_path,
+            canonical_text: self.canonical_text,
+        }
+    }
+}
+
+/// Slice each fragment's text out of the window canonical text. The canonical
+/// text is member texts joined by one blank line, with the cells of one table
+/// row joined by one tab (`projections::chunk`), so after a fragment's exact
+/// length the next characters are that tab, that blank line, or the end of the
+/// text. Any other layout means the fragments and the text disagree, and the
+/// plan fails loudly rather than attributing wrong text to a unit.
+fn fragment_targets(window: &SectionDenseWindow) -> Result<Vec<InvocationTarget>, ApiError> {
+    let layout_failure = |detail: &str| ApiError::AnnotationProducer {
+        message: format!(
+            "context window {} fragments do not lay out over its canonical text: {detail}",
+            window.window_id
+        ),
+    };
+    let chars: Vec<char> = window.targeting_text.chars().collect();
+    let mut cursor = 0usize;
+    let mut targets = Vec::with_capacity(window.fragments.len());
+    for (position, fragment) in window.fragments.iter().enumerate() {
+        let length = fragment
+            .end_char
+            .checked_sub(fragment.start_char)
+            .filter(|length| *length > 0)
+            .ok_or_else(|| layout_failure("empty or reversed fragment range"))?;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| layout_failure("fragment range overflows"))?;
+        let text: String = chars
+            .get(cursor..end)
+            .ok_or_else(|| layout_failure("fragment extends beyond the canonical text"))?
+            .iter()
+            .collect();
+        targets.push(InvocationTarget {
+            unit_id: fragment.unit_id.clone(),
+            text,
+            start_char: fragment.start_char,
+            end_char: fragment.end_char,
+        });
+        cursor = end;
+        if position + 1 == window.fragments.len() {
+            break;
+        }
+        if chars.get(cursor) == Some(&'\t') {
+            cursor += 1;
+        } else if chars.get(cursor..cursor + 2) == Some(&['\n', '\n']) {
+            cursor += 2;
+        } else {
+            return Err(layout_failure(
+                "fragment is not followed by a member separator",
+            ));
+        }
+    }
+    if cursor != chars.len() {
+        return Err(layout_failure("fragments do not cover the canonical text"));
+    }
+    Ok(targets)
+}
+
+/// Keep diagnostic excerpt indexes lossless even for pathological input sizes.
+fn checked_excerpt_index(index: usize) -> Result<u32, ApiError> {
+    u32::try_from(index).map_err(|_| ApiError::AnnotationProducer {
+        message: format!("annotation excerpt count exceeds the supported index range: {index}"),
+    })
 }
 
 /// Record the chain identity and exact source slices before work starts. Empty
@@ -383,6 +439,7 @@ fn invocation_plan(
 pub(crate) fn planned_provenance(
     kind: ProducerKind,
     config: &AnnotatorModelConfig,
+    indexing: &IndexingLimits,
     targets: &[InvocationTarget],
 ) -> Result<model::Provenance, ApiError> {
     let input_refs = targets
@@ -398,7 +455,7 @@ pub(crate) fn planned_provenance(
         producer_type: ProducerType::Model,
         producer_name: kind.producer_name().to_string(),
         producer_version: Some(kind.producer_version().to_string()),
-        config_hash: Some(kind.identity_hash(config)?),
+        config_hash: Some(kind.identity_hash(config, indexing)?),
         model_name: Some(config.model.clone()),
         model_version: None,
         prompt_hash: Some(kind.prompt_hash()?),
@@ -416,10 +473,10 @@ pub(crate) fn planned_provenance(
 
 /// Run an excerpt's dependent request chain before returning any persisted outputs.
 ///
-/// Kind/invocation compatibility: Entity and Relation consume `SectionGroup`
-/// invocations; Summary consumes `Document` invocations. A mismatch is a
-/// programming error in the stage-3 routing, surfaced loudly rather than
-/// silently producing wrong-scoped annotations.
+/// The passage is the excerpt's canonical text exactly as the planner bounded
+/// it (at most `excerpt_windows` context windows); nothing here reassembles a
+/// larger source. The section path travels separately as prompt context so it
+/// never enters the source text the stages quote from and match against.
 ///
 /// `temperature` is the per-call sampling temperature, passed through to the
 /// client verbatim: the base `PRODUCER_TEMPERATURE` for first attempts, or a
@@ -438,240 +495,80 @@ pub(crate) fn invoke(
     if let Some(reason) = client.cancellation().reason() {
         return Err(InvocationFailure::Cancelled(reason));
     }
-    match (kind, &invocation.kind) {
-        (ProducerKind::Entity | ProducerKind::Relation, InvocationKind::SectionGroup { .. }) => {}
-        (ProducerKind::Summary, InvocationKind::Document { .. }) => {}
-        (kind, other) => {
-            return Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
-                message: format!(
-                    "producer {} cannot consume invocation kind {other:?}",
-                    kind.producer_name()
-                ),
-            }));
-        }
-    }
-
-    // Never accidentally reassemble a large section into one request. The
-    // planner, memo key, and provenance all describe this single exact fragment.
-    let [target] = invocation.targets.as_slice() else {
-        return Err(InvocationFailure::Internal(ApiError::AnnotationProducer {
-            message: "annotation invocation must contain exactly one source excerpt".to_string(),
-        }));
-    };
-    if target.text.trim().is_empty() {
-        // A lossless partition may retain a whitespace-only fragment. Mark its
-        // coverage through the normal empty-result path without spending inference.
+    if invocation.canonical_text.trim().is_empty() {
+        // Windows are never whitespace-only by construction; if one ever is,
+        // mark its coverage through the empty-result path without spending inference.
         return Ok(Vec::new());
     }
-    chains::run(kind, client, &target.text, temperature, progress)
-}
-
-/// Choose which invocations a producer consumes. Exposed so the stage-3 worker
-/// filters the shared plan without re-encoding the routing rule: Entity and
-/// Relation take section groups, Summary takes the document composite.
-pub(crate) fn invocation_matches_kind(kind: ProducerKind, invocation: &Invocation) -> bool {
-    matches!(
-        (kind, &invocation.kind),
-        (
-            ProducerKind::Entity | ProducerKind::Relation,
-            InvocationKind::SectionGroup { .. }
-        ) | (ProducerKind::Summary, InvocationKind::Document { .. })
+    // The section line is a one-line context header (stages.rs promises the
+    // model "a line starting Section:"); heading text may carry newlines from
+    // `<br/>`, so every whitespace run collapses to one space here.
+    let section = (!invocation.section_path.is_empty()).then(|| {
+        invocation
+            .section_path
+            .iter()
+            .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    });
+    chains::run(
+        kind,
+        client,
+        &invocation.canonical_text,
+        section.as_deref(),
+        temperature,
+        progress,
     )
 }
 
-/// Resolve a unit's owning section by walking the `primary_parent_id` chain up
-/// to the nearest ancestor that is a `text_section`. Returns `None` when no
-/// ancestor is a section (the unit precedes any section, or the document has
-/// none), which routes the unit into the leading synthetic group. The walk is
-/// bounded by the parent-map size, so a cyclic/self-referential chain
-/// terminates instead of looping.
-fn owning_section<'units>(
-    unit_id: &'units str,
-    parent_of: &std::collections::HashMap<&'units str, &'units str>,
-    section_ids: &std::collections::HashSet<&'units str>,
-) -> Option<&'units str> {
-    let mut current = unit_id;
-    let mut steps = 0usize;
-    let max_steps = parent_of.len();
-    while let Some(&parent) = parent_of.get(current) {
-        if section_ids.contains(parent) {
-            return Some(parent);
-        }
-        current = parent;
-        steps += 1;
-        if steps > max_steps {
-            // Parent chain is cyclic or malformed; stop rather than loop. The
-            // unit falls into the leading synthetic group, which is a visible,
-            // covered outcome, not a silent drop.
-            return None;
-        }
-    }
-    None
+/// Choose which invocations a producer consumes. Every producer takes every
+/// excerpt; the function remains the single routing point the worker and the
+/// dry run filter through, so a future kind split changes only this rule.
+pub(crate) fn invocation_matches_kind(_kind: ProducerKind, invocation: &Invocation) -> bool {
+    matches!(invocation.kind, InvocationKind::Excerpt { .. })
 }
 
-/// Extract the evidence-bearing text for the content types the producers read,
-/// returning `None` for every other type (document, pages, sections, lists,
-/// list items, asides, tables, rows, and figures carry no direct producer
-/// text). The extracted text is the pure producer input (ruling 2); no
-/// normalization or metadata is mixed in beyond selecting the body's
-/// text-bearing field.
-///
-/// One of five synchronized readers of the SPEC-epub §2.1 evidence-bearing
-/// types (`text` for text_block, caption, table_cell; `code` for code_block;
-/// no normalized-text fallback). Keep field selection aligned with
-/// `assembly::evidence::evidence_text`,
-/// `projections::chunk::extract_targeting_text`,
-/// `projections::multivector::evidence_text`, and `projections::view`'s
-/// `render_document`. Query passages use the assembly extractor, so these
-/// readers must agree on canonical text when a content type changes.
-fn evidence_text(unit: &ContentUnit) -> Option<String> {
-    match unit.content_type {
-        ContentType::TextBlock | ContentType::Caption | ContentType::TableCell => unit
-            .body
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::CodeBlock => unit
-            .body
-            .get("code")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        ContentType::Document
-        | ContentType::Page
-        | ContentType::TextSection
-        | ContentType::List
-        | ContentType::ListItem
-        | ContentType::Aside
-        | ContentType::Table
-        | ContentType::TableRow
-        | ContentType::Figure => None,
-    }
-}
-
-/// Enumerate already-bounded fragments without recombining neighboring units.
-fn push_section_splits(
-    invocations: &mut Vec<Invocation>,
-    section_unit_id: &str,
-    targets: Vec<InvocationTarget>,
-) -> Result<(), ApiError> {
-    for (split_index, target) in targets.into_iter().enumerate() {
-        invocations.push(Invocation {
-            kind: InvocationKind::SectionGroup {
-                section_unit_id: section_unit_id.to_string(),
-                split_index: checked_split_index(split_index)?,
-            },
-            targets: vec![target],
-        });
-    }
-    Ok(())
-}
-
-/// Give each summary the same bounded excerpt used by entity/relation producers.
-fn push_document_splits(
-    invocations: &mut Vec<Invocation>,
-    targets: Vec<InvocationTarget>,
-) -> Result<(), ApiError> {
-    for (split_index, target) in targets.into_iter().enumerate() {
-        invocations.push(Invocation {
-            kind: InvocationKind::Document {
-                split_index: checked_split_index(split_index)?,
-            },
-            targets: vec![target],
-        });
-    }
-    Ok(())
-}
-
-/// Keep diagnostic invocation indexes lossless even for pathological input sizes.
-fn checked_split_index(index: usize) -> Result<u32, ApiError> {
-    u32::try_from(index).map_err(|_| ApiError::AnnotationProducer {
-        message: format!("annotation excerpt count exceeds the supported index range: {index}"),
-    })
-}
-
-/// Read one parse's content units in reading order (bounded by the parse's
-/// unit count). SQL failures surface as `StorageOperation` with the parse id,
-/// mirroring the annotation store's read discipline.
-fn read_parse_units(conn: &Connection, parse_id: &str) -> Result<Vec<ContentUnit>, ApiError> {
-    let mut statement =
-        conn.prepare(SELECT_PARSE_UNITS_SQL)
-            .map_err(|source| ApiError::StorageOperation {
-                message: format!(
-                    "failed to prepare parse-units query for parse {parse_id}: {source}"
-                ),
-            })?;
-    let rows = statement
-        .query_map(rusqlite::params![parse_id], |row| {
-            Ok(PlanUnitRow {
-                id: row.get(0)?,
-                content_type: row.get(1)?,
-                primary_parent_id: row.get(2)?,
-                body_json: row.get(3)?,
-            })
+/// Attribute one produced item to the excerpt fragments whose text supports it:
+/// an entity keeps the fragments matching its `name`, a relation keeps those
+/// matching any of its `evidenceQuotes`, and a summary keeps every fragment.
+/// Matching uses `source_text_matches` over each fragment's text alone, so a
+/// quote that spans two fragments matches neither. When nothing matches, the
+/// item keeps every fragment: the excerpt is still its true input, and coverage
+/// must never narrow to nothing. The returned targets are owned because they
+/// become the row's request and outlive this call.
+pub(crate) fn attribute(
+    kind: ProducerKind,
+    body: &Value,
+    targets: &[InvocationTarget],
+) -> Vec<InvocationTarget> {
+    let quotes: Vec<&str> = match kind {
+        ProducerKind::Entity => body
+            .get("name")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        ProducerKind::Relation => body
+            .get("evidenceQuotes")
+            .and_then(Value::as_array)
+            .map(|quotes| quotes.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default(),
+        ProducerKind::Summary => return targets.to_vec(),
+    };
+    let matched: Vec<InvocationTarget> = targets
+        .iter()
+        .filter(|target| {
+            quotes
+                .iter()
+                .any(|quote| source_text_matches(&target.text, quote))
         })
-        .map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to query units for parse {parse_id}: {source}"),
-        })?;
-
-    let mut units = Vec::new();
-    for row in rows {
-        let row = row.map_err(|source| ApiError::StorageOperation {
-            message: format!("failed to read unit row for parse {parse_id}: {source}"),
-        })?;
-        units.push(plan_unit(row, parse_id)?);
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        // Attribution fallback: no fragment individually supports the item, so
+        // the whole excerpt stays its recorded input rather than an empty set.
+        return targets.to_vec();
     }
-    Ok(units)
-}
-
-/// The columns of `content_units` this planner reads. Only reading-order,
-/// containment, type, and body are needed; the full `ContentUnit` envelope is
-/// reconstructed with placeholders for the fields planning never inspects.
-struct PlanUnitRow {
-    id: String,
-    content_type: String,
-    primary_parent_id: Option<String>,
-    body_json: String,
-}
-
-/// Re-type one persisted unit row into the subset of `ContentUnit` this
-/// planner needs. `content_type` re-types through the model enum (a value
-/// outside the schema CHECK set fails loudly), and `body_json` parses back to
-/// JSON so `evidence_text` can select its text field. Fields the planner never
-/// reads are filled with inert placeholders; this row view is internal to
-/// planning and never persisted or re-serialized.
-fn plan_unit(row: PlanUnitRow, parse_id: &str) -> Result<ContentUnit, ApiError> {
-    let content_type: ContentType = serde_json::from_value(serde_json::Value::String(
-        row.content_type.clone(),
-    ))
-    .map_err(|source| ApiError::StorageOperation {
-        message: format!(
-            "persisted content unit {} type {:?} is not a known variant: {source}",
-            row.id, row.content_type
-        ),
-    })?;
-    let body: serde_json::Value =
-        serde_json::from_str(&row.body_json).map_err(|source| ApiError::StorageOperation {
-            message: format!(
-                "persisted body of content unit {} is unparseable: {source}",
-                row.id
-            ),
-        })?;
-
-    Ok(ContentUnit {
-        id: row.id,
-        source_id: String::new(),
-        parse_id: parse_id.to_string(),
-        content_type,
-        body_hash: String::new(),
-        text_hash: None,
-        structure_hash: None,
-        primary_parent_id: row.primary_parent_id,
-        sequence_index: None,
-        locators: None,
-        body,
-        created_at: String::new(),
-        deleted_at: None,
-    })
+    matched
 }
 
 // --- Shared strict output-parsing helpers ---------------------------------

@@ -43,9 +43,9 @@ The example ships with placeholder paths (`/absolute/path/to/...`). Before first
 start, fill in at least the following:
 
 - **`[server].bind_address`** — the socket address the HTTP service binds.
-  Required, with no built-in default; `config.example.toml` ships
-  `127.0.0.1:8091`. The bundled client dials this same address; a
-  bind-all address (`0.0.0.0`/`::`) is converted to loopback for the client.
+  Required, with no built-in default. The bundled client dials this same
+  address; a bind-all address (`0.0.0.0`/`::`) is converted to loopback for
+  the client.
 
 - **`[admin].token_file_path`** — the file the service writes the startup admin
   token to, and the file the client reads it back from. Owner-only; see the
@@ -78,8 +78,17 @@ start, fill in at least the following:
   not archived and produce a warning), and `max_element_depth` (element
   nesting depth accepted in any XML member). Exceeding a budget other than
   `max_image_bytes` is a recorded parse failure naming the budget. The budgets
-  are not part of parser identity. `config.example.toml` ships `10000`,
-  `67108864`, `536870912`, `16777216`, `16777216`, and `256`.
+  are not part of parser identity.
+
+- **`[indexing]`** — the retrieval grains, all required: ColBERT-token caps
+  for fine chunks (`fine_max_tokens`), ColBERT windows (`colbert_max_tokens`,
+  which must equal the ColBERT model's document limit), and context windows
+  (`context_max_tokens`); the number of context windows per annotation excerpt
+  (`excerpt_windows`); and the minimum fill of any run as a fraction of its cap
+  (`min_fill_ratio`). Startup rejects a fine cap that could force the higher
+  grains to split a chunk and a context cap that, with its section-path
+  prefix, does not fit the dense and reranker capacities. See README,
+  "Retrieval grains".
 
 - **`[models.colbert].backend`** — required, selecting `local` or `http` without
   fallback. Local requires an absolute `path` to ColBERT-Zero artifacts. HTTP
@@ -174,10 +183,16 @@ content-addressed artifact store tree under `{index_root}/fabric/artifacts` is
 not created by setup; the running service creates it lazily on first use.
 
 `--setup-storage` is the **only** path that installs schema. The running service
-never creates or migrates schema; that is a fixed process rule. Treat setup as a
-deliberate, one-time operator action. Re-run it only when pointing at a new or
-clean `index_root`; when run against an existing fabric plane, it validates the
-existing schema rather than recreating it.
+never creates or migrates schema; that is a fixed process rule. Re-running
+setup against an existing fabric plane is safe when the plane is compatible
+(same schema version, every table contract valid): it validates the database
+and leaves it untouched. An incompatible plane (schema version differs, or a
+table contract fails) is never migrated: setup logs the reason and the row
+counts of `content_units`, `semantic_annotations`, and `annotation_memo` that
+are about to be lost, deletes the whole `{index_root}/fabric` directory
+(hot plane and artifact store), and creates a fresh database. There is no
+confirmation prompt; if that data matters, back up `{index_root}/fabric`
+before re-running setup after a schema change.
 
 The command prints `fabric storage schema ready at <path>` and exits on success.
 
@@ -302,12 +317,15 @@ intended procedure is:
    data-store-service --config config.toml --annotation-dry-run <N>
    ```
 
-   `<N>` is a positive integer: the pass parses the corpus, then
-   sample-annotates the first `<N>` section groups per source per type with the
-   entity and relation producers (summaries are excluded). The mode always runs
-   in the foreground and serves only health, the vocabulary route, operation
-   reads, and shutdown. (`--annotation-dry-run`, like `--setup-storage`, is a
-   service-binary flag; the `data-store` client rejects it.)
+   `<N>` is a positive integer: the pass parses the corpus, then is meant to
+   sample-annotate the first `<N>` excerpts per source per type with the
+   entity and relation producers (summaries are excluded). The mode currently
+   cannot sample: excerpts are runs of context windows, which the dry-run pass
+   does not build, so its annotation plans are empty (SPEC-SERVER.md §4.7).
+   The mode always runs in the foreground and serves only health, the
+   vocabulary route, operation reads, and shutdown. (`--annotation-dry-run`,
+   like `--setup-storage`, is a service-binary flag; the `data-store` client
+   rejects it.)
 
    **`Ready: no` in health is expected here**: no inference runtime is
    started, and the inference component reports

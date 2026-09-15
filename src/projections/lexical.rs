@@ -50,21 +50,20 @@ const LEXICAL_PRODUCER_NAME: &str = "fabric-lexical-index";
 const LEXICAL_PRODUCER_VERSION: &str = "1";
 
 /// Ordered SELECT of one parse's chunk projections, read back into
-/// `StoredChunk`. The order is deterministic (`created_at`, then `id` as a
-/// total tiebreak) so a rebuild indexes chunks in the same order every run —
-/// mirror of the producer's parse-unit ordering
-/// (`annotations::producer::SELECT_PARSE_UNITS_SQL`), adapted to chunk rows
-/// which carry `created_at` rather than a `sequence_index`. No deleted-row
-/// filter: `chunk_projections` rows are hard-deleted by hot cleanup (§31.2),
-/// never soft-deleted — the table has no `deleted_at` column.
+/// `StoredChunk` in reading order: `chunk_index` is the only reading-order
+/// authority for chunks (unique per parse), so the order is total and the
+/// higher grains that pack runs of consecutive chunks read through this
+/// statement. No deleted-row filter: `chunk_projections` rows are hard-deleted
+/// by hot cleanup (§31.2), never soft-deleted — the table has no `deleted_at`
+/// column.
 const SELECT_PARSE_CHUNKS_SQL: &str = "
 SELECT
   id, projection_id, source_id, parse_id, input_unit_ids_json,
   targeting_text, token_count, chunker_name, chunker_version,
-  chunker_config_hash
+  chunker_config_hash, fragments_json, section_path_json, chunk_index
 FROM chunk_projections
 WHERE parse_id = ?1
-ORDER BY created_at, id";
+ORDER BY chunk_index";
 
 /// Delete every `chunk_text_index` row belonging to this parse's chunks. The
 /// FTS5 table stores `chunk_id` UNINDEXED, so parse scoping is a subselect on
@@ -244,13 +243,18 @@ fn index_parse_chunks(
     Ok(chunks.len())
 }
 
-/// Read one parse's chunk projections back into `StoredChunk`, in the
-/// deterministic order of `SELECT_PARSE_CHUNKS_SQL`. Reader convention (mirror
-/// of `annotations::store`): readers take `&Connection` and run one bounded
-/// SELECT (bounded by the parse scope). `input_unit_ids_json` is decoded from
-/// its canonical JSON array; a malformed value fails loudly with the chunk's
-/// identity rather than being silently dropped.
-fn read_parse_chunks(conn: &Connection, parse_id: &str) -> Result<Vec<StoredChunk>, ApiError> {
+/// Read one parse's chunk projections back into `StoredChunk`, in reading
+/// order (`SELECT_PARSE_CHUNKS_SQL`, ordered by `chunk_index`). This is the
+/// shared chunk reader: the section-dense builder and its validators consume
+/// it too, so there is one SELECT that defines chunk order. Reader convention
+/// (mirror of `annotations::store`): readers take `&Connection` and run one
+/// bounded SELECT (bounded by the parse scope). `input_unit_ids_json` is
+/// decoded from its canonical JSON array; a malformed value fails loudly with
+/// the chunk's identity rather than being silently dropped.
+pub(crate) fn read_parse_chunks(
+    conn: &Connection,
+    parse_id: &str,
+) -> Result<Vec<StoredChunk>, ApiError> {
     let mut statement =
         conn.prepare(SELECT_PARSE_CHUNKS_SQL)
             .map_err(|source| ApiError::StorageOperation {
@@ -271,6 +275,9 @@ fn read_parse_chunks(conn: &Connection, parse_id: &str) -> Result<Vec<StoredChun
                 chunker_name: row.get(7)?,
                 chunker_version: row.get(8)?,
                 chunker_config_hash: row.get(9)?,
+                fragments_json: row.get(10)?,
+                section_path_json: row.get(11)?,
+                chunk_index: row.get(12)?,
             })
         })
         .map_err(|source| ApiError::StorageOperation {
@@ -287,8 +294,9 @@ fn read_parse_chunks(conn: &Connection, parse_id: &str) -> Result<Vec<StoredChun
     Ok(chunks)
 }
 
-/// One `chunk_projections` row as read from SQLite, before `input_unit_ids_json`
-/// is decoded back into the `StoredChunk` string vector.
+/// One `chunk_projections` row as read from SQLite, before its JSON columns
+/// (`input_unit_ids_json`, `fragments_json`, `section_path_json`) are decoded
+/// into the `StoredChunk` vectors and its INTEGER `chunk_index` is re-typed.
 struct ChunkRow {
     id: String,
     projection_id: String,
@@ -300,21 +308,24 @@ struct ChunkRow {
     chunker_name: String,
     chunker_version: String,
     chunker_config_hash: String,
+    fragments_json: String,
+    section_path_json: String,
+    chunk_index: i64,
 }
 
-/// Decode one persisted chunk row into `StoredChunk`, parsing the canonical
-/// `input_unit_ids_json` array. A stored value that no longer parses as a
-/// string array is corruption surfaced with the chunk's identity.
+/// Decode one persisted chunk row into `StoredChunk`, parsing its canonical
+/// JSON columns. A stored value that no longer parses, or a negative
+/// `chunk_index`, is corruption surfaced with the chunk's identity.
 fn chunk_from_row(row: ChunkRow) -> Result<StoredChunk, ApiError> {
-    let input_unit_ids: Vec<String> =
-        serde_json::from_str(&row.input_unit_ids_json).map_err(|source| {
-            ApiError::StorageOperation {
-                message: format!(
-                    "input unit ids of chunk {} are unparseable: {source}",
-                    row.id
-                ),
-            }
-        })?;
+    let input_unit_ids = decode_json_column(&row.input_unit_ids_json, &row.id, "input unit ids")?;
+    let fragments = decode_json_column(&row.fragments_json, &row.id, "fragments")?;
+    let section_path = decode_json_column(&row.section_path_json, &row.id, "section path")?;
+    let chunk_index = usize::try_from(row.chunk_index).map_err(|_| ApiError::StorageOperation {
+        message: format!(
+            "chunk {} has an invalid stored chunk_index {}",
+            row.id, row.chunk_index
+        ),
+    })?;
     Ok(StoredChunk {
         id: row.id,
         projection_id: row.projection_id,
@@ -326,6 +337,21 @@ fn chunk_from_row(row: ChunkRow) -> Result<StoredChunk, ApiError> {
         chunker_name: row.chunker_name,
         chunker_version: row.chunker_version,
         chunker_config_hash: row.chunker_config_hash,
+        fragments,
+        section_path,
+        chunk_index,
+    })
+}
+
+/// Decode one canonical JSON column of a chunk row, naming the chunk and the
+/// column on failure so corruption is attributable.
+fn decode_json_column<T: serde::de::DeserializeOwned>(
+    json: &str,
+    chunk_id: &str,
+    what: &str,
+) -> Result<T, ApiError> {
+    serde_json::from_str(json).map_err(|source| ApiError::StorageOperation {
+        message: format!("{what} of chunk {chunk_id} are unparseable: {source}"),
     })
 }
 

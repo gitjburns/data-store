@@ -1,12 +1,39 @@
-//! Section context vectors are immutable targeting artifacts, never canonical evidence.
+//! Context windows (PLAN-grains Section 2, context grain): section context
+//! vectors over runs of consecutive fine chunks. They are immutable targeting
+//! artifacts, never canonical evidence.
+//!
+//! Construction. Windows are packed from the parse's `chunk_projections` rows
+//! in `chunk_index` order (the only reading-order authority for chunks), read
+//! on the caller's transaction through the shared `lexical::read_parse_chunks`
+//! reader. A run grows while the exact joined canonical text fits
+//! `indexing.context_max_tokens`; runs cross section boundaries and never
+//! split a chunk (every fine chunk fits the context cap because
+//! `indexing.fine_max_tokens` is below it — a chunk that does not fails the
+//! build). At document end a run below `indexing.min_fill_ratio` merges into
+//! its predecessor when the combined text fits.
+//!
+//! Each window records its member `chunk_ids` in order, `fragments` as the
+//! concatenation of its chunks' fragments (Unicode scalar offsets, never
+//! bytes), `input_unit_ids` derived from those fragments, the `section_path`
+//! of its first chunk (used only as the model-input prefix), its canonical
+//! text (`targeting_text`: chunk texts joined by one blank line) and the
+//! token count measured on exactly that text. The embedded model input is
+//! `chunk::model_input(section_path, canonical)`; the prefix is never part of
+//! any range, hash, or stored text.
+//!
+//! Validation re-keys every window to chunk rows and never runs a tokenizer:
+//! chunk ids must be consecutive in chunk order, all windows together cover
+//! every chunk exactly once, fragments and canonical text must equal the
+//! members' concatenation, and the recorded token count must be within the
+//! recorded cap.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use crate::limits::{ResourceLimits, RuntimeLimits};
+use crate::limits::{IndexingLimits, ResourceLimits};
 use crate::sqlite::{Connection, Transaction};
 use rusqlite::params;
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
@@ -16,32 +43,30 @@ use tokenizers::Tokenizer;
 use tracing::{error, info};
 
 use crate::artifact_store::ArtifactStore;
-use crate::assembly::evidence::evidence_text;
 use crate::canonical::canonical_json_bytes_of;
 use crate::config::{DenseBackendKind, DenseModelConfig};
 use crate::error::ApiError;
 use crate::inference::DenseEmbeddingBackend;
-use crate::model::{ContentType, ProducerType, Provenance};
+use crate::model::{ProducerType, Provenance};
 use crate::primitives::sha256_hex;
 use crate::primitives::validate::validate_vector;
 use crate::sections::read_section;
 use crate::state::ModelCallPermit;
 
+use super::StoredChunk;
+use super::chunk::{self, Fragment};
 use super::envelope::{self, NewProjection, ProjectionType};
 
 /// Distinguishes archived section vectors from the fine passage dense plane.
+/// Consumers key on it as the envelope index name, not as a format version;
+/// the construction descriptor and policy hash carry the version.
 pub(crate) const SECTION_DENSE_INDEX_NAME: &str = "section_dense_v1";
-// This exact string is the archived v1 policy, never the current build setting.
-const WINDOW_POLICY: &str = "section_dense_v1;nearest_logical_section;canonical_sequence;heading_path_slash;paragraph_separator_double_newline;utf8_prefix_split;max_tokens=2048;special_tokens=true;no_truncation;no_padding;exclude_header_footer;retain_short_text";
-const UNITS_SQL: &str = "
-SELECT id, source_id, content_type,
-       CASE WHEN length(CAST(body_json AS BLOB)) <= ?2 THEN body_json END
-FROM content_units WHERE parse_id = ?1
-ORDER BY sequence_index IS NULL, sequence_index, id LIMIT ?3";
-const CANONICAL_LEAF_SQL: &str = "
-SELECT content_type,
-       CASE WHEN length(CAST(body_json AS BLOB)) <= ?4 THEN body_json END
-FROM content_units WHERE id = ?1 AND source_id = ?2 AND parse_id = ?3";
+// The version-3 construction: consecutive fine chunks in chunk_index order,
+// packed under the context cap with the minimum-fill rule, never split,
+// crossing sections; canonical text joined by one blank line and measured
+// without the section-path prefix; fragments in scalar offsets. Hashed with
+// the construction descriptor, so a change here is a visible policy change.
+const WINDOW_POLICY: &str = "section_dense_v3;consecutive_fine_chunks;chunk_index_order;cross_sections;no_chunk_split;min_fill_merge_at_end;canonical_join_double_newline;model_input_section_path_slash_prefix;token_count_on_canonical;fragments_scalar_offsets;special_tokens=true;no_truncation;no_padding";
 const ENVELOPE_SQL: &str = "
 SELECT source_id, projection_type, freshness_status,
        CASE WHEN length(CAST(payload_uri AS BLOB)) <= ?3 THEN payload_uri END,
@@ -53,8 +78,7 @@ FROM retrieval_projections WHERE parse_id = ?1 AND index_name = ?2 LIMIT 2";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SectionDensePlane {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) construction: Option<SectionConstruction>,
+    pub(crate) construction: SectionConstruction,
     pub(crate) source_id: String,
     pub(crate) parse_id: String,
     pub(crate) dimension: usize,
@@ -66,39 +90,46 @@ pub(crate) struct SectionDensePlane {
     pub(crate) windows: Vec<SectionDenseWindow>,
 }
 
-/// Archived construction semantics are independent of current admission budgets.
+/// Archived construction semantics are independent of current admission
+/// budgets: the cap and minimum-fill ratio that shaped the runs travel with
+/// the artifact so validation never consults today's limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SectionConstruction {
     version: u32,
     window_max_tokens: u32,
+    min_fill_ratio: f64,
     tokenizer_hash: String,
     model_identity: String,
 }
 
+/// The construction version this module builds and accepts.
+pub(crate) const CONSTRUCTION_VERSION: u32 = 3;
+
 impl SectionDensePlane {
-    /// The unversioned payload is explicitly the frozen 2048-token v1 format.
+    /// The token cap every window of this artifact was measured against.
     fn window_max_tokens(&self) -> usize {
-        self.construction
-            .as_ref()
-            .map_or(2048, |policy| policy.window_max_tokens as usize)
+        self.construction.window_max_tokens as usize
     }
 
-    /// Fail closed for unknown versions and authenticate the complete recorded policy.
+    /// Fail closed for unknown versions and authenticate the complete recorded
+    /// policy: older payloads carry byte-offset fragments and no chunk ids, so
+    /// only version 3 is readable.
     fn recorded_policy_hash(&self) -> Result<String, ApiError> {
-        match &self.construction {
-            None => Ok(policy_hash()),
-            Some(policy)
-                if policy.version == 2
-                    && policy.window_max_tokens > 0
-                    && policy.tokenizer_hash == self.tokenizer_hash
-                    && !policy.model_identity.is_empty() =>
-            {
-                crate::canonical::canonical_sha256_hex_of(&(WINDOW_POLICY, policy))
-            }
-            Some(_) => Err(failure(
+        let policy = &self.construction;
+        if policy.version == CONSTRUCTION_VERSION
+            && policy.window_max_tokens > 0
+            && policy.min_fill_ratio.is_finite()
+            && policy.min_fill_ratio > 0.0
+            && policy.min_fill_ratio < 1.0
+            && policy.tokenizer_hash == self.tokenizer_hash
+            && !policy.model_identity.is_empty()
+        {
+            crate::canonical::canonical_sha256_hex_of(&(WINDOW_POLICY, policy))
+        } else {
+            Err(failure(
                 "unsupported or invalid section construction policy".to_owned(),
-            )),
+            ))
         }
     }
 }
@@ -121,36 +152,33 @@ struct SectionDenseEnvelope {
     input_unit_ids: Vec<String>,
 }
 
-/// Exact heading-prefixed model input and its canonical targets, bounded at build time.
+/// One context window: a run of consecutive fine chunks, its canonical text,
+/// and its vector. `targeting_text` is the canonical text (no prefix);
+/// `input_unit_ids` is always `chunk::ordered_unit_ids(fragments)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SectionDenseWindow {
     pub(crate) window_id: String,
     pub(crate) section_id: Option<String>,
     pub(crate) section_path: Vec<String>,
+    /// Member chunk ids in chunk order; consecutive `chunk_index` positions.
+    pub(crate) chunk_ids: Vec<String>,
     pub(crate) input_unit_ids: Vec<String>,
     pub(crate) targeting_text: String,
     pub(crate) token_count: usize,
     pub(crate) vector: Vec<f32>,
     pub(crate) norm: f32,
-    /// UTF-8 byte ranges permit lossless verification when an oversized leaf is split.
-    pub(crate) fragments: Vec<SectionDenseFragment>,
+    /// The concatenation of the member chunks' fragments, scalar offsets.
+    pub(crate) fragments: Vec<Fragment>,
 }
 
-/// A canonical leaf excerpt; offsets address evidence_text, not the raw body JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SectionDenseFragment {
-    pub(crate) unit_id: String,
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
-}
-
-/// Canonical leaves retain source order while section grouping owns targeting context.
-struct Leaf {
+/// The chunk fields the context grain consumes, in chunk order: hot rows come
+/// from `StoredChunk`, archived rows from the snapshot's `chunk_projections`
+/// JSONL. A member's position in the slice is its `chunk_index`.
+struct ContextMember {
     id: String,
-    text: String,
-    section_id: Option<String>,
+    targeting_text: String,
+    fragments: Vec<Fragment>,
     section_path: Vec<String>,
 }
 
@@ -175,7 +203,7 @@ pub(crate) fn build_section_dense(
         event = "section_dense.build.started",
         source_id,
         parse_id,
-        max_tokens = tx.limits().indexing.section_max_tokens,
+        max_tokens = tx.limits().indexing.context_max_tokens,
         "building section context vectors"
     );
     let result = (|| {
@@ -190,7 +218,7 @@ pub(crate) fn build_section_dense(
             )));
         }
         // Runtime tokenizers may truncate at the ColBERT model limit. This independent
-        // CPU-only copy counts the full section input and never silently clips it.
+        // CPU-only copy counts the full window text and never silently clips it.
         let mut counter = tokenizer.clone();
         counter.with_truncation(None).map_err(|source| {
             failure(format!(
@@ -203,9 +231,16 @@ pub(crate) fn build_section_dense(
             .map_err(|source| failure(format!("serialize section tokenizer identity: {source}")))?;
         let tokenizer_value: Value = serde_json::from_str(&tokenizer_json)
             .map_err(|source| failure(format!("decode section tokenizer identity: {source}")))?;
-        let leaves = read_leaves(tx, source_id, parse_id)?;
-        let max_tokens = tx.limits().indexing.section_max_tokens;
-        let windows = build_windows(&leaves, parse_id, &counter, max_tokens as usize)?;
+        // The chunk rows are read on the caller's transaction so the windows
+        // describe exactly the chunk set this build's owner is publishing.
+        let members = hot_members(
+            super::lexical::read_parse_chunks(tx, parse_id)?,
+            source_id,
+            parse_id,
+        )?;
+        let indexing = &tx.limits().indexing;
+        let windows = build_windows(&members, parse_id, &counter, indexing)?;
+        let windows = resolve_section_ids(tx, parse_id, windows)?;
         let tokenizer_hash = sha256_hex(&canonical_json_bytes_of(&tokenizer_value)?);
         let (model_backend, model_name) = match config.backend {
             DenseBackendKind::Local => ("local", config.local_path()?.display().to_string()),
@@ -217,12 +252,13 @@ pub(crate) fn build_section_dense(
             ),
         };
         let mut plane = SectionDensePlane {
-            construction: Some(SectionConstruction {
-                version: 2,
-                window_max_tokens: max_tokens,
+            construction: SectionConstruction {
+                version: CONSTRUCTION_VERSION,
+                window_max_tokens: indexing.context_max_tokens,
+                min_fill_ratio: indexing.min_fill_ratio,
                 tokenizer_hash: tokenizer_hash.clone(),
                 model_identity: model_identity.to_owned(),
-            }),
+            },
             source_id: source_id.to_owned(),
             parse_id: parse_id.to_owned(),
             dimension: config.dimension as usize,
@@ -234,7 +270,7 @@ pub(crate) fn build_section_dense(
             windows,
         };
         plane.policy_hash = plane.recorded_policy_hash()?;
-        info!(event = "section_dense.windows.ready", source_id, parse_id, unit_count = leaves.len(), window_count = plane.windows.len(), policy_hash = %plane.policy_hash, elapsed_ms = started.elapsed().as_millis() as u64, "section inputs constructed");
+        info!(event = "section_dense.windows.ready", source_id, parse_id, chunk_count = members.len(), window_count = plane.windows.len(), policy_hash = %plane.policy_hash, elapsed_ms = started.elapsed().as_millis() as u64, "section inputs constructed");
         let projection = envelope::insert_building(tx, &new_projection(&plane))?;
         let built = (|| {
             info!(
@@ -244,11 +280,13 @@ pub(crate) fn build_section_dense(
                 window_count = plane.windows.len(),
                 "embedding section context inputs"
             );
-            let texts: Vec<&str> = plane
+            // The model sees the section-path prefix; the stored text does not.
+            let inputs: Vec<String> = plane
                 .windows
                 .iter()
-                .map(|window| window.targeting_text.as_str())
+                .map(|window| chunk::model_input(&window.section_path, &window.targeting_text))
                 .collect();
+            let texts: Vec<&str> = inputs.iter().map(String::as_str).collect();
             if let Some(monitor) = monitor {
                 monitor.stage(
                     "dense section embeddings",
@@ -280,7 +318,9 @@ pub(crate) fn build_section_dense(
                 "section vectors validated"
             );
             validate_payload(&plane, source_id, parse_id, plane.dimension)?;
-            validate_leaves(&leaves, &plane)?;
+            // The archived plane must pass the same chunk-keyed check every
+            // later reader applies, before any bytes are written.
+            validate_members(&members, &plane)?;
             let bytes = canonical_json_bytes_of(&plane)?;
             info!(
                 event = "section_dense.archive.started",
@@ -370,7 +410,9 @@ fn read_section_envelope(
     }))
 }
 
-/// Validate persisted sections incrementally before publishing a small active handle.
+/// Validate persisted sections incrementally against the parse's chunk rows
+/// before publishing a small active handle. The chunk rows of one parse are
+/// held for the duration of this check; the vector payload is still streamed.
 pub(crate) fn load_section_dense_reference(
     conn: &Connection,
     store: &ArtifactStore,
@@ -380,7 +422,11 @@ pub(crate) fn load_section_dense_reference(
     let Some(envelope) = read_section_envelope(conn, parse_id)? else {
         return Ok(None);
     };
-    let mut canonical = CanonicalSectionInputs::new(conn, &envelope.source_id, parse_id)?;
+    let members = hot_members(
+        super::lexical::read_parse_chunks(conn, parse_id)?,
+        &envelope.source_id,
+        parse_id,
+    )?;
     let mut reference = SectionDenseReference {
         source_id: envelope.source_id,
         parse_id: parse_id.to_owned(),
@@ -388,18 +434,24 @@ pub(crate) fn load_section_dense_reference(
         window_count: 0,
         payload_uri: envelope.payload_uri,
     };
+    // The cap is only known once the header is decoded, and header order is
+    // unrestricted; the seed checks every streamed count against the recorded
+    // cap, so the cursor here checks structure and coverage only.
+    let mut cursor = MemberCursor::new(&members, usize::MAX);
+    let mut seen_units = BTreeSet::new();
     let (_, window_count) = stream_section_payload(store, &reference, |window| {
-        canonical.validate_window(conn, &reference, window)
+        cursor.validate_window(window)?;
+        seen_units.extend(window.input_unit_ids.iter().cloned());
+        Ok(())
     })?;
     reference.window_count = window_count;
-    canonical.finish(&reference.parse_id)?;
-    let ids: BTreeSet<&str> = canonical.ordered.iter().map(String::as_str).collect();
+    cursor.finish(&reference.parse_id)?;
     if envelope
         .input_unit_ids
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
-        != ids.into_iter().collect::<Vec<_>>()
+        != seen_units.iter().map(String::as_str).collect::<Vec<_>>()
     {
         return Err(failure(format!(
             "section envelope input membership differs from payload for {parse_id}"
@@ -452,160 +504,129 @@ pub(crate) fn visit_section_dense(
     Ok(())
 }
 
-/// Canonical validation keeps only capped input IDs and one current leaf body.
-/// Group order matches build_windows, including sections interleaved in source order.
-struct CanonicalSectionInputs {
-    ordered: Vec<String>,
-    next_index: usize,
-    offset: usize,
-    current: Option<Leaf>,
+/// Walks the parse's chunk members in chunk order while windows arrive in
+/// window order, so one pass checks consecutiveness and coverage:
+/// `next` is the position of the first chunk the next window must start at.
+struct MemberCursor<'a> {
+    members: &'a [ContextMember],
+    next: usize,
+    max_tokens: usize,
 }
 
-impl CanonicalSectionInputs {
-    /// Recover canonical section grouping without retaining the document's text.
-    fn new(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Self, ApiError> {
-        let mut positions = BTreeMap::new();
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        visit_leaves(conn, source_id, parse_id, |leaf| {
-            let index = *positions.entry(leaf.section_id).or_insert_with(|| {
-                groups.push(Vec::new());
-                groups.len() - 1
-            });
-            groups[index].push(leaf.id);
-            Ok(())
-        })?;
-        Ok(Self {
-            ordered: groups.into_iter().flatten().collect(),
-            next_index: 0,
-            offset: 0,
-            current: None,
-        })
+impl<'a> MemberCursor<'a> {
+    /// Start at the first chunk; `max_tokens` is the recorded cap, or
+    /// `usize::MAX` when a streaming reader enforces the cap separately.
+    fn new(members: &'a [ContextMember], max_tokens: usize) -> Self {
+        Self {
+            members,
+            next: 0,
+            max_tokens,
+        }
     }
 
-    /// Require continuous UTF-8 coverage in build order and reconstruct each
-    /// heading-prefixed input exactly; a split leaf stays loaded until consumed.
-    fn validate_window(
-        &mut self,
-        conn: &Connection,
-        reference: &SectionDenseReference,
-        window: &SectionDenseWindow,
-    ) -> Result<(), ApiError> {
-        let mut text = heading_prefix(&window.section_path);
-        for (index, fragment) in window.fragments.iter().enumerate() {
-            if self.current.is_none() {
-                let id = self.ordered.get(self.next_index).ok_or_else(|| {
-                    failure(format!(
-                        "section plane {} has unexpected fragments",
-                        reference.parse_id
-                    ))
-                })?;
-                self.current = Some(read_canonical_leaf(conn, reference, id)?);
-            }
-            let leaf = self.current.as_ref().ok_or_else(|| {
-                failure(format!(
-                    "section canonical cursor missing for {}",
-                    reference.parse_id
-                ))
-            })?;
-            if leaf.id != fragment.unit_id
-                || self.offset != fragment.start_byte
-                || leaf.section_id != window.section_id
-                || leaf.section_path != window.section_path
-            {
-                return Err(failure(format!(
-                    "section window {} canonical order/ancestry differs at {}",
-                    window.window_id, fragment.unit_id
-                )));
-            }
-            let part = leaf
-                .text
-                .get(fragment.start_byte..fragment.end_byte)
-                .ok_or_else(|| {
-                    failure(format!(
-                        "section window {} has invalid UTF-8 range for {}",
-                        window.window_id, leaf.id
-                    ))
-                })?;
-            // Malformed fragment metadata must not expand a bounded window into
-            // an unbounded canonical-text buffer before the equality check.
-            if text
-                .len()
-                .checked_add(part.len())
-                .and_then(|length| length.checked_add(if index == 0 { 0 } else { 2 }))
-                .is_none_or(|length| length > window.targeting_text.len())
-            {
-                return Err(failure(format!(
-                    "section window {} canonical fragments exceed its input text",
-                    window.window_id
-                )));
-            }
-            if index != 0 {
-                text.push_str("\n\n");
-            }
-            text.push_str(part);
-            self.offset = fragment.end_byte;
-            if self.offset == leaf.text.len() {
-                self.next_index += 1;
-                self.offset = 0;
-                self.current = None;
-            }
-        }
-        if text != window.targeting_text {
+    /// Check one window against the members it must cover next. Consecutive:
+    /// the window's chunk ids are exactly the members at positions
+    /// `next..next + chunk_ids.len()`, in order. Content: fragments equal the
+    /// members' fragments concatenated, canonical text equals the members'
+    /// texts joined by one blank line, unit ids derive from the fragments, the
+    /// section path is the first member's, and the token count is within the
+    /// cap. No tokenizer runs here.
+    fn validate_window(&mut self, window: &SectionDenseWindow) -> Result<(), ApiError> {
+        let Some(first) = self.members.get(self.next) else {
             return Err(failure(format!(
-                "section window {} input differs from canonical fragments",
+                "section window {} lies beyond the parse's last chunk",
+                window.window_id
+            )));
+        };
+        if window.chunk_ids.is_empty() {
+            return Err(failure(format!(
+                "section window {} has no chunks",
                 window.window_id
             )));
         }
+        let mut fragments = Vec::new();
+        let mut text = String::new();
+        for (offset, chunk_id) in window.chunk_ids.iter().enumerate() {
+            let member = self.members.get(self.next + offset).ok_or_else(|| {
+                failure(format!(
+                    "section window {} lists more chunks than the parse has",
+                    window.window_id
+                ))
+            })?;
+            if member.id != *chunk_id {
+                return Err(failure(format!(
+                    "section window {} chunk {chunk_id} is not the next chunk in chunk order (expected {})",
+                    window.window_id, member.id
+                )));
+            }
+            // Malformed metadata must not expand a bounded window into an
+            // unbounded buffer before the equality check: the reconstruction
+            // may never grow past the window's own text.
+            let separator = if offset == 0 { 0 } else { 2 };
+            if text
+                .len()
+                .saturating_add(member.targeting_text.len())
+                .saturating_add(separator)
+                > window.targeting_text.len()
+            {
+                return Err(failure(format!(
+                    "section window {} canonical text is shorter than its chunks' text",
+                    window.window_id
+                )));
+            }
+            if offset == 0 {
+                text.push_str(&member.targeting_text);
+            } else {
+                text = chunk::join_text(&text, &member.targeting_text);
+            }
+            fragments.extend(member.fragments.iter().cloned());
+        }
+        if fragments != window.fragments {
+            return Err(failure(format!(
+                "section window {} fragments differ from its chunks' fragments",
+                window.window_id
+            )));
+        }
+        if text != window.targeting_text {
+            return Err(failure(format!(
+                "section window {} canonical text differs from its chunks' text",
+                window.window_id
+            )));
+        }
+        if window.input_unit_ids != chunk::ordered_unit_ids(&window.fragments) {
+            return Err(failure(format!(
+                "section window {} unit ids do not derive from its fragments",
+                window.window_id
+            )));
+        }
+        if window.section_path != first.section_path {
+            return Err(failure(format!(
+                "section window {} section path differs from its first chunk's",
+                window.window_id
+            )));
+        }
+        if window.token_count > self.max_tokens {
+            return Err(failure(format!(
+                "section window {} token count {} exceeds the recorded cap {}",
+                window.window_id, window.token_count, self.max_tokens
+            )));
+        }
+        self.next += window.chunk_ids.len();
         Ok(())
     }
 
-    /// A clean end of JSON is insufficient when eligible canonical text is omitted.
+    /// Coverage: every chunk of the parse was consumed by exactly one window.
+    /// Zero windows are valid only for a parse with zero chunks.
     fn finish(&self, parse_id: &str) -> Result<(), ApiError> {
-        if self.next_index != self.ordered.len() || self.offset != 0 {
+        if self.next != self.members.len() {
             return Err(failure(format!(
-                "section plane {parse_id} omits canonical text"
+                "section plane {parse_id} covers {} of {} chunks",
+                self.next,
+                self.members.len()
             )));
         }
         Ok(())
     }
-}
-
-/// Read the single canonical leaf currently needed by streaming coverage checks.
-fn read_canonical_leaf(
-    conn: &Connection,
-    reference: &SectionDenseReference,
-    id: &str,
-) -> Result<Leaf, ApiError> {
-    let (kind, body) = conn
-        .query_row(
-            CANONICAL_LEAF_SQL,
-            params![
-                id,
-                reference.source_id,
-                reference.parse_id,
-                conn.limits().resources.max_source_body_bytes
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .map_err(|source| failure(format!("read canonical section leaf {id}: {source}")))?;
-    let body = body.ok_or_else(|| {
-        failure(format!(
-            "resource limit: section leaf {id} exceeds configured body bytes"
-        ))
-    })?;
-    let kind: ContentType = serde_json::from_value(Value::String(kind))
-        .map_err(|source| failure(format!("section leaf type {id}: {source}")))?;
-    let body = serde_json::from_str(&body)
-        .map_err(|source| failure(format!("section leaf body {id}: {source}")))?;
-    let text = eligible_text(kind, &body)
-        .ok_or_else(|| failure(format!("section leaf {id} is no longer eligible")))?;
-    let (section_id, section_path) = read_section(conn, &reference.parse_id, id)?;
-    Ok(Leaf {
-        id: id.to_owned(),
-        text,
-        section_id,
-        section_path,
-    })
 }
 
 /// Decode each window with a bounded record buffer and a dimension-limited vector.
@@ -868,6 +889,7 @@ impl<'de> Visitor<'de> for SectionWindowSeed {
         let mut window_id = None;
         let mut section_id = None;
         let mut section_path = None;
+        let mut chunk_ids = None;
         let mut input_unit_ids = None;
         let mut targeting_text = None;
         let mut token_count = None;
@@ -875,7 +897,7 @@ impl<'de> Visitor<'de> for SectionWindowSeed {
         let mut fragments = None;
         let mut vector = None;
         while let Some(key) = map.next_key::<String>()? {
-            // The set owns at most the nine field names while the current key
+            // The set owns at most the ten field names while the current key
             // remains borrowed for dispatch and contextual duplicate errors.
             if !fields.insert(key.clone()) {
                 return Err(M::Error::custom(format!(
@@ -886,6 +908,7 @@ impl<'de> Visitor<'de> for SectionWindowSeed {
                 "windowId" => window_id = Some(map.next_value()?),
                 "sectionId" => section_id = map.next_value()?,
                 "sectionPath" => section_path = Some(map.next_value()?),
+                "chunkIds" => chunk_ids = Some(map.next_value()?),
                 "inputUnitIds" => input_unit_ids = Some(map.next_value()?),
                 "targetingText" => targeting_text = Some(map.next_value()?),
                 "tokenCount" => token_count = Some(map.next_value()?),
@@ -907,6 +930,7 @@ impl<'de> Visitor<'de> for SectionWindowSeed {
             window_id: window_id.ok_or_else(|| M::Error::missing_field("windowId"))?,
             section_id,
             section_path: section_path.ok_or_else(|| M::Error::missing_field("sectionPath"))?,
+            chunk_ids: chunk_ids.ok_or_else(|| M::Error::missing_field("chunkIds"))?,
             input_unit_ids: input_unit_ids
                 .ok_or_else(|| M::Error::missing_field("inputUnitIds"))?,
             targeting_text: targeting_text
@@ -965,7 +989,7 @@ impl<'de> Visitor<'de> for SectionVectorSeed {
 }
 
 /// Verify immutable artifact integrity and shape without requiring model inference.
-/// Snapshot readers additionally call validate_plane against captured canonical rows.
+/// Snapshot readers additionally call validate_plane against hot chunk rows.
 pub(crate) fn read_section_payload(
     store: &ArtifactStore,
     uri: &str,
@@ -991,156 +1015,127 @@ pub(crate) fn read_section_payload(
     Ok(plane)
 }
 
-/// Confirm every eligible leaf is represented exactly once, possibly split across
-/// windows, and each stored input is reconstructible from the canonical parse.
+/// Confirm the plane's windows are consecutive runs covering every hot chunk
+/// row of the parse exactly once, with fragments and canonical text equal to
+/// their chunks'. Reads the chunk rows through the shared reader on `conn`.
 pub(crate) fn validate_plane(conn: &Connection, plane: &SectionDensePlane) -> Result<(), ApiError> {
-    let leaves = read_leaves(conn, &plane.source_id, &plane.parse_id)?;
-    validate_leaves(&leaves, plane)
+    let members = hot_members(
+        super::lexical::read_parse_chunks(conn, &plane.parse_id)?,
+        &plane.source_id,
+        &plane.parse_id,
+    )?;
+    validate_members(&members, plane)
 }
 
-/// Verify snapshot section inputs against archived SQL rows before any restore
-/// writes. The same completeness checker is used after canonical rows are imported.
+/// Verify snapshot section windows against the archived `chunk_projections`
+/// records (the corpus-wide JSONL the verifier already loads) before any
+/// restore writes. The same checker runs after the rows are re-imported.
 pub(crate) fn validate_archived_plane(
-    units: &[Value],
-    relationships: &[Value],
+    chunks: &[Value],
     plane: &SectionDensePlane,
-    limits: &RuntimeLimits,
 ) -> Result<(), ApiError> {
-    let mut nodes = BTreeMap::new();
-    let mut order = Vec::new();
-    for unit in units.iter().filter(|unit| {
-        unit.get("parse_id").and_then(Value::as_str) == Some(plane.parse_id.as_str())
-    }) {
-        let id = archived_string(unit, "id")?;
-        if archived_string(unit, "source_id")? != plane.source_id {
+    let members = archived_members(chunks, &plane.source_id, &plane.parse_id)?;
+    validate_members(&members, plane)
+}
+
+/// Re-type hot chunk rows into context members, requiring that every row
+/// belongs to the expected source and parse and that `chunk_index` is exactly
+/// the row's position (0..n contiguous), so positions can stand in for it.
+fn hot_members(
+    chunks: Vec<StoredChunk>,
+    source_id: &str,
+    parse_id: &str,
+) -> Result<Vec<ContextMember>, ApiError> {
+    let mut members = Vec::with_capacity(chunks.len());
+    for (position, chunk) in chunks.into_iter().enumerate() {
+        if chunk.source_id != source_id || chunk.parse_id != parse_id {
             return Err(failure(format!(
-                "archived section leaf {id} has a different source from {}",
-                plane.source_id
+                "chunk {} belongs to source {} parse {}, not source {source_id} parse {parse_id}",
+                chunk.id, chunk.source_id, chunk.parse_id
             )));
         }
-        let kind: ContentType = serde_json::from_value(Value::String(
-            archived_string(unit, "content_type")?.to_owned(),
-        ))
-        .map_err(|source| failure(format!("archived section leaf type {id}: {source}")))?;
-        let raw_body = archived_string(unit, "body_json")?;
-        if raw_body.len() > limits.resources.max_source_body_bytes {
+        if chunk.chunk_index != position {
             return Err(failure(format!(
-                "resource limit: archived section unit {id} exceeds configured body bytes"
+                "chunk {} of parse {parse_id} has chunk_index {} at position {position}; chunk order is not contiguous",
+                chunk.id, chunk.chunk_index
             )));
         }
-        let body: Value = serde_json::from_str(raw_body)
-            .map_err(|source| failure(format!("archived section unit body {id}: {source}")))?;
-        let sequence = match unit.get("sequence_index") {
-            Some(Value::Null) | None => None,
-            Some(value) => Some(
-                value
-                    .as_u64()
-                    .ok_or_else(|| failure(format!("invalid archived sequence index for {id}")))?,
-            ),
-        };
-        if nodes.insert(id, (kind, body)).is_some() {
-            return Err(failure(format!("duplicate archived section unit {id}")));
-        }
-        order.push((sequence.is_none(), sequence, id));
-    }
-    if nodes.len() > limits.resources.max_parse_units {
-        return Err(failure(format!(
-            "resource limit: archived section parse {} exceeds configured unit count",
-            plane.parse_id
-        )));
-    }
-    order.sort_unstable();
-    let mut parents: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for relation in relationships.iter().filter(|relation| {
-        relation.get("parse_id").and_then(Value::as_str) == Some(plane.parse_id.as_str())
-    }) {
-        if archived_string(relation, "relationship_type")? != "contains" {
-            continue;
-        }
-        let from = archived_string(relation, "from_unit_id")?;
-        let to = archived_string(relation, "to_unit_id")?;
-        if nodes
-            .get(from)
-            .is_some_and(|(kind, _)| *kind != ContentType::Page)
-        {
-            parents.entry(to).or_default().insert(from);
-        }
-    }
-    let mut leaves = Vec::new();
-    for (_, _, id) in order {
-        let (kind, body) = nodes
-            .get(id)
-            .ok_or_else(|| failure(format!("archived section unit {id} disappeared")))?;
-        let Some(text) = eligible_text(*kind, body) else {
-            continue;
-        };
-        let (section_id, section_path) = archived_section(
-            id,
-            &plane.parse_id,
-            &nodes,
-            &parents,
-            limits.retrieval.max_section_ancestry,
-        )?;
-        leaves.push(Leaf {
-            id: id.to_owned(),
-            text,
-            section_id,
-            section_path,
+        members.push(ContextMember {
+            id: chunk.id,
+            targeting_text: chunk.targeting_text,
+            fragments: chunk.fragments,
+            section_path: chunk.section_path,
         });
     }
-    validate_leaves(&leaves, plane)
+    Ok(members)
 }
 
-/// Resolve the archived equivalent of read_section without opening a scratch DB.
-/// Parent sets mirror SQL DISTINCT over `contains` edges and, like the SQL,
-/// never admit a `page` unit as an ancestor.
-fn archived_section(
-    unit_id: &str,
+/// Re-type archived `chunk_projections` JSONL records of one parse into
+/// context members in `chunk_index` order, with the same ownership and
+/// contiguity requirements as `hot_members`. SQL row snapshots keep snake_case
+/// column names, raw JSON-string columns, and INTEGER columns as numbers.
+fn archived_members(
+    chunks: &[Value],
+    source_id: &str,
     parse_id: &str,
-    nodes: &BTreeMap<&str, (ContentType, Value)>,
-    parents: &BTreeMap<&str, BTreeSet<&str>>,
-    max_ancestry: usize,
-) -> Result<(Option<String>, Vec<String>), ApiError> {
-    let mut current = unit_id;
-    let mut visited = BTreeSet::from([current]);
-    for _ in 0..max_ancestry {
-        let Some(links) = parents.get(current) else {
-            return Ok((None, Vec::new()));
-        };
-        if links.len() > 1 {
+) -> Result<Vec<ContextMember>, ApiError> {
+    let mut indexed = Vec::new();
+    for record in chunks
+        .iter()
+        .filter(|record| record.get("parse_id").and_then(Value::as_str) == Some(parse_id))
+    {
+        let id = archived_string(record, "id")?;
+        if archived_string(record, "source_id")? != source_id {
             return Err(failure(format!(
-                "ambiguous archived logical parent of {current} in {parse_id}"
+                "archived chunk {id} of parse {parse_id} belongs to a different source than {source_id}"
             )));
         }
-        let Some(id) = links.first().copied() else {
-            return Ok((None, Vec::new()));
-        };
-        if !visited.insert(id) {
-            return Err(failure(format!(
-                "archived logical containment cycle at {id} in {parse_id}"
-            )));
-        }
-        let (kind, body) = nodes.get(id).ok_or_else(|| {
-            failure(format!(
-                "missing archived section ancestor {id} in {parse_id}"
-            ))
-        })?;
-        if *kind == ContentType::TextSection {
-            let path = crate::sections::section_path(body, parse_id, id)?;
-            return Ok((Some(id.to_owned()), path));
-        }
-        current = id;
+        let chunk_index = record
+            .get("chunk_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                failure(format!(
+                    "archived chunk {id} has a missing or invalid chunk_index"
+                ))
+            })?;
+        let fragments: Vec<Fragment> =
+            serde_json::from_str(archived_string(record, "fragments_json")?)
+                .map_err(|source| failure(format!("archived chunk {id} fragments: {source}")))?;
+        let section_path: Vec<String> =
+            serde_json::from_str(archived_string(record, "section_path_json")?)
+                .map_err(|source| failure(format!("archived chunk {id} section path: {source}")))?;
+        indexed.push((
+            chunk_index,
+            ContextMember {
+                id: id.to_owned(),
+                targeting_text: archived_string(record, "targeting_text")?.to_owned(),
+                fragments,
+                section_path,
+            },
+        ));
     }
-    Err(failure(format!(
-        "resource limit: archived logical section ancestry of {unit_id} in {parse_id} exceeds configured depth limit"
-    )))
+    indexed.sort_by_key(|(chunk_index, _)| *chunk_index);
+    // Contiguity after sorting: a duplicate or missing index shows up as a
+    // position mismatch.
+    let mut members = Vec::with_capacity(indexed.len());
+    for (position, (chunk_index, member)) in indexed.into_iter().enumerate() {
+        if chunk_index != position {
+            return Err(failure(format!(
+                "archived chunk {} of parse {parse_id} has chunk_index {chunk_index} at position {position}; chunk order is not contiguous",
+                member.id
+            )));
+        }
+        members.push(member);
+    }
+    Ok(members)
 }
 
-/// SQL row snapshots retain snake_case column names and raw body_json strings.
+/// SQL row snapshots retain snake_case column names and raw JSON-string columns.
 fn archived_string<'a>(row: &'a Value, field: &str) -> Result<&'a str, ApiError> {
     row.get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| failure(format!("archived section row has missing/invalid {field}")))
+        .ok_or_else(|| failure(format!("archived chunk row has missing/invalid {field}")))
 }
 
 /// Reject partial, foreign, or invalid vector payloads before they reach the cache.
@@ -1180,7 +1175,10 @@ fn validate_payload(
     Ok(())
 }
 
-/// Validate one streamed window with the same invariants used by archive readers.
+/// Validate one streamed window's own shape, with the same invariants used by
+/// archive readers: identity, vector, non-empty unique chunk ids, well-formed
+/// fragments, and unit ids derived from the fragments. Chunk-row agreement is
+/// `MemberCursor`'s job.
 fn validate_window(
     window: &SectionDenseWindow,
     parse_id: &str,
@@ -1198,17 +1196,14 @@ fn validate_window(
         || window.token_count == 0
         || window.token_count > max_tokens
         || window.targeting_text.trim().is_empty()
-        || window.input_unit_ids.is_empty()
-        || window.fragments.len() != window.input_unit_ids.len()
-        || window.input_unit_ids.iter().collect::<BTreeSet<_>>().len()
-            != window.input_unit_ids.len()
+        || window.chunk_ids.is_empty()
+        || window.chunk_ids.iter().collect::<BTreeSet<_>>().len() != window.chunk_ids.len()
+        || window.fragments.is_empty()
         || window
             .fragments
             .iter()
-            .zip(&window.input_unit_ids)
-            .any(|(fragment, id)| {
-                fragment.unit_id != *id || fragment.start_byte >= fragment.end_byte
-            })
+            .any(|fragment| fragment.start_char >= fragment.end_char)
+        || window.input_unit_ids != chunk::ordered_unit_ids(&window.fragments)
         || !window.norm.is_finite()
         || window.norm <= 0.0
         || (checked.norm - window.norm).abs() > checked.norm * 1e-5
@@ -1222,248 +1217,174 @@ fn validate_window(
     Ok(())
 }
 
-/// Read canonical evidence in the same sequence as passage chunking, retaining
-/// even short nonempty leaves.
-fn read_leaves(conn: &Connection, source_id: &str, parse_id: &str) -> Result<Vec<Leaf>, ApiError> {
-    let mut leaves = Vec::new();
-    visit_leaves(conn, source_id, parse_id, |leaf| {
-        leaves.push(leaf);
-        Ok(())
-    })?;
-    Ok(leaves)
+/// The run being packed: the member positions it spans (`start..end`), its
+/// canonical text, and the token count measured on exactly that text — every
+/// path that changes `text` measures the new text whole before storing it.
+struct OpenRun {
+    start: usize,
+    end: usize,
+    text: String,
+    tokens: usize,
 }
 
-/// Offer canonical leaves one at a time so stream validation retains only IDs
-/// needed to reproduce section grouping, not all of the document's evidence text.
-fn visit_leaves(
-    conn: &Connection,
-    source_id: &str,
-    parse_id: &str,
-    mut visit: impl FnMut(Leaf) -> Result<(), ApiError>,
-) -> Result<(), ApiError> {
-    let limits = &conn.limits().resources;
-    let mut statement = conn
-        .prepare(UNITS_SQL)
-        .map_err(|source| failure(format!("prepare section leaves for {parse_id}: {source}")))?;
-    let rows = statement
-        .query_map(
-            params![
-                parse_id,
-                limits.max_source_body_bytes,
-                limits.max_parse_units + 1
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .map_err(|source| failure(format!("read section leaves for {parse_id}: {source}")))?;
-    for (index, row) in rows.enumerate() {
-        if index == limits.max_parse_units {
-            return Err(failure(format!(
-                "resource limit: section parse {parse_id} exceeds configured canonical unit count"
-            )));
-        }
-        let (id, source, kind, body) =
-            row.map_err(|source| failure(format!("decode section leaf in {parse_id}: {source}")))?;
-        if source != source_id {
-            return Err(failure(format!(
-                "section leaf {id} in {parse_id} belongs to unexpected source {source}"
-            )));
-        }
-        let kind: ContentType = serde_json::from_value(Value::String(kind))
-            .map_err(|source| failure(format!("section leaf type {id}: {source}")))?;
-        let body = body.ok_or_else(|| {
-            failure(format!(
-                "resource limit: section leaf {id} exceeds configured body bytes"
-            ))
-        })?;
-        let body: Value = serde_json::from_str(&body)
-            .map_err(|source| failure(format!("section leaf body {id}: {source}")))?;
-        let Some(text) = eligible_text(kind, &body) else {
-            continue;
-        };
-        let (section_id, section_path) = read_section(conn, parse_id, &id)?;
-        visit(Leaf {
-            id,
-            text,
-            section_id,
-            section_path,
-        })?;
-    }
-    Ok(())
-}
-
-/// Keep live and archived leaf selection identical: the shared evidence-text
-/// contract, minus blank text. v0.4 has no furniture roles to exclude.
-fn eligible_text(kind: ContentType, body: &Value) -> Option<String> {
-    evidence_text(kind, body).filter(|text| !text.trim().is_empty())
-}
-
-/// Preserve first-seen section order and canonical leaf order within each section.
-fn grouped_leaves(leaves: &[Leaf]) -> Vec<Vec<&Leaf>> {
-    let mut positions = BTreeMap::new();
-    let mut groups: Vec<Vec<&Leaf>> = Vec::new();
-    for leaf in leaves {
-        let position = *positions
-            .entry(leaf.section_id.as_deref())
-            .or_insert_with(|| {
-                groups.push(Vec::new());
-                groups.len() - 1
-            });
-        groups[position].push(leaf);
-    }
-    groups
-}
-
-/// Greedy section windows retain all leaf bytes; only oversized leaves are split,
-/// and heading plus separators participate in every exact token-cap measurement.
+/// Pack chunk members into windows under `indexing.context_max_tokens` with
+/// the Section 2 minimum-fill rule, never splitting a chunk:
+///   - a member joins the open run while the EXACT joined canonical text fits
+///     the cap (tokenization is not additive across joins, so every candidate
+///     is measured whole);
+///   - when it would overflow, the run closes and the member opens the next
+///     run — with no split available, a run below the minimum closes short
+///     rather than borrowing part of the next chunk;
+///   - a member that alone exceeds the cap fails the build naming both keys,
+///     since `indexing.fine_max_tokens` below the cap is what guarantees every
+///     chunk fits;
+///   - at document end a final run below the minimum merges into the
+///     preceding run when the combined text fits the cap; otherwise it stays
+///     as the one permitted sub-minimum run.
+///
+/// Runs never consult section boundaries.
 fn build_windows(
-    leaves: &[Leaf],
+    members: &[ContextMember],
     parse_id: &str,
     tokenizer: &Tokenizer,
-    max_tokens: usize,
+    indexing: &IndexingLimits,
 ) -> Result<Vec<SectionDenseWindow>, ApiError> {
-    let mut windows = Vec::new();
-    for group in grouped_leaves(leaves) {
-        let mut pending: Option<SectionDenseWindow> = None;
-        for leaf in group {
-            let mut offset = 0;
-            while offset < leaf.text.len() {
-                let window = pending.get_or_insert_with(|| empty_window(leaf));
-                let separator = if window.fragments.is_empty() {
-                    ""
+    let max_tokens = indexing.context_max_tokens as usize;
+    // The minimum is computed once, floored, so every run is held to one
+    // integer bound.
+    let min_tokens = (max_tokens as f64 * indexing.min_fill_ratio).floor() as usize;
+    let mut runs: Vec<OpenRun> = Vec::new();
+    let mut open: Option<OpenRun> = None;
+    for (position, member) in members.iter().enumerate() {
+        if let Some(mut run) = open.take() {
+            let candidate = chunk::join_text(&run.text, &member.targeting_text);
+            let tokens = count_tokens(tokenizer, &candidate)?;
+            if tokens <= max_tokens {
+                run.end = position + 1;
+                run.text = candidate;
+                run.tokens = tokens;
+                open = Some(run);
+                continue;
+            }
+            // The member would overflow: the run closes as is, even below the
+            // minimum, because a chunk is never split to top it up.
+            runs.push(run);
+        }
+        let tokens = count_tokens(tokenizer, &member.targeting_text)?;
+        if tokens > max_tokens {
+            return Err(failure(format!(
+                "chunk {} of parse {parse_id} measures {tokens} tokens alone, above indexing.context_max_tokens={max_tokens}; indexing.fine_max_tokens={} must keep every fine chunk within the context cap",
+                member.id, indexing.fine_max_tokens
+            )));
+        }
+        open = Some(OpenRun {
+            start: position,
+            end: position + 1,
+            // The run's text is extended in place as members join; the member
+            // keeps its own text for the chunk-keyed validation of the result.
+            text: member.targeting_text.clone(),
+            tokens,
+        });
+    }
+    if let Some(run) = open.take() {
+        // Document end: a final sub-minimum run merges backward when the
+        // combined text fits the cap; otherwise it is the one permitted
+        // sub-minimum run.
+        let merge_target = if run.tokens < min_tokens {
+            runs.last_mut()
+        } else {
+            None
+        };
+        match merge_target {
+            Some(previous) => {
+                let candidate = chunk::join_text(&previous.text, &run.text);
+                let tokens = count_tokens(tokenizer, &candidate)?;
+                if tokens <= max_tokens {
+                    previous.end = run.end;
+                    previous.text = candidate;
+                    previous.tokens = tokens;
                 } else {
-                    "\n\n"
-                };
-                let full = format!(
-                    "{}{separator}{}",
-                    window.targeting_text,
-                    &leaf.text[offset..]
-                );
-                if count_tokens(tokenizer, &full)? <= max_tokens {
-                    window.targeting_text = full;
-                    window.input_unit_ids.push(leaf.id.clone());
-                    window.fragments.push(SectionDenseFragment {
-                        unit_id: leaf.id.clone(),
-                        start_byte: offset,
-                        end_byte: leaf.text.len(),
-                    });
-                    offset = leaf.text.len();
-                } else if !window.fragments.is_empty() {
-                    flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
-                } else {
-                    let length = fitting_prefix(
-                        tokenizer,
-                        &window.targeting_text,
-                        &leaf.text[offset..],
-                        max_tokens,
-                    )?;
-                    window
-                        .targeting_text
-                        .push_str(&leaf.text[offset..offset + length]);
-                    window.input_unit_ids.push(leaf.id.clone());
-                    window.fragments.push(SectionDenseFragment {
-                        unit_id: leaf.id.clone(),
-                        start_byte: offset,
-                        end_byte: offset + length,
-                    });
-                    offset += length;
-                    flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
+                    runs.push(run);
                 }
             }
+            None => runs.push(run),
         }
-        flush_window(&mut pending, &mut windows, parse_id, tokenizer, max_tokens)?;
     }
-    Ok(windows)
+    runs.into_iter()
+        .enumerate()
+        .map(|(index, run)| window_from_run(members, parse_id, index, run))
+        .collect()
 }
 
-/// Prefix only actual heading metadata; document-scoped windows have no invented label.
-fn heading_prefix(path: &[String]) -> String {
-    if path.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n\n", path.join(" / "))
-    }
-}
-
-/// Start targeting context independently of the canonical text fragments that follow.
-fn empty_window(leaf: &Leaf) -> SectionDenseWindow {
-    SectionDenseWindow {
-        window_id: String::new(),
-        section_id: leaf.section_id.clone(),
-        section_path: leaf.section_path.clone(),
-        input_unit_ids: Vec::new(),
-        targeting_text: heading_prefix(&leaf.section_path),
-        token_count: 0,
+/// Materialize one run as a window: chunk ids in order, fragments
+/// concatenated, unit ids derived from the fragments, and the section path of
+/// the first chunk. `section_id` is resolved afterwards on the transaction.
+fn window_from_run(
+    members: &[ContextMember],
+    parse_id: &str,
+    index: usize,
+    run: OpenRun,
+) -> Result<SectionDenseWindow, ApiError> {
+    let span = members.get(run.start..run.end).ok_or_else(|| {
+        failure(format!(
+            "section window {index} of {parse_id} spans chunks the parse does not have"
+        ))
+    })?;
+    let first = span.first().ok_or_else(|| {
+        failure(format!(
+            "section window {index} of {parse_id} has no chunks"
+        ))
+    })?;
+    // The window is the persisted artifact; the members remain borrowed for
+    // the post-build validation, so their ids, fragments, and path are copied.
+    let fragments: Vec<Fragment> = span
+        .iter()
+        .flat_map(|member| member.fragments.iter().cloned())
+        .collect();
+    Ok(SectionDenseWindow {
+        window_id: window_id(parse_id, index),
+        section_id: None,
+        section_path: first.section_path.clone(),
+        chunk_ids: span.iter().map(|member| member.id.clone()).collect(),
+        input_unit_ids: chunk::ordered_unit_ids(&fragments),
+        targeting_text: run.text,
+        token_count: run.tokens,
         vector: Vec::new(),
         norm: 0.0,
-        fragments: Vec::new(),
-    }
+        fragments,
+    })
 }
 
-/// Assign deterministic identities after grouping and recheck the exact completed input.
-fn flush_window(
-    pending: &mut Option<SectionDenseWindow>,
-    windows: &mut Vec<SectionDenseWindow>,
+/// Resolve each window's `section_id` from its first fragment's unit on the
+/// caller's transaction, and require the resolved path to equal the stored
+/// `section_path` of the first chunk (the chunker resolved it from the same
+/// unit); validation never re-derives it.
+fn resolve_section_ids(
+    tx: &Transaction<'_>,
     parse_id: &str,
-    tokenizer: &Tokenizer,
-    max_tokens: usize,
-) -> Result<(), ApiError> {
-    if let Some(mut window) = pending.take() {
-        if window.fragments.is_empty() {
-            return Ok(());
-        }
-        window.window_id = window_id(parse_id, windows.len());
-        window.token_count = count_tokens(tokenizer, &window.targeting_text)?;
-        if window.token_count > max_tokens {
+    mut windows: Vec<SectionDenseWindow>,
+) -> Result<Vec<SectionDenseWindow>, ApiError> {
+    for window in &mut windows {
+        let first_unit = window
+            .fragments
+            .first()
+            .map(|fragment| fragment.unit_id.as_str())
+            .ok_or_else(|| {
+                failure(format!(
+                    "section window {} has no fragments",
+                    window.window_id
+                ))
+            })?;
+        let (section_id, section_path) = read_section(tx, parse_id, first_unit)?;
+        if section_path != window.section_path {
             return Err(failure(format!(
-                "section window {} exceeds token cap",
+                "section window {} first chunk's stored section path differs from the resolved path of unit {first_unit}",
                 window.window_id
             )));
         }
-        windows.push(window);
+        window.section_id = section_id;
     }
-    Ok(())
-}
-
-/// Search UTF-8 boundaries and keep only measured fitting prefixes. Token counts
-/// need not be monotone: the search may underfill a window but can never overfill it.
-fn fitting_prefix(
-    tokenizer: &Tokenizer,
-    prefix: &str,
-    text: &str,
-    max_tokens: usize,
-) -> Result<usize, ApiError> {
-    let boundaries: Vec<usize> = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .skip(1)
-        .chain(std::iter::once(text.len()))
-        .collect();
-    let mut low = 0;
-    let mut high = boundaries.len();
-    let mut fitting = 0;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let length = boundaries[middle];
-        if count_tokens(tokenizer, &format!("{prefix}{}", &text[..length]))? <= max_tokens {
-            fitting = length;
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    if fitting == 0 {
-        return Err(failure(format!(
-            "section heading leaves no room for canonical text under the {max_tokens}-token cap"
-        )));
-    }
-    Ok(fitting)
+    Ok(windows)
 }
 
 /// Use the untruncated tokenizer including its special tokens for every window bound.
@@ -1474,64 +1395,14 @@ fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize, ApiError> {
         .map_err(|source| failure(format!("count section input tokens: {source}")))
 }
 
-/// Validate exact input text, ancestry, order, and complete byte coverage against
-/// immutable canonical leaves; zero windows are valid only for a text-empty parse.
-fn validate_leaves(leaves: &[Leaf], plane: &SectionDensePlane) -> Result<(), ApiError> {
-    let ordered: Vec<&Leaf> = grouped_leaves(leaves).into_iter().flatten().collect();
-    let mut leaf_index = 0;
-    let mut offset = 0;
+/// Run the chunk-keyed checks over a fully decoded plane: consecutiveness,
+/// content equality, and coverage of every member exactly once.
+fn validate_members(members: &[ContextMember], plane: &SectionDensePlane) -> Result<(), ApiError> {
+    let mut cursor = MemberCursor::new(members, plane.window_max_tokens());
     for window in &plane.windows {
-        let mut text = heading_prefix(&window.section_path);
-        for (index, fragment) in window.fragments.iter().enumerate() {
-            let leaf = ordered.get(leaf_index).ok_or_else(|| {
-                failure(format!(
-                    "section plane {} has unexpected fragments",
-                    plane.parse_id
-                ))
-            })?;
-            if leaf.id != fragment.unit_id
-                || offset != fragment.start_byte
-                || leaf.section_id != window.section_id
-                || leaf.section_path != window.section_path
-            {
-                return Err(failure(format!(
-                    "section window {} canonical order/ancestry differs at {}",
-                    window.window_id, fragment.unit_id
-                )));
-            }
-            let part = leaf
-                .text
-                .get(fragment.start_byte..fragment.end_byte)
-                .ok_or_else(|| {
-                    failure(format!(
-                        "section window {} has invalid UTF-8 range for {}",
-                        window.window_id, leaf.id
-                    ))
-                })?;
-            if index != 0 {
-                text.push_str("\n\n");
-            }
-            text.push_str(part);
-            offset = fragment.end_byte;
-            if offset == leaf.text.len() {
-                leaf_index += 1;
-                offset = 0;
-            }
-        }
-        if text != window.targeting_text {
-            return Err(failure(format!(
-                "section window {} input differs from canonical fragments",
-                window.window_id
-            )));
-        }
+        cursor.validate_window(window)?;
     }
-    if leaf_index != ordered.len() || offset != 0 {
-        return Err(failure(format!(
-            "section plane {} omits canonical text",
-            plane.parse_id
-        )));
-    }
-    Ok(())
+    cursor.finish(&plane.parse_id)
 }
 
 /// Stable input membership is identical in the projection envelope and its payload.
@@ -1556,14 +1427,7 @@ fn new_projection(plane: &SectionDensePlane) -> NewProjection {
         producer: Provenance {
             producer_type: ProducerType::Model,
             producer_name: "fabric-section-dense".to_owned(),
-            producer_version: Some(
-                if plane.construction.is_some() {
-                    "2"
-                } else {
-                    "1"
-                }
-                .to_owned(),
-            ),
+            producer_version: Some(CONSTRUCTION_VERSION.to_string()),
             config_hash: Some(plane.policy_hash.clone()),
             model_name: Some(plane.model_name.clone()),
             model_version: None,
@@ -1583,11 +1447,6 @@ fn new_projection(plane: &SectionDensePlane) -> NewProjection {
 /// Window identity is stable for the immutable parse and versioned build policy.
 fn window_id(parse_id: &str, index: usize) -> String {
     format!("{SECTION_DENSE_INDEX_NAME}:{parse_id}:{index}")
-}
-
-/// One policy fingerprint prevents mixed window semantics across cache and restore.
-fn policy_hash() -> String {
-    sha256_hex(WINDOW_POLICY.as_bytes())
 }
 
 /// Keep section build and canonical corruption context in the storage error flow.

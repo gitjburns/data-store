@@ -932,6 +932,9 @@ fn publish_document_embeddings(
     document: &mut ProjectionDocumentProgress,
     budget: &mut EmbeddingBudget<'_>,
 ) -> Result<(), ApiError> {
+    // Discovery streams the parse's context windows from the artifact store,
+    // so the store is opened before the discovery snapshot.
+    let store = ArtifactStore::open_existing(&inputs.index_root)?;
     let (plans, published) = {
         let mut connection = hot_plane::open_read(&inputs.index_root)?;
         let tx = connection
@@ -949,8 +952,10 @@ fn publish_document_embeddings(
         (
             annotation::plan_for_parse(
                 &tx,
+                &store,
                 &source.source_id,
                 &source.parse_id,
+                inputs.dense_dimension,
                 &runtime.embedding_identity,
             )?,
             annotation::published_for_parse(&tx, &source.source_id, &source.parse_id)?,
@@ -1002,7 +1007,6 @@ fn publish_document_embeddings(
         document_activity(document)
     };
     publish_document(inputs, document)?;
-    let store = ArtifactStore::open_existing(&inputs.index_root)?;
     if let Some(last) = budget.cursor.last_cohort.get(&source.source_id) {
         let start = pending.partition_point(|plan| plan.cohort_id.as_str() <= last.as_str());
         pending.rotate_left(start);
@@ -1173,7 +1177,7 @@ fn build_and_publish_cohort(
 }
 
 /// Keep at most one small response batch of matrices/vectors resident. Inputs use
-/// their actual canonical unit identity, while returned order maps representations.
+/// the cohort window's identity, while returned order maps representations.
 fn embed_and_archive(
     inputs: &WorkerInputs,
     cancellation: &AnnotationCancellation,
@@ -1236,7 +1240,7 @@ fn embed_and_archive(
         }
         let documents: Vec<_> = passages
             .iter()
-            .map(|text| (plan.target.unit_id.as_str(), *text))
+            .map(|text| (plan.target.window_id.as_str(), *text))
             .collect();
         let matrices = {
             monitor.stage(
@@ -1289,7 +1293,8 @@ fn embed_and_archive(
             "representations archived",
         );
         for ((input, vector), matrix) in batch.into_iter().zip(dense_vectors).zip(matrices) {
-            if matrix.unit_id != plan.target.unit_id || matrix.dimension != inputs.colbert_dimension
+            if matrix.unit_id != plan.target.window_id
+                || matrix.dimension != inputs.colbert_dimension
             {
                 return Err(ApiError::InferenceInit {
                     message: format!(
@@ -1441,7 +1446,9 @@ fn embedding_request(plan: &CohortPlan, kind: ProjectionType) -> NewProjection {
         source_id: plan.source_id.clone(),
         parse_id: plan.parse_id.clone(),
         projection_type: kind,
-        input_unit_ids: Some(vec![plan.target.unit_id.clone()]),
+        input_unit_ids: Some(crate::projections::chunk::ordered_unit_ids(
+            &plan.target.fragments,
+        )),
         input_annotation_ids: Some(
             plan.inputs
                 .iter()

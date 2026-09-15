@@ -46,7 +46,7 @@ operator prompting:
    **A source has at most one active parse**; a fresh parse is built and gated
    against the current active parse.
 4. **Build projections** — content-derived retrieval projections (chunk,
-   lexical/FTS5, dense, ColBERT/multivector matrices, derived view) are built
+   lexical/FTS5, dense, ColBERT windows, derived view) are built
    for the candidate parse. The summary and graph projections are **not** built
    here — they derive from semantic annotations and build post-activation
    (§12.1).
@@ -70,7 +70,8 @@ reusing memoized producer output (`annotation_memo`) on a memo-key hit and
 retrying failed chains under the independent execution and malformed-output
 budgets in §13. Only malformed outputs advance sampling temperature.
 Single-goal stages call the external OpenAI-compatible chat-completions endpoint
-(`[models.annotator]`) with thinking, structured output, and streaming diagnostics.
+(`[models.annotator]`) with thinking, structured output, and complete
+non-streaming responses.
 
 The annotation worker is **deliberately not readiness-critical.** Client-load
 failures, such as an unreadable API-key file, **park** it for the run while the
@@ -118,13 +119,11 @@ express (positivity, absolute-path requirements, per-backend required/forbidden
 field sets) are checked in `ServiceConfig::validate` and fail startup with an
 `InvalidConfig` message naming the offending key.
 
-**Config holds operational settings**, including annotation retry policy.
-Retrieval and chunker tunables
-that were once configuration (top-k, RRF constants, candidate-pool sizes,
-chunker limits) have moved to **versioned, hashed policy documents** (the
-RetrievalProfile and chunker configuration folded into their config hashes), not
-this file. Config may hold the path to an active policy document, not its
-values.
+**Config holds operational settings**, including annotation retry policy and
+the grain caps of §2.12. Retrieval limits and grain caps are folded into hashed
+policy documents (the RetrievalProfile and `chunkerConfigHash`) so a projection
+records the settings it was built under. Config may hold the path to an
+operator policy document, not its values.
 
 The sections below document each `[section]` and its supported keys. See
 `config.example.toml` for a complete annotated example.
@@ -134,7 +133,7 @@ The sections below document each `[section]` and its supported keys. See
 | Key | Meaning |
 | --- | --- |
 | `bind_address` | Socket address where the HTTP service binds (e.g. `127.0.0.1:8091`). |
-| `startup_delay_seconds` | Required nonnegative integer seconds before ordinary corpus initialization on normal service startup. `0` disables the wait; supplied configurations use `10`. HTTP serves during the window (§4.2). |
+| `startup_delay_seconds` | Required nonnegative integer seconds before ordinary corpus initialization on normal service startup. `0` disables the wait. HTTP serves during the window (§4.2). |
 | `max_request_body_bytes` | HTTP body limit applied before request JSON is accepted (over-limit → 413). Must be > 0. |
 | `max_ingest_source_chars` | Maximum length of an ingest source reference after JSON parsing. Must be > 0. |
 | `max_search_query_chars` | Maximum length of a search query after JSON parsing. Must be > 0. |
@@ -203,7 +202,8 @@ validates** this section (so `deny_unknown_fields` accepts the shared file) but
 
 The polling loop has no overall deadline; it continues until a terminal status
 or request failure. The client-facing API uses JSON responses and polling;
-internal annotator SSE streams use the separate model-call timeout (§2.9).
+internal annotator calls (`stream: false`) use the separate model-call
+timeout (§2.9).
 
 ### 2.5 `[inference]`
 
@@ -316,16 +316,17 @@ as failed for later retry under §13; there is no fallback model or endpoint.
 | `model` | Model name sent in request bodies. Non-empty. |
 | `timeout_seconds` | Whole-request timeout for each single-goal model call, including thinking. > 0. |
 | `api_key_file_path` | Optional owner-only file holding the bearer API key. |
-| `max_input_chars` | Source-excerpt cap in Unicode characters; oversized units split without dropping text. Prompts and prior-stage output are additional. > 0. |
+| `max_completion_tokens` | Completion-token allowance per call, including reasoning; a length stop fails the call. > 0. |
 | `annotation_max_retries` | Required nonnegative integer; malformed-output retries after the initial attempt. `0` disables this category's retries. |
 | `annotation_retry_interval_seconds` | Required positive fixed interval for malformed-output retries; no backoff ceiling applies. |
 | `execution_max_retries` | Required nonnegative integer; execution-failure retries after the initial attempt. `0` disables this category's retries. |
 | `execution_retry_initial_delay_seconds` | Required positive initial execution-failure backoff. |
-| `execution_retry_max_delay_seconds` | Required positive execution-failure ceiling, at least the initial delay. Independent of `MAX_BACKOFF_MS`. |
+| `execution_retry_max_delay_seconds` | Required positive execution-failure ceiling, at least the initial delay. Independent of `scheduling.max_backoff_ms`. |
 
 The retry settings are required without runtime defaults and enter application
-configuration identity. Shipped values are listed in README's annotation settings
-and `config.example.toml`. Counter, temperature, and scheduling semantics are in §13.
+configuration identity. `config.example.toml` holds the shipped values.
+Counter, temperature, and scheduling semantics are in §13. Excerpt size is not
+an annotator setting; it follows from `[indexing]` (§2.12).
 
 ### 2.10 `[policies]`
 
@@ -367,6 +368,27 @@ and are not parser identity (§10.6).
 | `max_candidate_warnings` | Candidate warnings accepted for one parse. |
 | `max_unit_body_bytes` | UTF-8 bytes accepted in one candidate unit body. |
 
+### 2.12 `[indexing]`
+
+Required. The grain contract of §12.1: caps are ColBERT tokens measured with
+the ColBERT tokenizer (truncation and padding disabled, special tokens
+retained).
+
+| Key | Meaning |
+| --- | --- |
+| `fine_max_tokens` | Cap for fine chunks (paragraph grain): fine dense vectors and the lexical index. |
+| `colbert_max_tokens` | Cap for ColBERT windows; must equal the ColBERT model's document limit (`models.colbert.document_max_tokens`). |
+| `context_max_tokens` | Cap for context windows (page grain): context dense vectors, annotation source windows, and annotation cohorts. |
+| `excerpt_windows` | Consecutive context windows forming one annotation excerpt. Positive. |
+| `min_fill_ratio` | Minimum fill of any run as a fraction of its cap, in (0, 1); shorter runs merge with a neighbor. |
+
+Startup validates: `colbert_max_tokens` equals the ColBERT document limit;
+`fine_max_tokens <= cap - floor(cap * min_fill_ratio)` for both higher caps,
+so the ColBERT and context grains never split a chunk; `context_max_tokens`
+plus the section-path prefix budget fits `models.dense.max_tokens` and
+`models.reranker.max_tokens`. The caps are chunker identity
+(`chunkerConfigHash`, §12.4) and excerpt sizing is producer identity (§13).
+
 ---
 
 ## 3. Storage and schema contract
@@ -382,13 +404,16 @@ Physical layout derives from `[storage].index_root`:
 - **Event log** — the `system_events` table in the hot plane, written inside the
   owning operation's transaction.
 
-**Connection and deadline policy** (all code constants, never config, per spec §35):
+**Connection and deadline policy** (durability is fixed in code; budgets come
+from `[sqlite]`):
 
 - `journal_mode = WAL` — set at setup and **validated fatally at startup**; never
   repaired at runtime.
 - `synchronous = FULL` on write-capable connections (durability guarantee: a
   lost-but-served record is a breach).
-- `busy_timeout` and per-statement deadlines are code constants (both 5000 ms).
+- `sqlite.busy_timeout_ms` bounds lock waiting; `sqlite.execution_timeout_ms`
+  bounds SQL execution through cooperative callbacks every
+  `sqlite.progress_operations` VM steps.
 - Read paths open `SQLITE_OPEN_READ_ONLY`; `foreign_keys = ON` per connection; a
   fresh connection per operation.
 - The database carries its own `PRAGMA user_version` sequence **starting at 1**
@@ -406,7 +431,10 @@ Fabric tables (from `sql/fabric/schema.sql`):
 `parse_runs`, `content_units`, `unit_relationships`, `retrieval_projections`,
 `query_execution_records`, `forensic_snapshots`, `operations`,
 `semantic_annotations`, `annotation_memo`, `system_events`, `chunk_projections`,
-`chunk_dense_vectors`, `unit_multivector_projections`, `graph_entity_mentions`,
+`chunk_dense_vectors`, `colbert_windows` (one row per ColBERT window: `id`,
+`projection_id`, `source_id`, `parse_id`, `window_index`, `chunk_ids_json`,
+`fragments_json`, `token_count`, `dimension`, `matrix_blob`, `created_at`;
+unique on `(parse_id, window_index)`), `graph_entity_mentions`,
 `graph_entity_edges`, `policy_versions` (the append-only system-assigned
 registry of operator policy-document content hashes, §2.10), plus the
 `chunk_text_index` FTS5 virtual table (the
@@ -556,7 +584,11 @@ existing ready runs without repeating extraction.
 Sampling annotates with the **entity and relation** producers only, over the
 **first N excerpts per source per type** in plan order (N is the CLI
 argument); the **summary producer is excluded** — sampling exists to surface
-naming and predicate vocabulary. The sampled annotations are ordinary
+naming and predicate vocabulary. **The mode currently cannot sample.** An
+excerpt is a run of context windows (§13), context windows are built by the
+projection build, and the pass truncates before that build; the planner finds
+no published context windows, logs `annotator_plan.windows_unpublished`, and
+returns an empty plan, so no annotation call is made. The sampled annotations, when the mode can produce them, are ordinary
 `semantic_annotations` rows on parses that are never activated, so vocabulary
 inspection in this mode uses `scope=all`. A **failed pass keeps the process
 serving** whatever annotations landed, so a partial sample is still
@@ -734,8 +766,8 @@ place; 100% annotation completion does not assert retrieval projection publicati
 
 Admission itself: the `/query` handler acquires a permit from a fail-fast
 in-flight search gate before running the pipeline. Saturation surfaces the
-existing `ServiceUnavailable` (503) path; the gate's capacity is a code constant,
-not operator-tunable.
+existing `ServiceUnavailable` (503) path; the gate's capacity is
+`retrieval.max_concurrent_queries`.
 
 ---
 
@@ -873,12 +905,12 @@ stale wreckage from a crash, never live work.
 
 ### 9.2 Knob-free adaptive cadence
 
-The detection cadence is **knob-free** (spec §35): its interval, growth factors,
-and smoothing weights are code constants. Quiet cycles grow the delay
-multiplicatively, observed changes pull it down, and undrained backlog or failed
-cycles increase it. All paths, including the scan-duration floor, obey the shared
-60-second backoff ceiling (`src/util.rs::MAX_BACKOFF_MS`). Cadence logs report
-changes after applying the ceiling; `cadence_ms` publishes the effective delay.
+The detection cadence is adaptive: its floor, growth factors, and smoothing
+weight come from `[scheduling]`. Quiet cycles grow the delay multiplicatively,
+observed changes pull it down, and undrained backlog or failed cycles increase
+it. All paths, including the scan-duration floor, obey the shared backoff
+ceiling `scheduling.max_backoff_ms`. Cadence logs report changes after applying
+the ceiling; `cadence_ms` publishes the effective delay.
 
 The same ceiling applies to dense HTTP retry sleeps. Annotation retries use
 their own configured intervals and execution-backoff ceiling (§13). These delay
@@ -1169,21 +1201,63 @@ sufficient. Snapshots are never minted under a held barrier (§15.2).
 Projections are rebuildable retrieval-targeting and ranking artifacts over a
 parse — **never canonical evidence**. The MVP set:
 
-- **Content-derived, built pre-activation** for the candidate parse: chunk,
-  lexical (the `chunk_text_index` FTS5 index over chunk text), dense
-  (per-chunk vectors plus section windows), multivector (per-unit ColBERT matrices), derived view.
-  These are the activation-required set (§11.1).
+- **Content-derived, built pre-activation** for the candidate parse: chunk
+  (fine chunks), lexical (the `chunk_text_index` FTS5 index over chunk text),
+  dense (fine-chunk vectors plus context windows), multivector (ColBERT
+  windows), derived view. These are the activation-required set (§11.1).
 - **Annotation-derived, built post-activation** by the annotation worker:
   summary (materializing summary annotations) and graph (entity mentions and
   entity edges derived from entity/relation annotations).
 
-Section windows include heading hierarchy and canonical text up to 2,048 local
-ColBERT-tokenizer tokens. Their vectors and exact fragment mappings live in an
-immutable artifact referenced by a `dense_vector` envelope with
-`index_name = section_dense_v1`. Both this envelope and the fine-passage envelope
-must be fresh before activation. The cache reloads both on startup and publishes
-both atomically on activation/restore. Missing legacy representations require an
-explicit rebuild-all; no schema or runtime migration is performed.
+**Grains.** Embedding and annotation operate on four grains, each a run of
+consecutive members of the grain below it in reading order, packed greedily
+under the `[indexing]` caps (§2.12):
+
+| Grain | Members | Persisted | Consumers |
+| --- | --- | --- | --- |
+| Fine | evidence members | `chunk_projections` | fine dense vectors, lexical index |
+| ColBERT | fine chunks | `colbert_windows` | MaxSim |
+| Context | fine chunks | section-dense artifact | context dense vectors, annotation source windows, annotation cohorts |
+| Excerpt | context windows | provenance only | annotation calls |
+
+Evidence derivation is applied once, at the fine chunker, and inherited by
+every higher grain: evidence-bearing units are `text_block`, `caption`,
+`table_cell`, `code_block`; a `text_block` with role `heading` is not evidence
+and contributes to the section path only; all cells of one `table_row` form
+one member whose text is the cell texts joined by a tab and whose fragments
+list every cell with its range in its own cell text; everything else is one
+member per unit.
+
+Minimum fill: a run must reach `min_fill_ratio` of its cap. When the next
+member would overflow the cap and the open run is below the minimum, the
+member is split at a measured boundary (sentence, then word) so the open run
+reaches the minimum and the remainder continues as the next member; a member
+that alone exceeds the cap splits the same way. Splitting happens at the fine
+grain only. At document end a final run below the minimum merges into its
+predecessor when the combined run fits; otherwise it stays, the one permitted
+sub-minimum run.
+
+Reading order of fine chunks is `chunk_projections.chunk_index`, assigned by
+the chunker, unique per parse, and the only order authority for every higher
+grain. Runs never depend on section boundaries; the section path of a run's
+first member is carried as metadata for the model-input prefix only.
+
+Every grain has canonical text (member texts joined by one blank line) and
+model input (the section path joined by " / ", a blank line, then the
+canonical text). Canonical text feeds hashes, provenance ranges, the
+annotation source matcher, and citations; model input feeds embedding and
+annotation calls. The prefix is never part of any range. A ColBERT window
+whose prefixed input would exceed the document limit is embedded without the
+prefix. Every persisted run records `fragments`, an ordered list of
+`{ unitId, startChar, endChar }` in Unicode scalar offsets over the unit's
+evidence text, end exclusive; byte offsets are stored nowhere.
+
+Context-window vectors and fragment mappings live in an immutable artifact
+referenced by a `dense_vector` envelope with `index_name = section_dense_v1`.
+Both this envelope and the fine-chunk envelope must be fresh before
+activation. The cache reloads both on startup and publishes both atomically on
+activation/restore. Missing representations require an explicit rebuild-all;
+no schema or runtime migration is performed.
 
 ### 12.2 Parse-scoped, active-only
 
@@ -1210,8 +1284,9 @@ events atomically.
   blobs** via the little-endian f32 codec. Restore and verification
   **re-import the stored bytes and never re-embed**.
 
-The chunker's identity (name, version, and its boundary-affecting limits) is a
-hashed code document folded into `chunkerConfigHash`, not configuration.
+The chunker's identity (name, version, and the `[indexing]` caps of §2.12) is
+folded into `chunkerConfigHash`, so a chunk plane records the settings it was
+built under.
 
 ### 12.5 Chunks are targeting artifacts
 
@@ -1219,14 +1294,13 @@ Chunks exist to be found — lexical and dense targets that resolve back to
 canonical units. **A chunk is never served as evidence**; evidence is always
 canonical ContentUnits (§14.3 step 7).
 
-The chunker measures the exact whitespace-normalized
-`targeting_text` for boundary decisions and stored `token_count`. Counts include
-ColBERT special tokens, with truncation and padding disabled on a per-build
-tokenizer copy. Every retained chunk is checked against the 512-token cap before
-persistence. Individually oversized words split at valid UTF-8 boundaries and
-retain their canonical unit ID; the fitting final suffix can join subsequent
-words. Chunks below 400 normalized characters are discarded, including split
-remainders.
+The chunker measures the exact canonical `targeting_text` (never normalized)
+for boundary decisions and stored `token_count`. Counts include ColBERT
+special tokens, with truncation and padding disabled on a per-build tokenizer
+copy. Every retained chunk is checked against `indexing.fine_max_tokens`
+before persistence. Splits operate on Unicode scalar offsets and every split
+range is recorded as a fragment pointing at its canonical unit; no chunk is
+discarded for length — the minimum-fill rule of §12.1 governs short runs.
 
 ---
 
@@ -1237,25 +1311,37 @@ The annotation worker (§1.2) builds the MVP semantic annotation types
 activation or the sync pipeline (the §21.4 policy's MVP blocking set is
 empty).
 
-- **Excerpt coverage.** Each invocation consumes one source fragment bounded by
-  `max_input_chars`. Oversized units are split losslessly at paragraph,
-  sentence, whitespace, or Unicode-character boundaries. Provenance
-  `inputRefs[].textRange` records start/end Unicode scalar offsets
-  (end-exclusive) and the exact UTF-8 text hash.
+- **Excerpt coverage.** Each invocation consumes one excerpt: a run of
+  `indexing.excerpt_windows` consecutive context windows of the active parse,
+  read from the section-dense artifact in order (the final run may be
+  shorter). The planner issues one `InvocationKind::Excerpt { index }` for all
+  three producers; the excerpt's targets are its fragments. A parse without
+  published context windows yields an empty plan
+  (`annotator_plan.windows_unpublished`). The model receives the excerpt's
+  canonical text as its only source text and the section path as a separate
+  prompt field. Provenance `inputRefs[].textRange` records start/end Unicode
+  scalar offsets (end-exclusive) and the exact UTF-8 text hash.
+- **Attribution.** Entity rows keep the excerpt fragments whose text matches
+  the name via `source_text_matches`; relation rows keep the fragments
+  matching any evidence quote; summaries keep every fragment; an item that
+  matches no fragment keeps every fragment. Matching runs per fragment, so a
+  quote spanning two fragments matches neither.
 - **Single-goal chains.** Entity discovery precedes entity typing; statement
   selection precedes per-statement relationship formation and supporting
   quotation selection; summaries cover individual excerpts. Downstream requests
-  receive that excerpt and bounded prior-stage outputs from the same chain.
+  receive that excerpt and prior-stage outputs from the same chain, with
+  intermediate candidate arrays bounded by the excerpt's character count.
   Prompts and schemas are defined in `src/annotations/stages.rs`; operator
   naming rules are not appended.
-- **Concurrency.** Up to 32 independent chains run per worker wave. Dependent
-  stages within a chain execute sequentially; SQLite writes remain serial on
-  the owning worker thread.
+- **Concurrency.** Up to `workers.annotation_concurrent_calls` independent
+  chains run per worker wave. Dependent stages within a chain execute
+  sequentially; SQLite writes remain serial on the owning worker thread.
 - **Model-call contract.** Every call enables thinking, requests strict
-  JSON-schema output, and streams over SSE with a 150,000-token output allowance
-  including reasoning. The configured `timeout_seconds` applies to each call.
-  A terminal `[DONE]`, `finish_reason = stop`, and nonempty final content are
-  required before stage parsing. The endpoint is exclusive, with no fallback.
+  JSON-schema output, and a complete response (`stream: false`) with the
+  output allowance `max_completion_tokens` including reasoning. The configured
+  `timeout_seconds` applies to each call, including thinking.
+  One choice at index zero, `finish_reason = stop`, and nonempty message
+  content are required before stage parsing. The endpoint is exclusive, with no fallback.
 - **Structural validation.** Required fields, source substrings, name mappings,
   and receipt indexes are checked. Relation bodies retain `evidenceQuotes`.
   Semantic verification is not implemented; structural acceptance does not
@@ -1272,16 +1358,16 @@ empty).
   the model does not invalidate already-fresh coverage.
 - **Content-based reuse.** `memoization_key_hash` excludes target unit IDs and
   includes producer identity: stage prompts/schemas, model/endpoint, excerpt
-  cap, and generation controls. Equal content can reuse output at another
+  sizing (`indexing.excerpt_windows`, `indexing.context_max_tokens`), and
+  generation controls. Equal content can reuse output at another
   location while preserving that location's annotation references. Pending
   duplicate memo keys are flushed before another cache lookup. Memo rows
   survive parse archival and cleanup (§15.10).
 - **Provenance and publication.** Re-minted annotations carry `memoized` and
   per-item `memoizedFrom`; completion stamps the running producer's memo key.
   Actual sampling temperature is recorded separately from producer identity.
-  Existing annotations remain intact; legacy keys cannot satisfy new excerpt
-  coverage. Summary/graph publication requires the current plan's keys to be
-  fresh and the parse to remain active; unrelated legacy failed rows do not
+  Summary/graph publication requires the current plan's keys to be
+  fresh and the parse to remain active; unrelated failed rows do not
   block it. Reads serve only the source's current active parse.
 - **Independent retry budgets.** Per-annotation, per-process counters separate
   malformed outputs from execution failures. The latter includes network,
@@ -1293,7 +1379,7 @@ empty).
   `annotation_retry_interval_seconds`, with no backoff ceiling. Execution
   delays double from `execution_retry_initial_delay_seconds` to
   `execution_retry_max_delay_seconds`. Neither path is capped by
-  `MAX_BACKOFF_MS`. Eligibility is tracked per annotation with a monotonic
+  `scheduling.max_backoff_ms`. Eligibility is tracked per annotation with a monotonic
   timer; ineligible work is skipped. Short waits wake the worker before its
   ordinary discovery interval; long waits permit intervening scans.
 - **Retry sampling.** Temperature starts at `0.0` and becomes
@@ -1329,8 +1415,8 @@ duration (bounded by admission), and the snapshot-held duration is logged.
 
 The `/query` handler acquires a permit from the fail-fast in-flight gate
 before the pipeline runs and holds it across the whole blocking pipeline.
-Capacity is a code constant — **one in-flight search** at MVP; saturation is
-an immediate 503. (§7.)
+Capacity is `retrieval.max_concurrent_queries`; saturation is an immediate
+503. (§7.)
 
 ### 14.3 Stage order
 
@@ -1340,12 +1426,14 @@ an immediate 503. (§7.)
 2. **Cutover-barrier probe** over the captured sources, before any retrieval
    stage (§11.4).
 3. **Dense + lexical candidate generation**, with independent candidate limits
-   of 100 per channel. Resolve chunks to canonical units.
-   Dense additionally shortlists 20 section windows with the same query vector;
-   each nominates up to five units by best fine-chunk cosine within that window.
-   Units without fine vectors cannot be nominated. Equal-weight RRF combines
-   the direct and section-guided lists, deduplicating to 100 dense candidates
-   before outer fusion. Provenance retains the representation and section path.
+   of `retrieval.max_candidates_per_channel` per channel. Resolve chunks to
+   canonical units. Dense additionally shortlists
+   `retrieval.section_candidate_limit` context windows with the same query
+   vector; each nominates up to `retrieval.section_passages_per_window` units
+   by best fine-chunk cosine within that window. Units without fine vectors
+   cannot be nominated. Equal-weight RRF combines the direct and window-guided
+   lists, deduplicating to the per-channel limit before outer fusion.
+   Provenance retains the representation and section path.
 4. **Graph candidate generation**: entity-name entry, then a
    semantic-only one-hop traversal over annotation-derived mentions/edges, no
    LLM in the query path. Entry matching (the D9 amendment) has an always-on
@@ -1362,26 +1450,32 @@ an immediate 503. (§7.)
    disabled (the shipped default) the path is byte-identical to the prior
    exact-only behavior:** no per-parse name enumeration runs at all, so every
    match is `exact` and the class component of the order is constant.
-5. **RRF across dense, lexical, and graph candidates**, deduplicated to 100
-   canonical units, then **ColBERT MaxSim over that pool**. RRF is rank-only;
-   its score is not a semantic similarity. The deferred
+5. **RRF across dense, lexical, and graph candidates**, deduplicated to
+   `retrieval.colbert_candidate_pool_size` targets, then **ColBERT MaxSim over
+   that pool**. MaxSim keys are ColBERT window ids: chunk hits map to the
+   windows containing their chunks, graph and annotation hits map to windows
+   through shared fine-chunk membership, and exact-window annotation matches
+   key by context window and map to ColBERT windows the same way. RRF is
+   rank-only; its score is not a semantic similarity. The deferred
    `multi_vector` *retrieval channel* (§19) is candidate generation; this
    stage is late-interaction re-scoring of the already-fused pool and is
-   built and live. Document matrices are the persisted ones (recomputing
-   document vectors at search time is forbidden); only the query is embedded
-   live.
-6. **Passage construction** from MaxSim-ranked units: canonical reading order
-   within one source, parse, and logical section, at most 64 constituent units
-   and 512 ColBERT tokens. Overlapping passages merge when they fit; structured
-   content retains its boundaries. An oversized single unit becomes a marked
-   excerpt, with its full canonical body retained in the EvidencePack.
-7. **Final reranker** scores up to 30 passages, or the requested count if larger
-   (maximum 100), including their section headings, via the config-selected backend —
-   exclusive local ModernBERT or HTTP Cohere-compatible, **no cross-backend
-   fallback** (§2.9).
+   built and live. Document matrices are the persisted `colbert_windows`
+   rows (recomputing document vectors at search time is forbidden); only the
+   query is embedded live.
+6. **Passage construction** from MaxSim-ranked windows, built from window
+   fragments in canonical reading order within one source and parse, bounded
+   by `retrieval.max_passage_units` and `retrieval.passage_max_tokens`.
+   Overlapping passages merge when they fit; structured content retains its
+   boundaries. An oversized single unit becomes a marked excerpt, with its
+   full canonical body retained in the EvidencePack.
+7. **Final reranker** scores `retrieval.reranker_candidate_pool_size`
+   passages, or the requested count if larger, including their section
+   headings, via the config-selected backend — exclusive local ModernBERT or
+   HTTP Cohere-compatible, **no cross-backend fallback** (§2.9).
 8. **Final selection and evidence**: `maxFinalEvidenceUnits` caps returned
-   passages (default 10, maximum 100). Resolve citations and retain exactly the
-   selected canonical constituents under AssemblyPolicy v2, inside the same
+   passages (`retrieval.default_results` when omitted, at most
+   `retrieval.max_results`). Resolve citations and retain exactly the
+   selected canonical constituents under AssemblyPolicy v3, inside the same
    read transaction. No automatic neighbor/container expansion follows selection;
    raw safety-limit failures are errors, never partial packs. The response carries
    `results`, `evidencePack`, and optional request-enabled `diagnostics`.
@@ -1623,9 +1717,9 @@ These are deliberate, recorded deviations, not defects:
   deferred. `query_execution_records` exists only as a reserved schema seam. The
   delivered system answers evidence questions at serve time only; retrospective
   per-query reconstruction is not available until this tier lands.
-- **`multi_vector` retrieval channel deferred.** ColBERT multivector matrices are
-  still built and **persisted** (`unit_multivector_projections`, archived as raw
-  bytes so a restore re-imports them), but the `multi_vector` retrieval channel
+- **`multi_vector` retrieval channel deferred.** ColBERT window matrices are
+  still built and **persisted** (`colbert_windows`, archived as raw bytes so a
+  restore re-imports them), but the `multi_vector` retrieval channel
   is deferred post-MVP (an exhaustive MaxSim candidate scan measured infeasible
   at the actual corpus/hardware). **This deferral is candidate generation only —
   it does not mean "no late interaction": the ColBERT MaxSim rerank stage over

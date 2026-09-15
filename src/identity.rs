@@ -253,7 +253,6 @@ struct ModelIdentity {
     /// Resolved PATH of the annotator API-key file, never its contents.
     #[serde(skip_serializing_if = "Option::is_none")]
     annotator_api_key_file_path: Option<String>,
-    annotator_max_input_chars: usize,
     annotator_max_completion_tokens: u64,
     // Operational retry policy belongs to the audit identity, not producer
     // memo identity. Each call's actual retry temperature is recorded in provenance.
@@ -358,7 +357,6 @@ impl ConfigurationIdentity {
                     .as_deref()
                     .map(path_string),
                 annotator_annotation_max_retries: config.models.annotator.annotation_max_retries,
-                annotator_max_input_chars: config.models.annotator.max_input_chars,
                 annotator_max_completion_tokens: config.models.annotator.max_completion_tokens,
                 annotator_annotation_retry_interval_seconds: config
                     .models

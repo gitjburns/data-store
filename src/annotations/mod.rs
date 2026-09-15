@@ -3,7 +3,8 @@
 //! Layout, one module per CA work package:
 //! - `store` (CAa): hot-plane persistence and freshness lifecycle for
 //!   SemanticAnnotation rows, with atomic `annotation.*` events.
-//! - `excerpt` + `producer`: lossless source slices, identity, and provenance.
+//! - `producer`: excerpts over published context windows, identity,
+//!   provenance, and per-item fragment attribution.
 //! - `stages` + `chains` + `llm_client`: single-goal requests over each excerpt.
 //! - `entity`/`relation`/`summary`: final annotation shape validation.
 //! - `memo` (CAc): §21.2 content-keyed memoization cache; reuse is recorded
@@ -15,7 +16,6 @@
 
 pub(crate) mod chains;
 pub(crate) mod entity;
-pub(crate) mod excerpt;
 pub(crate) mod llm_client;
 pub(crate) mod memo;
 pub(crate) mod policy;

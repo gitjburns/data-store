@@ -1,8 +1,10 @@
-//! Query-time passages built from canonical units in the caller's read snapshot.
-//! Persisted embeddings rank source units and exact excerpts; the final reranker
-//! receives their bounded canonical text, headings, and separately labeled matched annotations.
+//! Query-time passages built from scored ColBERT windows and exact excerpts in
+//! the caller's read snapshot. Both seed kinds carry fragments (PLAN-grains
+//! Section 2), so every passage is sliced from canonical units by the same
+//! rule; the final reranker receives the bounded canonical text, headings, and
+//! separately labeled matched annotations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::sqlite::Connection;
@@ -15,16 +17,16 @@ use tracing::{error, info};
 use crate::assembly::evidence::evidence_text;
 use crate::canonical::{canonical_sha256_hex_of, sha256_hex_bytes};
 use crate::error::ApiError;
-use crate::inference::ColbertCandidateScore;
 use crate::limits::RetrievalLimits;
 use crate::model::{ContentType, SourceLocationStatus};
 use crate::projections::annotation::slice_chars;
-use crate::query::annotation::ScoredExcerpt;
+use crate::query::annotation::{ScoredExcerpt, excerpt_cites_unit, excerpt_unit_ids};
 use crate::query::model::RetrievalHit;
 use crate::query::provenance::{
     AnnotationContribution, AnnotationMatch, AnnotationRepresentation, GraphReach,
-    RetrievalChannel, RetrievalProvenance, SourceExcerpt, UnitRetrievalMatch,
+    RetrievalChannel, RetrievalProvenance, SourceExcerpt, SourceFragment, UnitRetrievalMatch,
 };
+use crate::query::rerank::ColbertWindowScore;
 use crate::sections::read_section;
 
 // Bound cells before bringing them into Rust. Oversized authoritative data is
@@ -33,16 +35,6 @@ const UNIT_SQL: &str = "
 SELECT source_id, content_type,
        CASE WHEN length(CAST(body_json AS BLOB)) <= ?3 THEN body_json END
 FROM content_units WHERE parse_id = ?1 AND id = ?2";
-// Reading order is the single `precedes` edge type (SPEC-epub §2.4); the
-// previous neighbor is the edge's `from` side, the next neighbor its `to` side.
-const PREVIOUS_SQL: &str = "
-SELECT DISTINCT from_unit_id
-FROM unit_relationships WHERE parse_id = ?1 AND
-  relationship_type = 'precedes' AND to_unit_id = ?2 LIMIT 2";
-const NEXT_SQL: &str = "
-SELECT DISTINCT to_unit_id
-FROM unit_relationships WHERE parse_id = ?1 AND
-  relationship_type = 'precedes' AND from_unit_id = ?2 LIMIT 2";
 const LOCATIONS_SQL: &str = "
 SELECT CASE WHEN length(CAST(native_uri AS BLOB)) <= ?2 THEN native_uri END, status
 FROM source_locations WHERE source_id = ?1
@@ -71,7 +63,7 @@ pub(crate) struct SearchResult {
     pub(crate) source_locations: Vec<SourceCitation>,
     pub(crate) section_path: Vec<String>,
     pub(crate) score: f64,
-    /// A legacy unit seed was clipped by the passage budget; exact retrieved windows remain complete.
+    /// A ColBERT window seed was clipped by the passage budget; exact retrieved windows remain complete.
     pub(crate) truncated: bool,
     pub(crate) retrieval_provenance: RetrievalProvenance,
 }
@@ -86,12 +78,14 @@ struct PassagePart {
 }
 
 impl PassagePart {
-    /// Hash the displayed canonical bytes, including the exact range left by any legacy prefix selection.
+    /// Hash the displayed canonical bytes, including the exact range left by any budget clip.
     fn source_excerpt(&self) -> SourceExcerpt {
         SourceExcerpt {
-            unit_id: self.id.clone(),
-            start_char: self.start_char,
-            end_char: self.end_char,
+            fragments: vec![SourceFragment {
+                unit_id: self.id.clone(),
+                start_char: self.start_char,
+                end_char: self.end_char,
+            }],
             text_hash: sha256_hex_bytes(self.text.as_bytes()),
         }
     }
@@ -120,9 +114,9 @@ pub(crate) struct PassageCandidate {
     section_id: Option<String>,
     #[serde(skip)]
     parts: Vec<PassagePart>,
-    // Legacy unit nominations belong only to the anchor text actually constructed, never another slice of that unit.
+    // Window seeds attach unit hits only to the ranges actually displayed, never another slice of that unit.
     #[serde(skip)]
-    legacy_seed_ranges: Vec<SourceExcerpt>,
+    seed_ranges: Vec<SourceExcerpt>,
     // Matched annotation bodies affect model input, but are not serialized into ordinary diagnostics/results.
     #[serde(skip)]
     annotation_context: Vec<ScopedAnnotationContext>,
@@ -200,14 +194,18 @@ impl PassageCandidate {
         self.graph_context = context;
     }
 
-    /// Coordinate containment prevents a later match in the same unit from attaching to its prefix.
+    /// Coordinate containment of every fragment prevents a later match in the
+    /// same unit from attaching to its prefix; an excerpt is covered only whole.
     fn covers_excerpt(&self, excerpt: &SourceExcerpt) -> bool {
-        self.parts.iter().any(|part| {
-            part.id == excerpt.unit_id
-                && part.start_char <= excerpt.start_char
-                && excerpt.start_char < excerpt.end_char
-                && part.end_char >= excerpt.end_char
-        })
+        !excerpt.fragments.is_empty()
+            && excerpt.fragments.iter().all(|fragment| {
+                self.parts.iter().any(|part| {
+                    part.id == fragment.unit_id
+                        && part.start_char <= fragment.start_char
+                        && fragment.start_char < fragment.end_char
+                        && part.end_char >= fragment.end_char
+                })
+            })
     }
 
     /// Range overlap, rather than unit equality, lets disjoint source excerpts remain separate candidates.
@@ -236,7 +234,7 @@ impl PassageCandidate {
             })
     }
 
-    /// Exact hits require their full source range; legacy hits require the retained anchor range they actually seeded.
+    /// Exact hits require their full source range; unit hits require a displayed window range citing the unit.
     fn contains_hit(&self, hit: &RetrievalHit, unit_id: &str) -> bool {
         if hit.source_id != self.source_id
             || hit.parse_id != self.parse_id
@@ -245,20 +243,19 @@ impl PassageCandidate {
             return false;
         }
         match &hit.source_excerpt {
-            Some(excerpt) => excerpt.unit_id == unit_id && self.covers_excerpt(excerpt),
-            // This locates the displayed legacy seed, not a newly invented exact annotation match.
-            None => self
-                .legacy_seed_ranges
-                .iter()
-                .any(|excerpt| excerpt.unit_id == unit_id && self.covers_excerpt(excerpt)),
+            Some(excerpt) => excerpt_cites_unit(excerpt, unit_id) && self.covers_excerpt(excerpt),
+            // This locates the displayed window range, not a newly invented exact annotation match.
+            None => self.seed_ranges.iter().any(|excerpt| {
+                excerpt_cites_unit(excerpt, unit_id) && self.covers_excerpt(excerpt)
+            }),
         }
     }
 
     /// Covered or merged candidates transfer only match lineage whose complete support remains displayed.
     fn retain_supported_matches(&mut self, other: &Self) {
-        for excerpt in &other.legacy_seed_ranges {
-            if self.covers_excerpt(excerpt) && !self.legacy_seed_ranges.contains(excerpt) {
-                self.legacy_seed_ranges.push(excerpt.clone());
+        for excerpt in &other.seed_ranges {
+            if self.covers_excerpt(excerpt) && !self.seed_ranges.contains(excerpt) {
+                self.seed_ranges.push(excerpt.clone());
             }
         }
         for context in &other.annotation_context {
@@ -347,7 +344,7 @@ impl PassageCandidate {
                     hit.annotation_matches
                         .iter()
                         .filter(|matched| {
-                            matched.excerpt.unit_id == *unit_id
+                            excerpt_cites_unit(&matched.excerpt, unit_id)
                                 && self.covers_excerpt(&matched.excerpt)
                         })
                         .cloned(),
@@ -357,7 +354,8 @@ impl PassageCandidate {
                 self.annotation_matches
                     .iter()
                     .filter(|matched| {
-                        matched.excerpt.unit_id == *unit_id && self.covers_excerpt(&matched.excerpt)
+                        excerpt_cites_unit(&matched.excerpt, unit_id)
+                            && self.covers_excerpt(&matched.excerpt)
                     })
                     .cloned(),
             );
@@ -413,19 +411,6 @@ struct Unit {
 }
 
 impl Unit {
-    /// Only ordinary prose is expanded (SPEC-epub §13.2: `paragraph`, `quote`,
-    /// `definition`, `unknown`); headings, terms, footnotes, formulas, captions,
-    /// cells and code retain their own structural boundaries instead of being
-    /// mixed into prose. `role` is required on every v0.4 `text_block` body, so
-    /// a missing role is treated as non-prose rather than defaulted.
-    fn is_prose(&self) -> bool {
-        self.content_type == ContentType::TextBlock
-            && matches!(
-                self.body.get("role").and_then(Value::as_str),
-                Some("paragraph" | "quote" | "definition" | "unknown")
-            )
-    }
-
     /// Resolve the shared evidence-text contract for this unit's whole text.
     fn part(&self) -> Option<PassagePart> {
         let text = evidence_text(self.content_type, &self.body)?;
@@ -445,9 +430,8 @@ impl Unit {
 /// diagnostics before the caller applies the final passage reranker.
 pub(crate) fn build_passages(
     conn: &Connection,
-    ranked: &[ColbertCandidateScore],
+    ranked: &[ColbertWindowScore],
     excerpts: &[ScoredExcerpt],
-    parse_of_unit: &BTreeMap<String, String>,
     tokenizer: &Tokenizer,
     candidate_limit: usize,
     query_id: &str,
@@ -468,7 +452,6 @@ pub(crate) fn build_passages(
             conn,
             ranked,
             excerpts,
-            parse_of_unit,
             &counter,
             candidate_limit,
             &mut counts,
@@ -512,9 +495,8 @@ struct PassageBuildCounts {
 /// return two candidates sharing canonical text. Disjoint windows remain separate.
 fn build_passages_body(
     conn: &Connection,
-    ranked: &[ColbertCandidateScore],
+    ranked: &[ColbertWindowScore],
     excerpts: &[ScoredExcerpt],
-    parse_of_unit: &BTreeMap<String, String>,
     tokenizer: &Tokenizer,
     candidate_limit: usize,
     counts: &mut PassageBuildCounts,
@@ -522,7 +504,7 @@ fn build_passages_body(
     let mut passages: Vec<PassageCandidate> = Vec::new();
     let mut seeds: Vec<_> = ranked
         .iter()
-        .map(PassageSeed::Unit)
+        .map(PassageSeed::Window)
         .chain(excerpts.iter().map(PassageSeed::Excerpt))
         .collect();
     seeds.sort_by(|left, right| {
@@ -533,53 +515,21 @@ fn build_passages_body(
             .then_with(|| left_key.cmp(right_key))
     });
     for seed in seeds {
-        let Some(candidate) = build_seed(conn, &seed, parse_of_unit, tokenizer)? else {
+        let candidates = build_seed(conn, &seed, tokenizer)?;
+        if candidates.is_empty() {
             counts.unrenderable_seeds += 1;
             continue;
-        };
-        if let Some(existing) = passages
-            .iter_mut()
-            .find(|existing| existing.covers_candidate(&candidate))
-        {
-            existing.retain_supported_matches(&candidate);
-            counts.covered_seeds += 1;
-            continue;
         }
-        let overlapping: Vec<usize> = passages
-            .iter()
-            .enumerate()
-            .filter_map(|(i, existing)| existing.overlaps(&candidate).then_some(i))
-            .collect();
-        if overlapping.is_empty() {
-            passages.push(candidate);
-            continue;
-        }
-        // Work on an owned trial so a cap failure leaves stronger candidates intact.
-        let first = overlapping[0];
-        let mut merged = passages[first].clone();
-        let mut fits = merge_passage(&mut merged, &candidate, tokenizer, &conn.limits().retrieval)?;
-        for &index in overlapping.iter().skip(1) {
-            if fits {
-                fits = merge_passage(
-                    &mut merged,
-                    &passages[index],
-                    tokenizer,
-                    &conn.limits().retrieval,
-                )?;
-            }
-        }
-        if fits {
-            counts.merged_windows += overlapping.len();
-            passages[first] = merged;
-            for &index in overlapping.iter().skip(1).rev() {
-                passages.remove(index);
-            }
-        } else {
-            // A rejected expansion can still carry match lineage wholly supported by a stronger passage.
-            for &index in &overlapping {
-                passages[index].retain_supported_matches(&candidate);
-            }
-            counts.overlap_rejections += 1;
+        // A window's section groups are admitted in reading order under the
+        // window's one score; each is a distinct candidate to the merge rules.
+        for candidate in candidates {
+            admit_candidate(
+                &mut passages,
+                candidate,
+                tokenizer,
+                &conn.limits().retrieval,
+                counts,
+            )?;
         }
     }
     counts.candidate_limit_exclusions = passages.len().saturating_sub(candidate_limit);
@@ -587,9 +537,63 @@ fn build_passages_body(
     Ok(passages)
 }
 
-/// Source-unit and exact-window seeds share MaxSim ordering without losing their distinct targeting.
+/// Admit one built candidate against the passages already kept: a candidate
+/// wholly covered transfers its lineage; a disjoint one is appended; an
+/// overlapping one merges with every overlapping passage when the merged
+/// result fits the budget, and otherwise only transfers supported lineage.
+fn admit_candidate(
+    passages: &mut Vec<PassageCandidate>,
+    candidate: PassageCandidate,
+    tokenizer: &Tokenizer,
+    limits: &RetrievalLimits,
+    counts: &mut PassageBuildCounts,
+) -> Result<(), ApiError> {
+    if let Some(existing) = passages
+        .iter_mut()
+        .find(|existing| existing.covers_candidate(&candidate))
+    {
+        existing.retain_supported_matches(&candidate);
+        counts.covered_seeds += 1;
+        return Ok(());
+    }
+    let overlapping: Vec<usize> = passages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, existing)| existing.overlaps(&candidate).then_some(i))
+        .collect();
+    let Some(&first) = overlapping.first() else {
+        passages.push(candidate);
+        return Ok(());
+    };
+    // Work on an owned trial so a cap failure leaves stronger candidates intact.
+    let mut merged = passages[first].clone();
+    let mut fits = merge_passage(&mut merged, &candidate, tokenizer, limits)?;
+    for &index in overlapping.iter().skip(1) {
+        if fits {
+            fits = merge_passage(&mut merged, &passages[index], tokenizer, limits)?;
+        }
+    }
+    if fits {
+        counts.merged_windows += overlapping.len();
+        passages[first] = merged;
+        for &index in overlapping.iter().skip(1).rev() {
+            passages.remove(index);
+        }
+    } else {
+        // A rejected expansion can still carry match lineage wholly supported by a stronger passage.
+        for &index in &overlapping {
+            passages[index].retain_supported_matches(&candidate);
+        }
+        counts.overlap_rejections += 1;
+    }
+    Ok(())
+}
+
+/// ColBERT-window and exact-window seeds share MaxSim ordering without losing
+/// their distinct targeting: both carry fragments, but only an exact window
+/// carries archived text to verify and annotation attribution to attach.
 enum PassageSeed<'a> {
-    Unit(&'a ColbertCandidateScore),
+    Window(&'a ColbertWindowScore),
     Excerpt(&'a ScoredExcerpt),
 }
 
@@ -597,74 +601,105 @@ impl PassageSeed<'_> {
     /// Use the actual MaxSim score and a stable key to compare both seed kinds in one ordering.
     fn score_and_key(&self) -> (f32, &str) {
         match self {
-            Self::Unit(seed) => (seed.score, &seed.unit_id),
+            Self::Window(seed) => (seed.score, &seed.window_id),
             Self::Excerpt(seed) => (seed.score, &seed.candidate_id),
         }
     }
 }
 
-/// Retain legacy unit expansion while exact-window seeds bypass all prefix selection.
+/// Build a seed's passages: a ColBERT window yields one per section group, an
+/// exact window at most one. An empty result is an unrenderable seed.
 fn build_seed(
     conn: &Connection,
     seed: &PassageSeed<'_>,
-    parse_of_unit: &BTreeMap<String, String>,
     tokenizer: &Tokenizer,
-) -> Result<Option<PassageCandidate>, ApiError> {
+) -> Result<Vec<PassageCandidate>, ApiError> {
     match seed {
-        PassageSeed::Unit(seed) => {
-            let parse_id = parse_of_unit.get(&seed.unit_id).ok_or_else(|| {
+        PassageSeed::Window(seed) => {
+            build_window_passages(conn, seed, tokenizer).map_err(|source| {
                 failure(format!(
-                    "passage seed {} has no captured parse",
-                    seed.unit_id
-                ))
-            })?;
-            build_passage(conn, parse_id, &seed.unit_id, tokenizer).map_err(|source| {
-                failure(format!(
-                    "passage seed {} in {parse_id}: {source}",
-                    seed.unit_id
+                    "passage window {} in {}: {source}",
+                    seed.window_id, seed.parse_id
                 ))
             })
         }
-        PassageSeed::Excerpt(seed) => {
-            build_excerpt_passage(conn, seed, tokenizer).map_err(|source| {
+        PassageSeed::Excerpt(seed) => build_excerpt_passage(conn, seed, tokenizer)
+            .map(|passage| passage.into_iter().collect())
+            .map_err(|source| {
                 failure(format!(
                     "passage excerpt {} in {}: {source}",
                     seed.candidate_id, seed.parse_id
                 ))
-            })
-        }
+            }),
     }
 }
 
-/// Verify the immutable source window against canonical evidence before it can become cited text.
+/// Verify the immutable source window against canonical evidence before it can
+/// become cited text: every fragment is sliced from its unit under this
+/// snapshot, and the archived window text must be those slices in order with
+/// only whitespace between, before, or after them (the grain's join, or the
+/// remnant of one at a partition boundary). Abutting fragments of one unit
+/// become one part, so a unit split across member chunks is one displayed
+/// range and reading-order merges see one part per unit.
 fn build_excerpt_passage(
     conn: &Connection,
     seed: &ScoredExcerpt,
     tokenizer: &Tokenizer,
 ) -> Result<Option<PassageCandidate>, ApiError> {
-    let unit = read_unit(conn, &seed.parse_id, &seed.excerpt.unit_id)?;
-    if unit.source_id != seed.source_id {
+    if sha256_hex_bytes(seed.text.as_bytes()) != seed.excerpt.text_hash {
         return Err(failure(
-            "exact passage seed and canonical unit have different sources",
+            "exact passage text differs from its archived window hash",
         ));
     }
-    let Some(mut part) = unit.part() else {
+    let mut parts: Vec<PassagePart> = Vec::new();
+    let mut remaining = seed.text.as_str();
+    for fragment in &seed.excerpt.fragments {
+        let Some((unit_source, part)) = read_fragment_part(conn, &seed.parse_id, fragment)? else {
+            return Ok(None);
+        };
+        if unit_source != seed.source_id {
+            return Err(failure(
+                "exact passage seed and canonical unit have different sources",
+            ));
+        }
+        remaining = strip_after_whitespace(remaining, &part.text).ok_or_else(|| {
+            failure(format!(
+                "exact passage text differs from canonical unit {} [{}, {})",
+                fragment.unit_id, fragment.start_char, fragment.end_char
+            ))
+        })?;
+        push_part(&mut parts, part);
+    }
+    if !remaining.trim().is_empty() {
+        return Err(failure(
+            "exact passage text holds characters outside its fragments",
+        ));
+    }
+    let Some(anchor) = parts.first().map(|part| part.id.clone()) else {
         return Ok(None);
     };
-    let text = slice_chars(&part.text, seed.excerpt.start_char, seed.excerpt.end_char)?;
-    if text != seed.text || sha256_hex_bytes(text.as_bytes()) != seed.excerpt.text_hash {
-        return Err(failure(
-            "exact passage text or hash differs from its canonical source range",
-        ));
+    // The archived partition was bounded by the ColBERT cap, but the displayed
+    // passage re-joins parts with blank lines where the archive used tabs, so a
+    // cap-filling partition can re-tokenize above `passage_max_tokens`. Clip
+    // exactly as window passages do (trailing parts first, then a lone part's
+    // text) and mark the passage truncated; never fail the query over display.
+    let max_tokens = conn.limits().retrieval.passage_max_tokens as usize;
+    let mut truncated = false;
+    while parts.len() > 1 && token_count(tokenizer, &join_parts(&parts))? > max_tokens {
+        parts.pop();
+        truncated = true;
     }
+    if let [part] = parts.as_mut_slice()
+        && token_count(tokenizer, &part.text)? > max_tokens
+    {
+        let (text, _) = bounded_text(&part.text, tokenizer, max_tokens)?;
+        part.end_char = part.start_char + text.chars().count();
+        part.text = text;
+        truncated = true;
+    }
+    let text = join_parts(&parts);
     if text.trim().is_empty() {
         return Ok(None);
-    }
-    if token_count(tokenizer, text)? > conn.limits().retrieval.passage_max_tokens as usize {
-        return Err(failure(format!(
-            "resource limit: exact source window exceeds retrieval.passage_max_tokens {}",
-            conn.limits().retrieval.passage_max_tokens
-        )));
     }
     if seed
         .annotation_matches
@@ -675,24 +710,19 @@ fn build_excerpt_passage(
             "exact passage annotation attribution has a different supporting range",
         ));
     }
-    // The seed's exact window replaces the whole-unit text; its offsets stay verbatim.
-    part.text = text.to_owned();
-    part.start_char = seed.excerpt.start_char;
-    part.end_char = seed.excerpt.end_char;
-    let (section_id, section_path) = read_section(conn, &seed.parse_id, &seed.excerpt.unit_id)?;
-    let parts = vec![part];
+    let (section_id, section_path) = read_section(conn, &seed.parse_id, &anchor)?;
     Ok(Some(PassageCandidate {
         candidate_id: passage_candidate_id(&seed.source_id, &seed.parse_id, &parts)?,
-        anchor_unit_id: seed.excerpt.unit_id.clone(),
+        anchor_unit_id: anchor,
         source_id: seed.source_id.clone(),
         parse_id: seed.parse_id.clone(),
-        unit_ids: vec![seed.excerpt.unit_id.clone()],
-        text: join_parts(&parts),
+        unit_ids: excerpt_unit_ids(&seed.excerpt),
+        text,
         section_path,
-        truncated: false,
+        truncated,
         section_id,
         parts,
-        legacy_seed_ranges: Vec::new(),
+        seed_ranges: Vec::new(),
         annotation_context: seed
             .annotation_context
             .iter()
@@ -704,6 +734,19 @@ fn build_excerpt_passage(
         graph_context: Vec::new(),
         annotation_matches: seed.annotation_matches.clone(),
     }))
+}
+
+/// The text after `slice`, where `slice` may be preceded only by whitespace.
+/// Every whitespace-prefix depth is tried so a slice that itself begins with
+/// whitespace is not lost to trimming.
+fn strip_after_whitespace<'a>(text: &'a str, slice: &str) -> Option<&'a str> {
+    let boundaries = text
+        .char_indices()
+        .take_while(|(_, character)| character.is_whitespace())
+        .map(|(offset, character)| offset + character.len_utf8());
+    std::iter::once(0)
+        .chain(boundaries)
+        .find_map(|offset| text[offset..].strip_prefix(slice))
 }
 
 /// Bind scoring identity to complete displayed source ranges, independently of which seed was strongest.
@@ -718,97 +761,136 @@ fn passage_candidate_id(
         .map_err(|source| failure(format!("hash passage candidate identity: {source}")))
 }
 
-/// Follow canonical reading-order edges around a seed, stopping at section or
-/// content boundaries. Alternating directions avoids spending the whole budget
-/// on just the preceding context. Traversal is bounded by `max_passage_units`
-/// and by the cycle check, independent of what each neighbor turns out to be.
-fn build_passage(
+/// Build the passages one scored ColBERT window seeds. The window's fragments
+/// are sliced from their canonical units under this snapshot (abutting
+/// fragments of one unit become one part); consecutive parts in one section
+/// form one passage, because the window itself never consulted section
+/// boundaries; each passage is then held to `max_passage_units` and
+/// `passage_max_tokens` by dropping trailing parts and, for a lone part still
+/// over budget, clipping its text — either clip sets `truncated`. Every unit
+/// must belong to one source. A unit without evidence text makes the window
+/// unrenderable (an empty result), as for exact excerpts. Each passage's
+/// seed ranges are exactly its displayed parts, so a unit hit attaches only
+/// to the range shown.
+fn build_window_passages(
     conn: &Connection,
-    parse_id: &str,
-    anchor: &str,
+    seed: &ColbertWindowScore,
     tokenizer: &Tokenizer,
-) -> Result<Option<PassageCandidate>, ApiError> {
-    let unit = read_unit(conn, parse_id, anchor)?;
-    let Some(mut part) = unit.part() else {
-        return Ok(None);
+) -> Result<Vec<PassageCandidate>, ApiError> {
+    let mut parts: Vec<PassagePart> = Vec::new();
+    let mut source_id: Option<String> = None;
+    for fragment in &seed.fragments {
+        let Some((unit_source, part)) = read_fragment_part(conn, &seed.parse_id, fragment)? else {
+            return Ok(Vec::new());
+        };
+        match &source_id {
+            Some(known) if *known != unit_source => {
+                return Err(failure(format!(
+                    "window spans sources {known} and {unit_source}"
+                )));
+            }
+            Some(_) => {}
+            None => source_id = Some(unit_source),
+        }
+        push_part(&mut parts, part);
+    }
+    let Some(source_id) = source_id else {
+        return Ok(Vec::new());
     };
-    let (section_id, section_path) = read_section(conn, parse_id, anchor)?;
-    let limits = &conn.limits().retrieval;
-    let (text, truncated) =
-        bounded_text(&part.text, tokenizer, limits.passage_max_tokens as usize)?;
-    part.end_char = part.start_char + text.chars().count();
-    part.text = text;
-    let legacy_seed_range = part.source_excerpt();
-    let mut parts = vec![part];
-    if unit.is_prose() && !truncated {
-        let mut cursors = [Some(anchor.to_string()), Some(anchor.to_string())];
-        let mut visited = BTreeSet::from([anchor.to_string()]);
-        for step in 0..limits.max_passage_units - 1 {
-            let direction = step % 2;
-            let Some(current) = cursors[direction].as_deref() else {
-                if cursors.iter().all(Option::is_none) {
-                    break;
-                }
-                continue;
-            };
-            let sql = if direction == 0 {
-                PREVIOUS_SQL
-            } else {
-                NEXT_SQL
-            };
-            let next = unique_link(conn, sql, parse_id, current, "reading order")?;
-            cursors[direction] = next.clone();
-            let Some(next) = next else {
-                continue;
-            };
-            if !visited.insert(next.clone()) {
-                return Err(failure(format!(
-                    "reading-order cycle at unit {next} in parse {parse_id}"
-                )));
-            }
-            let neighbor = read_unit(conn, parse_id, &next)?;
-            if neighbor.source_id != unit.source_id {
-                return Err(failure(format!(
-                    "passage crosses source at unit {next} in parse {parse_id}"
-                )));
-            }
-            if !neighbor.is_prose() || read_section(conn, parse_id, &next)?.0 != section_id {
-                cursors[direction] = None;
-                continue;
-            }
-            let Some(part) = neighbor.part() else {
-                continue;
-            };
-            let joined = if direction == 0 {
-                format!("{}\n\n{}", part.text, join_parts(&parts))
-            } else {
-                format!("{}\n\n{}", join_parts(&parts), part.text)
-            };
-            if token_count(tokenizer, &joined)? > limits.passage_max_tokens as usize {
-                cursors[direction] = None;
-            } else if direction == 0 {
-                parts.insert(0, part);
-            } else {
-                parts.push(part);
-            }
+
+    // Section groups: consecutive parts whose units share a section id.
+    let mut groups: Vec<(Option<String>, Vec<String>, Vec<PassagePart>)> = Vec::new();
+    for part in parts {
+        let (section_id, section_path) = read_section(conn, &seed.parse_id, &part.id)?;
+        match groups.last_mut() {
+            Some((known, _, members)) if *known == section_id => members.push(part),
+            _ => groups.push((section_id, section_path, vec![part])),
         }
     }
-    Ok(Some(PassageCandidate {
-        candidate_id: passage_candidate_id(&unit.source_id, parse_id, &parts)?,
-        anchor_unit_id: anchor.to_string(),
-        source_id: unit.source_id,
-        parse_id: parse_id.to_string(),
-        unit_ids: parts.iter().map(|p| p.id.clone()).collect(),
-        text: join_parts(&parts),
-        section_id,
-        section_path,
-        truncated,
-        parts,
-        legacy_seed_ranges: vec![legacy_seed_range],
-        annotation_context: Vec::new(),
-        graph_context: Vec::new(),
-        annotation_matches: Vec::new(),
-    }))
+
+    let limits = &conn.limits().retrieval;
+    let max_tokens = limits.passage_max_tokens as usize;
+    let mut passages = Vec::with_capacity(groups.len());
+    for (section_id, section_path, mut parts) in groups {
+        let mut truncated = false;
+        if parts.len() > limits.max_passage_units {
+            parts.truncate(limits.max_passage_units);
+            truncated = true;
+        }
+        // Trailing parts go first; only a lone over-budget part is clipped
+        // inside its text, keeping the displayed range a prefix of the unit range.
+        while parts.len() > 1 && token_count(tokenizer, &join_parts(&parts))? > max_tokens {
+            parts.pop();
+            truncated = true;
+        }
+        if let [part] = parts.as_mut_slice()
+            && token_count(tokenizer, &part.text)? > max_tokens
+        {
+            let (text, _) = bounded_text(&part.text, tokenizer, max_tokens)?;
+            part.end_char = part.start_char + text.chars().count();
+            part.text = text;
+            truncated = true;
+        }
+        let Some(anchor) = parts.first().map(|part| part.id.clone()) else {
+            continue;
+        };
+        let text = join_parts(&parts);
+        if text.trim().is_empty() {
+            continue;
+        }
+        passages.push(PassageCandidate {
+            candidate_id: passage_candidate_id(&source_id, &seed.parse_id, &parts)?,
+            anchor_unit_id: anchor,
+            source_id: source_id.clone(),
+            parse_id: seed.parse_id.clone(),
+            unit_ids: parts.iter().map(|part| part.id.clone()).collect(),
+            text,
+            section_path,
+            truncated,
+            section_id,
+            seed_ranges: parts.iter().map(PassagePart::source_excerpt).collect(),
+            parts,
+            annotation_context: Vec::new(),
+            graph_context: Vec::new(),
+            annotation_matches: Vec::new(),
+        });
+    }
+    Ok(passages)
+}
+
+/// Slice one fragment from its canonical unit under this snapshot, returning
+/// the unit's source id with the part. `None` when the unit has no evidence
+/// text, which no persisted fragment should cite.
+fn read_fragment_part(
+    conn: &Connection,
+    parse_id: &str,
+    fragment: &SourceFragment,
+) -> Result<Option<(String, PassagePart)>, ApiError> {
+    let unit = read_unit(conn, parse_id, &fragment.unit_id)?;
+    let Some(whole) = unit.part() else {
+        return Ok(None);
+    };
+    let slice = slice_chars(&whole.text, fragment.start_char, fragment.end_char)?;
+    let part = PassagePart {
+        id: fragment.unit_id.clone(),
+        start_char: fragment.start_char,
+        end_char: fragment.end_char,
+        text: slice.to_owned(),
+    };
+    Ok(Some((unit.source_id, part)))
+}
+
+/// Append a part, merging it into the previous one when both slice the same
+/// unit and abut, so a unit split across member chunks is one displayed range
+/// and reading-order merges see one part per unit.
+fn push_part(parts: &mut Vec<PassagePart>, part: PassagePart) {
+    match parts.last_mut() {
+        Some(last) if last.id == part.id && last.end_char == part.start_char => {
+            last.text.push_str(&part.text);
+            last.end_char = part.end_char;
+        }
+        _ => parts.push(part),
+    }
 }
 
 /// Stitch two overlapping ordered windows without sorting opaque unit IDs.
@@ -940,7 +1022,7 @@ fn token_count(tokenizer: &Tokenizer, text: &str) -> Result<usize, ApiError> {
         .map_err(|source| failure(format!("passage tokenization failed: {source}")))
 }
 
-/// Excerpt only an oversized single unit, retaining original UTF-8 bytes and
+/// Clip an oversized lone part to a prefix, retaining original UTF-8 bytes and
 /// exposing truncation. Its complete canonical body still appears in evidencePack.
 fn bounded_text(
     text: &str,
@@ -1005,31 +1087,6 @@ fn read_unit(conn: &Connection, parse_id: &str, unit_id: &str) -> Result<Unit, A
         body: serde_json::from_str(&body)
             .map_err(|source| failure(format!("body of {unit_id}: {source}")))?,
     })
-}
-
-/// Detect ambiguous graph boundaries explicitly instead of choosing an arbitrary
-/// branch and presenting it as a coherent passage.
-fn unique_link(
-    conn: &Connection,
-    sql: &str,
-    parse_id: &str,
-    unit_id: &str,
-    purpose: &str,
-) -> Result<Option<String>, ApiError> {
-    let mut statement = conn
-        .prepare(sql)
-        .map_err(|source| failure(format!("prepare {purpose} for {unit_id}: {source}")))?;
-    let values = statement
-        .query_map(params![parse_id, unit_id], |row| row.get::<_, String>(0))
-        .map_err(|source| failure(format!("read {purpose} for {unit_id}: {source}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| failure(format!("decode {purpose} for {unit_id}: {source}")))?;
-    if values.len() > 1 {
-        return Err(failure(format!(
-            "ambiguous {purpose} for {unit_id} in {parse_id}"
-        )));
-    }
-    Ok(values.into_iter().next())
 }
 
 /// Preserve recorded locations and their states; an absent location is reported

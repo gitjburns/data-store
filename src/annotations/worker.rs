@@ -95,14 +95,15 @@ use crate::annotations::llm_client::{AnnotatorClient, PRODUCER_TEMPERATURE};
 use crate::annotations::memo::{self, MemoItem};
 use crate::annotations::policy;
 use crate::annotations::producer::{
-    self, Invocation, InvocationFailure, ProducedAnnotation, ProducerKind,
+    self, Invocation, InvocationFailure, InvocationTarget, ProducedAnnotation, ProducerKind,
 };
 use crate::annotations::progress::{self, DocumentProgress, WorkState};
 use crate::annotations::store::{self, NewAnnotation};
+use crate::artifact_store::ArtifactStore;
 use crate::config::AnnotatorModelConfig;
 use crate::error::ApiError;
 use crate::hot_plane::{self, WriteTransactionAttempt};
-use crate::limits::DiagnosticLimits;
+use crate::limits::{DiagnosticLimits, IndexingLimits};
 use crate::maintenance::{AnnotationCancelReason, AnnotationCancellation};
 use crate::model::{Provenance, SemanticAnnotationType};
 use crate::monitoring::{Monitoring, WorkGuard, WorkHandle};
@@ -264,10 +265,13 @@ WHERE active_parse_id IS NOT NULL AND deactivated_at IS NULL";
 /// the worker's clean stop is observable.
 /// Producer prompts contain only their single annotation goal; operator naming
 /// rules are not appended to requests or incorporated into producer memo identity.
+/// `dense_dimension` is the configured dense model dimension, needed to load
+/// the section-dense artifact the planner reads context windows from.
 pub(crate) fn start(
     index_root: crate::runtime::StorageContext,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
+    dense_dimension: usize,
     shutdown: Arc<ShutdownSignal>,
     maintenance: Arc<crate::maintenance::MaintenanceGate>,
     // C10b diagnostic-only health slot the worker publishes into each cycle (and
@@ -295,6 +299,7 @@ pub(crate) fn start(
                     index_root,
                     annotator_config,
                     config_root,
+                    dense_dimension,
                     shutdown,
                     maintenance,
                     health_slot,
@@ -348,6 +353,7 @@ fn run_worker(
     index_root: crate::runtime::StorageContext,
     annotator_config: AnnotatorModelConfig,
     config_root: PathBuf,
+    dense_dimension: usize,
     shutdown: Arc<ShutdownSignal>,
     maintenance: Arc<crate::maintenance::MaintenanceGate>,
     health_slot: Arc<Mutex<AnnotationHealth>>,
@@ -500,6 +506,7 @@ fn run_worker(
         match run_cycle(
             &index_root,
             &annotator_config,
+            dense_dimension,
             &client,
             &shutdown,
             &mut output_retries,
@@ -595,6 +602,7 @@ fn stop_document_activity(slot: &Mutex<AnnotationHealth>, reason: &str) {
 fn run_cycle(
     index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
+    dense_dimension: usize,
     client: &AnnotatorClient,
     shutdown: &ShutdownSignal,
     output_retries: &mut RetryState,
@@ -670,7 +678,7 @@ fn run_cycle(
             return cancelled_cycle(reason);
         }
         if let Err(source_error) =
-            read_source_plan(index_root, config, source, true).and_then(|plan| {
+            read_source_plan(index_root, config, dense_dimension, source, true).and_then(|plan| {
                 plan.progress(
                     source,
                     config,
@@ -720,6 +728,7 @@ fn run_cycle(
         match build_source(
             index_root,
             config,
+            dense_dimension,
             client,
             source,
             shutdown,
@@ -1081,9 +1090,8 @@ impl SourceCounts<'_> {
     }
 }
 
-/// One unit of work: a single (invocation × matching producer) pair. Entity
-/// and Relation each consume every SectionGroup invocation; Summary consumes
-/// every Document invocation (ruling A / `producer::invocation_matches_kind`).
+/// One unit of work: a single (invocation × matching producer) pair. Every
+/// producer consumes every excerpt invocation (`producer::invocation_matches_kind`).
 /// `Clone` so a memo-miss item can be carried into a `PendingBuild` wave while
 /// the enumerated list keeps ownership of the originals.
 #[derive(Clone)]
@@ -1328,13 +1336,17 @@ struct SourcePlan {
 }
 
 /// Read a plan without holding SQLite across model work or health publication.
+/// The artifact store is opened per read, as the projection worker does, so
+/// no store handle outlives the plan snapshot.
 fn read_source_plan(
     index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
+    dense_dimension: usize,
     source: &ActiveSource,
     inventory_only: bool,
 ) -> Result<SourcePlan, ApiError> {
     let (work_items, present_keys, reopenable) = {
+        let store = ArtifactStore::open_existing(index_root)?;
         let mut connection = hot_plane::open_read(index_root)?;
         // Pin plan and coverage together; activation may run on the scheduler.
         let connection = connection
@@ -1351,7 +1363,13 @@ fn read_source_plan(
         } else {
             producer::build_invocation_plan
         };
-        let plan = plan_builder(&connection, &source.active_parse_id, config.max_input_chars)?;
+        let plan = plan_builder(
+            &connection,
+            &store,
+            &source.active_parse_id,
+            dense_dimension,
+            &index_root.limits().indexing,
+        )?;
         let work_items = enumerate_work_items(&connection, config, &plan)?;
         // Only fresh CONTENT keys satisfy coverage. The reopenable map holds
         // one reusable row per unsatisfied CONTENT key
@@ -1465,6 +1483,7 @@ impl SourcePlan {
 fn build_source<'slot>(
     index_root: &crate::runtime::StorageContext,
     config: &AnnotatorModelConfig,
+    dense_dimension: usize,
     client: &AnnotatorClient,
     source: &ActiveSource,
     shutdown: &ShutdownSignal,
@@ -1481,7 +1500,7 @@ fn build_source<'slot>(
 
     // Build the shared invocation plan and per-item keys on a read connection,
     // dropped before any long-running producer call or write transaction.
-    let plan = read_source_plan(index_root, config, source, false)?;
+    let plan = read_source_plan(index_root, config, dense_dimension, source, false)?;
     counts.progress = Some(plan.progress(
         source,
         config,
@@ -1973,7 +1992,16 @@ fn remint_from_memo(
     if let Some(reason) = cancellation.reason() {
         return Ok(BuildFlow::Cancelled(reason));
     }
-    let request = new_annotation_request(config, source, item)?;
+    // The building row opens over the whole excerpt; each re-minted item is
+    // then attributed against THIS invocation's targets, since the cached
+    // output may have been produced at another location of the same text.
+    let request = new_annotation_request(
+        config,
+        &index_root.limits().indexing,
+        source,
+        item,
+        &item.invocation.targets,
+    )?;
 
     let mut connection = hot_plane::open_write(index_root)?;
     // PRE-PAID boundary: nothing has been produced yet, so writer contention is
@@ -2003,7 +2031,14 @@ fn remint_from_memo(
                 message: format!("memo entry for key {} is empty on re-mint", item.key),
             });
         };
-        let first_provenance = memoized_provenance(&request.provenance, item, first);
+        let first_request = attributed_request(
+            config,
+            &index_root.limits().indexing,
+            source,
+            item,
+            &first.body,
+        )?;
+        let first_provenance = memoized_provenance(&first_request.provenance, item, first);
         // Re-stamp the memo key to THIS invocation's identity (CA2): a
         // content-scoped reopen may have adopted a row minted under a different
         // producer identity. `item.key` is the memo key just used for the cache
@@ -2015,13 +2050,21 @@ fn remint_from_memo(
             first.confidence,
             &first_provenance,
             &item.key,
+            &first_request.target_unit_ids,
         )?;
 
         for extra in items {
-            let extra_provenance = memoized_provenance(&request.provenance, item, extra);
+            let extra_request = attributed_request(
+                config,
+                &index_root.limits().indexing,
+                source,
+                item,
+                &extra.body,
+            )?;
+            let extra_provenance = memoized_provenance(&extra_request.provenance, item, extra);
             store::insert_fresh(
                 &tx,
-                &request,
+                &extra_request,
                 &extra.body,
                 extra.confidence,
                 &extra_provenance,
@@ -2080,7 +2123,15 @@ fn open_producer_build(
     if cancellation.reason().is_some() {
         return Ok(None);
     }
-    let request = new_annotation_request(config, source, item)?;
+    // No output exists yet, so the building row opens over the whole excerpt;
+    // completion narrows each item to its attributed fragments.
+    let request = new_annotation_request(
+        config,
+        &index_root.limits().indexing,
+        source,
+        item,
+        &item.invocation.targets,
+    )?;
 
     let mut connection = hot_plane::open_write(index_root)?;
     let tx = match hot_plane::begin_write_transaction_if_free(
@@ -2464,9 +2515,12 @@ fn dispatch_and_commit_wave(
 /// Phase 2b success: complete item 1 into the building row, insert items 2..N
 /// directly fresh, and record the memo entry — all in ONE transaction, so the
 /// cache row and the annotation rows it caches commit together. Each row's
-/// final provenance records the concrete confidence plus the effective
-/// sampling temperature the producer call ran at; the memo entry caches the
-/// full item array keyed by the shared memo key.
+/// target units and provenance input refs are the item's attributed fragments
+/// (`producer::attribute`), replacing the whole-excerpt set the building row
+/// was opened with; its final provenance records the concrete confidence plus
+/// the effective sampling temperature the producer call ran at. The memo entry
+/// caches the full item array keyed by the shared memo key; attribution is not
+/// cached because a reuse recomputes it against its own invocation's targets.
 // Completion carries persistence ownership, cancellation, and effective sampling
 // temperature explicitly so paid output follows the worker's serial write boundary.
 #[allow(clippy::too_many_arguments)]
@@ -2523,8 +2577,18 @@ fn complete_build(
                     completed_provenance(&request.provenance, None, effective_temperature);
                 // CA2 memo-key re-stamp: `item.key` is the running producer's
                 // memo key; a reopened row minted under another identity gets
-                // its cache key corrected here (content key unchanged).
-                store::complete_fresh(tx, building_id, &empty_body, None, &provenance, &item.key)?;
+                // its cache key corrected here (content key unchanged). An
+                // empty result has nothing to attribute, so the marker row
+                // keeps the whole excerpt as its coverage.
+                store::complete_fresh(
+                    tx,
+                    building_id,
+                    &empty_body,
+                    None,
+                    &provenance,
+                    &item.key,
+                    &request.target_unit_ids,
+                )?;
                 // Nothing to cache: an empty invocation output has no reusable
                 // items, so no memo row is written.
                 return Ok(0);
@@ -2533,8 +2597,18 @@ fn complete_build(
             // Item 1 completes the building row; the memo items collect every
             // produced item paired with the annotation id it was minted as, so a
             // later reuse can name the exact per-item memoizedFrom target.
-            let first_provenance =
-                completed_provenance(&request.provenance, first.confidence, effective_temperature);
+            let first_request = attributed_request(
+                config,
+                &index_root.limits().indexing,
+                source,
+                item,
+                &first.body,
+            )?;
+            let first_provenance = completed_provenance(
+                &first_request.provenance,
+                first.confidence,
+                effective_temperature,
+            );
             // CA2 memo-key re-stamp to the running producer's identity (`item.key`);
             // the same key is recorded on the memo row below, so cache and row agree.
             store::complete_fresh(
@@ -2544,6 +2618,7 @@ fn complete_build(
                 first.confidence,
                 &first_provenance,
                 &item.key,
+                &first_request.target_unit_ids,
             )?;
             let mut memo_items = vec![MemoItem {
                 body: first.body.clone(),
@@ -2552,14 +2627,21 @@ fn complete_build(
             }];
 
             for extra in rest {
+                let extra_request = attributed_request(
+                    config,
+                    &index_root.limits().indexing,
+                    source,
+                    item,
+                    &extra.body,
+                )?;
                 let extra_provenance = completed_provenance(
-                    &request.provenance,
+                    &extra_request.provenance,
                     extra.confidence,
                     effective_temperature,
                 );
                 let extra_id = store::insert_fresh(
                     tx,
-                    request,
+                    &extra_request,
                     &extra.body,
                     extra.confidence,
                     &extra_provenance,
@@ -2573,7 +2655,9 @@ fn complete_build(
 
             // Cache write atomic with the truth it caches (ruling D.2). The
             // identity uses the same single-goal prompt contracts as the memo key.
-            let identity_hash = item.kind.identity_hash(config)?;
+            let identity_hash = item
+                .kind
+                .identity_hash(config, &index_root.limits().indexing)?;
             memo::record(
                 tx,
                 &item.key,
@@ -2678,22 +2762,21 @@ fn fail_build(
     Ok(CompletionOutcome::Committed)
 }
 
-/// Assemble the `NewAnnotation` request for one work item: the invocation's
-/// ordered target unit ids are exactly the resulting annotation's
-/// `targetUnitIds` (CAb identity chain), and the planned producer provenance
-/// plus memo key are carried up front (§21 rule 3).
+/// Assemble the `NewAnnotation` request for one work item over `targets`: the
+/// targets' unit ids (deduplicated in order) are exactly the resulting
+/// annotation's `targetUnitIds` (CAb identity chain), the planned provenance's
+/// input refs are the same targets, and both keys are carried up front (§21
+/// rule 3). The building row passes the whole excerpt; completed items pass
+/// their attributed subset through `attributed_request`.
 fn new_annotation_request(
     config: &AnnotatorModelConfig,
+    indexing: &IndexingLimits,
     source: &ActiveSource,
     item: &WorkItem,
+    targets: &[InvocationTarget],
 ) -> Result<NewAnnotation, ApiError> {
-    let target_unit_ids = item
-        .invocation
-        .targets
-        .iter()
-        .map(|target| target.unit_id.clone())
-        .collect::<Vec<_>>();
-    let provenance = producer::planned_provenance(item.kind, config, &item.invocation.targets)?;
+    let target_unit_ids = producer::target_unit_ids(targets);
+    let provenance = producer::planned_provenance(item.kind, config, indexing, targets)?;
 
     Ok(NewAnnotation {
         source_id: source.source_id.clone(),
@@ -2704,6 +2787,20 @@ fn new_annotation_request(
         memoization_key_hash: item.key.clone(),
         content_key_hash: item.content_key.clone(),
     })
+}
+
+/// The request for one produced item: its targets are the fragments of the
+/// item's invocation that `producer::attribute` keeps for its body, so the row's
+/// `targetUnitIds` and provenance input refs name only supporting fragments.
+fn attributed_request(
+    config: &AnnotatorModelConfig,
+    indexing: &IndexingLimits,
+    source: &ActiveSource,
+    item: &WorkItem,
+    body: &serde_json::Value,
+) -> Result<NewAnnotation, ApiError> {
+    let targets = producer::attribute(item.kind, body, &item.invocation.targets);
+    new_annotation_request(config, indexing, source, item, &targets)
 }
 
 /// Derive the final provenance of a freshly-produced (model-run) annotation

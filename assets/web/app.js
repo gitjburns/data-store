@@ -728,10 +728,14 @@ function denseMatchDescription(match) {
   return `Section-guided match: ${path || match.sectionId}`;
 }
 
-/** Describe half-open canonical character coordinates without exposing source or annotation bodies. */
+/** Describe an excerpt's half-open canonical character coordinates, one per fragment, without exposing source or annotation bodies. */
 function sourceExcerptDescription(excerpt) {
-  if (!excerpt || excerpt.startChar == null || excerpt.endChar == null) return 'Source range unavailable';
-  return `source characters [${excerpt.startChar}, ${excerpt.endChar})`;
+  if (!excerpt || !Array.isArray(excerpt.fragments) || excerpt.fragments.length === 0) return 'Source range unavailable';
+  return excerpt.fragments
+    .map((fragment) => (fragment.startChar == null || fragment.endChar == null
+      ? 'source range unavailable'
+      : `${fragment.unitId} [${fragment.startChar}, ${fragment.endChar})`))
+    .join(', ');
 }
 
 /** Keep raw source embeddings distinct from annotation evidence, including historical whole-unit scope. */
@@ -749,10 +753,11 @@ function annotationMatchesMarkup(matches) {
   return `<ul class="retrieval-matches">${matches.map((match) => `<li>${esc(annotationMatchDescription(match))}</li>`).join('')}</ul>`;
 }
 
-/** Keep source-unit navigation separate from the plain-text coordinates of an exact candidate. */
+/** Link each cited unit, keeping navigation separate from the plain-text coordinates of an exact candidate. */
 function sourceExcerptMarkup(excerpt) {
-  if (!excerpt || typeof excerpt !== 'object') return escOr(null);
-  return `${unitLink(excerpt.unitId)} · ${esc(sourceExcerptDescription(excerpt))}`;
+  if (!excerpt || typeof excerpt !== 'object' || !Array.isArray(excerpt.fragments)) return escOr(null);
+  const units = [...new Set(excerpt.fragments.map((fragment) => fragment.unitId))];
+  return `${idListMarkup(units, unitLink)} · ${esc(sourceExcerptDescription(excerpt))}`;
 }
 
 /**
@@ -1167,11 +1172,16 @@ function retrievalHitsMarkup(pool, title, channelHeading) {
   )}`;
 }
 
-/** MaxSim scores over the fused pool, best-first as the service ordered them. */
+/** MaxSim scores over the ColBERT windows the fused pool reaches, best-first as the service ordered them. */
 function maxsimMarkup(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return '';
-  const rows = entries.map((entry) => [escOr(entry.rank), unitLink(entry.unitId), formatScore(entry.score)]);
-  return `<h3 class="subhead">maxsim</h3>${dataTable(['rank', 'unitId', 'score'], rows)}`;
+  const rows = entries.map((entry) => [
+    escOr(entry.rank),
+    `<code>${escOr(entry.windowId)}</code>`,
+    idListMarkup(entry.chunkIds),
+    formatScore(entry.score),
+  ]);
+  return `<h3 class="subhead">maxsim</h3>${dataTable(['rank', 'windowId', 'chunkIds', 'score'], rows)}`;
 }
 
 /** Exact-window diagnostics expose measured scores and attribution, never source or annotation body copies. */

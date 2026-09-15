@@ -43,8 +43,8 @@ cadence:
   │  PARSE   │   Imported bundles become canonical units; invalid bundles fail.
   └────┬─────┘
        ▼
-  ┌──────────────┐   chunks, lexical index, passage/section dense vectors,
-  │ PROJECTIONS  │   persisted ColBERT token matrices, and derived views
+  ┌──────────────┐   fine chunks, lexical index, fine and context dense vectors,
+  │ PROJECTIONS  │   persisted ColBERT windows, and derived views
   └────┬─────────┘
        ▼
   ┌──────────────┐   one active parse per source; dominance checks can hold
@@ -66,12 +66,51 @@ rankings. ColBERT evaluates source and matched annotation representations; final
 reranking receives canonical passages plus separately labeled matched context.
 Publication and retrieval do not wait for all annotation types to finish.
 
+### Retrieval grains
+
+Embedding and annotation never operate on single canonical units. Four grains
+stack, each a run of consecutive members of the grain below it in reading
+order, packed greedily under a ColBERT-token cap from `[indexing]`
+(`config.example.toml` is the reference for every cap):
+
+- **Fine chunks** (`indexing.fine_max_tokens`) pack evidence members; they feed
+  the fine dense vectors and the lexical index and are stored in
+  `chunk_projections`.
+- **ColBERT windows** (`indexing.colbert_max_tokens`) pack fine chunks; their
+  token matrices are stored in `colbert_windows` and scored by MaxSim.
+- **Context windows** (`indexing.context_max_tokens`) pack fine chunks; they
+  feed the context dense vectors, the annotation source windows, and the
+  annotation cohorts.
+- **Excerpts** (`indexing.excerpt_windows` consecutive context windows) are
+  the unit of one annotation call and exist only in provenance.
+
+Evidence members are derived once, at the fine chunker: a `text_block` with
+role `heading` is not evidence and contributes only to the section path; all
+cells of one `table_row` form one member whose text is the cell texts joined by
+a tab; every other evidence-bearing unit is one member. Reading order of fine
+chunks is `chunk_projections.chunk_index`, the only order authority for every
+higher grain. Runs cross section boundaries; the section path of a run's first
+member is carried as metadata.
+
+Every grain has canonical text (member texts joined by one blank line) and
+model input (the section path joined by " / ", a blank line, then the canonical
+text). Canonical text feeds hashes, provenance ranges, the annotation source
+matcher, and citations; model input feeds embedding and annotation calls, and
+the prefix is never part of any range. A run below `indexing.min_fill_ratio`
+of its cap is filled by splitting the next member (fine grain only, at a
+sentence, then word boundary) or, at document end, merged into its predecessor
+when the combined run fits; the one permitted sub-minimum run is a final run
+that cannot merge. Every persisted run records `fragments`: the Unicode scalar
+ranges of each unit's evidence text it is sliced from.
+
 ### Annotation request chains
 
-Each evidence-bearing unit is split into excerpts bounded by `max_input_chars`,
-without dropping oversized-unit tails. Entity, relation, and summary work use
-separate chains. Within a chain, model requests run sequentially; the server
-validates each response before passing its output to the next request.
+Each annotation call consumes one excerpt: a run of consecutive context windows
+of the active parse. The model receives the excerpt's canonical text as its
+only source text, with the section path as a separate context line. Entity,
+relation, and summary work use separate chains. Within a chain, model requests
+run sequentially; the server validates each response before passing its output
+to the next request.
 
 - **Entities:** extract candidate names from the excerpt, then send the same
   excerpt and bounded batches of those names for classification or rejection.
@@ -91,6 +130,11 @@ validates each response before passing its output to the next request.
   are permitted.
 - **Summaries:** request one summary per excerpt and validate its response shape.
 
+Each produced item is attributed to the excerpt fragments whose text supports
+it: an entity keeps the fragments matching its name, a relation keeps the
+fragments matching any of its evidence quotes, and a summary keeps every
+fragment. An item that matches no fragment keeps every fragment.
+
 Empty name extraction skips typing. An entirely rejected candidate set also
 produces no entities. Both are successful empty results: the worker records fresh
 coverage so the excerpt is not retried merely because it has no annotations.
@@ -108,8 +152,7 @@ Existing annotations are not automatically reclassified or removed.
 **Start the service.** The server binary is `data-store-service`. After inference
 initialization, it serves HTTP during the configured
 `server.startup_delay_seconds` window before initializing corpus storage or
-starting workers. The supplied configuration uses 10 seconds; `0` disables the
-wait. Send `data-store --config config.toml --rebuild-all` during this window to
+starting workers; `0` disables the wait. Send `data-store --config config.toml --rebuild-all` during this window to
 clear the old corpus before ordinary startup can modify it. Health, Operation
 polling, rebuild-all, and shutdown remain available; other storage-dependent
 requests return `503` and readiness stays false. Rebuild-all ends the countdown
@@ -117,11 +160,15 @@ immediately; after successful clearing, normal startup continues without waiting
 out the remaining delay. Failed rebuilds keep storage paused. Startup logging
 and admin-token publication remain active.
 
-**Set up storage once.** Run the server with `--setup-storage` to build the
+**Set up storage.** Run the server with `--setup-storage` to build the
 fabric hot plane's SQLite schema. This is one deliberate operator
 action. The runtime NEVER creates or migrates schema — all schema arrives through
-this explicit setup step. See **INSTALL.md** for the full procedure and the
-model artifacts required before first start.
+this explicit setup step. Re-running it validates an existing compatible
+database and leaves it untouched; an incompatible one (schema version or table
+contract mismatch) is deleted with the whole `{index_root}/fabric` directory and
+recreated, after logging the reason and the row counts being lost. See
+**INSTALL.md** for the full procedure and the model artifacts required before
+first start.
 
 ```sh
 data-store-service --config config.toml --setup-storage
@@ -145,12 +192,14 @@ readiness-critical components: `inference` and `sync`. Everything else reported 
 health is diagnostic-only and never makes a running service report unavailable.
 
 **Annotation work.** The worker runs the [annotation request chains](#annotation-request-chains)
-over bounded excerpts. Each call enables thinking, requests structured JSON
-without streaming, and allows up to 150,000 output tokens including reasoning.
+over excerpts. Each call enables thinking, requests structured JSON without
+streaming, and allows the completion tokens set by
+`models.annotator.max_completion_tokens`, including reasoning.
 
 **Projection work.** A separate synchronous worker publishes graph and summary
 inputs independently, and builds dense/ColBERT representations for individual
-annotations, combined annotations per excerpt, and canonical source windows.
+annotations, combined annotations per context window, and the context windows
+themselves as source representations.
 It discovers existing committed annotations without regenerating them. Embedding
 failures retain annotation results and the previous valid publication.
 
@@ -161,10 +210,14 @@ versioned at startup. The annotator-naming document is not applied to the curren
 single-goal prompts; editing it does not change producer memo identity.
 
 **Annotation dry run.** `data-store-service --annotation-dry-run <N>` parses the
-corpus and samples the first `<N>` excerpts per source per type (entity and
-relation; no summaries or embeddings). Inspect them with
-`--vocabulary <entity|relation> all`: sampled parses are not active. Normal
-startup adopts those parses without re-converting them and completes ingestion.
+corpus and is meant to sample the first `<N>` excerpts per source per type
+(entity and relation; no summaries or embeddings). It currently cannot sample:
+excerpts are runs of context windows, the dry-run pass stops before the
+projection build that constructs them, and the planner returns an empty plan
+(`annotator_plan.windows_unpublished` in the service log). Inspect whatever
+annotations exist with `--vocabulary <entity|relation> all`: sampled parses
+are not active. Normal startup adopts the parses without re-converting them
+and completes ingestion.
 
 ## The HTTP surface at a glance
 
@@ -380,8 +433,8 @@ verdict.
 ### Example: query the fabric
 
 `queryText` is the only required field. `retrieval.default_results` and
-`retrieval.max_results` configure the default and maximum passage counts
-(shipped values: 10 and 100). `maxFinalEvidenceUnits` selects a count within that range. Raw unit
+`retrieval.max_results` configure the default and maximum passage counts.
+`maxFinalEvidenceUnits` selects a count within that range. Raw unit
 locators default on; relationships, annotations, and `debug` default off.
 
 ```sh
@@ -416,10 +469,12 @@ This attribution is available without `debug`; it describes candidate matches,
 not a measured improvement in retrieval quality. Web retrieval details retain
 unit mappings and supporting references.
 
-Dense retrieval combines passage, section, and canonical source-window matches.
-Individual and combined annotations are searched separately and share a grouped
-annotation ranking with graph matches. Exact source excerpts remain identifiable
-through ColBERT scoring, passage construction, reranking, and citations.
+Dense retrieval combines fine-chunk and context-window matches. Individual and
+combined annotations are searched separately and share a grouped annotation
+ranking with graph matches. ColBERT MaxSim scores ColBERT windows; graph and
+annotation hits reach windows through shared fine-chunk membership, and
+passages are built from window fragments, so exact source excerpts remain
+identifiable through scoring, passage construction, reranking, and citations.
 
 Query scoring streams persisted vectors with bounded buffers; operating-system
 file caching can use spare RAM without requiring resident vector planes. Chunk
@@ -429,11 +484,12 @@ embeddings still need `data-store --config config.toml --rebuild-all` from the
 project root, which clears indexed state and reingests the corpus. Snapshots
 lacking the required passage/section representations are rejected before restore.
 
-`indexing.chunk_max_tokens` bounds normalized retrieval chunks; annotation and
-section windows have separate indexing limits. Displayed passages use
-`retrieval.passage_max_tokens`. Final reranking uses a configured candidate depth
-(shipped value: 100), raised for larger valid result requests. Matched graph
-context shares the reranker's total input capacity without a separate token cutoff.
+`[indexing]` sets the fine, ColBERT, and context caps, the excerpt length, and
+the minimum fill (see "Retrieval grains"). Displayed passages use
+`retrieval.passage_max_tokens`. Final reranking uses the candidate depth
+`retrieval.reranker_candidate_pool_size`, raised for larger valid result
+requests. Matched graph context shares the reranker's total input capacity
+without a separate token cutoff.
 
 The CLI prints each passage once with its citation. Use `--query-raw` (REPL:
 `query-raw`) with the same query text to print the complete response JSON. Raw
@@ -513,7 +569,7 @@ comments specify units, enforcement scope, and excess-input behavior. The sectio
 | `[admin]` | Admin token file location. |
 | `[client]` | Client deadlines, polling cadence, and provenance previews. |
 | `[retrieval]`, `[retrieval.entity_matching]` | Result counts, candidate depths, graph matching, passage/evidence budgets, and query admission. |
-| `[indexing]` | Independent chunk, annotation-window, and section construction limits. |
+| `[indexing]` | ColBERT-token caps for fine chunks, ColBERT windows, and context windows; context windows per excerpt; minimum fill ratio. |
 | `[resources]` | Read, allocation, and inventory admission guards. |
 | `[workers]` | Annotation/projection batching, concurrency, polling, and publication allowances. |
 | `[sqlite]` | Lock-wait timeout, cooperative SQL execution timeout, and progress-callback cadence. |
@@ -529,13 +585,15 @@ comments specify units, enforcement scope, and excess-input behavior. The sectio
 
 See **INSTALL.md** for the annotated example and the required absolute paths.
 
-Model serving capacity is separate from retrieval window size. The configured
-HTTP capacities are 32,768 for `Qwen/Qwen3-Embedding-8B` and
-`Qwen/Qwen3-Reranker-0.6B`, and 518 for `lightonai/ColBERT-Zero`; ColBERT query
-and document inputs remain 512. Startup requires `/v1/models` to advertise the
-configured capacity. Server-side truncation is disabled; oversized HTTP inputs
-fail visibly. Existing application-side ColBERT token-ID and local-model prefix
-handling remains in place; annotation windows preserve complete input through splitting.
+Model serving capacity is separate from grain size. `models.dense.max_tokens`
+and `models.reranker.max_tokens` declare the served capacities, and
+`models.colbert.document_max_tokens` the ColBERT document limit; startup
+requires `/v1/models` to advertise the configured capacity, requires
+`indexing.colbert_max_tokens` to equal the ColBERT document limit, and requires
+a context window plus its section-path prefix budget to fit the dense and
+reranker capacities. Server-side truncation is disabled; oversized HTTP inputs
+fail visibly. A ColBERT window whose prefixed input would exceed the document
+limit is embedded without the prefix.
 
 Construction settings are recorded with new projections. Restore validates their
 recorded settings or explicit legacy formats without inference. Current resource
@@ -555,18 +613,19 @@ routed.
 
 ### Annotation settings
 
-These `[models.annotator]` settings are required; the shipped values are:
+These `[models.annotator]` settings are required; `config.example.toml` holds
+the shipped values. Excerpt size is not an annotator setting: it follows from
+`indexing.context_max_tokens` and `indexing.excerpt_windows`.
 
-| Setting | Value | Meaning |
-| --- | ---: | --- |
-| `max_input_chars` | 2000 | Source text per excerpt, in Unicode characters; prompts and prior-stage output are additional. |
-| `timeout_seconds` | 120 | Deadline for each model call, including thinking. |
-| `max_completion_tokens` | 150000 | Completion-token allowance per call, including reasoning. |
-| `annotation_max_retries` | 10 | Malformed-output retries after the initial attempt. |
-| `annotation_retry_interval_seconds` | 5 | Fixed malformed-output retry interval, with no backoff ceiling. |
-| `execution_max_retries` | 10 | Execution-failure retries after the initial attempt. |
-| `execution_retry_initial_delay_seconds` | 5 | Initial execution-failure retry delay. |
-| `execution_retry_max_delay_seconds` | 300 | Execution-failure backoff ceiling. |
+| Setting | Meaning |
+| --- | --- |
+| `timeout_seconds` | Deadline for each model call, including thinking. |
+| `max_completion_tokens` | Completion-token allowance per call, including reasoning. |
+| `annotation_max_retries` | Malformed-output retries after the initial attempt. |
+| `annotation_retry_interval_seconds` | Fixed malformed-output retry interval, with no backoff ceiling. |
+| `execution_max_retries` | Execution-failure retries after the initial attempt. |
+| `execution_retry_initial_delay_seconds` | Initial execution-failure retry delay. |
+| `execution_retry_max_delay_seconds` | Execution-failure backoff ceiling. |
 
 The two failure counters are independent. Execution failures include timeouts,
 HTTP/protocol errors, token-limit termination, and internal producer failures.

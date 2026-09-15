@@ -542,9 +542,6 @@ pub struct AnnotatorModelConfig {
     pub timeout_seconds: u64,
     /// Optional owner-only file holding the bearer API key.
     pub api_key_file_path: Option<PathBuf>,
-    /// Maximum source-excerpt length in Unicode characters. Prompts and prior
-    /// stage outputs are additional; this is not a model token-budget estimate.
-    pub max_input_chars: usize,
     /// Provider completion-token allowance per call, including reasoning tokens.
     pub max_completion_tokens: u64,
     /// Malformed-output retry allowance per annotation; zero permits only the
@@ -657,15 +654,12 @@ impl ServiceConfig {
             self.models.colbert.document_max_tokens,
         )?;
         validate_reranker_backend_fields(&self.models.reranker)?;
+        validate_grain_capacities(&self.indexing, &self.models)?;
         require_non_empty("models.annotator.endpoint", &self.models.annotator.endpoint)?;
         require_non_empty("models.annotator.model", &self.models.annotator.model)?;
         require_positive_u64(
             "models.annotator.timeout_seconds",
             self.models.annotator.timeout_seconds,
-        )?;
-        require_positive_usize(
-            "models.annotator.max_input_chars",
-            self.models.annotator.max_input_chars,
         )?;
         require_positive_u64(
             "models.annotator.max_completion_tokens",
@@ -943,6 +937,47 @@ fn validate_dense_backend_fields(dense: &DenseModelConfig) -> Result<(), ApiErro
         }
     }
 
+    Ok(())
+}
+
+/// Longest section-path prefix, in tokens, that model input adds ahead of a
+/// context window's canonical text (PLAN-grains Section 4).
+const SECTION_PATH_PREFIX_TOKENS: u32 = 256;
+
+/// Bind grain caps to the model capacities that consume them. ColBERT windows
+/// are embedded whole, so their cap must equal the document limit the ColBERT
+/// backend enforces (`models.colbert.document_max_tokens` feeds both local and
+/// HTTP backends). Context windows gain a section-path prefix before the dense
+/// and reranker models see them, so the cap plus that prefix must fit each
+/// model's configured capacity.
+fn validate_grain_capacities(
+    indexing: &IndexingLimits,
+    models: &ModelConfig,
+) -> Result<(), ApiError> {
+    if indexing.colbert_max_tokens != models.colbert.document_max_tokens {
+        return Err(ApiError::InvalidConfig {
+            message: format!(
+                "indexing.colbert_max_tokens {} must equal models.colbert.document_max_tokens {}",
+                indexing.colbert_max_tokens, models.colbert.document_max_tokens
+            ),
+        });
+    }
+    let context_input_tokens = indexing
+        .context_max_tokens
+        .saturating_add(SECTION_PATH_PREFIX_TOKENS);
+    for (label, capacity) in [
+        ("models.dense.max_tokens", models.dense.max_tokens),
+        ("models.reranker.max_tokens", models.reranker.max_tokens),
+    ] {
+        if context_input_tokens > capacity {
+            return Err(ApiError::InvalidConfig {
+                message: format!(
+                    "indexing.context_max_tokens {} plus the {SECTION_PATH_PREFIX_TOKENS}-token section path prefix exceeds {label} {capacity}",
+                    indexing.context_max_tokens
+                ),
+            });
+        }
+    }
     Ok(())
 }
 

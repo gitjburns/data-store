@@ -3,7 +3,7 @@
 DELETE FROM chunk_text_index;
 DELETE FROM graph_entity_edges;
 DELETE FROM graph_entity_mentions;
-DELETE FROM unit_multivector_projections;
+DELETE FROM colbert_windows;
 DELETE FROM chunk_dense_vectors;
 DELETE FROM chunk_projections;
 DELETE FROM retrieval_projections;

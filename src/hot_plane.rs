@@ -12,6 +12,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,7 +20,7 @@ use std::{
 };
 
 use rusqlite::{OpenFlags, TransactionBehavior};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::ApiError;
 use crate::runtime::{RuntimeSettings, StorageContext};
@@ -38,10 +39,12 @@ const FABRIC_DATABASE_FILE_NAME: &str = "fabric.sqlite3";
 /// `setup_fabric_storage`, never as a runtime migration.
 const FABRIC_SCHEMA_SQL: &str = include_str!("../sql/fabric/schema.sql");
 
-/// `PRAGMA user_version` stamped at the end of sql/fabric/schema.sql. Any
-/// other value means the database was created by a different schema revision
-/// and the process must stop rather than guess.
-const EXPECTED_FABRIC_SCHEMA_VERSION: i64 = 1;
+/// `PRAGMA user_version` stamped at the end of sql/fabric/schema.sql; the
+/// single source the runtime and the setup path compare against. Any other
+/// value means the database was created by a different schema revision: the
+/// runtime must stop rather than guess, and `--setup-storage` recreates it.
+/// Bump together with every change to the schema file.
+const FABRIC_SCHEMA_VERSION: i64 = 2;
 
 /// One column of the fabric schema contract: declared name and type, and
 /// whether NULL must be rejected (satisfied by NOT NULL or by PRIMARY KEY
@@ -349,10 +352,17 @@ const FABRIC_TABLE_CONTRACTS: &[(&str, &[FabricColumn])] = &[
             col("targeting_text", "TEXT", true),
             // token_count is nullable: §22 ChunkPayload.tokenCount is optional.
             col("token_count", "INTEGER", false),
+            // Fine-grain membership (PLAN-grains.md Section 2): per-unit scalar
+            // ranges and the section path used only as the model-input prefix.
+            col("fragments_json", "TEXT", true),
+            col("section_path_json", "TEXT", true),
             col("chunker_name", "TEXT", true),
             col("chunker_version", "TEXT", true),
             col("chunker_config_hash", "TEXT", true),
             col("created_at", "TEXT", true),
+            // 0-based reading-order position within the parse: the only
+            // reading-order authority for chunks (schema.sql chunk_projections).
+            col("chunk_index", "INTEGER", true),
         ],
     ),
     (
@@ -370,13 +380,18 @@ const FABRIC_TABLE_CONTRACTS: &[(&str, &[FabricColumn])] = &[
         ],
     ),
     (
-        "unit_multivector_projections",
+        "colbert_windows",
         &[
             col("id", "TEXT", true),
             col("projection_id", "TEXT", true),
             col("source_id", "TEXT", true),
             col("parse_id", "TEXT", true),
-            col("unit_id", "TEXT", true),
+            // ColBERT-grain membership (PLAN-grains.md Section 2): reading-order
+            // position, member chunk ids in order, and their concatenated
+            // scalar-offset fragments (schema.sql colbert_windows).
+            col("window_index", "INTEGER", true),
+            col("chunk_ids_json", "TEXT", true),
+            col("fragments_json", "TEXT", true),
             col("token_count", "INTEGER", true),
             col("dimension", "INTEGER", true),
             col("matrix_blob", "BLOB", true),
@@ -429,11 +444,28 @@ fn fabric_database_path(index_root: &Path) -> PathBuf {
         .join(FABRIC_DATABASE_FILE_NAME)
 }
 
+/// Tables whose row counts are logged before an incompatible database is
+/// deleted: the ones holding operator-visible work (parsed units, produced
+/// annotations, cached annotator responses) that a recreate throws away.
+const LOST_ROW_COUNT_TABLES: [&str; 3] =
+    ["content_units", "semantic_annotations", "annotation_memo"];
+
+/// Why an existing fabric database cannot be kept, captured together with the
+/// row counts of `LOST_ROW_COUNT_TABLES` while the database is still open, so
+/// the operator log describes the loss before the directory is deleted.
+struct FabricIncompatibility {
+    reason: String,
+    /// Parallel to `LOST_ROW_COUNT_TABLES`; a count is the decimal number or
+    /// `unavailable` when the table cannot be counted (typically missing).
+    row_counts: [String; 3],
+}
+
 /// Create the fabric hot-plane database through the explicit operator setup
-/// action — the only schema-creation path. Idempotent re-runs validate the
-/// existing database instead of recreating it and never migrate: a database
-/// from a different schema revision is a fatal error, not an upgrade target.
-/// This function owns the setup diagnostic boundary and logs start, terminal
+/// action — the only schema-creation path. Re-runs keep a compatible existing
+/// database (same schema version, every contract valid) and only validate it;
+/// an incompatible one is never migrated — the whole fabric directory is
+/// deleted after its loss is logged, and a fresh database is created. This
+/// function owns the setup diagnostic boundary and logs start, terminal
 /// success, and terminal failure with elapsed time.
 pub(crate) fn setup_fabric_storage(index_root: &StorageContext) -> Result<PathBuf, ApiError> {
     let started = Instant::now();
@@ -445,12 +477,17 @@ pub(crate) fn setup_fabric_storage(index_root: &StorageContext) -> Result<PathBu
         already_exists,
         "fabric hot-plane setup starting"
     );
-    match setup_fabric_database(&db_path, already_exists, index_root.shared_settings()) {
-        Ok(()) => {
+    let outcome = if already_exists {
+        setup_existing_fabric_database(index_root, &db_path)
+    } else {
+        setup_fabric_database(&db_path, index_root.shared_settings()).map(|()| "created")
+    };
+    match outcome {
+        Ok(mode) => {
             info!(
                 event = "hot_plane.setup_completed",
                 db_path = %db_path.display(),
-                mode = if already_exists { "validated_existing" } else { "created" },
+                mode,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "fabric hot-plane setup completed"
             );
@@ -469,14 +506,124 @@ pub(crate) fn setup_fabric_storage(index_root: &StorageContext) -> Result<PathBu
     }
 }
 
-/// Perform the setup work behind `setup_fabric_storage`, which owns the
-/// diagnostic boundary: create the fabric directory, then either create and
-/// stamp a fresh database or validate an existing one untouched.
-fn setup_fabric_database(
+/// Setup re-run against an existing database: keep and report it when
+/// compatible, otherwise log the reason and the rows about to be lost, delete
+/// the fabric directory, and create fresh. Returns the completion mode.
+fn setup_existing_fabric_database(
+    index_root: &StorageContext,
     db_path: &Path,
-    already_exists: bool,
+) -> Result<&'static str, ApiError> {
+    let incompatibility =
+        match inspect_existing_fabric_database(db_path, index_root.shared_settings())? {
+            None => return Ok("validated_existing"),
+            Some(incompatibility) => incompatibility,
+        };
+    warn!(
+        event = "storage_setup.incompatible_database",
+        db_path = %db_path.display(),
+        reason = %incompatibility.reason,
+        "existing fabric database is incompatible with this schema; it will be deleted and recreated"
+    );
+    let [content_units, semantic_annotations, annotation_memo] = &incompatibility.row_counts;
+    warn!(
+        event = "storage_setup.rows_to_be_lost",
+        db_path = %db_path.display(),
+        content_units = %content_units,
+        semantic_annotations = %semantic_annotations,
+        annotation_memo = %annotation_memo,
+        "row counts in the incompatible fabric database about to be deleted"
+    );
+    let deleted_path = remove_fabric_directory(index_root)?;
+    setup_fabric_database(db_path, index_root.shared_settings())?;
+    warn!(
+        event = "storage_setup.recreated",
+        deleted_path = %deleted_path.display(),
+        db_path = %db_path.display(),
+        "fabric directory deleted and fabric database recreated"
+    );
+    Ok("recreated")
+}
+
+/// Decide whether an existing database is compatible: `Ok(None)` when it
+/// passes, `Ok(Some(..))` with the reason and pre-deletion row counts when it
+/// does not. Failing to open the file read-write (locked, unreadable, not
+/// WAL) is an ordinary error, not grounds for deletion. The connection is
+/// dropped before returning so nothing holds the file open during deletion.
+fn inspect_existing_fabric_database(
+    db_path: &Path,
     settings: Arc<RuntimeSettings>,
-) -> Result<(), ApiError> {
+) -> Result<Option<FabricIncompatibility>, ApiError> {
+    let connection = open_write_at(db_path, settings)?;
+    // Version first: a stamp from another revision is reported as such even
+    // when the column contracts also differ, and only a matching stamp earns
+    // the full contract battery.
+    let reason = match read_fabric_schema_version(&connection) {
+        Ok(version) if version == FABRIC_SCHEMA_VERSION => validate_fabric_schema(&connection)
+            .err()
+            .map(|source| source.to_string()),
+        Ok(version) => Some(format!(
+            "fabric schema version is {version}, expected {FABRIC_SCHEMA_VERSION}"
+        )),
+        Err(source) => Some(source.to_string()),
+    };
+    Ok(reason.map(|reason| FabricIncompatibility {
+        reason,
+        row_counts: LOST_ROW_COUNT_TABLES
+            .map(|table_name| fabric_row_count_display(&connection, table_name)),
+    }))
+}
+
+/// Count one table's rows for the pre-deletion log; a table that cannot be
+/// counted (missing in the old revision, or unreadable) reads `unavailable`
+/// rather than failing setup, since the database is being discarded anyway.
+fn fabric_row_count_display(connection: &Connection, table_name: &str) -> String {
+    // The table name comes from the static LOST_ROW_COUNT_TABLES list, never
+    // from input, so interpolating it into the statement is safe.
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table_name};"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_or_else(|_| "unavailable".to_string(), |count| count.to_string())
+}
+
+/// Delete the whole `{index_root}/fabric` tree (hot plane and artifact
+/// store) ahead of a recreate, returning the deleted path. This is the only
+/// deletion in the module and it is guarded to exactly that directory.
+fn remove_fabric_directory(index_root: &StorageContext) -> Result<PathBuf, ApiError> {
+    let fabric_dir = index_root.join(FABRIC_DIR_NAME);
+    // Deletion guard: refuse unless the target is a real directory (a symlink
+    // signals a layout setup does not own, so it is refused rather than
+    // unlinked) named `fabric` whose parent is the index root itself. The
+    // path is built from constants, so a failure here means the layout on
+    // disk is not the one setup owns.
+    let is_real_directory = fs::symlink_metadata(&fabric_dir)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    let is_fabric_under_index_root = fabric_dir.file_name() == Some(OsStr::new(FABRIC_DIR_NAME))
+        && fabric_dir.parent() == Some(index_root.as_ref());
+    if !(is_real_directory && is_fabric_under_index_root) {
+        return Err(ApiError::StorageInit {
+            message: format!(
+                "refusing to delete {}: not a directory named {FABRIC_DIR_NAME} directly under \
+                 index root {}",
+                fabric_dir.display(),
+                index_root.display()
+            ),
+        });
+    }
+    fs::remove_dir_all(&fabric_dir).map_err(|source| ApiError::StorageInit {
+        message: format!(
+            "failed to delete fabric directory {}: {source}",
+            fabric_dir.display()
+        ),
+    })?;
+    Ok(fabric_dir)
+}
+
+/// Create a fresh, stamped fabric database at `db_path` for
+/// `setup_fabric_storage`: create the fabric directory, build at a temp path,
+/// publish by rename. The caller guarantees no database exists at `db_path`.
+fn setup_fabric_database(db_path: &Path, settings: Arc<RuntimeSettings>) -> Result<(), ApiError> {
     // The fabric directory is shared with the artifact store; creating it
     // here keeps setup self-sufficient on a fresh index root.
     if let Some(parent) = db_path.parent() {
@@ -488,19 +635,10 @@ fn setup_fabric_database(
         })?;
     }
 
-    if already_exists {
-        // Idempotent re-run: an existing database is validated, never
-        // recreated and never migrated. `open_write` already enforces the
-        // per-connection policy and the WAL check.
-        let connection = open_write_at(db_path, settings)?;
-        return validate_fabric_schema(&connection);
-    }
-
-    // Fresh database: build it at a temp path in the same directory, then
-    // publish with one atomic rename. A crash mid-setup therefore never
-    // leaves a partial database at the real path — which would otherwise be
-    // permanently rejected by the never-recreate policy — only an inert
-    // temp file the next setup run overwrites.
+    // Build at a temp path in the same directory, then publish with one
+    // atomic rename. A crash mid-setup therefore never leaves a partial
+    // database at the real path, only an inert temp file the next setup run
+    // overwrites.
     let temp_path = db_path.with_extension("sqlite3.setup-tmp");
     let build_result = build_fresh_fabric_database(&temp_path, settings);
     if let Err(source) = build_result {
@@ -911,19 +1049,25 @@ pub(crate) fn validate_fabric_schema(connection: &Connection) -> Result<(), ApiE
     Ok(())
 }
 
-/// Check the stamped schema version so a database from another schema
-/// revision stops the process instead of being silently reinterpreted.
-fn validate_fabric_schema_version(connection: &Connection) -> Result<(), ApiError> {
-    let version = connection
+/// Read the `PRAGMA user_version` stamp without judging it, so the setup path
+/// can compare versions before running the column contracts.
+fn read_fabric_schema_version(connection: &Connection) -> Result<i64, ApiError> {
+    connection
         .query_row("PRAGMA user_version;", [], |row| row.get::<_, i64>(0))
         .map_err(|source| ApiError::StorageInit {
             message: format!("failed to read fabric schema version: {source}"),
-        })?;
-    if version != EXPECTED_FABRIC_SCHEMA_VERSION {
+        })
+}
+
+/// Check the stamped schema version so a database from another schema
+/// revision stops the process instead of being silently reinterpreted.
+fn validate_fabric_schema_version(connection: &Connection) -> Result<(), ApiError> {
+    let version = read_fabric_schema_version(connection)?;
+    if version != FABRIC_SCHEMA_VERSION {
         return Err(ApiError::StorageInit {
             message: format!(
                 "fabric schema version is {version}, expected \
-                 {EXPECTED_FABRIC_SCHEMA_VERSION}; run --setup-storage"
+                 {FABRIC_SCHEMA_VERSION}; run --setup-storage"
             ),
         });
     }

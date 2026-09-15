@@ -48,6 +48,11 @@ const EVIDENCE_FORMAT: &str = r#"Return a JSON object with exactly one field, "e
 const SUMMARY_FORMAT: &str =
     r#"Return a JSON object with exactly one field, "summary", containing a nonempty string."#;
 const FINAL_ANSWER_FORMAT: &str = "Your final answer must contain only the specified JSON object, without Markdown fences or commentary.";
+// Every stage message may open with the excerpt's section path. The line is
+// context for reading the passage and is never source text: nothing may be
+// extracted, quoted, or summarized from it. Composed into every prompt so a
+// change here is a visible prompt-hash change.
+const SECTION_CONTEXT_NOTE: &str = "The input may begin with a line starting \"Section:\" followed by a blank line. That line names where the passage sits in the document and is context only. Only the passage is source text: never extract names, sentences, quotations, or summary content from the Section line.";
 
 /// Each stage has one semantic goal; schemas constrain representation only.
 #[derive(Debug, Clone, Copy)]
@@ -73,8 +78,9 @@ impl Stage {
         }
     }
 
-    /// Compose task and final-answer instructions identically for live requests
-    /// and producer hashing, so cached output cannot cross a prompt change.
+    /// Compose task, section-context, and final-answer instructions identically
+    /// for live requests and producer hashing, so cached output cannot cross a
+    /// prompt change.
     pub(crate) fn prompt(self) -> String {
         let task = match self {
             Self::EntityNames => {
@@ -100,7 +106,7 @@ impl Stage {
             Self::Evidence => EVIDENCE_FORMAT,
             Self::Summary => SUMMARY_FORMAT,
         };
-        format!("{task}\n\n{output_format}\n\n{FINAL_ANSWER_FORMAT}")
+        format!("{task}\n\n{SECTION_CONTEXT_NOTE}\n\n{output_format}\n\n{FINAL_ANSWER_FORMAT}")
     }
 
     /// Decode owned contract data explicitly; a broken schema is a local error,

@@ -423,15 +423,26 @@ CREATE TABLE IF NOT EXISTS policy_versions (
 -- rebuilt and re-linked to a fresh envelope within one parse, and because
 -- hot cleanup deletes envelopes and payloads independently.
 
--- Spec §22 ChunkPayload. One chunk projection: a retrieval targeting artifact
--- over one or more canonical ContentUnits (§23 rule 2), never evidence.
+-- Spec §22 ChunkPayload; PLAN-grains Section 2 fine grain. One chunk
+-- projection: a retrieval targeting artifact over a run of evidence members
+-- from one or more canonical ContentUnits (§23 rule 2), never evidence.
 -- input_unit_ids_json is a canonical JSON string array of the ContentUnit IDs
--- the chunk targets; targeting_text is the exact text indexed for lexical and
--- dense retrieval (both channels share chunk granularity per the C6 design).
--- token_count is nullable because it is measured by the caller-supplied
--- tokenizer and may be absent (§22 ChunkPayload.tokenCount is optional). The
--- chunker_* columns pin the producing chunker identity and its config hash so
--- a chunk's provenance and rebuild determinism are answerable from the row.
+-- the chunk targets; targeting_text is the chunk's canonical text (member
+-- texts joined by one blank line), indexed as-is by the lexical channel and
+-- embedded behind the section-path prefix by the dense channel.
+-- fragments_json is the canonical JSON array of { unitId, startChar, endChar }
+-- membership records in Unicode scalar offsets over each unit's evidence
+-- text, end exclusive (never byte offsets); section_path_json is the
+-- canonical JSON string array of the first member's section path, used only
+-- for the model-input prefix. token_count is nullable because it is measured
+-- by the caller-supplied tokenizer and may be absent (§22
+-- ChunkPayload.tokenCount is optional). The chunker_* columns pin the
+-- producing chunker identity and its config hash so a chunk's provenance and
+-- rebuild determinism are answerable from the row. chunk_index is the
+-- chunk's 0-based position in reading order within its parse, assigned by the
+-- chunker at insert; it is the ONLY reading-order authority for chunks (ids
+-- and created_at carry no order), and every higher grain that packs runs of
+-- consecutive chunks orders by it.
 CREATE TABLE IF NOT EXISTS chunk_projections (
   id TEXT PRIMARY KEY,
   projection_id TEXT NOT NULL,
@@ -443,13 +454,21 @@ CREATE TABLE IF NOT EXISTS chunk_projections (
   chunker_name TEXT NOT NULL,
   chunker_version TEXT NOT NULL,
   chunker_config_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  fragments_json TEXT NOT NULL,
+  section_path_json TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL
 );
 
 -- Per-parse chunk scans: the lexical/dense builders and hot cleanup walk a
 -- parse's chunks, and chunk-hit resolution maps a chunk back to its parse.
 CREATE INDEX IF NOT EXISTS idx_chunk_projections_parse
 ON chunk_projections(parse_id);
+
+-- Reading order is total within a parse: one chunk per position, and ordered
+-- per-parse reads (section windows, ColBERT windows) walk this index.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_projections_parse_order
+ON chunk_projections(parse_id, chunk_index);
 
 -- Spec §22/§36. FTS5 lexical index over chunk targeting text — the C6a
 -- lexical channel's candidate generation surface. chunk_id is UNINDEXED
@@ -487,30 +506,40 @@ CREATE TABLE IF NOT EXISTS chunk_dense_vectors (
 CREATE INDEX IF NOT EXISTS idx_chunk_dense_vectors_parse
 ON chunk_dense_vectors(parse_id);
 
--- Spec §22 multi_vector projection (D4 resolution), per CONTENT UNIT. ColBERT
--- token matrices persist per unit, not per chunk (D4), so unit_id is the
--- payload key. token_count and dimension bound the row-major f32 matrix_blob
--- (token_count * dimension values), letting the C6e decoder validate the
--- matrix without a separate shape record (mirrors UnitColbertDocumentVector /
--- StoredColbertDocumentVector in src/primitives/{codec,validate}.rs). The
--- (source_id, parse_id, unit_id) columns are the parse-scoped identity;
+-- Spec §22 multi_vector projection at the ColBERT grain (PLAN-grains.md
+-- Section 2): one ColBERT token matrix per WINDOW, a run of consecutive fine
+-- chunks packed under indexing.colbert_max_tokens in chunk_index order.
+-- window_index is the window's 0-based reading-order position within the
+-- parse; chunk_ids_json is the canonical JSON array of member chunk ids in
+-- order; fragments_json is the concatenation of the members' fragments
+-- ({unitId, startChar, endChar} in Unicode scalar offsets). token_count and
+-- dimension bound the row-major f32 matrix_blob (token_count * dimension
+-- values), letting the decoder validate the matrix without a separate shape
+-- record (mirrors UnitColbertDocumentVector / StoredColbertDocumentVector in
+-- src/primitives/{codec,validate}.rs); token_count is the matrix row count.
 -- projection_id links the shared retrieval_projections envelope.
-CREATE TABLE IF NOT EXISTS unit_multivector_projections (
+CREATE TABLE IF NOT EXISTS colbert_windows (
   id TEXT PRIMARY KEY,
   projection_id TEXT NOT NULL,
   source_id TEXT NOT NULL,
   parse_id TEXT NOT NULL,
-  unit_id TEXT NOT NULL,
+  window_index INTEGER NOT NULL,
+  chunk_ids_json TEXT NOT NULL,
+  fragments_json TEXT NOT NULL,
   token_count INTEGER NOT NULL,
   dimension INTEGER NOT NULL,
   matrix_blob BLOB NOT NULL,
   created_at TEXT NOT NULL
 );
 
--- One multi-vector matrix per (parse, unit); also the per-parse scan key for
--- the C6e builder, MaxSim scoring (C7c), and hot cleanup.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unit_multivector_parse_unit
-ON unit_multivector_projections(parse_id, unit_id);
+-- One window per (parse, reading-order position).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_colbert_windows_parse_window
+ON colbert_windows(parse_id, window_index);
+
+-- Per-parse scan key for the builder's delete-first rebuild, the query-side
+-- membership lookups, and hot cleanup.
+CREATE INDEX IF NOT EXISTS idx_colbert_windows_parse
+ON colbert_windows(parse_id);
 
 -- Spec §22 graph_projection, D9 resolution: entity mentions keyed by
 -- normalized entity name. Entity node identity IS the normalized name
@@ -565,4 +594,7 @@ ON graph_entity_edges(parse_id, from_normalized_name);
 CREATE INDEX IF NOT EXISTS idx_graph_entity_edges_parse_to
 ON graph_entity_edges(parse_id, to_normalized_name);
 
-PRAGMA user_version = 1;
+-- Schema revision stamp compared against hot_plane::FABRIC_SCHEMA_VERSION.
+-- Every change to this file bumps it (and the Rust constant); --setup-storage
+-- recreates any existing database whose stamp differs.
+PRAGMA user_version = 2;

@@ -26,7 +26,7 @@ pub(crate) fn encode_vector_blob(vector: &[f32]) -> Vec<u8> {
 }
 
 /// Encode a validated row-major ColBERT token matrix as the `matrix_blob`
-/// persisted to `unit_multivector_projections` (C6e). `vector` holds
+/// persisted to `colbert_windows` (C6e). `vector` holds
 /// `token_count * dimension` contiguous f32 values in row (token) major order;
 /// the byte layout is the SAME little-endian f32 contract as
 /// `encode_vector_blob`, so this reuses `encode_f32_blob` — the matrix is one

@@ -62,6 +62,9 @@ pub struct ColbertRuntime {
     encoder: ColbertEncoderRuntime,
     query_max_tokens: usize,
     document_max_tokens: usize,
+    /// Tokens `format_document` adds over the bare text, measured once at load
+    /// with this tokenizer (see `measure_document_format_overhead`).
+    document_format_overhead: usize,
     document_batch_size: usize,
     local_batch_max_tokens: usize,
     attention_smoke: ColbertAttentionSmoke,
@@ -351,6 +354,7 @@ impl ColbertRuntime {
             ))
         })?;
         progress("colbert_tokenizer_ready")?;
+        let document_format_overhead = measure_document_format_overhead(&tokenizer)?;
         progress("colbert_config_loading")?;
         let model_config = load_modernbert_config(&artifacts.config_path)?;
         validate_modernbert_config(&model_config)?;
@@ -567,6 +571,7 @@ impl ColbertRuntime {
             encoder,
             query_max_tokens: config.query_max_tokens as usize,
             document_max_tokens: config.document_max_tokens as usize,
+            document_format_overhead,
             document_batch_size: config.document_batch_size,
             local_batch_max_tokens: config.local_batch_max_tokens,
             attention_smoke,
@@ -654,6 +659,12 @@ impl ColbertRuntime {
     /// Share the actual formatted-document capacity with source-window construction.
     pub(super) fn document_max_tokens(&self) -> usize {
         self.document_max_tokens
+    }
+
+    /// Tokens the document prompt and marker add over bare text, so packers can
+    /// keep a window's formatted input within `document_max_tokens`.
+    pub(super) fn document_format_overhead(&self) -> usize {
+        self.document_format_overhead
     }
 
     /// Bound padded document batches at the builder's admission boundary.
@@ -2865,6 +2876,35 @@ pub(super) fn format_query(text: &str) -> String {
 /// Apply the ColBERT-Zero document prompt and marker inside the runtime boundary.
 pub(super) fn format_document(text: &str) -> String {
     format!("{DOCUMENT_PROMPT}{DOCUMENT_MARKER}{text}")
+}
+
+/// Measure how many tokens `format_document` adds over the bare text: both the
+/// formatted empty string and the empty string are encoded exactly as the
+/// document encoders encode (`encode(text, true)`, so special tokens cancel
+/// out), and the difference is the prompt-plus-marker cost. Both backends
+/// measure with their own tokenizer so the value matches what they truncate.
+pub(super) fn measure_document_format_overhead(tokenizer: &Tokenizer) -> Result<usize, ApiError> {
+    let formatted = tokenizer
+        .encode(format_document(""), true)
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT document format overhead tokenization failed: {source}"
+            ))
+        })?
+        .len();
+    let bare = tokenizer
+        .encode("", true)
+        .map_err(|source| {
+            inference_error(format!(
+                "ColBERT bare document tokenization failed: {source}"
+            ))
+        })?
+        .len();
+    formatted.checked_sub(bare).ok_or_else(|| {
+        inference_error(format!(
+            "ColBERT formatted empty document measures {formatted} tokens, fewer than the bare empty document's {bare}"
+        ))
+    })
 }
 
 /// Tokenize one formatted ColBERT text and apply the configured service truncation.

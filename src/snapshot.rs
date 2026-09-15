@@ -29,7 +29,7 @@
 //! artifact store here (`archive_*`); artifacts already archived with a durable
 //! uri+hash (the sealed §12.3 canonical parse bundle, the raw source bytes) are
 //! REFERENCED by that existing uri+hash, never re-copied. The dense-vector and
-//! multivector blobs are archived as raw bytes so a restore RE-IMPORTS them
+//! ColBERT-window blobs are archived as raw bytes so a restore RE-IMPORTS them
 //! (§31.3) rather than re-embedding — they are byte-reproducible only from the
 //! stored blobs. FTS5 (`chunk_text_index`) and the graph planes are NOT archived
 //! (C9b's deletion-gate deterministic rebuild covers them, §8.3/§30.5).
@@ -688,14 +688,17 @@ fn build_and_archive_manifest(
     retrieval_projections.push(dense.metadata);
     retrieval_indexes.extend(dense.plane);
     let dense_blob_count = dense.row_count;
+    // ColBERT windows: one matrix per window; the metadata record carries the
+    // window's membership columns (window_index, chunk_ids_json,
+    // fragments_json) so restore reproduces the row without re-deriving runs.
     let multivector = archive_blob_plane(
         store,
         connection,
         scope,
-        "unit_multivector_projections",
+        "colbert_windows",
         "id",
         "matrix_blob",
-        "multivector_blob",
+        "colbert_window_blob",
     )?;
     retrieval_projections.push(multivector.metadata);
     retrieval_indexes.extend(multivector.plane);
@@ -1168,7 +1171,7 @@ struct BlobPlaneArchive {
     row_count: usize,
 }
 
-/// Archive a binary plane (dense vectors, multivector matrices) in the
+/// Archive a binary plane (dense vectors, ColBERT window matrices) in the
 /// `MANIFEST_FORMAT_VERSION` layout: every in-scope row's binary payload is
 /// concatenated, in primary-key order, into ONE content-addressed blob, and each
 /// row's scalar columns become one metadata record carrying the row's byte
