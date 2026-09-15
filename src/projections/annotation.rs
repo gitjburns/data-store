@@ -25,7 +25,7 @@ use crate::{
 
 use super::{
     annotation_io::{EmbeddingRef, validate_ref},
-    chunk::{Fragment, join_text, ordered_unit_ids},
+    chunk::{Fragment, fragment_spans, join_text, ordered_unit_ids},
     section_dense::{
         CONSTRUCTION_VERSION as CONTEXT_WINDOW_CONSTRUCTION_VERSION, load_section_dense_reference,
         visit_section_dense,
@@ -120,7 +120,9 @@ pub(crate) struct AnnotationConstruction {
 }
 
 /// Where one fragment's slice lies in the window's canonical text, so a
-/// ColBERT partition of that text maps back to exact fragment ranges.
+/// ColBERT partition of that text maps back to exact fragment ranges. Owns
+/// its fragment, unlike `chunk::FragmentSpan`, which is the per-member layout
+/// this is offset from.
 struct FragmentSpan {
     fragment: Fragment,
     start_char: usize,
@@ -929,10 +931,13 @@ pub(crate) fn intersects_window(annotation: &SemanticAnnotation, fragments: &[Fr
 }
 
 /// Rebuild the cohort window's canonical text from its member chunk rows in
-/// the caller's snapshot and lay out every fragment inside it. Layout is the
-/// chunker's: fragments of one member are joined by one tab (a table row's
-/// cells), members by one blank line. The rebuilt fragments must equal the
-/// plan's and the text must hash to the plan's, or the window has changed.
+/// the caller's snapshot and lay out every fragment inside it. Each member's
+/// fragments are laid out over that member's own `targeting_text` by
+/// `chunk::fragment_spans` (the text, not the fragment list, decides whether a
+/// tab or a blank line separates two fragments), then offset by the member's
+/// base in the window text, where members are joined by one blank line. The
+/// rebuilt fragments must equal the plan's and the text must hash to the
+/// plan's, or the window has changed.
 fn window_text(conn: &Connection, plan: &CohortPlan) -> Result<WindowText, ApiError> {
     let max_source_bytes = conn.limits().resources.max_source_body_bytes;
     let mut statement = conn
@@ -967,23 +972,20 @@ fn window_text(conn: &Connection, plan: &CohortPlan) -> Result<WindowText, ApiEr
         } else {
             canonical.chars().count() + 2
         };
-        let mut offset = base;
-        for (index, fragment) in fragments.into_iter().enumerate() {
-            if index > 0 {
-                offset += 1;
-            }
-            let end_char = offset + (fragment.end_char - fragment.start_char);
+        // The walker yields exactly one span per fragment, in order, and
+        // proves the member text is fully covered; the offsets are copied out
+        // so the fragments can then be moved into the window's owned spans.
+        let member_spans: Vec<(usize, usize)> = fragment_spans(&text, &fragments)
+            .map_err(|source| failure(format!("member {chunk_id}: {source}")))?
+            .iter()
+            .map(|span| (span.start_char, span.end_char))
+            .collect();
+        for (fragment, (start_char, end_char)) in fragments.into_iter().zip(member_spans) {
             spans.push(FragmentSpan {
                 fragment,
-                start_char: offset,
-                end_char,
+                start_char: base + start_char,
+                end_char: base + end_char,
             });
-            offset = end_char;
-        }
-        if offset - base != text.chars().count() {
-            return Err(failure(format!(
-                "member {chunk_id} text length disagrees with its fragment layout"
-            )));
         }
         canonical = if canonical.is_empty() {
             text

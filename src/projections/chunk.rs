@@ -44,6 +44,7 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::Instant;
 
 use crate::artifact_store::ArtifactStore;
@@ -920,6 +921,100 @@ impl OpenRun {
 /// the higher grains, whose canonical text is member texts joined the same way.
 pub(crate) fn join_text(left: &str, right: &str) -> String {
     format!("{left}\n\n{right}")
+}
+
+/// Where one fragment lies in a chunk's canonical text: `start_char..end_char`
+/// are Unicode scalar offsets into that text, end exclusive. Borrows the
+/// fragment it was laid out from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FragmentSpan<'a> {
+    pub(crate) fragment: &'a Fragment,
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+}
+
+/// Why a fragment list does not lay out over a chunk text. `index` names the
+/// offending fragment (the last fragment when text is left over). Callers wrap
+/// it in their own `ApiError` variant so verification, producer, and
+/// projection failures keep their classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FragmentLayoutError {
+    pub(crate) index: usize,
+    pub(crate) detail: &'static str,
+}
+
+impl fmt::Display for FragmentLayoutError {
+    // Names the fragment by list position so the message locates it in `fragments_json`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "fragment {} {}", self.index, self.detail)
+    }
+}
+
+/// Lay `fragments` out over `text`, a chunk's canonical text, and return each
+/// fragment's span in it. The text is the layout authority: `fragments_json`
+/// lists fragments in order but carries no separator information by design,
+/// because the separator between two consecutive fragments is decided by how
+/// the chunker joined them — one tab between the cells of one table-row
+/// member, one blank line between members (`join_text`) — and is recorded
+/// nowhere but in the text itself. The walk therefore consumes each fragment's
+/// exact scalar length in order, then requires the text to continue with
+/// exactly the one separator that is present (`\t` or `\n\n`) before the next
+/// fragment, and to end after the last one. An empty fragment, a fragment
+/// running past the text, a missing separator, or leftover text is an error
+/// naming the fragment. An empty list lays out over empty text only.
+pub(crate) fn fragment_spans<'a>(
+    text: &str,
+    fragments: &'a [Fragment],
+) -> Result<Vec<FragmentSpan<'a>>, FragmentLayoutError> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut cursor = 0_usize;
+    let mut spans = Vec::with_capacity(fragments.len());
+    let last = fragments.len().checked_sub(1);
+    for (index, fragment) in fragments.iter().enumerate() {
+        let length = fragment
+            .end_char
+            .checked_sub(fragment.start_char)
+            .filter(|length| *length > 0)
+            .ok_or(FragmentLayoutError {
+                index,
+                detail: "has an empty or reversed range",
+            })?;
+        let end_char = cursor
+            .checked_add(length)
+            .filter(|end| *end <= chars.len())
+            .ok_or(FragmentLayoutError {
+                index,
+                detail: "extends beyond the chunk text",
+            })?;
+        spans.push(FragmentSpan {
+            fragment,
+            start_char: cursor,
+            end_char,
+        });
+        cursor = end_char;
+        if Some(index) == last {
+            break;
+        }
+        // `cursor <= chars.len()` holds, so the slice cannot panic.
+        let rest = &chars[cursor..];
+        if rest.first() == Some(&'\t') {
+            cursor += 1;
+        } else if rest.starts_with(&['\n', '\n']) {
+            cursor += 2;
+        } else {
+            return Err(FragmentLayoutError {
+                index,
+                detail: "is not followed by a tab or a blank line",
+            });
+        }
+    }
+    if cursor != chars.len() {
+        return Err(FragmentLayoutError {
+            index: last.unwrap_or(0),
+            detail: "does not reach the end of the chunk text",
+        });
+    }
+    Ok(spans)
 }
 
 /// The result of splitting one member at a measured boundary: the head that

@@ -60,7 +60,7 @@ use crate::model::{
     SemanticAnnotation, SemanticAnnotationType, SnapshotArtifactRef,
 };
 use crate::projections::ChunkerConfig;
-use crate::projections::chunk::{Fragment, ordered_unit_ids};
+use crate::projections::chunk::{Fragment, fragment_spans, ordered_unit_ids};
 use crate::projections::graph::{CapturedGraph, DerivedEdge};
 use crate::projections::section_dense::{
     SECTION_DENSE_INDEX_NAME, SectionDensePlane, read_section_payload,
@@ -352,19 +352,24 @@ struct ExpectedSourceInput {
 /// One archived `chunk_projections` row's window-membership fields, retained
 /// only for parses that publish annotation cohorts. Cohort windows are checked
 /// against these rows, not against the manifest's own copy of the layout.
+/// `targeting_text` is retained because it alone records how the row's
+/// fragments are separated (`chunk::fragment_spans`).
 #[derive(serde::Deserialize)]
 struct ArchivedChunkMember {
     id: String,
     parse_id: String,
     chunk_index: u64,
+    targeting_text: String,
     fragments_json: String,
 }
 
-/// Decoded membership of one archived chunk: its reading-order index and
-/// fragments, the two facts a cohort window is verified against.
+/// Decoded membership of one archived chunk: its reading-order index, its
+/// canonical text, and its fragments — the facts a cohort window's layout is
+/// verified against.
 struct ChunkMember {
     parse_id: String,
     chunk_index: u64,
+    targeting_text: String,
     fragments: Vec<Fragment>,
 }
 
@@ -607,6 +612,7 @@ fn collect_chunk_members(
             let member = ChunkMember {
                 parse_id: row.parse_id,
                 chunk_index: row.chunk_index,
+                targeting_text: row.targeting_text,
                 fragments,
             };
             if chunks.insert(row.id.clone(), member).is_some() {
@@ -882,9 +888,12 @@ fn collect_annotation_expectations(
 /// Bind a cohort window to the archived chunk rows it names: every member
 /// exists in the plan's parse, members carry consecutive `chunk_index`, and the
 /// window's fragments are the members' fragments concatenated in that order.
-/// Returns each window fragment's `[start, end)` span in the canonical text
-/// under the chunker's layout: fragments of one member joined by one tab,
-/// members by one blank line (`chunk::join_text`).
+/// Returns each window fragment's `[start, end)` span in the canonical text:
+/// each member's fragments are laid out over that member's archived
+/// `targeting_text` by `chunk::fragment_spans` (the text decides whether a tab
+/// or a blank line separates two fragments), then offset by the member's base
+/// in the window text, where members are joined by one blank line
+/// (`chunk::join_text`).
 fn verify_window_members(
     snapshot_id: &str,
     plan: &annotation::CohortPlan,
@@ -895,7 +904,7 @@ fn verify_window_members(
     let mut rebuilt: Vec<&Fragment> = Vec::with_capacity(plan.target.fragments.len());
     let mut next_index = None;
     let mut offset = 0_usize;
-    for chunk_id in &plan.target.chunk_ids {
+    for (position, chunk_id) in plan.target.chunk_ids.iter().enumerate() {
         let member = chunks
             .get(chunk_id)
             .filter(|member| member.parse_id == plan.parse_id)
@@ -912,27 +921,24 @@ fn verify_window_members(
             ));
         }
         next_index = Some(member.chunk_index.checked_add(1));
-        if !rebuilt.is_empty() {
+        // Every member after the first sits behind the window-level blank line.
+        if position > 0 {
             offset += 2;
         }
-        for (index, fragment) in member.fragments.iter().enumerate() {
-            if index > 0 {
-                offset += 1;
-            }
-            let end_char = fragment
-                .end_char
-                .checked_sub(fragment.start_char)
-                .and_then(|length| offset.checked_add(length))
-                .ok_or_else(|| {
-                    annotation_snapshot_failure(
-                        snapshot_id,
-                        format!("archived chunk {chunk_id} has an inverted fragment range"),
-                    )
-                })?;
-            layout.push((offset, end_char));
-            rebuilt.push(fragment);
-            offset = end_char;
+        let spans =
+            fragment_spans(&member.targeting_text, &member.fragments).map_err(|source| {
+                annotation_snapshot_failure(
+                    snapshot_id,
+                    format!("archived chunk {chunk_id} {source}"),
+                )
+            })?;
+        for span in spans {
+            layout.push((offset + span.start_char, offset + span.end_char));
+            rebuilt.push(span.fragment);
         }
+        // The walker proved the member text is fully covered, so the member
+        // advances the window offset by exactly its scalar length.
+        offset += member.targeting_text.chars().count();
     }
     if !rebuilt.iter().copied().eq(plan.target.fragments.iter()) {
         return Err(annotation_snapshot_failure(

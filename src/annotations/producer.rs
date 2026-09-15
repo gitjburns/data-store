@@ -371,60 +371,40 @@ impl ExcerptRun {
     }
 }
 
-/// Slice each fragment's text out of the window canonical text. The canonical
-/// text is member texts joined by one blank line, with the cells of one table
-/// row joined by one tab (`projections::chunk`), so after a fragment's exact
-/// length the next characters are that tab, that blank line, or the end of the
-/// text. Any other layout means the fragments and the text disagree, and the
-/// plan fails loudly rather than attributing wrong text to a unit.
+/// Slice each fragment's text out of the window canonical text. The layout is
+/// `chunk::fragment_spans`'s: the canonical text is member texts joined by one
+/// blank line, with the cells of one table row joined by one tab, and the text
+/// itself decides which separator follows each fragment. A layout the walker
+/// rejects means the fragments and the text disagree, and the plan fails
+/// loudly rather than attributing wrong text to a unit.
 fn fragment_targets(window: &SectionDenseWindow) -> Result<Vec<InvocationTarget>, ApiError> {
-    let layout_failure = |detail: &str| ApiError::AnnotationProducer {
+    let layout_failure = |detail: &dyn std::fmt::Display| ApiError::AnnotationProducer {
         message: format!(
             "context window {} fragments do not lay out over its canonical text: {detail}",
             window.window_id
         ),
     };
+    let spans = chunk::fragment_spans(&window.targeting_text, &window.fragments)
+        .map_err(|source| layout_failure(&source))?;
     let chars: Vec<char> = window.targeting_text.chars().collect();
-    let mut cursor = 0usize;
-    let mut targets = Vec::with_capacity(window.fragments.len());
-    for (position, fragment) in window.fragments.iter().enumerate() {
-        let length = fragment
-            .end_char
-            .checked_sub(fragment.start_char)
-            .filter(|length| *length > 0)
-            .ok_or_else(|| layout_failure("empty or reversed fragment range"))?;
-        let end = cursor
-            .checked_add(length)
-            .ok_or_else(|| layout_failure("fragment range overflows"))?;
-        let text: String = chars
-            .get(cursor..end)
-            .ok_or_else(|| layout_failure("fragment extends beyond the canonical text"))?
-            .iter()
-            .collect();
-        targets.push(InvocationTarget {
-            unit_id: fragment.unit_id.clone(),
-            text,
-            start_char: fragment.start_char,
-            end_char: fragment.end_char,
-        });
-        cursor = end;
-        if position + 1 == window.fragments.len() {
-            break;
-        }
-        if chars.get(cursor) == Some(&'\t') {
-            cursor += 1;
-        } else if chars.get(cursor..cursor + 2) == Some(&['\n', '\n']) {
-            cursor += 2;
-        } else {
-            return Err(layout_failure(
-                "fragment is not followed by a member separator",
-            ));
-        }
-    }
-    if cursor != chars.len() {
-        return Err(layout_failure("fragments do not cover the canonical text"));
-    }
-    Ok(targets)
+    spans
+        .into_iter()
+        .map(|span| {
+            // The walker bounds every span by the text, so a miss here is a
+            // walker defect rather than bad data; it still fails instead of panicking.
+            let text: String = chars
+                .get(span.start_char..span.end_char)
+                .ok_or_else(|| layout_failure(&"fragment span lies outside the canonical text"))?
+                .iter()
+                .collect();
+            Ok(InvocationTarget {
+                unit_id: span.fragment.unit_id.clone(),
+                text,
+                start_char: span.fragment.start_char,
+                end_char: span.fragment.end_char,
+            })
+        })
+        .collect()
 }
 
 /// Keep diagnostic excerpt indexes lossless even for pathological input sizes.
